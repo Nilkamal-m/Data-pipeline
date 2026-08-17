@@ -1,0 +1,21 @@
+{
+  "Comment": "AWS Step Functions State Machine for Custom Tables & Custom Query Extractions",
+  "StartAt": "ExtractServiceNowCustomTablesAndQueries",
+  "States": {
+    "ExtractServiceNowCustomTablesAndQueries": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "glue-incremental-data-loader",
+        "Arguments": {
+          "--SOURCE_SYSTEM": "servicenow",
+          "--TABLE_NAME.$": "$.tables",
+          "--CUSTOM_QUERY.$": "$.custom_query",
+          "--SECRET_NAME.$": "$.secret_name",
+          "--BRONZE_BUCKET.$": "$.bronze_bucket"
+        }
+      },
+      "End": true
+    }
+  }
+}

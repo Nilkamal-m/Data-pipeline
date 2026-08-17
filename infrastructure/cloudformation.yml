@@ -1,0 +1,705 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation Template for UAX Single-Bucket Data Lake Architecture.
+  Deploys a Single S3 Bucket with partitioned folders (bronze/, silver/, athena-results/, metadata/, scripts/bronze/, scripts/silver/),
+  AWS Glue API Ingestion (Python Shell), AWS Glue PySpark Iceberg ETL, AWS Glue Data Catalog & Crawler,
+  Amazon Athena WorkGroup, Amazon SNS Alert Topic, AWS Step Functions State Machine, and EventBridge Cron Schedule.
+
+# ==============================================================================
+# Parameters
+# ==============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment stage.
+
+  AppName:
+    Type: String
+    Default: uax-data-pipeline
+    Description: Application name prefix for resources.
+
+  DataLakeBucketName:
+    Type: String
+    Default: uax-data-lake-bucket
+    Description: Single S3 bucket storing bronze/, silver/, athena-results/, metadata/, and scripts/.
+
+  AlertEmailAddress:
+    Type: String
+    Default: data-eng-alerts@company.com
+    Description: Email address to receive pipeline failure/success SNS notifications.
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 6 * * ? *)"
+    Description: EventBridge cron expression for automated pipeline execution.
+
+  InitialLoadDate:
+    Type: String
+    Default: "2024-01-01T00:00:00Z"
+    Description: Fallback High-Water Mark ISO timestamp for initial pipeline execution.
+
+  OutputFormat:
+    Type: String
+    Default: parquet
+    AllowedValues: [parquet, json]
+    Description: Raw Bronze data serialization format.
+
+# ==============================================================================
+# Resources
+# ==============================================================================
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # 1. Single S3 Data Lake Bucket
+  # ----------------------------------------------------------------------------
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${DataLakeBucketName}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ----------------------------------------------------------------------------
+  # 2. AWS Secrets Manager (OAuth 2.0 API Credentials Secrets)
+  # ----------------------------------------------------------------------------
+  ServiceNowOAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "data-lake/servicenow-credentials-${Environment}"
+      Description: ServiceNow OAuth 2.0 credentials (Password/Client Credentials flow).
+      SecretString: !Sub |
+        {
+          "grant_type": "password",
+          "client_id": "CHANGE_ME_SERVICENOW_CLIENT_ID",
+          "client_secret": "CHANGE_ME_SERVICENOW_CLIENT_SECRET",
+          "username": "servicenow_api_user",
+          "password": "CHANGE_ME_SERVICENOW_PASSWORD",
+          "token_url": "https://your-instance.service-now.com/oauth_token.do"
+        }
+
+  MoveworksOAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "data-lake/moveworks-credentials-${Environment}"
+      Description: Moveworks OAuth 2.0 credentials (Client Credentials flow).
+      SecretString: !Sub |
+        {
+          "grant_type": "client_credentials",
+          "client_id": "CHANGE_ME_MOVEWORKS_CLIENT_ID",
+          "client_secret": "CHANGE_ME_MOVEWORKS_CLIENT_SECRET",
+          "token_url": "https://api.moveworks.ai/rest/v1/oauth/token",
+          "scope": "export:read"
+        }
+
+  GenesysOAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "data-lake/genesys-credentials-${Environment}"
+      Description: Genesys PureCloud OAuth 2.0 credentials (Client Credentials flow).
+      SecretString: !Sub |
+        {
+          "grant_type": "client_credentials",
+          "client_id": "CHANGE_ME_GENESYS_CLIENT_ID",
+          "client_secret": "CHANGE_ME_GENESYS_CLIENT_SECRET",
+          "token_url": "https://login.mypurecloud.com/oauth/token"
+        }
+
+  # ----------------------------------------------------------------------------
+  # 3. Amazon SNS Topic & Subscription (Alerts & Notifications)
+  # ----------------------------------------------------------------------------
+  PipelineAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AppName}-alerts-${Environment}"
+      DisplayName: !Sub "UAX Data Pipeline Alerts (${Environment})"
+
+  PipelineAlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PipelineAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailAddress
+
+  # ----------------------------------------------------------------------------
+  # 4. IAM Execution Roles (Glue, Step Functions, EventBridge)
+  # ----------------------------------------------------------------------------
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-glue-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [glue.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: !Sub "${AppName}-single-bucket-permissions-${Environment}"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataLakeBucketName}-${Environment}"
+                  - !Sub "arn:aws:s3:::${DataLakeBucketName}-${Environment}/*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref ServiceNowOAuthSecret
+                  - !Ref MoveworksOAuthSecret
+                  - !Ref GenesysOAuthSecret
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-sfn-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [states.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: !Sub "${AppName}-sfn-permissions-${Environment}"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PipelineAlertTopic
+
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-eventbridge-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: !Sub "${AppName}-eventbridge-permissions-${Environment}"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref PipelineOrchestratorStateMachine
+
+  # ----------------------------------------------------------------------------
+  # 5. AWS Glue Database, Jobs & Crawler (Organized under scripts/bronze & scripts/silver)
+  # ----------------------------------------------------------------------------
+  GlueCatalogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "uax_data_lake_db_${Environment}"
+        Description: Single-bucket UAX Data Lake Catalog Database storing Silver/Gold tables.
+
+  GlueApiIngestionJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${AppName}-api-ingestion-${Environment}"
+      Description: AWS Glue Python Shell Job executing Bronze REST API ingestion.
+      Role: !GetAtt GlueExecutionRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/bronze/incremental_load_handler.py"
+      DefaultArguments:
+        "--extra-py-files": !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/bronze/config_loader.py,s3://${DataLakeBucketName}-${Environment}/scripts/bronze/connectors.zip"
+        "--CONFIG_S3_PATH": !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/bronze/config/bronze_config.json"
+        "--BRONZE_BUCKET": !Ref DataLakeBucket
+        "--OUTPUT_FORMAT": !Ref OutputFormat
+        "--CLOUDWATCH_NAMESPACE": "UAX/DataPipeline/Ingestion"
+        "--ERROR_HANDLING_MODE": "CONTINUE_ON_ERROR"
+        "--job-language": "python"
+
+  GlueSilverIcebergETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${AppName}-silver-iceberg-etl-${Environment}"
+      Description: AWS Glue PySpark ETL Job transforming Bronze raw data into Silver Apache Iceberg tables.
+      Role: !GetAtt GlueExecutionRole.Arn
+      GlueVersion: "4.0"
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/silver/silver_iceberg_etl.py"
+      DefaultArguments:
+        "--extra-py-files": !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/silver/silver_config_loader.py,s3://${DataLakeBucketName}-${Environment}/scripts/silver/transformer.py"
+        "--SILVER_CONFIG_S3_PATH": !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/silver/config/silver_config.json"
+        "--datalake-formats": "iceberg"
+        "--conf": "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+        "--DATA_LAKE_BUCKET": !Ref DataLakeBucket
+        "--GLUE_DATABASE": !Ref GlueCatalogDatabase
+        "--SOURCE_SYSTEM": "servicenow"
+        "--job-language": "python"
+
+  SilverIcebergCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${AppName}-silver-crawler-${Environment}"
+      Description: Crawls Silver Iceberg tables located under s3://bucket/silver/ folder.
+      Role: !GetAtt GlueExecutionRole.Arn
+      DatabaseName: !Ref GlueCatalogDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataLakeBucketName}-${Environment}/silver/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # ----------------------------------------------------------------------------
+  # 6. Amazon Athena WorkGroup (Gold Layer Query Engine)
+  # ----------------------------------------------------------------------------
+  AthenaGoldQueryWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AppName}-athena-workgroup-${Environment}"
+      Description: Athena WorkGroup outputting query results to s3://bucket/athena-results/ folder.
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataLakeBucketName}-${Environment}/athena-results/"
+
+  # ----------------------------------------------------------------------------
+  # 7. AWS Step Functions State Machines (ServiceNow, Moveworks, Genesys)
+  # ----------------------------------------------------------------------------
+
+  # --- ServiceNow Pipeline State Machine ---
+  ServiceNowStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AppName}-servicenow-orchestrator-${Environment}"
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "ServiceNow Ingestion, Silver Iceberg ETL & Crawler Orchestrator",
+          "StartAt": "TriggerServiceNowIngestion",
+          "States": {
+            "TriggerServiceNowIngestion": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${AppName}-api-ingestion-${Environment}",
+                "Arguments": {
+                  "--SOURCE_SYSTEM": "servicenow",
+                  "--SECRET_NAME": "data-lake/servicenow-credentials-${Environment}",
+                  "--BRONZE_BUCKET": "${DataLakeBucketName}-${Environment}"
+                }
+              },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "TriggerServiceNowSilverETL"
+            },
+            "TriggerServiceNowSilverETL": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${AppName}-silver-iceberg-etl-${Environment}",
+                "Arguments": {
+                  "--SOURCE_SYSTEM": "servicenow",
+                  "--TABLE_NAME": "incident",
+                  "--DATA_LAKE_BUCKET": "${DataLakeBucketName}-${Environment}",
+                  "--GLUE_DATABASE": "uax_data_lake_db_${Environment}"
+                }
+              },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "StartSilverCrawler"
+            },
+            "StartSilverCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startCrawler",
+              "Parameters": { "Name": "${AppName}-silver-crawler-${Environment}" },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "WaitForCrawlerToSync"
+            },
+            "WaitForCrawlerToSync": {
+              "Type": "Wait",
+              "Seconds": 15,
+              "Next": "CheckCrawlerStatus"
+            },
+            "CheckCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": { "Name": "${AppName}-silver-crawler-${Environment}" },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "IsCrawlerReady"
+            },
+            "IsCrawlerReady": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "PublishSuccessAlert"
+                }
+              ],
+              "Default": "WaitForCrawlerToSync"
+            },
+            "PublishSuccessAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${PipelineAlertTopic}",
+                "Subject": "SUCCESS: ServiceNow Pipeline Succeeded (${Environment})",
+                "Message": "ServiceNow Bronze Ingestion, Silver Iceberg ETL, and Crawler Partition Sync completed successfully."
+              },
+              "End": true
+            },
+            "PublishFailureAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${PipelineAlertTopic}",
+                "Subject": "FAILURE: ServiceNow Pipeline Failed (${Environment})",
+                "Message": "An error occurred during ServiceNow pipeline execution. Please inspect AWS Glue job logs and Step Functions details."
+              },
+              "Next": "PipelineFailedState"
+            },
+            "PipelineFailedState": {
+              "Type": "Fail",
+              "Error": "ServiceNowPipelineFailed",
+              "Cause": "ServiceNow ingestion or transformation task failed."
+            }
+          }
+        }
+
+  # --- Moveworks Pipeline State Machine ---
+  MoveworksStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AppName}-moveworks-orchestrator-${Environment}"
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Moveworks Ingestion, Silver Iceberg ETL & Crawler Orchestrator",
+          "StartAt": "TriggerMoveworksIngestion",
+          "States": {
+            "TriggerMoveworksIngestion": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${AppName}-api-ingestion-${Environment}",
+                "Arguments": {
+                  "--SOURCE_SYSTEM": "moveworks",
+                  "--SECRET_NAME": "data-lake/moveworks-credentials-${Environment}",
+                  "--BRONZE_BUCKET": "${DataLakeBucketName}-${Environment}"
+                }
+              },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "TriggerMoveworksSilverETL"
+            },
+            "TriggerMoveworksSilverETL": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${AppName}-silver-iceberg-etl-${Environment}",
+                "Arguments": {
+                  "--SOURCE_SYSTEM": "moveworks",
+                  "--TABLE_NAME": "interactions",
+                  "--DATA_LAKE_BUCKET": "${DataLakeBucketName}-${Environment}",
+                  "--GLUE_DATABASE": "uax_data_lake_db_${Environment}"
+                }
+              },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "StartSilverCrawler"
+            },
+            "StartSilverCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startCrawler",
+              "Parameters": { "Name": "${AppName}-silver-crawler-${Environment}" },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "WaitForCrawlerToSync"
+            },
+            "WaitForCrawlerToSync": {
+              "Type": "Wait",
+              "Seconds": 15,
+              "Next": "CheckCrawlerStatus"
+            },
+            "CheckCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": { "Name": "${AppName}-silver-crawler-${Environment}" },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "IsCrawlerReady"
+            },
+            "IsCrawlerReady": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "PublishSuccessAlert"
+                }
+              ],
+              "Default": "WaitForCrawlerToSync"
+            },
+            "PublishSuccessAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${PipelineAlertTopic}",
+                "Subject": "SUCCESS: Moveworks Pipeline Succeeded (${Environment})",
+                "Message": "Moveworks Bronze Ingestion, Silver Iceberg ETL, and Crawler Partition Sync completed successfully."
+              },
+              "End": true
+            },
+            "PublishFailureAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${PipelineAlertTopic}",
+                "Subject": "FAILURE: Moveworks Pipeline Failed (${Environment})",
+                "Message": "An error occurred during Moveworks pipeline execution. Please inspect AWS Glue job logs and Step Functions details."
+              },
+              "Next": "PipelineFailedState"
+            },
+            "PipelineFailedState": {
+              "Type": "Fail",
+              "Error": "MoveworksPipelineFailed",
+              "Cause": "Moveworks ingestion or transformation task failed."
+            }
+          }
+        }
+
+  # --- Genesys Pipeline State Machine ---
+  GenesysStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AppName}-genesys-orchestrator-${Environment}"
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Genesys Ingestion, Silver Iceberg ETL & Crawler Orchestrator",
+          "StartAt": "TriggerGenesysIngestion",
+          "States": {
+            "TriggerGenesysIngestion": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${AppName}-api-ingestion-${Environment}",
+                "Arguments": {
+                  "--SOURCE_SYSTEM": "genesys",
+                  "--SECRET_NAME": "data-lake/genesys-credentials-${Environment}",
+                  "--BRONZE_BUCKET": "${DataLakeBucketName}-${Environment}"
+                }
+              },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "TriggerGenesysSilverETL"
+            },
+            "TriggerGenesysSilverETL": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${AppName}-silver-iceberg-etl-${Environment}",
+                "Arguments": {
+                  "--SOURCE_SYSTEM": "genesys",
+                  "--TABLE_NAME": "conversations",
+                  "--DATA_LAKE_BUCKET": "${DataLakeBucketName}-${Environment}",
+                  "--GLUE_DATABASE": "uax_data_lake_db_${Environment}"
+                }
+              },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "StartSilverCrawler"
+            },
+            "StartSilverCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startCrawler",
+              "Parameters": { "Name": "${AppName}-silver-crawler-${Environment}" },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "WaitForCrawlerToSync"
+            },
+            "WaitForCrawlerToSync": {
+              "Type": "Wait",
+              "Seconds": 15,
+              "Next": "CheckCrawlerStatus"
+            },
+            "CheckCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": { "Name": "${AppName}-silver-crawler-${Environment}" },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PublishFailureAlert" }],
+              "Next": "IsCrawlerReady"
+            },
+            "IsCrawlerReady": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "PublishSuccessAlert"
+                }
+              ],
+              "Default": "WaitForCrawlerToSync"
+            },
+            "PublishSuccessAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${PipelineAlertTopic}",
+                "Subject": "SUCCESS: Genesys Pipeline Succeeded (${Environment})",
+                "Message": "Genesys Bronze Ingestion, Silver Iceberg ETL, and Crawler Partition Sync completed successfully."
+              },
+              "End": true
+            },
+            "PublishFailureAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${PipelineAlertTopic}",
+                "Subject": "FAILURE: Genesys Pipeline Failed (${Environment})",
+                "Message": "An error occurred during Genesys pipeline execution. Please inspect AWS Glue job logs and Step Functions details."
+              },
+              "Next": "PipelineFailedState"
+            },
+            "PipelineFailedState": {
+              "Type": "Fail",
+              "Error": "GenesysPipelineFailed",
+              "Cause": "Genesys ingestion or transformation task failed."
+            }
+          }
+        }
+
+  # ----------------------------------------------------------------------------
+  # 8. Amazon EventBridge Cron Schedule Rules (ServiceNow, Moveworks, Genesys)
+  # ----------------------------------------------------------------------------
+  ServiceNowCronRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AppName}-servicenow-cron-${Environment}"
+      Description: Automated cron rule triggering ServiceNow State Machine.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref ServiceNowStateMachine
+          Id: TargetServiceNowStateMachine
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  MoveworksCronRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AppName}-moveworks-cron-${Environment}"
+      Description: Automated cron rule triggering Moveworks State Machine.
+      ScheduleExpression: "cron(30 6 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref MoveworksStateMachine
+          Id: TargetMoveworksStateMachine
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  GenesysCronRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AppName}-genesys-cron-${Environment}"
+      Description: Automated cron rule triggering Genesys State Machine.
+      ScheduleExpression: "cron(0 7 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref GenesysStateMachine
+          Id: TargetGenesysStateMachine
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  DataLakeBucketOutput:
+    Description: Single S3 Data Lake Bucket Name
+    Value: !Ref DataLakeBucket
+
+  BronzePathOutput:
+    Description: S3 Bronze Layer Prefix Path
+    Value: !Sub "s3://${DataLakeBucketName}-${Environment}/bronze/"
+
+  SilverPathOutput:
+    Description: S3 Silver Layer Prefix Path
+    Value: !Sub "s3://${DataLakeBucketName}-${Environment}/silver/"
+
+  BronzeScriptsPathOutput:
+    Description: S3 Bronze Scripts Location
+    Value: !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/bronze/"
+
+  SilverScriptsPathOutput:
+    Description: S3 Silver Scripts Location
+    Value: !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/silver/"
+
+  GlueDatabaseOutput:
+    Description: AWS Glue Catalog Database Name
+    Value: !Ref GlueCatalogDatabase
+
+  ServiceNowStateMachineArnOutput:
+    Description: ServiceNow Step Functions State Machine ARN
+    Value: !Ref ServiceNowStateMachine
+
+  MoveworksStateMachineArnOutput:
+    Description: Moveworks Step Functions State Machine ARN
+    Value: !Ref MoveworksStateMachine
+
+  GenesysStateMachineArnOutput:
+    Description: Genesys Step Functions State Machine ARN
+    Value: !Ref GenesysStateMachine
+
+  SNSTopicArnOutput:
+    Description: Amazon SNS Alert Topic ARN
+    Value: !Ref PipelineAlertTopic
+
+  ServiceNowSecretArnOutput:
+    Description: ServiceNow OAuth 2.0 Secret ARN
+    Value: !Ref ServiceNowOAuthSecret
+
+  MoveworksSecretArnOutput:
+    Description: Moveworks OAuth 2.0 Secret ARN
+    Value: !Ref MoveworksOAuthSecret
+
+  GenesysSecretArnOutput:
+    Description: Genesys PureCloud OAuth 2.0 Secret ARN
+    Value: !Ref GenesysOAuthSecret

@@ -1,0 +1,244 @@
+{
+  "silver_defaults": {
+    "target_format": "iceberg",
+    "merge_strategy": "upsert",
+    "scd_type": "scd1",
+    "scd_type2_config": {
+      "valid_from_column": "_valid_from",
+      "valid_to_column": "_valid_to",
+      "is_current_column": "_is_current"
+    },
+    "glue_database": "uax_data_lake_db",
+    "deduplication": {
+      "enabled": true,
+      "strategy": "latest_by_order_column",
+      "default_pk_column": "sys_id",
+      "default_order_column": "_ingested_at"
+    }
+  },
+  "source_systems": {
+    "servicenow": {
+      "default_tables": ["incident", "change_request", "problem", "sys_user"],
+      "table_configs": {
+        "incident": {
+          "primary_key": "sys_id",
+          "deduplication_keys": ["sys_id"],
+          "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {
+            "sys_mod_count": "integer"
+          },
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": "custom_transforms/servicenow_incident.py"
+        },
+        "change_request": {
+          "primary_key": "sys_id",
+          "deduplication_keys": ["sys_id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd2",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "problem": {
+          "primary_key": "sys_id",
+          "deduplication_keys": ["sys_id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "sys_user": {
+          "primary_key": "sys_id",
+          "deduplication_keys": ["sys_id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        }
+      }
+    },
+    "genesys": {
+      "default_tables": ["conversations", "users", "queues"],
+      "table_configs": {
+        "conversations": {
+          "primary_key": "id",
+          "deduplication_keys": ["id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "users": {
+          "primary_key": "id",
+          "deduplication_keys": ["id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "queues": {
+          "primary_key": "id",
+          "deduplication_keys": ["id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        }
+      }
+    },
+    "moveworks": {
+      "default_tables": ["interactions", "users", "tickets"],
+      "table_configs": {
+        "interactions": {
+          "primary_key": "id",
+          "deduplication_keys": ["id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "users": {
+          "primary_key": "id",
+          "deduplication_keys": ["id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "tickets": {
+          "primary_key": "id",
+          "deduplication_keys": ["id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        }
+      }
+    },
+    "postgresql": {
+      "default_tables": ["orders", "order_items", "customers"],
+      "table_configs": {
+        "orders": {
+          "primary_key": "order_id",
+          "deduplication_keys": ["order_id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "order_items": {
+          "primary_key": ["order_id", "item_id"],
+          "deduplication_keys": ["order_id", "item_id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "customers": {
+          "primary_key": "customer_id",
+          "deduplication_keys": ["customer_id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd2",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        }
+      }
+    },
+    "mysql": {
+      "default_tables": ["transactions", "users", "accounts"],
+      "table_configs": {
+        "transactions": {
+          "primary_key": "transaction_id",
+          "deduplication_keys": ["transaction_id"],
+          "deduplication_order_by": ["_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        }
+      }
+    }
+  }
+}

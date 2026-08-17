@@ -1,0 +1,114 @@
+{
+  "pipeline_defaults": {
+    "batch_size": 1000,
+    "s3_chunk_size": 10000,
+    "max_retries": 3,
+    "state_prefix": "metadata",
+    "bronze_prefix": "bronze",
+    "output_format": "parquet",
+    "parquet_compression": "snappy",
+    "flatten_nested_json": true,
+    "flatten_separator": "_",
+    "error_handling_mode": "CONTINUE_ON_ERROR",
+    "cloudwatch_namespace": "UAX/DataPipeline/Ingestion"
+  },
+  "source_systems": {
+    "servicenow": {
+      "base_url": "https://your-instance.service-now.com",
+      "api_endpoint_template": "/api/now/table/{table_name}",
+      "query_param_template": "sysparm_query={query_filter}^ORDERBYsys_updated_on&sysparm_limit={limit}&sysparm_offset={offset}",
+      "default_delta_filter": "sys_updated_on>={last_load_date}",
+      "default_tables": ["incident", "change_request", "problem", "sys_user"],
+      "response_records_key": "result",
+      "table_initial_load_dates": {
+        "incident": "2024-01-01T00:00:00Z",
+        "change_request": "2024-03-01T00:00:00Z",
+        "problem": "2024-06-01T00:00:00Z",
+        "sys_user": "2024-01-01T00:00:00Z"
+      },
+      "table_query_overrides": {
+        "incident": "active=true^sys_updated_on>={last_load_date}",
+        "u_custom_incident": "u_active=true^u_category=hardware^sys_updated_on>={last_load_date}"
+      },
+      "custom_table_endpoints": {
+        "u_special_report": "/api/now/v1/custom_reports"
+      }
+    },
+    "genesys": {
+      "base_url": "https://api.mypurecloud.com",
+      "api_endpoint_template": "/api/v2/{table_name}",
+      "query_param_template": "pageSize={limit}&pageNumber={page_number}&interval={last_load_date}",
+      "default_delta_filter": "{last_load_date}",
+      "default_tables": ["conversations", "users", "queues"],
+      "response_records_key": "entities",
+      "table_initial_load_dates": {
+        "conversations": "2024-01-01T00:00:00Z",
+        "users": "2024-01-01T00:00:00Z",
+        "queues": "2024-01-01T00:00:00Z"
+      },
+      "table_query_overrides": {},
+      "custom_table_endpoints": {}
+    },
+    "moveworks": {
+      "base_url": "https://api.moveworks.ai",
+      "api_endpoint_template": "/export/v1/records/{table_name}",
+      "query_param_template": "$filter=updated_at gt '{last_load_date}'",
+      "default_delta_filter": "updated_at gt '{last_load_date}'",
+      "default_tables": ["interactions", "users", "tickets"],
+      "response_records_key": "value",
+      "table_initial_load_dates": {
+        "interactions": "2024-01-01T00:00:00Z",
+        "users": "2024-01-01T00:00:00Z",
+        "tickets": "2024-01-01T00:00:00Z"
+      },
+      "table_query_overrides": {},
+      "custom_table_endpoints": {}
+    },
+    "postgresql": {
+      "connection_type": "database",
+      "db_type": "postgresql",
+      "driver": "org.postgresql.Driver",
+      "port": 5432,
+      "default_delta_filter": "updated_at >= '{last_load_date}'",
+      "default_tables": ["orders", "order_items", "customers"],
+      "query_template": "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC",
+      "fetch_size": 10000,
+      "table_initial_load_dates": {
+        "orders": "2024-01-01T00:00:00Z",
+        "order_items": "2024-01-01T00:00:00Z",
+        "customers": "2024-01-01T00:00:00Z"
+      },
+      "table_query_overrides": {
+        "orders": "status = 'COMPLETED' AND updated_at >= '{last_load_date}'"
+      }
+    },
+    "mysql": {
+      "connection_type": "database",
+      "db_type": "mysql",
+      "driver": "com.mysql.cj.jdbc.Driver",
+      "port": 3306,
+      "default_delta_filter": "updated_at >= '{last_load_date}'",
+      "default_tables": ["transactions", "users", "accounts"],
+      "query_template": "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC",
+      "fetch_size": 10000,
+      "table_initial_load_dates": {
+        "transactions": "2024-01-01T00:00:00Z",
+        "users": "2024-01-01T00:00:00Z",
+        "accounts": "2024-01-01T00:00:00Z"
+      },
+      "table_query_overrides": {}
+    },
+    "database": {
+      "connection_type": "database",
+      "db_type": "generic",
+      "default_delta_filter": "updated_at >= '{last_load_date}'",
+      "default_tables": ["records"],
+      "query_template": "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC",
+      "fetch_size": 10000,
+      "table_initial_load_dates": {
+        "records": "2024-01-01T00:00:00Z"
+      },
+      "table_query_overrides": {}
+    }
+  }
+}
