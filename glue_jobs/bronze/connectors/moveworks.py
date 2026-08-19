@@ -1,3 +1,10 @@
+"""
+Moveworks Records API Connector for AWS Glue Data Pipeline.
+
+Strict Policy: No hardcoded default URLs, credentials, or table names.
+Raises explicit ValueError if any required parameter is missing to prevent wrong data extraction.
+"""
+
 import logging
 from typing import List, Dict, Any, Optional, Callable
 import urllib.parse
@@ -16,21 +23,35 @@ class MoveworksConnector:
     def fetch_delta(
         last_load_date: str,
         secret_dict: Dict[str, Any],
-        table_name: str = "interactions",
-        source_config: Dict[str, Any] = None,
+        table_name: str,
+        source_config: Dict[str, Any],
         custom_query: Optional[str] = None,
         on_chunk_callback: Optional[Callable[[List[Dict[str, Any]], int], None]] = None,
         s3_chunk_size: int = 10000
     ) -> List[Dict[str, Any]]:
         """
         Extracts Moveworks records updated since last_load_date.
+        Raises ValueError if required parameters or base URLs are missing.
         """
+        if not table_name or not table_name.strip():
+            raise ValueError("Moveworks connector error: 'table_name' parameter is required and cannot be empty.")
+
+        if not last_load_date or not last_load_date.strip():
+            raise ValueError(f"Moveworks connector error: 'last_load_date' is required for entity '{table_name}'.")
+
         config = source_config or {}
-        base_url = secret_dict.get('api_base_url') or config.get('base_url', 'https://api.moveworks.ai')
-        base_url = base_url.rstrip('/')
+
+        # Resolve Base URL strictly (no dummy hardcoded defaults)
+        base_url = secret_dict.get('api_base_url') or secret_dict.get('base_url') or config.get('base_url')
+        if not base_url or not str(base_url).strip():
+            raise ValueError(
+                f"Moveworks connector error for entity '{table_name}': "
+                f"Base URL ('base_url' / 'api_base_url') is missing in Secrets Manager and bronze_config.json."
+            )
+        base_url = str(base_url).strip().rstrip('/')
 
         endpoint = ConfigLoader.get_table_endpoint('moveworks', table_name, config)
-        response_key = config.get('response_records_key', 'value')
+        response_key = config.get('response_records_key') or secret_dict.get('response_records_key') or 'value'
 
         target_entity = table_name.strip()
         records_buffer = []
@@ -47,7 +68,7 @@ class MoveworksConnector:
         next_url = f"{base_url}{endpoint}?$filter={query_str}"
         page_count = 0
 
-        logger.info(f"Extracting Moveworks entity '{target_entity}' (chunk threshold: {s3_chunk_size})...")
+        logger.info(f"Extracting Moveworks entity '{target_entity}' from '{base_url}' (chunk threshold: {s3_chunk_size})...")
 
         while next_url:
             page_count += 1
@@ -56,7 +77,21 @@ class MoveworksConnector:
                 secret_dict=secret_dict
             )
 
-            batch = response.get(response_key, response.get('records', []))
+            if response_key not in response and not isinstance(response, list):
+                alt_keys = [k for k in ('value', 'records', 'data') if k in response]
+                if alt_keys:
+                    batch = response[alt_keys[0]]
+                else:
+                    raise KeyError(
+                        f"Moveworks response for entity '{target_entity}' missing expected records key '{response_key}'. "
+                        f"Available response keys: {list(response.keys()) if isinstance(response, dict) else type(response)}"
+                    )
+            else:
+                batch = response.get(response_key, response) if isinstance(response, dict) else response
+
+            if not isinstance(batch, list):
+                raise TypeError(f"Expected records list for Moveworks entity '{target_entity}', got: {type(batch)}")
+
             batch_count = len(batch)
             total_extracted += batch_count
 

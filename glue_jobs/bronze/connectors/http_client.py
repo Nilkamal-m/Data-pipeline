@@ -1,8 +1,12 @@
 """
-HTTP GET Client Utility for AWS Glue REST API Connectors.
+HTTP Client Utility for AWS Glue REST API Connectors.
 
-STRICT GUARANTEE: Exclusively executes HTTP GET requests.
-No HTTP POST requests are ever used for authentication, payload queries, or API verification.
+Supports:
+- HTTP Basic Authentication (username & password via Authorization: Basic <base64>)
+- OAuth 2.0 Bearer Authentication (via OAuth2Client token manager and Authorization: Bearer <token>)
+- Custom API Key Headers
+- Automatic 401 Unauthorized Token Refresh & Retry
+- Exponential Backoff for 429 & 5xx Rate Limits
 """
 
 import json
@@ -13,59 +17,80 @@ import urllib.request
 import urllib.parse
 from urllib.error import HTTPError, URLError
 from typing import Dict, Any, Optional
+from .oauth import OAuth2Client
 
 logger = logging.getLogger(__name__)
 
 
 class HTTPClient:
     """
-    HTTP GET-only client for managing API authentication and data extractions.
-    Uses standard library urllib (native to AWS Glue Python Shell).
+    HTTP GET client supporting Basic Auth, OAuth 2.0 (Bearer), and API Key headers.
     """
 
     @staticmethod
-    def build_auth_header(secret_dict: Dict[str, Any]) -> Dict[str, str]:
+    def build_auth_header(secret_dict: Dict[str, Any], force_oauth_refresh: bool = False) -> Dict[str, str]:
         """
-        Builds HTTP GET Authorization headers based on secret credentials provided in AWS Secrets Manager.
-        Supports Bearer Tokens, API Keys, and Basic Auth — ALL via HTTP GET headers.
+        Builds Authorization HTTP headers based on secret credentials.
+        Dynamically determines whether to use Basic Auth or OAuth 2.0.
 
         Args:
-            secret_dict (dict): Parsed secret JSON containing:
-                                - api_token / bearer_token / token
-                                - OR username & password
-                                - OR api_key
+            secret_dict (dict): Secrets Manager credentials dictionary.
+            force_oauth_refresh (bool): Force refresh of OAuth 2.0 access token.
 
         Returns:
-            dict: Authorization header dictionary.
+            dict: Authorization headers dictionary.
         """
         headers = {}
+        auth_type = (secret_dict.get('auth_type') or '').lower()
 
-        # 1. Bearer Token / API Token
-        token = secret_dict.get('api_token') or secret_dict.get('bearer_token') or secret_dict.get('token')
-        if token:
-            headers['Authorization'] = f"Bearer {token}"
-            logger.info("Configured HTTP GET Authorization: Bearer Token")
-            return headers
+        # 1. Explicit Basic Auth OR (username + password provided WITHOUT token_url/grant_type)
+        is_basic = (
+            auth_type in ('basic', 'basic_auth') or
+            (
+                secret_dict.get('username') and
+                secret_dict.get('password') and
+                not secret_dict.get('token_url') and
+                not secret_dict.get('grant_type') and
+                not secret_dict.get('auth_type')
+            )
+        )
 
-        # 2. HTTP Basic Authentication (Username + Password)
-        username = secret_dict.get('username')
-        password = secret_dict.get('password')
-        if username and password:
+        if is_basic:
+            username = secret_dict.get('username', '')
+            password = secret_dict.get('password', '')
             user_pass = f"{username}:{password}".encode('utf-8')
             b64_credentials = base64.b64encode(user_pass).decode('utf-8')
             headers['Authorization'] = f"Basic {b64_credentials}"
-            logger.info("Configured HTTP GET Authorization: Basic Auth")
+            logger.info(f"Configured HTTP Authorization: Basic Auth (User: '{username}')")
             return headers
+
+        # 2. OAuth 2.0 or Bearer Token (token_url, grant_type, access_token, bearer_token)
+        has_oauth = (
+            auth_type in ('oauth', 'oauth2', 'bearer') or
+            secret_dict.get('token_url') or
+            secret_dict.get('grant_type') or
+            secret_dict.get('access_token') or
+            secret_dict.get('bearer_token')
+        )
+
+        if has_oauth:
+            try:
+                access_token = OAuth2Client.get_access_token(secret_dict, force_refresh=force_oauth_refresh)
+                headers['Authorization'] = f"Bearer {access_token}"
+                logger.info("Configured HTTP Authorization: OAuth 2.0 Bearer Token")
+                return headers
+            except Exception as oauth_err:
+                logger.warning(f"OAuth 2.0 token resolution failed ({oauth_err}). Trying fallback headers...")
 
         # 3. Custom API Key Header
         api_key = secret_dict.get('api_key')
         if api_key:
             header_name = secret_dict.get('api_key_header', 'x-api-key')
             headers[header_name] = api_key
-            logger.info(f"Configured HTTP GET Authorization Header: {header_name}")
+            logger.info(f"Configured HTTP Authorization Header: {header_name}")
             return headers
 
-        logger.warning("No explicit auth token/basic credentials found in secret_dict. Proceeding with standard headers.")
+        logger.warning("No explicit Basic Auth or OAuth 2.0 credentials found in secret_dict. Proceeding without Auth header.")
         return headers
 
     @staticmethod
@@ -76,7 +101,7 @@ class HTTPClient:
         max_retries: int = 3
     ) -> Any:
         """
-        Executes strictly an HTTP GET request with retries and exponential backoff.
+        Executes an HTTP GET request with retries, exponential backoff, and 401 OAuth token refresh.
 
         Args:
             url (str): Target REST API endpoint URL.
@@ -92,7 +117,7 @@ class HTTPClient:
             'User-Agent': 'AWS-Glue-Python-Shell-Ingestion/1.0'
         }
 
-        # Inject Authorization headers built for HTTP GET
+        # Build initial Auth headers
         auth_headers = HTTPClient.build_auth_header(secret_dict)
         request_headers.update(auth_headers)
 
@@ -101,10 +126,10 @@ class HTTPClient:
 
         attempt = 0
         backoff_seconds = 2.0
+        oauth_refreshed = False
 
         while attempt <= max_retries:
             attempt += 1
-            # STRICT ENFORCEMENT: method='GET'
             req = urllib.request.Request(url, headers=request_headers, method='GET')
 
             try:
@@ -115,6 +140,15 @@ class HTTPClient:
 
             except HTTPError as http_err:
                 status_code = http_err.code
+
+                # Handle 401 Unauthorized (Trigger OAuth 2.0 token refresh once)
+                if status_code == 401 and not oauth_refreshed and (secret_dict.get('token_url') or secret_dict.get('grant_type')):
+                    logger.warning("HTTP 401 Unauthorized encountered. Refreshing OAuth 2.0 access token...")
+                    oauth_refreshed = True
+                    new_auth = HTTPClient.build_auth_header(secret_dict, force_oauth_refresh=True)
+                    request_headers.update(new_auth)
+                    time.sleep(1.0)
+                    continue
 
                 if status_code in (429, 500, 502, 503, 504) and attempt <= max_retries:
                     retry_after = http_err.headers.get('Retry-After')

@@ -1,7 +1,8 @@
 """
-Dynamic Database (JDBC / DB-API) Connector for Relational Databases (PostgreSQL, MySQL, Oracle, SQL Server).
+Dynamic Database Connector for Relational Databases (PostgreSQL, MySQL, Oracle, SQL Server).
 
-Supports memory-safe chunked streaming of relational table delta rows directly into Bronze S3 staging.
+Strict Policy: No hardcoded default hostnames, database names, or table names.
+Raises explicit ValueError if any required parameter is missing to prevent wrong data extraction.
 """
 
 import logging
@@ -22,22 +23,30 @@ class DatabaseConnector:
         last_load_date: str,
         secret_dict: Dict[str, Any],
         table_name: str,
-        source_config: Dict[str, Any] = None,
+        source_config: Dict[str, Any],
         custom_query: Optional[str] = None,
         on_chunk_callback: Optional[Callable[[List[Dict[str, Any]], int], None]] = None,
         s3_chunk_size: int = 10000
     ) -> List[Dict[str, Any]]:
         """
         Extracts incremental rows from a database table modified/updated since last_load_date.
+        Raises ValueError if required parameters or database connection details are missing.
         """
+        if not table_name or not table_name.strip():
+            raise ValueError("Database connector error: 'table_name' parameter is required and cannot be empty.")
+
+        if not last_load_date or not last_load_date.strip():
+            raise ValueError(f"Database connector error: 'last_load_date' is required for table '{table_name}'.")
+
         config = source_config or {}
-        source_name = config.get('db_type', 'database')
+        source_name = config.get('db_type') or secret_dict.get('engine') or 'database'
         
         query_filter = ConfigLoader.get_table_query_filter(source_name, table_name, last_load_date, custom_query, config)
-        query_template = config.get('query_template', "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC")
+        query_template = config.get('query_template') or "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC"
         
         sql_query = query_template.format(table_name=table_name, query_filter=query_filter)
-        fetch_size = config.get('fetch_size', 10000)
+        fetch_size = config.get('fetch_size') or secret_dict.get('fetch_size') or 10000
+        fetch_size = int(fetch_size)
 
         logger.info(f"Connecting to database source '{source_name}' to extract table '{table_name}'...")
         logger.info(f"Executing SQL Query: {sql_query}")
@@ -96,20 +105,39 @@ class DatabaseConnector:
     def _get_connection(secret_dict: Dict[str, Any], source_config: Dict[str, Any]):
         """
         Dynamically establishes DB connection using driver libraries (pg8000, pymysql, psycopg2, sqlite3).
+        Validates host, dbname, and credentials strictly.
         """
-        db_type = source_config.get('db_type', secret_dict.get('engine', 'postgresql')).lower()
-        host = secret_dict.get('host') or secret_dict.get('hostname', 'localhost')
-        port = int(secret_dict.get('port') or source_config.get('port', 5432))
-        dbname = secret_dict.get('dbname') or secret_dict.get('database', 'postgres')
-        user = secret_dict.get('username') or secret_dict.get('user', 'postgres')
+        db_type = (source_config.get('db_type') or secret_dict.get('engine') or '').lower()
+        if not db_type:
+            raise ValueError("Database connection error: 'db_type' or 'engine' must be specified in config or secret.")
+
+        if db_type == 'sqlite':
+            dbname = secret_dict.get('dbname') or secret_dict.get('database')
+            if not dbname:
+                raise ValueError("SQLite connection error: 'dbname' or 'database' path is required.")
+            import sqlite3
+            return sqlite3.connect(dbname)
+
+        host = secret_dict.get('host') or secret_dict.get('hostname') or source_config.get('host')
+        if not host:
+            raise ValueError(f"Database connection error for '{db_type}': Database 'host' / 'hostname' is missing in Secret.")
+
+        dbname = secret_dict.get('dbname') or secret_dict.get('database') or source_config.get('dbname')
+        if not dbname:
+            raise ValueError(f"Database connection error for '{db_type}': Database 'dbname' / 'database' is missing in Secret.")
+
+        user = secret_dict.get('username') or secret_dict.get('user')
+        if not user:
+            raise ValueError(f"Database connection error for '{db_type}': Database 'username' / 'user' is missing in Secret.")
+
         password = secret_dict.get('password', '')
+        port = int(secret_dict.get('port') or source_config.get('port') or (5432 if 'postgre' in db_type else 3306))
 
         if db_type in ('postgresql', 'postgres'):
             try:
                 # pyrefly: ignore [missing-import]
                 import pg8000.native
                 conn = pg8000.native.Connection(user=user, host=host, port=port, database=dbname, password=password)
-                # Wrap pg8000 native interface with standard cursor adapter if needed
                 class DBAPIAdapter:
                     def __init__(self, native_conn): self.native = native_conn
                     def cursor(self): return self
@@ -133,6 +161,4 @@ class DatabaseConnector:
             return pymysql.connect(host=host, port=port, database=dbname, user=user, password=password)
 
         else:
-            # Fallback to sqlite3 / standard DB-API driver
-            import sqlite3
-            return sqlite3.connect(dbname)
+            raise ValueError(f"Unsupported database engine type '{db_type}'. Supported engines: postgresql, mysql, mariadb, sqlite.")

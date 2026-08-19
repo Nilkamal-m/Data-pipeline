@@ -1,3 +1,10 @@
+"""
+ServiceNow REST API Connector for AWS Glue Data Pipeline.
+
+Strict Policy: No hardcoded default URLs, credentials, or table names.
+Raises explicit ValueError if any required parameter is missing to prevent wrong data extraction.
+"""
+
 import logging
 from typing import List, Dict, Any, Optional, Callable
 from .http_client import HTTPClient
@@ -9,44 +16,48 @@ logger = logging.getLogger(__name__)
 class ServiceNowConnector:
     """
     Dynamic ServiceNow REST API Connector using HTTP GET requests.
-    Supports memory-safe streaming of large datasets (>1,000 to millions of records) via chunked callbacks.
+    Supports memory-safe streaming of large datasets via chunked callbacks.
     """
 
     @staticmethod
     def fetch_delta(
         last_load_date: str,
         secret_dict: Dict[str, Any],
-        table_name: str = "incident",
-        source_config: Dict[str, Any] = None,
+        table_name: str,
+        source_config: Dict[str, Any],
         custom_query: Optional[str] = None,
         on_chunk_callback: Optional[Callable[[List[Dict[str, Any]], int], None]] = None,
         s3_chunk_size: int = 10000
     ) -> List[Dict[str, Any]]:
         """
         Extracts raw records for any standard or custom ServiceNow table updated since last_load_date.
-
-        Args:
-            last_load_date (str): High-Water Mark ISO timestamp.
-            secret_dict (dict): Secrets Manager credentials.
-            table_name (str): Target ServiceNow table.
-            source_config (dict, optional): Centralized configuration.
-            custom_query (str, optional): Explicit custom query filter.
-            on_chunk_callback (callable, optional): Streaming callback invoked when buffer reaches s3_chunk_size.
-            s3_chunk_size (int): Max records per memory chunk before flushing to S3.
-
-        Returns:
-            list: List of extracted records if callback is None, or empty list if streamed via callback.
+        Raises ValueError if required parameters or base URLs are missing.
         """
+        if not table_name or not table_name.strip():
+            raise ValueError("ServiceNow connector error: 'table_name' parameter is required and cannot be empty.")
+
+        if not last_load_date or not last_load_date.strip():
+            raise ValueError(f"ServiceNow connector error: 'last_load_date' is required for table '{table_name}'.")
+
         config = source_config or {}
-        base_url = secret_dict.get('instance_url') or config.get('base_url', 'https://your-instance.service-now.com')
-        base_url = base_url.rstrip('/')
+        
+        # Resolve Base URL strictly (no dummy hardcoded defaults)
+        base_url = secret_dict.get('instance_url') or secret_dict.get('base_url') or config.get('base_url')
+        if not base_url or not str(base_url).strip():
+            raise ValueError(
+                f"ServiceNow connector error for table '{table_name}': "
+                f"Base URL ('base_url' / 'instance_url') is missing in Secrets Manager and bronze_config.json."
+            )
+        base_url = str(base_url).strip().rstrip('/')
 
         endpoint = ConfigLoader.get_table_endpoint('servicenow', table_name, config)
         query_filter = ConfigLoader.get_table_query_filter('servicenow', table_name, last_load_date, custom_query, config)
-        response_key = config.get('response_records_key', 'result')
-
-        # API limit per HTTP GET request (ServiceNow recommends 1,000)
-        limit = secret_dict.get('batch_size') or config.get('batch_size', 1000)
+        
+        response_key = config.get('response_records_key') or secret_dict.get('response_records_key') or 'result'
+        limit = secret_dict.get('batch_size') or config.get('batch_size')
+        if not limit or int(limit) <= 0:
+            raise ValueError(f"ServiceNow connector error for table '{table_name}': Invalid or missing 'batch_size' in configuration.")
+        limit = int(limit)
 
         target_table = table_name.strip()
         records_buffer = []
@@ -56,7 +67,7 @@ class ServiceNowConnector:
         offset = 0
         has_more = True
 
-        logger.info(f"Extracting ServiceNow table '{target_table}' (API page size: {limit}, S3 chunk threshold: {s3_chunk_size})...")
+        logger.info(f"Extracting ServiceNow table '{target_table}' from '{base_url}' (API limit: {limit}, chunk threshold: {s3_chunk_size})...")
 
         while has_more:
             query = f"sysparm_query={query_filter}^ORDERBYsys_updated_on&sysparm_limit={limit}&sysparm_offset={offset}"
@@ -67,7 +78,16 @@ class ServiceNowConnector:
                 secret_dict=secret_dict
             )
 
-            batch = response.get(response_key, [])
+            if response_key not in response and not isinstance(response, list):
+                raise KeyError(
+                    f"ServiceNow response for table '{target_table}' missing expected records key '{response_key}'. "
+                    f"Available response keys: {list(response.keys()) if isinstance(response, dict) else type(response)}"
+                )
+
+            batch = response.get(response_key, response) if isinstance(response, dict) else response
+            if not isinstance(batch, list):
+                raise TypeError(f"Expected records list for ServiceNow table '{target_table}', got: {type(batch)}")
+
             batch_count = len(batch)
             total_extracted += batch_count
 
@@ -75,7 +95,6 @@ class ServiceNowConnector:
 
             if on_chunk_callback:
                 records_buffer.extend(batch)
-                # If buffer exceeds chunk threshold, flush to S3 immediately
                 if len(records_buffer) >= s3_chunk_size:
                     logger.info(f"Chunk threshold reached ({len(records_buffer)} records). Flushing part {part_number} to S3...")
                     on_chunk_callback(records_buffer, part_number)
