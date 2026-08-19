@@ -82,6 +82,27 @@ def parse_arguments() -> dict:
     pipeline_defaults = ConfigLoader.get_pipeline_defaults(full_config)
     source_config = ConfigLoader.get_source_config(source_system_clean, full_config)
 
+    # Allow CLI parameters to dynamically override bronze_config.json values for manual testing / Step Functions
+    if arg_dict.get('BASE_URL'):
+        source_config['base_url'] = arg_dict['BASE_URL'].strip()
+        logger.info(f"CLI Parameter Override: 'base_url' -> '{source_config['base_url']}'")
+
+    if arg_dict.get('BATCH_SIZE'):
+        source_config['batch_size'] = int(arg_dict['BATCH_SIZE'])
+        logger.info(f"CLI Parameter Override: 'batch_size' -> {source_config['batch_size']}")
+
+    if arg_dict.get('RESPONSE_RECORDS_KEY'):
+        source_config['response_records_key'] = arg_dict['RESPONSE_RECORDS_KEY'].strip()
+        logger.info(f"CLI Parameter Override: 'response_records_key' -> '{source_config['response_records_key']}'")
+
+    if arg_dict.get('FLATTEN_NESTED_JSON'):
+        source_config['flatten_nested_json'] = (arg_dict['FLATTEN_NESTED_JSON'].strip().lower() == 'true')
+        logger.info(f"CLI Parameter Override: 'flatten_nested_json' -> {source_config['flatten_nested_json']}")
+
+    if arg_dict.get('FLATTEN_SEPARATOR'):
+        source_config['flatten_separator'] = arg_dict['FLATTEN_SEPARATOR'].strip()
+        logger.info(f"CLI Parameter Override: 'flatten_separator' -> '{source_config['flatten_separator']}'")
+
     # Resolve table list
     raw_tables = arg_dict.get('TABLE_NAME') or arg_dict.get('TABLES') or arg_dict.get('TABLE_NAMES')
     if raw_tables:

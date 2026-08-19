@@ -113,11 +113,13 @@ class MoveworksConnector:
                 (response.get('paging', {}).get('next') if isinstance(response.get('paging'), dict) else None)
             )
 
-            if raw_next_link:
-                if raw_next_link.startswith('/'):
-                    next_url = f"{base_url}{raw_next_link}"
+            if raw_next_link and batch_count > 0:
+                resolved_next = f"{base_url}{raw_next_link}" if raw_next_link.startswith('/') else raw_next_link
+                if resolved_next == next_url:
+                    logger.warning(f"Moveworks pagination loop detected identical nextLink '{resolved_next}'. Terminating loop.")
+                    next_url = None
                 else:
-                    next_url = raw_next_link
+                    next_url = resolved_next
             else:
                 next_url = None
                 logger.info(f"Reached end of Moveworks entity '{target_entity}' delta extraction.")

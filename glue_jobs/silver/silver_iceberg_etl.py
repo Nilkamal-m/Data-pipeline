@@ -246,17 +246,34 @@ def main():
                 logger.warning(f"Could not read Parquet at '{bronze_path}' ({read_err}). Reading JSON format...")
                 df_bronze = spark.read.json(bronze_path)
 
+            # Allow CLI Arguments to dynamically override silver_config.json settings for manual testing / Step Functions
+            cli_args = params.get('ARG_DICT', {})
+            merge_strategy = (cli_args.get('MERGE_STRATEGY') or table_cfg.get('merge_strategy') or defaults_cfg.get('merge_strategy', 'upsert')).lower()
+            scd_type = (cli_args.get('SCD_TYPE') or table_cfg.get('scd_type') or defaults_cfg.get('scd_type', 'scd1')).lower()
+            scd2_cfg = table_cfg.get('scd2_config') or defaults_cfg.get('scd2_defaults', {})
+            dedup_strategy = (cli_args.get('DEDUPLICATION_STRATEGY') or table_cfg.get('deduplication_strategy') or defaults_cfg.get('deduplication', {}).get('strategy', 'latest_by_order_column')).lower()
+
             if df_bronze.rdd.isEmpty():
                 logger.warning(f"No records found in Bronze layer at '{bronze_path}'. Skipping Silver table write.")
                 continue
 
             columns = df_bronze.columns
 
-            # Dynamically resolve Deduplication Keys from config (fallback to primary_key)
-            pk_keys = table_cfg.get('deduplication_keys') or table_cfg.get('primary_key') or ("sys_id" if "sys_id" in columns else ("id" if "id" in columns else columns[0]))
+            # Dynamically resolve Deduplication Keys from CLI override -> config (fallback to primary_key)
+            cli_pk = cli_args.get('DEDUPLICATION_KEYS') or cli_args.get('PRIMARY_KEY')
+            if cli_pk:
+                pk_keys = [k.strip() for k in cli_pk.split(',')] if ',' in cli_pk else cli_pk.strip()
+                logger.info(f"CLI Parameter Override: 'deduplication_keys' -> {pk_keys}")
+            else:
+                pk_keys = table_cfg.get('deduplication_keys') or table_cfg.get('primary_key') or ("sys_id" if "sys_id" in columns else ("id" if "id" in columns else columns[0]))
             
-            # Dynamically resolve Deduplication Order-By Columns from config (fallback to order_by)
-            order_cols = table_cfg.get('deduplication_order_by') or table_cfg.get('order_by') or ("_ingested_at" if "_ingested_at" in columns else ("sys_updated_on" if "sys_updated_on" in columns else columns[0]))
+            # Dynamically resolve Deduplication Order-By Columns from CLI override -> config
+            cli_order = cli_args.get('DEDUPLICATION_ORDER_BY') or cli_args.get('ORDER_BY')
+            if cli_order:
+                order_cols = [c.strip() for c in cli_order.split(',')] if ',' in cli_order else cli_order.strip()
+                logger.info(f"CLI Parameter Override: 'deduplication_order_by' -> {order_cols}")
+            else:
+                order_cols = table_cfg.get('deduplication_order_by') or table_cfg.get('order_by') or ("_ingested_at" if "_ingested_at" in columns else ("sys_updated_on" if "sys_updated_on" in columns else columns[0]))
 
             logger.info(f"Deduplicating table '{table_clean}': PK={pk_keys}, OrderBy={order_cols}, Strategy='{dedup_strategy}'")
 
