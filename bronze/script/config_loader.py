@@ -45,6 +45,7 @@ class ConfigLoader:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         possible_paths = [
             os.path.join(current_dir, "config", "bronze_config.json"),
+            "bronze/script/config/bronze_config.json",
             "glue_jobs/bronze/config/bronze_config.json"
         ]
 

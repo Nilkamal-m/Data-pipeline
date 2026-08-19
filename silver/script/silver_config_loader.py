@@ -41,6 +41,7 @@ class SilverConfigLoader:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         possible_paths = [
             os.path.join(current_dir, "config", "silver_config.json"),
+            "silver/script/config/silver_config.json",
             "glue_jobs/silver/config/silver_config.json"
         ]
 

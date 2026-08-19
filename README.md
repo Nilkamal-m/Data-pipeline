@@ -7,22 +7,23 @@ A modular, serverless data pipeline designed for **incremental (delta) data inge
 ## 📁 Repository Structure
 
 ```text
-## 📁 Repository Structure
-
-```text
-Data-pipeline/
-├── glue_jobs/
-│   ├── bronze/                       # Bronze Layer Glue Ingestion Job Code
-│   │   ├── connectors/               # Modular API connector package
-│   │   │   ├── __init__.py           # Connector registry & factory (get_connector)
-│   │   │   ├── servicenow.py         # ServiceNow REST API connector module
-│   │   │   ├── genesys.py            # Genesys Analytics API connector module
-│   │   │   └── moveworks.py          # Moveworks OData API connector module
-│   │   ├── config/
-│   │   │   └── bronze_config.json    # Centralized Bronze configuration & table load dates
-│   │   ├── config_loader.py          # Bronze configuration loader class
-│   │   └── incremental_load_handler.py # Main AWS Glue Python Shell job script
-│   └── silver/                       # Silver Layer Glue Iceberg Transformation Code
+Data-pipeline/.
+├── bronze/                           # Bronze Layer Glue Python Shell Ingestion Code
+│   └── script/                       # Bronze script directory (maps to s3://<bucket>/bronze/script/)
+│       ├── config/
+│       │   └── bronze_config.json    # Centralized Bronze static configuration & defaults
+│       ├── connectors/               # Extensible API & RDBMS Connector Plugin Modules
+│       │   ├── __init__.py           # Connector factory (get_connector)
+│       │   ├── database.py           # Relational DB (PostgreSQL, MySQL, Oracle, SQL Server) connector
+│       │   ├── genesys.py            # Genesys Analytics API connector module
+│       │   ├── http_client.py        # Central HTTP GET client with 401 refresh & exponential backoff
+│       │   ├── moveworks.py          # Moveworks OData API connector module
+│       │   ├── oauth.py              # OAuth 2.0 Client Credentials & Password Token Manager
+│       │   └── servicenow.py         # ServiceNow REST API connector module
+│       ├── config_loader.py          # Bronze configuration loader class
+│       └── incremental_load_handler.py # Main AWS Glue Python Shell job script
+├── silver/                           # Silver Layer Glue Iceberg Transformation Code
+│   └── script/                       # Silver script directory (maps to s3://<bucket>/silver/script/)
 │       ├── config/
 │       │   └── silver_config.json    # Centralized Silver configuration, merge & SCD2 settings
 │       ├── custom_transforms/        # Table-specific custom PySpark transformation scripts
