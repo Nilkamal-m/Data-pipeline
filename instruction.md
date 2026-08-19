@@ -40,15 +40,15 @@ DATA_LAKE_BUCKET="uax-data-lake-bucket-dev"
 
 # 1. Upload Main Python Shell Script
 aws s3 cp glue_jobs/bronze/incremental_load_handler.py \
-  s3://${DATA_LAKE_BUCKET}/scripts/bronze/incremental_load_handler.py
+  s3://${DATA_LAKE_BUCKET}/bronze/script/incremental_load_handler.py
 
 # 2. Upload Python Dependencies Zip (--extra-py-files)
 aws s3 cp glue_jobs/bronze/connectors.zip \
-  s3://${DATA_LAKE_BUCKET}/scripts/bronze/connectors.zip
+  s3://${DATA_LAKE_BUCKET}/bronze/script/connectors.zip
 
 # 3. Upload Static Configuration JSON separately
 aws s3 cp glue_jobs/bronze/config/bronze_config.json \
-  s3://${DATA_LAKE_BUCKET}/scripts/bronze/config/bronze_config.json
+  s3://${DATA_LAKE_BUCKET}/bronze/script/config/bronze_config.json
 ```
 
 ---
@@ -61,12 +61,12 @@ In the AWS Glue Console (or via CloudFormation), configure your Glue Python Shel
 - **IAM Role**: `AWSGlueServiceRole-DataLake` (with Secrets Manager & S3 permissions)
 - **Type**: `Python Shell`
 - **Python Version**: `Python 3.9` or `3.13`
-- **Script Path**: `s3://uax-data-lake-bucket-dev/scripts/bronze/incremental_load_handler.py`
+- **Script Path**: `s3://uax-data-lake-bucket-dev/bronze/script/incremental_load_handler.py`
 
 ### Glue Default Job Parameters:
 ```text
---extra-py-files        s3://uax-data-lake-bucket-dev/scripts/bronze/connectors.zip
---CONFIG_S3_PATH        s3://uax-data-lake-bucket-dev/scripts/bronze/config/bronze_config.json
+--extra-py-files        s3://uax-data-lake-bucket-dev/bronze/script/connectors.zip
+--CONFIG_S3_PATH        s3://uax-data-lake-bucket-dev/bronze/script/config/bronze_config.json
 --BRONZE_BUCKET         uax-data-lake-bucket-dev
 --STATE_BUCKET          uax-data-lake-bucket-dev
 --OUTPUT_FORMAT         parquet

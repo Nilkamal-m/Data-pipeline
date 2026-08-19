@@ -252,10 +252,10 @@ Resources:
       Command:
         Name: pythonshell
         PythonVersion: "3.9"
-        ScriptLocation: !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/bronze/incremental_load_handler.py"
+        ScriptLocation: !Sub "s3://${DataLakeBucketName}-${Environment}/bronze/script/incremental_load_handler.py"
       DefaultArguments:
-        "--extra-py-files": !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/bronze/config_loader.py,s3://${DataLakeBucketName}-${Environment}/scripts/bronze/connectors.zip"
-        "--CONFIG_S3_PATH": !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/bronze/config/bronze_config.json"
+        "--extra-py-files": !Sub "s3://${DataLakeBucketName}-${Environment}/bronze/script/config_loader.py,s3://${DataLakeBucketName}-${Environment}/bronze/script/connectors.zip"
+        "--CONFIG_S3_PATH": !Sub "s3://${DataLakeBucketName}-${Environment}/bronze/script/config/bronze_config.json"
         "--BRONZE_BUCKET": !Ref DataLakeBucket
         "--OUTPUT_FORMAT": !Ref OutputFormat
         "--CLOUDWATCH_NAMESPACE": "UAX/DataPipeline/Ingestion"
@@ -273,10 +273,10 @@ Resources:
       WorkerType: G.1X
       Command:
         Name: glueetl
-        ScriptLocation: !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/silver/silver_iceberg_etl.py"
+        ScriptLocation: !Sub "s3://${DataLakeBucketName}-${Environment}/silver/script/silver_iceberg_etl.py"
       DefaultArguments:
-        "--extra-py-files": !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/silver/silver_config_loader.py,s3://${DataLakeBucketName}-${Environment}/scripts/silver/transformer.py"
-        "--SILVER_CONFIG_S3_PATH": !Sub "s3://${DataLakeBucketName}-${Environment}/scripts/silver/config/silver_config.json"
+        "--extra-py-files": !Sub "s3://${DataLakeBucketName}-${Environment}/silver/script/silver_config_loader.py,s3://${DataLakeBucketName}-${Environment}/silver/script/transformer.py"
+        "--SILVER_CONFIG_S3_PATH": !Sub "s3://${DataLakeBucketName}-${Environment}/silver/script/config/silver_config.json"
         "--datalake-formats": "iceberg"
         "--conf": "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
         "--DATA_LAKE_BUCKET": !Ref DataLakeBucket
