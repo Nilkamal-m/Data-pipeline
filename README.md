@@ -30,8 +30,14 @@ Data-pipeline/.
 │       ├── silver_config_loader.py   # Silver configuration loader class
 │       ├── transformer.py            # Declarative & custom script transformation engine
 │       └── silver_iceberg_etl.py     # PySpark Iceberg ETL script
-├── infrastructure/
-│   └── cloudformation.yml            # CloudFormation Template (Single Bucket Data Lake & All IAM Roles)
+├── terraform/                        # Terraform Infrastructure as Code (IaC)
+│   ├── main.tf                       # Provider, S3, Secrets Manager, Glue Jobs, Crawler, Athena, SNS, EventBridge
+│   ├── iam.tf                        # IAM Roles & Policies for Glue, Step Functions, EventBridge
+│   ├── step_functions.tf             # ServiceNow, Moveworks, and Genesys Step Functions State Machines
+│   ├── variables.tf                  # Input variables
+│   ├── outputs.tf                    # Resource outputs
+│   └── terraform.tfvars.example      # Example input variables file
+├── instruction.md                    # Step-by-step packaging, Terraform deployment, and testing manual
 ├── docs/
 │   ├── incremental_load_architecture.md # Technical architectural guide & diagrams
 │   └── step_functions_orchestration.json# Step Functions state machine JSON definition

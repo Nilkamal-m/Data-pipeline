@@ -1,0 +1,8 @@
+# Example Terraform Input Variables
+aws_region            = "us-east-1"
+environment           = "dev"
+app_name              = "uax-data-pipeline"
+data_lake_bucket_name = "uax-data-lake-bucket"
+alert_email_address   = "data-eng-alerts@company.com"
+schedule_expression   = "cron(0 6 * * ? *)"
+output_format         = "parquet"
