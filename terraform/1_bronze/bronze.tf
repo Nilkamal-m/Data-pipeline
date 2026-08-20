@@ -7,8 +7,6 @@
 # Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
 
-
-
 provider "aws" {
   region = var.aws_region
 }
@@ -27,18 +25,18 @@ variable "aws_region" {
 variable "environment" {
   type        = string
   default     = "dev"
-  description = "Deployment environment stage (dev, staging, prod)."
+  description = "Deployment environment stage (dev, prod)."
 }
 
 variable "app_name" {
   type        = string
-  default     = "hr-datalake"
+  default     = "uax-datalake"
   description = "Application name prefix for resources."
 }
 
 variable "data_lake_bucket_name" {
   type        = string
-  default     = "uax-data-lake-bucket"
+  default     = "uax-datalake"
   description = "Base S3 data lake bucket name (environment suffix will be appended)."
 }
 
@@ -108,8 +106,6 @@ module "s3_bucket" {
 }
 
 
-
-
 # ------------------------------------------------------------------------------
 # 2. Secrets Manager Secrets using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
@@ -117,7 +113,7 @@ module "servicenow_secret" {
   source = "cps-terraform.anthem.com/organization/secrets-manager/aws"
 
   create      = !var.use_existing_secrets
-  name        = "data-lake/servicenow-credentials-${var.environment}"
+  name        = "${var.app_name}/servicenow-credentials-${var.environment}"
   description = "ServiceNow OAuth 2.0 credentials (Password/Client Credentials flow)."
 
   secret_string = jsonencode({
@@ -141,7 +137,7 @@ module "moveworks_secret" {
   source = "cps-terraform.anthem.com/organization/secrets-manager/aws"
 
   create      = !var.use_existing_secrets
-  name        = "data-lake/moveworks-credentials-${var.environment}"
+  name        = "${var.app_name}/moveworks-credentials-${var.environment}"
   description = "Moveworks OAuth 2.0 credentials (Client Credentials flow)."
 
   secret_string = jsonencode({
@@ -164,7 +160,7 @@ module "genesys_secret" {
   source = "cps-terraform.anthem.com/organization/secrets-manager/aws"
 
   create      = !var.use_existing_secrets
-  name        = "data-lake/genesys-credentials-${var.environment}"
+  name        = "${var.app_name}/genesys-credentials-${var.environment}"
   description = "Genesys Cloud OAuth 2.0 credentials (Client Credentials flow)."
 
   secret_string = jsonencode({
@@ -216,18 +212,27 @@ module "glue_iam_policy" {
           "secretsmanager:DescribeSecret"
         ]
         Resource = [
-          "arn:aws:secretsmanager:${var.aws_region}:*:secret:data-lake/*"
+          "arn:aws:secretsmanager:${var.aws_region}:*:secret:${var.app_name}/*"
         ]
       },
       {
         Effect = "Allow"
         Action = [
-          "cloudwatch:PutMetricData",
+          "cloudwatch:PutMetricData"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "logs:CreateLogGroup",
           "logs:CreateLogStream",
           "logs:PutLogEvents"
         ]
-        Resource = "*"
+        Resource = [
+          "arn:aws:logs:${var.aws_region}:*:log-group:/aws-glue/jobs/${var.app_name}*",
+          "arn:aws:logs:${var.aws_region}:*:log-group:${var.app_name}*"
+        ]
       },
       {
         Effect = "Allow"
@@ -316,11 +321,36 @@ module "bronze_glue_job" {
 }
 
 # ------------------------------------------------------------------------------
-# Bronze Layer Outputs
+# Bronze Layer Outputs (Prints details for all created services)
 # ------------------------------------------------------------------------------
 output "data_lake_s3_bucket_name" {
   value       = local.bucket_name
-  description = "Single S3 Data Lake bucket name."
+  description = "S3 Data Lake bucket name."
+}
+
+output "servicenow_secret_name" {
+  value       = "${var.app_name}/servicenow-credentials-${var.environment}"
+  description = "ServiceNow Secrets Manager Secret Name."
+}
+
+output "moveworks_secret_name" {
+  value       = "${var.app_name}/moveworks-credentials-${var.environment}"
+  description = "Moveworks Secrets Manager Secret Name."
+}
+
+output "genesys_secret_name" {
+  value       = "${var.app_name}/genesys-credentials-${var.environment}"
+  description = "Genesys Secrets Manager Secret Name."
+}
+
+output "glue_iam_policy_name" {
+  value       = "${var.app_name}-glue-policy-${var.environment}"
+  description = "AWS Glue IAM Execution Policy Name."
+}
+
+output "glue_iam_role_name" {
+  value       = "${var.app_name}-glue-execution-role-${var.environment}"
+  description = "AWS Glue IAM Execution Role Name."
 }
 
 output "glue_bronze_ingestion_job_name" {

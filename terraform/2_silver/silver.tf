@@ -30,13 +30,13 @@ variable "environment" {
 
 variable "app_name" {
   type        = string
-  default     = "hr-datalake"
+  default     = "uax-datalake"
   description = "Application name prefix for resources."
 }
 
 variable "data_lake_bucket_name" {
   type        = string
-  default     = "uax-data-lake-bucket"
+  default     = "uax-datalake"
   description = "Base S3 data lake bucket name (environment suffix will be appended)."
 }
 

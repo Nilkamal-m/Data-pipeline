@@ -30,13 +30,13 @@ variable "environment" {
 
 variable "app_name" {
   type        = string
-  default     = "hr-datalake"
+  default     = "uax-datalake"
   description = "Application name prefix for resources."
 }
 
 variable "data_lake_bucket_name" {
   type        = string
-  default     = "uax-data-lake-bucket"
+  default     = "uax-datalake"
   description = "Base S3 data lake bucket name (environment suffix will be appended)."
 }
 
@@ -254,7 +254,7 @@ module "servicenow_state_machine" {
           Arguments = {
             "--SOURCE_SYSTEM"  = "servicenow"
             "--TABLE_NAME"     = "incident,change_request,problem,sys_user"
-            "--SECRET_NAME"    = "data-lake/servicenow-credentials-${var.environment}"
+            "--SECRET_NAME"    = "${var.app_name}/servicenow-credentials-${var.environment}"
             "--CONFIG_S3_PATH" = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
           }
         }
@@ -380,7 +380,7 @@ module "moveworks_state_machine" {
           Arguments = {
             "--SOURCE_SYSTEM"  = "moveworks"
             "--TABLE_NAME"     = "interactions,users,tickets"
-            "--SECRET_NAME"    = "data-lake/moveworks-credentials-${var.environment}"
+            "--SECRET_NAME"    = "${var.app_name}/moveworks-credentials-${var.environment}"
             "--CONFIG_S3_PATH" = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
           }
         }
@@ -506,7 +506,7 @@ module "genesys_state_machine" {
           Arguments = {
             "--SOURCE_SYSTEM"  = "genesys"
             "--TABLE_NAME"     = "conversations,users,queues"
-            "--SECRET_NAME"    = "data-lake/genesys-credentials-${var.environment}"
+            "--SECRET_NAME"    = "${var.app_name}/genesys-credentials-${var.environment}"
             "--CONFIG_S3_PATH" = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
           }
         }
