@@ -23,19 +23,13 @@ variable "aws_region" {
 variable "environment" {
   type        = string
   default     = "dev"
-  description = "Deployment environment stage (dev, staging, prod)."
+  description = "Deployment environment stage (dev, prod)."
 }
 
 variable "app_name" {
   type        = string
   default     = "uax-datalake"
   description = "Application name prefix for resources."
-}
-
-variable "data_lake_bucket_name" {
-  type        = string
-  default     = "uax-datalake"
-  description = "Base S3 data lake bucket name (environment suffix will be appended)."
 }
 
 # Pre-existence safety toggles
@@ -46,8 +40,8 @@ variable "use_existing_athena_workgroup" {
 }
 
 locals {
-  bucket_name    = "${var.data_lake_bucket_name}-${var.environment}"
-  athena_wg_name = "uax_data_lake_workgroup_${var.environment}"
+  bucket_name    = "${var.app_name}-${var.environment}-bucket"
+  athena_wg_name = "${var.app_name}-workgroup-${var.environment}"
 }
 
 # ------------------------------------------------------------------------------
@@ -79,9 +73,14 @@ module "athena_workgroup" {
 }
 
 # ------------------------------------------------------------------------------
-# Athena Layer Outputs
+# Athena Layer Outputs (Prints details for all created services)
 # ------------------------------------------------------------------------------
 output "athena_workgroup_name" {
   value       = local.athena_wg_name
   description = "Amazon Athena WorkGroup Name."
+}
+
+output "athena_query_results_s3_path" {
+  value       = "s3://${local.bucket_name}/athena-results/"
+  description = "Amazon Athena Query Results S3 Location."
 }

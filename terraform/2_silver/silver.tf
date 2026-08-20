@@ -25,19 +25,13 @@ variable "aws_region" {
 variable "environment" {
   type        = string
   default     = "dev"
-  description = "Deployment environment stage (dev, staging, prod)."
+  description = "Deployment environment stage (dev, prod)."
 }
 
 variable "app_name" {
   type        = string
   default     = "uax-datalake"
   description = "Application name prefix for resources."
-}
-
-variable "data_lake_bucket_name" {
-  type        = string
-  default     = "uax-datalake"
-  description = "Base S3 data lake bucket name (environment suffix will be appended)."
 }
 
 # Pre-existence safety toggles
@@ -48,9 +42,9 @@ variable "use_existing_glue_database" {
 }
 
 locals {
-  bucket_name   = "${var.data_lake_bucket_name}-${var.environment}"
+  bucket_name   = "${var.app_name}-${var.environment}-bucket"
   glue_role_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}"
-  glue_db_name  = "uax_data_lake_db_${var.environment}"
+  glue_db_name  = "${var.app_name}-db-${var.environment}"
 }
 
 # ------------------------------------------------------------------------------
@@ -131,14 +125,19 @@ module "silver_iceberg_job" {
 }
 
 # ------------------------------------------------------------------------------
-# Silver Layer Outputs
+# Silver Layer Outputs (Prints details for all created services)
 # ------------------------------------------------------------------------------
-output "glue_silver_iceberg_job_name" {
-  value       = "${var.app_name}-silver-iceberg-etl-${var.environment}"
-  description = "AWS Glue PySpark Silver Iceberg ETL Job Name."
-}
-
 output "glue_catalog_database_name" {
   value       = local.glue_db_name
   description = "AWS Glue Data Catalog Database Name for Silver Iceberg Tables."
+}
+
+output "glue_silver_iceberg_crawler_name" {
+  value       = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
+  description = "AWS Glue Silver Iceberg Crawler Name."
+}
+
+output "glue_silver_iceberg_job_name" {
+  value       = "${var.app_name}-silver-iceberg-etl-${var.environment}"
+  description = "AWS Glue PySpark Silver Iceberg ETL Job Name."
 }

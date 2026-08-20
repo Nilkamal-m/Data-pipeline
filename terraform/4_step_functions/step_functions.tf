@@ -34,11 +34,7 @@ variable "app_name" {
   description = "Application name prefix for resources."
 }
 
-variable "data_lake_bucket_name" {
-  type        = string
-  default     = "uax-datalake"
-  description = "Base S3 data lake bucket name (environment suffix will be appended)."
-}
+
 
 variable "alert_email_address" {
   type        = string
@@ -66,7 +62,7 @@ variable "use_existing_step_functions_role" {
 }
 
 locals {
-  bucket_name         = "${var.data_lake_bucket_name}-${var.environment}"
+  bucket_name         = "${var.app_name}-${var.environment}-bucket"
   sns_topic_arn       = var.use_existing_sns_topic ? "arn:aws:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${var.app_name}-alerts-topic-${var.environment}" : module.sns_topic.topic_arn
   sfn_role_arn        = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : module.step_functions_iam_role.iam_role_arn
   bronze_job_name     = "${var.app_name}-bronze-ingestion-${var.environment}"
@@ -665,24 +661,49 @@ module "genesys_eventbridge_cron" {
 }
 
 # ------------------------------------------------------------------------------
-# Step Functions Layer Outputs
+# Step Functions Layer Outputs (Prints details for all created services)
 # ------------------------------------------------------------------------------
-output "sns_alert_topic_arn" {
-  value       = local.sns_topic_arn
-  description = "Amazon SNS Alert Topic ARN."
+output "sns_alert_topic_name" {
+  value       = "${var.app_name}-alerts-topic-${var.environment}"
+  description = "Amazon SNS Alert Topic Name."
 }
 
-output "servicenow_state_machine_arn" {
+output "step_functions_iam_role_name" {
+  value       = "${var.app_name}-stepfunctions-role-${var.environment}"
+  description = "Step Functions IAM Execution Role Name."
+}
+
+output "eventbridge_iam_role_name" {
+  value       = "${var.app_name}-eventbridge-role-${var.environment}"
+  description = "EventBridge IAM Execution Role Name."
+}
+
+output "servicenow_state_machine_name" {
   value       = "${var.app_name}-servicenow-orchestrator-${var.environment}"
-  description = "ServiceNow Step Functions State Machine ARN."
+  description = "ServiceNow Step Functions State Machine Name."
 }
 
-output "moveworks_state_machine_arn" {
+output "moveworks_state_machine_name" {
   value       = "${var.app_name}-moveworks-orchestrator-${var.environment}"
-  description = "Moveworks Step Functions State Machine ARN."
+  description = "Moveworks Step Functions State Machine Name."
 }
 
-output "genesys_state_machine_arn" {
+output "genesys_state_machine_name" {
   value       = "${var.app_name}-genesys-orchestrator-${var.environment}"
-  description = "Genesys Step Functions State Machine ARN."
+  description = "Genesys Step Functions State Machine Name."
+}
+
+output "servicenow_eventbridge_rule_name" {
+  value       = "${var.app_name}-servicenow-schedule-${var.environment}"
+  description = "ServiceNow EventBridge Cron Schedule Rule Name."
+}
+
+output "moveworks_eventbridge_rule_name" {
+  value       = "${var.app_name}-moveworks-schedule-${var.environment}"
+  description = "Moveworks EventBridge Cron Schedule Rule Name."
+}
+
+output "genesys_eventbridge_rule_name" {
+  value       = "${var.app_name}-genesys-schedule-${var.environment}"
+  description = "Genesys EventBridge Cron Schedule Rule Name."
 }
