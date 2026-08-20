@@ -52,9 +52,7 @@ class GenesysConnector:
 
         endpoint = ConfigLoader.get_table_endpoint('genesys', table_name, config)
         response_key = config.get('response_records_key') or secret_dict.get('response_records_key') or 'entities'
-        page_size = secret_dict.get('batch_size') or config.get('batch_size')
-        if not page_size or int(page_size) <= 0:
-            raise ValueError(f"Genesys connector error for entity '{table_name}': Invalid or missing 'batch_size' in configuration.")
+        page_size = secret_dict.get('batch_size') or config.get('batch_size') or 1000
         page_size = int(page_size)
 
         target_entity = table_name.strip()

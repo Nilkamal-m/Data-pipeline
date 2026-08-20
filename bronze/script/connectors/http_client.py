@@ -130,7 +130,8 @@ class HTTPClient:
 
         while attempt <= max_retries:
             attempt += 1
-            req = urllib.request.Request(url, headers=request_headers, method='GET')
+            clean_url = url.replace(' ', '%20')
+            req = urllib.request.Request(clean_url, headers=request_headers, method='GET')
 
             try:
                 logger.debug(f"Executing HTTP GET request (attempt {attempt}): {url}")

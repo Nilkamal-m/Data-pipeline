@@ -54,9 +54,7 @@ class ServiceNowConnector:
         query_filter = ConfigLoader.get_table_query_filter('servicenow', table_name, last_load_date, custom_query, config)
         
         response_key = config.get('response_records_key') or secret_dict.get('response_records_key') or 'result'
-        limit = secret_dict.get('batch_size') or config.get('batch_size')
-        if not limit or int(limit) <= 0:
-            raise ValueError(f"ServiceNow connector error for table '{table_name}': Invalid or missing 'batch_size' in configuration.")
+        limit = secret_dict.get('batch_size') or config.get('batch_size') or 1000
         limit = int(limit)
 
         target_table = table_name.strip()
