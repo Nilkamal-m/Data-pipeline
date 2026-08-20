@@ -2,6 +2,7 @@
 # STEP FUNCTIONS & SNS ORCHESTRATION INFRASTRUCTURE (terraform/4_step_functions/step_functions.tf)
 # ==============================================================================
 # Self-contained Terraform script for Step Functions Orchestration & SNS Alerts.
+# Uses Enterprise Private Registry: cps-terraform.anthem.com/organization/*
 # Contains all variables, SNS Topics, State Machines, and EventBridge Cron Rules.
 # Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
@@ -85,10 +86,10 @@ locals {
 
 
 # ------------------------------------------------------------------------------
-# 1. Amazon SNS Alert Topic & Email Subscription using AWS Community Module
+# 1. Amazon SNS Alert Topic & Email Subscription using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "sns_topic" {
-  source  = "terraform-aws-modules/sns/aws"
+  source  = "cps-terraform.anthem.com/organization/sns/aws"
   version = "~> 6.0.0"
 
   create = !var.use_existing_sns_topic
@@ -111,10 +112,10 @@ module "sns_topic" {
 
 
 # ------------------------------------------------------------------------------
-# 2. Step Functions & EventBridge IAM Roles & Policies using AWS Community Module
+# 2. Step Functions & EventBridge IAM Roles & Policies using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "step_functions_iam_policy" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-policy"
+  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
   version = "~> 5.30.0"
 
   create_policy = !var.use_existing_step_functions_role
@@ -171,7 +172,7 @@ module "step_functions_iam_policy" {
 }
 
 module "step_functions_iam_role" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role"
+  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
   version = "~> 5.30.0"
 
   create_role       = !var.use_existing_step_functions_role
@@ -195,7 +196,7 @@ module "step_functions_iam_role" {
 }
 
 module "eventbridge_iam_policy" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-policy"
+  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
   version = "~> 5.30.0"
 
   create_policy = true
@@ -224,7 +225,7 @@ module "eventbridge_iam_policy" {
 }
 
 module "eventbridge_iam_role" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role"
+  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
   version = "~> 5.30.0"
 
   create_role       = true

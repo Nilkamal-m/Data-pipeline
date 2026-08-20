@@ -1,7 +1,8 @@
 # ==============================================================================
 # BRONZE LAYER TERRAFORM INFRASTRUCTURE (terraform/1_bronze/bronze.tf)
 # ==============================================================================
-# Self-contained Terraform script for Bronze Ingestion using terraform-aws-modules.
+# Self-contained Terraform script for Bronze Ingestion using Enterprise Registry modules.
+# Uses Enterprise Private Registry: cps-terraform.anthem.com/organization/*
 # Contains all variables, S3 Bucket, Secrets Manager, IAM Roles, and Bronze Glue Job.
 # Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
@@ -82,10 +83,10 @@ locals {
 
 
 # ------------------------------------------------------------------------------
-# 1. Single S3 Bucket using AWS Community Module
+# 1. Single S3 Bucket using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "s3_bucket" {
-  source  = "terraform-aws-modules/s3-bucket/aws"
+  source  = "cps-terraform.anthem.com/organization/s3-bucket/aws"
   version = "~> 4.0"
 
   create_bucket = !var.use_existing_s3_bucket
@@ -133,10 +134,10 @@ resource "aws_s3_object" "folder_bronze_script" {
 
 
 # ------------------------------------------------------------------------------
-# 2. Secrets Manager Secrets using AWS Community Module
+# 2. Secrets Manager Secrets using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "servicenow_secret" {
-  source  = "terraform-aws-modules/secrets-manager/aws"
+  source  = "cps-terraform.anthem.com/organization/secrets-manager/aws"
   version = "~> 1.1.0"
 
   create      = !var.use_existing_secrets
@@ -161,7 +162,7 @@ module "servicenow_secret" {
 }
 
 module "moveworks_secret" {
-  source  = "terraform-aws-modules/secrets-manager/aws"
+  source  = "cps-terraform.anthem.com/organization/secrets-manager/aws"
   version = "~> 1.1.0"
 
   create      = !var.use_existing_secrets
@@ -185,7 +186,7 @@ module "moveworks_secret" {
 }
 
 module "genesys_secret" {
-  source  = "terraform-aws-modules/secrets-manager/aws"
+  source  = "cps-terraform.anthem.com/organization/secrets-manager/aws"
   version = "~> 1.1.0"
 
   create      = !var.use_existing_secrets
@@ -209,10 +210,10 @@ module "genesys_secret" {
 
 
 # ------------------------------------------------------------------------------
-# 3. AWS Glue Execution IAM Role & Policies using AWS Community Module
+# 3. AWS Glue Execution IAM Role & Policies using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "glue_iam_policy" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-policy"
+  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
   version = "~> 5.30.0"
 
   create_policy = !var.use_existing_iam_role
@@ -283,7 +284,7 @@ module "glue_iam_policy" {
 }
 
 module "glue_iam_role" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role"
+  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
   version = "~> 5.30.0"
 
   create_role       = !var.use_existing_iam_role
