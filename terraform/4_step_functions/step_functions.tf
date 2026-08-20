@@ -1,10 +1,88 @@
+# ==============================================================================
+# STEP FUNCTIONS & SNS ORCHESTRATION INFRASTRUCTURE (terraform/4_step_functions/step_functions.tf)
+# ==============================================================================
+# Self-contained Terraform script for Step Functions Orchestration & SNS Alerts.
+# Contains all variables, SNS Topics, State Machines, and EventBridge Cron Rules.
+# Includes pre-existence check logic to skip creating resources if already present.
+# ==============================================================================
+
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+data "aws_caller_identity" "current" {}
+
+# ------------------------------------------------------------------------------
+# Step Functions Layer Variables (All necessary variables defined inside this file)
+# ------------------------------------------------------------------------------
+variable "aws_region" {
+  type        = string
+  default     = "us-east-1"
+  description = "AWS deployment region."
+}
+
+variable "environment" {
+  type        = string
+  default     = "dev"
+  description = "Deployment environment stage (dev, staging, prod)."
+}
+
+variable "app_name" {
+  type        = string
+  default     = "hr-datalake"
+  description = "Application name prefix for resources."
+}
+
+variable "data_lake_bucket_name" {
+  type        = string
+  default     = "uax-data-lake-bucket"
+  description = "Base S3 data lake bucket name (environment suffix will be appended)."
+}
+
+variable "alert_email_address" {
+  type        = string
+  default     = "data-eng-alerts@company.com"
+  description = "Email address to receive pipeline execution success/failure SNS alerts."
+}
+
+variable "schedule_expression" {
+  type        = string
+  default     = "cron(0 6 * * ? *)"
+  description = "EventBridge cron expression for automated pipeline execution."
+}
+
+# Pre-existence safety toggles
+variable "use_existing_sns_topic" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating SNS topic and reuses existing SNS topic."
+}
+
+variable "use_existing_step_functions_role" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating Step Functions IAM role and reuses existing role."
+}
+
 locals {
+  bucket_name         = "${var.data_lake_bucket_name}-${var.environment}"
   sns_topic_arn       = var.use_existing_sns_topic ? "arn:aws:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${var.app_name}-alerts-topic-${var.environment}" : module.sns_topic.topic_arn
   sfn_role_arn        = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : module.step_functions_iam_role.iam_role_arn
   bronze_job_name     = "${var.app_name}-bronze-ingestion-${var.environment}"
   silver_job_name     = "${var.app_name}-silver-iceberg-etl-${var.environment}"
   silver_crawler_name = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
 }
+
 
 # ------------------------------------------------------------------------------
 # 1. Amazon SNS Alert Topic & Email Subscription using AWS Community Module
@@ -30,6 +108,7 @@ module "sns_topic" {
     ManagedBy   = "Terraform"
   }
 }
+
 
 # ------------------------------------------------------------------------------
 # 2. Step Functions & EventBridge IAM Roles & Policies using AWS Community Module
@@ -167,6 +246,7 @@ module "eventbridge_iam_role" {
     ManagedBy   = "Terraform"
   }
 }
+
 
 # ------------------------------------------------------------------------------
 # 3. AWS Step Functions State Machines
@@ -587,4 +667,27 @@ resource "aws_cloudwatch_event_target" "genesys_target" {
   target_id = "TriggerGenesysStateMachine"
   arn       = aws_sfn_state_machine.genesys_orchestrator.arn
   role_arn  = module.eventbridge_iam_role.iam_role_arn
+}
+
+# ------------------------------------------------------------------------------
+# Step Functions Layer Outputs
+# ------------------------------------------------------------------------------
+output "sns_alert_topic_arn" {
+  value       = local.sns_topic_arn
+  description = "Amazon SNS Alert Topic ARN."
+}
+
+output "servicenow_state_machine_arn" {
+  value       = aws_sfn_state_machine.servicenow_orchestrator.arn
+  description = "ServiceNow Step Functions State Machine ARN."
+}
+
+output "moveworks_state_machine_arn" {
+  value       = aws_sfn_state_machine.moveworks_orchestrator.arn
+  description = "Moveworks Step Functions State Machine ARN."
+}
+
+output "genesys_state_machine_arn" {
+  value       = aws_sfn_state_machine.genesys_orchestrator.arn
+  description = "Genesys Step Functions State Machine ARN."
 }
