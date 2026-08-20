@@ -1,29 +1,19 @@
-# AWS Data Pipeline - 3-Day Multi-Phase Deployment & Testing Guide (instruction.md)
+# AWS Data Pipeline - Single Standalone Terraform Deployment & Manual Testing Guide (instruction.md)
 
-This document provides a step-by-step guide for packaging code, deploying AWS infrastructure day-by-day using **HashiCorp Terraform** (**Day 1: Bronze** $\rightarrow$ **Day 2: Silver** $\rightarrow$ **Day 3: Step Functions**), and executing manual tests for the **UAX Data Lake Pipeline**.
+This document provides a step-by-step guide for packaging code, deploying AWS infrastructure using a **Single Self-Contained Standalone Terraform Executable (`main.tf`)**, and executing manual tests for the **UAX Data Lake Pipeline**.
 
 ---
 
-## 🏗️ 1. Layered Infrastructure Architecture
+## 🏗️ 1. Architecture Overview
 
-The Terraform infrastructure is organized into **3 distinct layer files** under `terraform/`:
-
-```text
-terraform/
-├── provider.tf              # AWS Provider setup
-├── variables.tf             # Global input variables (environment, app_name, data_lake_bucket_name)
-├── bronze.tf                # PART 1: Core S3 Bucket, Secrets Manager Secrets, Bronze IAM Role, Bronze Glue Job
-├── silver.tf                # PART 2: Silver S3 Objects, Glue Catalog DB, Iceberg Crawler, Silver PySpark Job, Athena
-├── step_functions.tf        # PART 3: Step Functions IAM, SNS Topic, 3 State Machines, 3 EventBridge Cron Rules
-├── outputs.tf               # Layered output values
-└── terraform.tfvars.example # Example variable values file
-```
+- **Single Executable File**: `terraform/main.tf` (All Bronze, Silver, Athena, SNS, Step Functions, and EventBridge resources defined in 1 standalone file).
+- **Pre-Existence Protection**: Includes `use_existing_*` boolean safety variables so that if a service (S3 bucket, IAM role, Glue database, Athena workgroup) already exists in your AWS account, Terraform safely reuses the existing service without throwing a creation conflict error!
 
 ---
 
 ## 📦 2. Code Packaging & S3 Upload
 
-Before deploying Terraform, package your Python dependencies into `.zip` files and upload script artifacts to S3:
+Before executing Terraform, package your Python dependencies into `.zip` files and upload script artifacts to S3:
 
 ### Step 2.1: Zip Bronze Python Dependencies
 ```bash
@@ -55,70 +45,44 @@ aws s3 cp silver/script/config/silver_config.json s3://${DATA_LAKE_BUCKET}/silve
 
 ---
 
-## 📅 3. Multi-Day Staged Terraform Deployment Schedule
+## 🚀 3. Single-Command Terraform Deployment
 
-### ☀️ DAY 1: Deploy Bronze Layer ONLY (`bronze.tf`)
-On Day 1, deploy **ONLY** the Bronze ingestion resources (S3 Data Lake Bucket, Secrets Manager Secrets, Glue Execution Role, and Bronze Glue Python Shell Job):
+### Step 3.1: Run Full Deployment (Single Executable File)
+Execute `terraform apply` directly inside `terraform/`. All variables are defined inside `main.tf` with default values:
 
 ```bash
 cd terraform
 terraform init
-
-# Deploy Bronze Layer Resources Only
-terraform apply \
-  -target=aws_s3_bucket.data_lake \
-  -target=aws_secretsmanager_secret.servicenow_secret \
-  -target=aws_secretsmanager_secret.moveworks_secret \
-  -target=aws_secretsmanager_secret.genesys_secret \
-  -target=aws_iam_role.glue_execution_role \
-  -target=aws_glue_job.bronze_ingestion_job \
-  -var="environment=dev" \
-  -var="data_lake_bucket_name=uax-data-lake-bucket" \
-  -var="alert_email_address=your-email@company.com" \
-  -auto-approve
+terraform apply -auto-approve
 ```
 
 ---
 
-### 🌤️ DAY 2: Deploy Silver Layer ONLY (`silver.tf`)
-On Day 2, add the Silver Iceberg ETL resources (Glue Data Catalog Database, Silver Iceberg Crawler, Silver PySpark ETL Job, and Athena WorkGroup) onto the existing Bronze infrastructure:
+### 🛡️ 4. Handling Pre-Existing AWS Resources (Ignore If Present)
+
+If an S3 bucket, IAM role, Glue Database, or Athena Workgroup already exists in your AWS account, pass the safety flag to reuse the existing service without throwing creation conflict errors:
 
 ```bash
 cd terraform
 
-# Deploy Silver Layer Resources Only
+# Example: Reuse existing S3 Bucket and Glue Database
 terraform apply \
-  -target=aws_glue_catalog_database.silver_db \
-  -target=aws_glue_crawler.silver_iceberg_crawler \
-  -target=aws_glue_job.silver_iceberg_job \
-  -target=aws_athena_workgroup.data_pipeline \
-  -var="environment=dev" \
-  -var="data_lake_bucket_name=uax-data-lake-bucket" \
-  -var="alert_email_address=your-email@company.com" \
+  -var="use_existing_s3_bucket=true" \
+  -var="use_existing_glue_database=true" \
   -auto-approve
 ```
 
----
-
-### 🌥️ DAY 3: Deploy Step Functions & Orchestration (`step_functions.tf`)
-On Day 3, deploy the Orchestration layer (SNS Alert Topic, 3 Step Functions State Machines, and EventBridge Cron Schedule Rules):
-
-```bash
-cd terraform
-
-# Deploy All Remaining Resources (Step Functions & EventBridge)
-terraform apply \
-  -var="environment=dev" \
-  -var="data_lake_bucket_name=uax-data-lake-bucket" \
-  -var="alert_email_address=your-email@company.com" \
-  -auto-approve
-```
+#### Available Pre-Existence Safety Toggles in `main.tf`:
+- `-var="use_existing_s3_bucket=true"`: Reuses existing `uax-data-lake-bucket-dev` bucket.
+- `-var="use_existing_iam_role=true"`: Reuses existing Glue execution IAM role.
+- `-var="use_existing_glue_database=true"`: Reuses existing `uax_data_lake_db_dev` Glue database.
+- `-var="use_existing_athena_workgroup=true"`: Reuses existing Athena workgroup.
 
 ---
 
-## 🧪 4. Manual Testing Execution Examples (AWS CLI)
+## 🧪 5. Manual Testing Execution Examples (AWS CLI)
 
-### Example 4.1: Test ServiceNow Ingestion (Bronze Layer - Available Day 1)
+### Example 5.1: Test ServiceNow Ingestion (Bronze Layer)
 ```bash
 aws glue start-job-run \
   --job-name uax-data-pipeline-bronze-ingestion-dev \
@@ -130,7 +94,7 @@ aws glue start-job-run \
   }'
 ```
 
-### Example 4.2: Test Genesys Cloud Ingestion (Bronze Layer - Available Day 1)
+### Example 5.2: Test Genesys Cloud Ingestion (Bronze Layer)
 ```bash
 aws glue start-job-run \
   --job-name uax-data-pipeline-bronze-ingestion-dev \
@@ -142,7 +106,7 @@ aws glue start-job-run \
   }'
 ```
 
-### Example 4.3: Test Moveworks Ingestion (Bronze Layer - Available Day 1)
+### Example 5.3: Test Moveworks Ingestion (Bronze Layer)
 ```bash
 aws glue start-job-run \
   --job-name uax-data-pipeline-bronze-ingestion-dev \
@@ -154,7 +118,7 @@ aws glue start-job-run \
   }'
 ```
 
-### Example 4.4: Test Silver PySpark Apache Iceberg Transformation (Available Day 2)
+### Example 5.4: Test Silver PySpark Apache Iceberg Transformation
 ```bash
 aws glue start-job-run \
   --job-name uax-data-pipeline-silver-iceberg-etl-dev \
@@ -167,7 +131,7 @@ aws glue start-job-run \
 
 ---
 
-## 🔄 5. Step Functions Orchestration Triggers (Available Day 3)
+## 🔄 6. Step Functions Orchestration Triggers
 
 Trigger full pipeline state machine executions manually:
 
@@ -179,7 +143,7 @@ aws stepfunctions start-execution \
 
 ---
 
-## 🧹 6. Destroying Infrastructure
+## 🧹 7. Destroying Infrastructure
 
 To tear down all deployed resources:
 ```bash
