@@ -39,7 +39,7 @@ variable "environment" {
 
 variable "app_name" {
   type        = string
-  default     = "uax-data-pipeline"
+  default     = "hr-datalake"
   description = "Application name prefix for resources."
 }
 
@@ -75,16 +75,16 @@ variable "use_existing_secrets" {
 }
 
 locals {
-  bucket_name   = var.use_existing_s3_bucket ? "${var.data_lake_bucket_name}-${var.environment}" : (length(aws_s3_bucket.data_lake) > 0 ? aws_s3_bucket.data_lake[0].bucket : "${var.data_lake_bucket_name}-${var.environment}")
-  bucket_arn    = var.use_existing_s3_bucket ? "arn:aws:s3:::${var.data_lake_bucket_name}-${var.environment}" : (length(aws_s3_bucket.data_lake) > 0 ? aws_s3_bucket.data_lake[0].arn : "arn:aws:s3:::${var.data_lake_bucket_name}-${var.environment}")
+  bucket_name   = var.use_existing_s3_bucket ? "${var.data_lake_bucket_name}-${var.environment}" : (length(aws_s3_bucket.bucket) > 0 ? aws_s3_bucket.bucket[0].bucket : "${var.data_lake_bucket_name}-${var.environment}")
+  bucket_arn    = var.use_existing_s3_bucket ? "arn:aws:s3:::${var.data_lake_bucket_name}-${var.environment}" : (length(aws_s3_bucket.bucket) > 0 ? aws_s3_bucket.bucket[0].arn : "arn:aws:s3:::${var.data_lake_bucket_name}-${var.environment}")
   glue_role_arn = var.use_existing_iam_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}" : (length(aws_iam_role.glue_execution_role) > 0 ? aws_iam_role.glue_execution_role[0].arn : "")
 }
 
 
 # ------------------------------------------------------------------------------
-# 1. Single S3 Data Lake Bucket (Skips creation if use_existing_s3_bucket = true)
+# 1. Single S3 Bucket (Skips creation if use_existing_s3_bucket = true)
 # ------------------------------------------------------------------------------
-resource "aws_s3_bucket" "data_lake" {
+resource "aws_s3_bucket" "bucket" {
   count         = var.use_existing_s3_bucket ? 0 : 1
   bucket        = "${var.data_lake_bucket_name}-${var.environment}"
   force_destroy = false
@@ -97,17 +97,9 @@ resource "aws_s3_bucket" "data_lake" {
   }
 }
 
-resource "aws_s3_bucket_versioning" "data_lake_versioning" {
-  count  = var.use_existing_s3_bucket ? 0 : 1
-  bucket = aws_s3_bucket.data_lake[0].id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
 resource "aws_s3_bucket_server_side_encryption_configuration" "data_lake_encryption" {
   count  = var.use_existing_s3_bucket ? 0 : 1
-  bucket = aws_s3_bucket.data_lake[0].id
+  bucket = aws_s3_bucket.bucket[0].id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -118,7 +110,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "data_lake_encrypt
 
 resource "aws_s3_bucket_public_access_block" "data_lake_public_block" {
   count                   = var.use_existing_s3_bucket ? 0 : 1
-  bucket                  = aws_s3_bucket.data_lake[0].id
+  bucket                  = aws_s3_bucket.bucket[0].id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true

@@ -39,7 +39,7 @@ variable "environment" {
 
 variable "app_name" {
   type        = string
-  default     = "uax-data-pipeline"
+  default     = "hr-datalake"
   description = "Application name prefix for resources."
 }
 

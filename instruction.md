@@ -123,7 +123,7 @@ terraform apply -var="use_existing_sns_topic=true" -auto-approve
 ### Example 5.1: Test ServiceNow Ingestion (Bronze Layer)
 ```bash
 aws glue start-job-run \
-  --job-name uax-data-pipeline-bronze-ingestion-dev \
+  --job-name hr-datalake-bronze-ingestion-dev \
   --arguments '{
     "--SOURCE_SYSTEM": "servicenow",
     "--TABLE_NAME": "incident",
@@ -135,7 +135,7 @@ aws glue start-job-run \
 ### Example 5.2: Test Silver PySpark Apache Iceberg Transformation
 ```bash
 aws glue start-job-run \
-  --job-name uax-data-pipeline-silver-iceberg-etl-dev \
+  --job-name hr-datalake-silver-iceberg-etl-dev \
   --arguments '{
     "--SOURCE_SYSTEM": "servicenow",
     "--TABLE_NAME": "incident",
@@ -152,7 +152,7 @@ Trigger full pipeline state machine executions manually:
 ```bash
 # Execute ServiceNow End-to-End State Machine
 aws stepfunctions start-execution \
-  --state-machine-arn "arn:aws:states:us-east-1:123456789012:stateMachine:uax-data-pipeline-servicenow-orchestrator-dev"
+  --state-machine-arn "arn:aws:states:us-east-1:123456789012:stateMachine:hr-datalake-servicenow-orchestrator-dev"
 ```
 
 ---
