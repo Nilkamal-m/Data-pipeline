@@ -75,19 +75,37 @@ variable "use_existing_secrets" {
 }
 
 locals {
-  bucket_name   = var.use_existing_s3_bucket ? "${var.data_lake_bucket_name}-${var.environment}" : (length(aws_s3_bucket.bucket) > 0 ? aws_s3_bucket.bucket[0].bucket : "${var.data_lake_bucket_name}-${var.environment}")
-  bucket_arn    = var.use_existing_s3_bucket ? "arn:aws:s3:::${var.data_lake_bucket_name}-${var.environment}" : (length(aws_s3_bucket.bucket) > 0 ? aws_s3_bucket.bucket[0].arn : "arn:aws:s3:::${var.data_lake_bucket_name}-${var.environment}")
+  bucket_name   = "${var.data_lake_bucket_name}-${var.environment}"
+  bucket_arn    = "arn:aws:s3:::${local.bucket_name}"
   glue_role_arn = var.use_existing_iam_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}" : (length(aws_iam_role.glue_execution_role) > 0 ? aws_iam_role.glue_execution_role[0].arn : "")
 }
 
 
 # ------------------------------------------------------------------------------
-# 1. Single S3 Bucket (Skips creation if use_existing_s3_bucket = true)
+# 1. Single S3 Bucket using AWS Community Module
 # ------------------------------------------------------------------------------
-resource "aws_s3_bucket" "bucket" {
-  count         = var.use_existing_s3_bucket ? 0 : 1
-  bucket        = "${var.data_lake_bucket_name}-${var.environment}"
+module "s3_bucket" {
+  source  = "terraform-aws-modules/s3-bucket/aws"
+  version = "~> 4.0"
+
+  create_bucket = !var.use_existing_s3_bucket
+  bucket        = local.bucket_name
   force_destroy = false
+
+  # Block public access
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+
+  # Server side encryption
+  server_side_encryption_configuration = {
+    rule = {
+      apply_server_side_encryption_by_default = {
+        sse_algorithm = "AES256"
+      }
+    }
+  }
 
   tags = {
     Environment = var.environment
@@ -95,26 +113,6 @@ resource "aws_s3_bucket" "bucket" {
     Layer       = "Bronze"
     ManagedBy   = "Terraform"
   }
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "data_lake_encryption" {
-  count  = var.use_existing_s3_bucket ? 0 : 1
-  bucket = aws_s3_bucket.bucket[0].id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "data_lake_public_block" {
-  count                   = var.use_existing_s3_bucket ? 0 : 1
-  bucket                  = aws_s3_bucket.bucket[0].id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
 }
 
 # Bronze S3 Folder Structure Placeholders
