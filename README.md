@@ -21,7 +21,7 @@ Data-pipeline/.
 │       │   ├── oauth.py              # OAuth 2.0 Client Credentials & Password Token Manager
 │       │   └── servicenow.py         # ServiceNow REST API connector module
 │       ├── config_loader.py          # Bronze configuration loader class
-│       └── incremental_load_handler.py # Main AWS Glue Python Shell job script
+│       └── uax_bronze_load.py # Main AWS Glue Python Shell job script
 ├── silver/                           # Silver Layer Glue Iceberg Transformation Code
 │   └── script/                       # Silver script directory (maps to s3://<bucket>/silver/script/)
 │       ├── config/
@@ -79,7 +79,7 @@ Data-pipeline/.
 Upload the local `glue_jobs/` folders to your single S3 Data Lake Bucket (`s3://<YOUR_DATA_LAKE_BUCKET>/`):
 
 1. **Upload Bronze Scripts (`s3://<YOUR_DATA_LAKE_BUCKET>/scripts/bronze/`)**:
-   - Main Ingestion Script: [`glue_jobs/bronze/incremental_load_handler.py`](file:///Users/nilkamalmahato/Documents/Data-pipeline/glue_jobs/bronze/incremental_load_handler.py) $\rightarrow$ `s3://<YOUR_DATA_LAKE_BUCKET>/scripts/bronze/incremental_load_handler.py`
+   - Main Ingestion Script: [`bronze/script/uax_bronze_load.py`](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py) $\rightarrow$ `s3://<YOUR_DATA_LAKE_BUCKET>/bronze/script/uax_bronze_load.py`
    - Config Loader: [`glue_jobs/bronze/config_loader.py`](file:///Users/nilkamalmahato/Documents/Data-pipeline/glue_jobs/bronze/config_loader.py) $\rightarrow$ `s3://<YOUR_DATA_LAKE_BUCKET>/scripts/bronze/config_loader.py`
    - Connectors Package: Zip [`glue_jobs/bronze/connectors/`](file:///Users/nilkamalmahato/Documents/Data-pipeline/glue_jobs/bronze/connectors/) into `connectors.zip` $\rightarrow$ `s3://<YOUR_DATA_LAKE_BUCKET>/scripts/bronze/connectors.zip`
    - Pipeline Config: [`glue_jobs/bronze/config/pipeline_config.json`](file:///Users/nilkamalmahato/Documents/Data-pipeline/glue_jobs/bronze/config/pipeline_config.json) $\rightarrow$ `s3://<YOUR_DATA_LAKE_BUCKET>/scripts/bronze/config/pipeline_config.json`

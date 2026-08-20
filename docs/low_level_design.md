@@ -76,7 +76,7 @@ flowchart TD
     *   `aws_s3_bucket.bucket`: Main storage container for data, scripts, and logs.
     *   `aws_secretsmanager_secret.servicenow_secret` / `moveworks_secret` / `genesys_secret`: Secure containers for API credentials.
     *   `aws_iam_role.glue_execution_role`: Role assumed by AWS Glue for S3, Secrets, Catalog, and CloudWatch access.
-    *   `aws_glue_job.bronze_ingestion_job`: Python Shell job running `incremental_load_handler.py`.
+    *   `aws_glue_job.bronze_ingestion_job`: Python Shell job running `uax_bronze_load.py`.
 *   **Connectivity**: References S3 path locations and Secrets Manager resource identifiers.
 
 #### 2. [`2_silver/silver.tf`](file:///Users/nilkamalmahato/Documents/Data-pipeline/terraform/2_silver/silver.tf)
@@ -129,7 +129,7 @@ flowchart TD
     *   `get_table_endpoint(source_system, table_name, config_dict)`: Interpolates URI paths for dynamic API extraction.
     *   `get_pipeline_defaults(config_dict)`: Extracts fallback system defaults (chunk size, formats).
 
-#### 2. [`incremental_load_handler.py`](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/incremental_load_handler.py)
+#### 2. [`uax_bronze_load.py`](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py)
 *   **Purpose**: Orchestrates incremental extraction, pagination, state updates, and data writing.
 *   **Why we care**: The primary ingestion driver. It runs REST queries, parses payloads, flattens JSON structures, writes Parquet chunks to staging, promotes files, and updates watermarks.
 *   **Core Functions**:

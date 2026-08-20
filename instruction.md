@@ -40,10 +40,10 @@ cd ../..
 
 ### Step 2.2: Upload Scripts & Config Artifacts to S3
 ```bash
-DATA_LAKE_BUCKET="uax-data-lake-bucket-dev"
+DATA_LAKE_BUCKET="uax-datalake-dev-bucket"
 
 # Upload Bronze Script Artifacts
-aws s3 cp bronze/script/incremental_load_handler.py s3://${DATA_LAKE_BUCKET}/bronze/script/incremental_load_handler.py
+aws s3 cp bronze/script/uax_bronze_load.py s3://${DATA_LAKE_BUCKET}/bronze/script/uax_bronze_load.py
 aws s3 cp bronze/script/connectors.zip s3://${DATA_LAKE_BUCKET}/bronze/script/connectors.zip
 aws s3 cp bronze/script/config/bronze_config.json s3://${DATA_LAKE_BUCKET}/bronze/script/config/bronze_config.json
 

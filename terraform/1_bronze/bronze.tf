@@ -34,11 +34,7 @@ variable "app_name" {
   description = "Application name prefix for resources."
 }
 
-variable "data_lake_bucket_name" {
-  type        = string
-  default     = "uax-datalake"
-  description = "Base S3 data lake bucket name (environment suffix will be appended)."
-}
+
 
 variable "output_format" {
   type        = string
@@ -66,7 +62,7 @@ variable "use_existing_secrets" {
 }
 
 locals {
-  bucket_name   = "${var.data_lake_bucket_name}-${var.environment}"
+  bucket_name   = "${var.app_name}-${var.environment}-bucket"
   bucket_arn    = "arn:aws:s3:::${local.bucket_name}"
   glue_role_arn = var.use_existing_iam_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}" : module.glue_iam_role.iam_role_arn
 }
@@ -114,15 +110,17 @@ module "servicenow_secret" {
 
   create      = !var.use_existing_secrets
   name        = "${var.app_name}/servicenow-credentials-${var.environment}"
-  description = "ServiceNow OAuth 2.0 credentials (Password/Client Credentials flow)."
+  description = "ServiceNow REST API credentials (Basic Auth)."
 
   secret_string = jsonencode({
-    grant_type    = "password"
-    client_id     = "CHANGE_ME_SERVICENOW_CLIENT_ID"
-    client_secret = "CHANGE_ME_SERVICENOW_CLIENT_SECRET"
+    auth_type     = "basic"
+    grant_type    = ""
+    client_id     = ""
+    client_secret = ""
     username      = "servicenow_api_user"
     password      = "CHANGE_ME_SERVICENOW_PASSWORD"
-    token_url     = "https://your-instance.service-now.com/oauth_token.do"
+    token_url     = ""
+    scope         = ""
   })
 
   tags = {
@@ -138,12 +136,15 @@ module "moveworks_secret" {
 
   create      = !var.use_existing_secrets
   name        = "${var.app_name}/moveworks-credentials-${var.environment}"
-  description = "Moveworks OAuth 2.0 credentials (Client Credentials flow)."
+  description = "Moveworks REST API credentials (OAuth 2.0)."
 
   secret_string = jsonencode({
+    auth_type     = "oauth2"
     grant_type    = "client_credentials"
     client_id     = "CHANGE_ME_MOVEWORKS_CLIENT_ID"
     client_secret = "CHANGE_ME_MOVEWORKS_CLIENT_SECRET"
+    username      = ""
+    password      = ""
     token_url     = "https://api.moveworks.ai/rest/v1/oauth/token"
     scope         = "export:read"
   })
@@ -161,13 +162,17 @@ module "genesys_secret" {
 
   create      = !var.use_existing_secrets
   name        = "${var.app_name}/genesys-credentials-${var.environment}"
-  description = "Genesys Cloud OAuth 2.0 credentials (Client Credentials flow)."
+  description = "Genesys Cloud REST API credentials (OAuth 2.0)."
 
   secret_string = jsonencode({
+    auth_type     = "oauth2"
     grant_type    = "client_credentials"
     client_id     = "CHANGE_ME_GENESYS_CLIENT_ID"
     client_secret = "CHANGE_ME_GENESYS_CLIENT_SECRET"
+    username      = ""
+    password      = ""
     token_url     = "https://login.mypurecloud.com/oauth/token"
+    scope         = ""
   })
 
   tags = {
@@ -299,7 +304,7 @@ module "bronze_glue_job" {
   command = {
     name            = "pythonshell"
     python_version  = "3.9"
-    script_location = "s3://${local.bucket_name}/bronze/script/incremental_load_handler.py"
+    script_location = "s3://${local.bucket_name}/bronze/script/uax_bronze_load.py"
   }
 
   default_arguments = {
