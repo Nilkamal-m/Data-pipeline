@@ -1,17 +1,88 @@
 # ==============================================================================
-# FILE 4: STEP FUNCTIONS & SNS ORCHESTRATION INFRASTRUCTURE (4_step_functions.tf)
+# STEP FUNCTIONS & SNS ORCHESTRATION INFRASTRUCTURE (terraform/4_step_functions/step_functions.tf)
 # ==============================================================================
-# Includes:
-# - Amazon SNS Alert Topic & Email Subscription
-# - Step Functions & EventBridge Execution IAM Roles & Policies
-# - 3 AWS Step Functions State Machines (ServiceNow, Moveworks, Genesys)
-# - 3 Amazon EventBridge Cron Rules & Targets
-# - Pre-existence skip logic (use_existing_sns_topic, use_existing_step_functions_role)
+# Self-contained Terraform script for Step Functions Orchestration & SNS Alerts.
+# Contains all variables, SNS Topics, State Machines, and EventBridge Cron Rules.
+# Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
 
-locals {
-  sns_topic_arn = var.use_existing_sns_topic ? "arn:aws:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${var.app_name}-alerts-topic-${var.environment}" : (length(aws_sns_topic.pipeline_alerts) > 0 ? aws_sns_topic.pipeline_alerts[0].arn : "")
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
 }
+
+provider "aws" {
+  region = var.aws_region
+}
+
+data "aws_caller_identity" "current" {}
+
+# ------------------------------------------------------------------------------
+# Step Functions Layer Variables (All necessary variables defined inside this file)
+# ------------------------------------------------------------------------------
+variable "aws_region" {
+  type        = string
+  default     = "us-east-1"
+  description = "AWS deployment region."
+}
+
+variable "environment" {
+  type        = string
+  default     = "dev"
+  description = "Deployment environment stage (dev, staging, prod)."
+}
+
+variable "app_name" {
+  type        = string
+  default     = "uax-data-pipeline"
+  description = "Application name prefix for resources."
+}
+
+variable "data_lake_bucket_name" {
+  type        = string
+  default     = "uax-data-lake-bucket"
+  description = "Base S3 data lake bucket name (environment suffix will be appended)."
+}
+
+variable "alert_email_address" {
+  type        = string
+  default     = "data-eng-alerts@company.com"
+  description = "Email address to receive pipeline execution success/failure SNS alerts."
+}
+
+variable "schedule_expression" {
+  type        = string
+  default     = "cron(0 6 * * ? *)"
+  description = "EventBridge cron expression for automated pipeline execution."
+}
+
+# Pre-existence safety toggles
+variable "use_existing_sns_topic" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating SNS topic and reuses existing SNS topic."
+}
+
+variable "use_existing_step_functions_role" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating Step Functions IAM role and reuses existing role."
+}
+
+locals {
+  bucket_name         = "${var.data_lake_bucket_name}-${var.environment}"
+  sns_topic_arn       = var.use_existing_sns_topic ? "arn:aws:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${var.app_name}-alerts-topic-${var.environment}" : (length(aws_sns_topic.pipeline_alerts) > 0 ? aws_sns_topic.pipeline_alerts[0].arn : "")
+  sfn_role_arn        = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : (length(aws_iam_role.step_functions_role) > 0 ? aws_iam_role.step_functions_role[0].arn : "")
+  bronze_job_name     = "${var.app_name}-bronze-ingestion-${var.environment}"
+  silver_job_name     = "${var.app_name}-silver-iceberg-etl-${var.environment}"
+  silver_crawler_name = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
+}
+
 
 # ------------------------------------------------------------------------------
 # 1. Amazon SNS Alert Topic & Email Subscription (Skips creation if use_existing_sns_topic = true)
@@ -173,7 +244,7 @@ resource "aws_iam_role_policy_attachment" "eventbridge_policy_attach" {
 # ServiceNow State Machine
 resource "aws_sfn_state_machine" "servicenow_orchestrator" {
   name     = "${var.app_name}-servicenow-orchestrator-${var.environment}"
-  role_arn = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : aws_iam_role.step_functions_role[0].arn
+  role_arn = local.sfn_role_arn
 
   definition = jsonencode({
     Comment = "Orchestrates ServiceNow Ingestion -> Silver Iceberg ETL -> Glue Crawler Sync -> SNS Alert"
@@ -183,11 +254,11 @@ resource "aws_sfn_state_machine" "servicenow_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
-          JobName = aws_glue_job.bronze_ingestion_job.name
+          JobName = local.bronze_job_name
           Arguments = {
             "--SOURCE_SYSTEM"   = "servicenow"
             "--TABLE_NAME"      = "incident,change_request,problem,sys_user"
-            "--SECRET_NAME"     = var.use_existing_secrets ? "data-lake/servicenow-credentials-${var.environment}" : aws_secretsmanager_secret.servicenow_secret[0].name
+            "--SECRET_NAME"     = "data-lake/servicenow-credentials-${var.environment}"
             "--CONFIG_S3_PATH"  = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
           }
         }
@@ -204,7 +275,7 @@ resource "aws_sfn_state_machine" "servicenow_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
-          JobName = aws_glue_job.silver_iceberg_job.name
+          JobName = local.silver_job_name
           Arguments = {
             "--SOURCE_SYSTEM"          = "servicenow"
             "--TABLE_NAME"             = "incident,change_request,problem,sys_user"
@@ -224,7 +295,7 @@ resource "aws_sfn_state_machine" "servicenow_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startCrawler"
         Parameters = {
-          Name = aws_glue_crawler.silver_iceberg_crawler.name
+          Name = local.silver_crawler_name
         }
         Catch = [
           {
@@ -245,7 +316,7 @@ resource "aws_sfn_state_machine" "servicenow_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::aws-sdk:glue:getCrawler"
         Parameters = {
-          Name = aws_glue_crawler.silver_iceberg_crawler.name
+          Name = local.silver_crawler_name
         }
         Next = "CheckCrawlerRunning"
       }
@@ -292,18 +363,12 @@ resource "aws_sfn_state_machine" "servicenow_orchestrator" {
     Layer       = "Orchestration"
     ManagedBy   = "Terraform"
   }
-
-  depends_on = [
-    aws_glue_job.bronze_ingestion_job,
-    aws_glue_job.silver_iceberg_job,
-    aws_glue_crawler.silver_iceberg_crawler
-  ]
 }
 
 # Moveworks State Machine
 resource "aws_sfn_state_machine" "moveworks_orchestrator" {
   name     = "${var.app_name}-moveworks-orchestrator-${var.environment}"
-  role_arn = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : aws_iam_role.step_functions_role[0].arn
+  role_arn = local.sfn_role_arn
 
   definition = jsonencode({
     Comment = "Orchestrates Moveworks Ingestion -> Silver Iceberg ETL -> Glue Crawler Sync -> SNS Alert"
@@ -313,11 +378,11 @@ resource "aws_sfn_state_machine" "moveworks_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
-          JobName = aws_glue_job.bronze_ingestion_job.name
+          JobName = local.bronze_job_name
           Arguments = {
             "--SOURCE_SYSTEM"   = "moveworks"
             "--TABLE_NAME"      = "interactions,users,tickets"
-            "--SECRET_NAME"     = var.use_existing_secrets ? "data-lake/moveworks-credentials-${var.environment}" : aws_secretsmanager_secret.moveworks_secret[0].name
+            "--SECRET_NAME"     = "data-lake/moveworks-credentials-${var.environment}"
             "--CONFIG_S3_PATH"  = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
           }
         }
@@ -334,7 +399,7 @@ resource "aws_sfn_state_machine" "moveworks_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
-          JobName = aws_glue_job.silver_iceberg_job.name
+          JobName = local.silver_job_name
           Arguments = {
             "--SOURCE_SYSTEM"          = "moveworks"
             "--TABLE_NAME"             = "interactions,users,tickets"
@@ -354,7 +419,7 @@ resource "aws_sfn_state_machine" "moveworks_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startCrawler"
         Parameters = {
-          Name = aws_glue_crawler.silver_iceberg_crawler.name
+          Name = local.silver_crawler_name
         }
         Catch = [
           {
@@ -375,7 +440,7 @@ resource "aws_sfn_state_machine" "moveworks_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::aws-sdk:glue:getCrawler"
         Parameters = {
-          Name = aws_glue_crawler.silver_iceberg_crawler.name
+          Name = local.silver_crawler_name
         }
         Next = "CheckCrawlerRunning"
       }
@@ -422,18 +487,12 @@ resource "aws_sfn_state_machine" "moveworks_orchestrator" {
     Layer       = "Orchestration"
     ManagedBy   = "Terraform"
   }
-
-  depends_on = [
-    aws_glue_job.bronze_ingestion_job,
-    aws_glue_job.silver_iceberg_job,
-    aws_glue_crawler.silver_iceberg_crawler
-  ]
 }
 
 # Genesys State Machine
 resource "aws_sfn_state_machine" "genesys_orchestrator" {
   name     = "${var.app_name}-genesys-orchestrator-${var.environment}"
-  role_arn = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : aws_iam_role.step_functions_role[0].arn
+  role_arn = local.sfn_role_arn
 
   definition = jsonencode({
     Comment = "Orchestrates Genesys Ingestion -> Silver Iceberg ETL -> Glue Crawler Sync -> SNS Alert"
@@ -443,11 +502,11 @@ resource "aws_sfn_state_machine" "genesys_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
-          JobName = aws_glue_job.bronze_ingestion_job.name
+          JobName = local.bronze_job_name
           Arguments = {
             "--SOURCE_SYSTEM"   = "genesys"
             "--TABLE_NAME"      = "conversations,users,queues"
-            "--SECRET_NAME"     = var.use_existing_secrets ? "data-lake/genesys-credentials-${var.environment}" : aws_secretsmanager_secret.genesys_secret[0].name
+            "--SECRET_NAME"     = "data-lake/genesys-credentials-${var.environment}"
             "--CONFIG_S3_PATH"  = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
           }
         }
@@ -464,7 +523,7 @@ resource "aws_sfn_state_machine" "genesys_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
-          JobName = aws_glue_job.silver_iceberg_job.name
+          JobName = local.silver_job_name
           Arguments = {
             "--SOURCE_SYSTEM"          = "genesys"
             "--TABLE_NAME"             = "conversations,users,queues"
@@ -484,7 +543,7 @@ resource "aws_sfn_state_machine" "genesys_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::glue:startCrawler"
         Parameters = {
-          Name = aws_glue_crawler.silver_iceberg_crawler.name
+          Name = local.silver_crawler_name
         }
         Catch = [
           {
@@ -505,7 +564,7 @@ resource "aws_sfn_state_machine" "genesys_orchestrator" {
         Type     = "Task"
         Resource = "arn:aws:states:::aws-sdk:glue:getCrawler"
         Parameters = {
-          Name = aws_glue_crawler.silver_iceberg_crawler.name
+          Name = local.silver_crawler_name
         }
         Next = "CheckCrawlerRunning"
       }
@@ -552,12 +611,6 @@ resource "aws_sfn_state_machine" "genesys_orchestrator" {
     Layer       = "Orchestration"
     ManagedBy   = "Terraform"
   }
-
-  depends_on = [
-    aws_glue_job.bronze_ingestion_job,
-    aws_glue_job.silver_iceberg_job,
-    aws_glue_crawler.silver_iceberg_crawler
-  ]
 }
 
 # ------------------------------------------------------------------------------
@@ -603,4 +656,27 @@ resource "aws_cloudwatch_event_target" "genesys_target" {
   target_id = "TriggerGenesysStateMachine"
   arn       = aws_sfn_state_machine.genesys_orchestrator.arn
   role_arn  = aws_iam_role.eventbridge_role.arn
+}
+
+# ------------------------------------------------------------------------------
+# Step Functions Layer Outputs
+# ------------------------------------------------------------------------------
+output "sns_alert_topic_arn" {
+  value       = local.sns_topic_arn
+  description = "Amazon SNS Alert Topic ARN."
+}
+
+output "servicenow_state_machine_arn" {
+  value       = aws_sfn_state_machine.servicenow_orchestrator.arn
+  description = "ServiceNow Step Functions State Machine ARN."
+}
+
+output "moveworks_state_machine_arn" {
+  value       = aws_sfn_state_machine.moveworks_orchestrator.arn
+  description = "Moveworks Step Functions State Machine ARN."
+}
+
+output "genesys_state_machine_arn" {
+  value       = aws_sfn_state_machine.genesys_orchestrator.arn
+  description = "Genesys Step Functions State Machine ARN."
 }

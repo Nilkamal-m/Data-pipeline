@@ -1,17 +1,73 @@
 # ==============================================================================
-# FILE 2: SILVER LAYER TERRAFORM INFRASTRUCTURE (2_silver.tf)
+# SILVER LAYER TERRAFORM INFRASTRUCTURE (terraform/2_silver/silver.tf)
 # ==============================================================================
-# Includes:
-# - Silver S3 Folder Structure Placeholders
-# - AWS Glue Data Catalog Database for Silver Layer Iceberg Tables
-# - AWS Glue Iceberg Crawler
-# - AWS Glue PySpark Apache Iceberg ETL Job (silver_iceberg_etl.py)
-# - Pre-existence skip logic (use_existing_glue_database)
+# Self-contained Terraform script for Silver Iceberg ETL Layer.
+# Contains all variables, Glue Catalog DB, Iceberg Crawler, and PySpark ETL Job.
+# Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
 
-locals {
-  glue_db_name = var.use_existing_glue_database ? "uax_data_lake_db_${var.environment}" : (length(aws_glue_catalog_database.silver_db) > 0 ? aws_glue_catalog_database.silver_db[0].name : "uax_data_lake_db_${var.environment}")
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
 }
+
+provider "aws" {
+  region = var.aws_region
+}
+
+data "aws_caller_identity" "current" {}
+
+# ------------------------------------------------------------------------------
+# Silver Layer Variables (All necessary variables defined inside this file)
+# ------------------------------------------------------------------------------
+variable "aws_region" {
+  type        = string
+  default     = "us-east-1"
+  description = "AWS deployment region."
+}
+
+variable "environment" {
+  type        = string
+  default     = "dev"
+  description = "Deployment environment stage (dev, staging, prod)."
+}
+
+variable "app_name" {
+  type        = string
+  default     = "uax-data-pipeline"
+  description = "Application name prefix for resources."
+}
+
+variable "data_lake_bucket_name" {
+  type        = string
+  default     = "uax-data-lake-bucket"
+  description = "Base S3 data lake bucket name (environment suffix will be appended)."
+}
+
+# Pre-existence safety toggles
+variable "use_existing_glue_database" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating Glue database and reuses existing database."
+}
+
+variable "use_existing_iam_role" {
+  type        = bool
+  default     = false
+  description = "If true, skips looking up custom role and resolves standard role."
+}
+
+locals {
+  bucket_name   = "${var.data_lake_bucket_name}-${var.environment}"
+  glue_role_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}"
+  glue_db_name  = var.use_existing_glue_database ? "uax_data_lake_db_${var.environment}" : (length(aws_glue_catalog_database.silver_db) > 0 ? aws_glue_catalog_database.silver_db[0].name : "uax_data_lake_db_${var.environment}")
+}
+
 
 # ------------------------------------------------------------------------------
 # 1. Silver S3 Folder Structure Placeholders
@@ -92,8 +148,17 @@ resource "aws_glue_job" "silver_iceberg_job" {
     Layer       = "Silver"
     ManagedBy   = "Terraform"
   }
+}
 
-  depends_on = [
-    aws_glue_job.bronze_ingestion_job
-  ]
+# ------------------------------------------------------------------------------
+# Silver Layer Outputs
+# ------------------------------------------------------------------------------
+output "glue_silver_iceberg_job_name" {
+  value       = aws_glue_job.silver_iceberg_job.name
+  description = "AWS Glue PySpark Silver Iceberg ETL Job Name."
+}
+
+output "glue_catalog_database_name" {
+  value       = local.glue_db_name
+  description = "AWS Glue Data Catalog Database Name for Silver Iceberg Tables."
 }

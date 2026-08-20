@@ -1,12 +1,9 @@
 # ==============================================================================
-# FILE 1: BRONZE LAYER TERRAFORM INFRASTRUCTURE (1_bronze.tf)
+# BRONZE LAYER TERRAFORM INFRASTRUCTURE (terraform/1_bronze/bronze.tf)
 # ==============================================================================
-# Includes:
-# - S3 Data Lake Bucket & Core S3 Folder Prefixes
-# - Secrets Manager Secrets for REST API OAuth 2.0 Credentials
-# - AWS Glue Execution IAM Role & Policy
-# - AWS Glue Python Shell Ingestion Job (incremental_load_handler.py)
-# - Pre-existence skip logic (use_existing_s3_bucket, use_existing_iam_role, use_existing_secrets)
+# Self-contained Terraform script for Bronze Ingestion.
+# Contains all variables, S3 Bucket, Secrets Manager, IAM Roles, and Bronze Glue Job.
+# Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
 
 terraform {
@@ -25,11 +22,64 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 
+# ------------------------------------------------------------------------------
+# Bronze Layer Variables (All necessary variables defined inside this file)
+# ------------------------------------------------------------------------------
+variable "aws_region" {
+  type        = string
+  default     = "us-east-1"
+  description = "AWS deployment region."
+}
+
+variable "environment" {
+  type        = string
+  default     = "dev"
+  description = "Deployment environment stage (dev, staging, prod)."
+}
+
+variable "app_name" {
+  type        = string
+  default     = "uax-data-pipeline"
+  description = "Application name prefix for resources."
+}
+
+variable "data_lake_bucket_name" {
+  type        = string
+  default     = "uax-data-lake-bucket"
+  description = "Base S3 data lake bucket name (environment suffix will be appended)."
+}
+
+variable "output_format" {
+  type        = string
+  default     = "parquet"
+  description = "Raw Bronze data serialization format (parquet or json)."
+}
+
+# Pre-existence safety toggles
+variable "use_existing_s3_bucket" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating S3 bucket and reuses existing bucket."
+}
+
+variable "use_existing_iam_role" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating Glue IAM role and reuses existing role."
+}
+
+variable "use_existing_secrets" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating Secrets Manager secrets and reuses existing secrets."
+}
+
 locals {
   bucket_name   = var.use_existing_s3_bucket ? "${var.data_lake_bucket_name}-${var.environment}" : (length(aws_s3_bucket.data_lake) > 0 ? aws_s3_bucket.data_lake[0].bucket : "${var.data_lake_bucket_name}-${var.environment}")
   bucket_arn    = var.use_existing_s3_bucket ? "arn:aws:s3:::${var.data_lake_bucket_name}-${var.environment}" : (length(aws_s3_bucket.data_lake) > 0 ? aws_s3_bucket.data_lake[0].arn : "arn:aws:s3:::${var.data_lake_bucket_name}-${var.environment}")
   glue_role_arn = var.use_existing_iam_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}" : (length(aws_iam_role.glue_execution_role) > 0 ? aws_iam_role.glue_execution_role[0].arn : "")
 }
+
 
 # ------------------------------------------------------------------------------
 # 1. Single S3 Data Lake Bucket (Skips creation if use_existing_s3_bucket = true)
@@ -75,7 +125,7 @@ resource "aws_s3_bucket_public_access_block" "data_lake_public_block" {
   restrict_public_buckets = true
 }
 
-# Bronze S3 Folder Objects
+# Bronze S3 Folder Structure Placeholders
 resource "aws_s3_object" "folder_bronze" {
   bucket = local.bucket_name
   key    = "bronze/"
@@ -304,4 +354,17 @@ resource "aws_glue_job" "bronze_ingestion_job" {
     Layer       = "Bronze"
     ManagedBy   = "Terraform"
   }
+}
+
+# ------------------------------------------------------------------------------
+# Bronze Layer Outputs
+# ------------------------------------------------------------------------------
+output "data_lake_s3_bucket_name" {
+  value       = local.bucket_name
+  description = "Single S3 Data Lake bucket name."
+}
+
+output "glue_bronze_ingestion_job_name" {
+  value       = aws_glue_job.bronze_ingestion_job.name
+  description = "AWS Glue Python Shell Bronze Ingestion Job Name."
 }
