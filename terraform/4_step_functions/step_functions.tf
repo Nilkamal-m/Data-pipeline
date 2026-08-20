@@ -7,8 +7,6 @@
 # Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
 
-
-
 provider "aws" {
   region = var.aws_region
 }
@@ -76,7 +74,6 @@ locals {
   silver_crawler_name = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
 }
 
-
 # ------------------------------------------------------------------------------
 # 1. Amazon SNS Alert Topic & Email Subscription using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
@@ -100,7 +97,6 @@ module "sns_topic" {
     ManagedBy   = "Terraform"
   }
 }
-
 
 # ------------------------------------------------------------------------------
 # 2. Step Functions & EventBridge IAM Roles & Policies using Enterprise Private Registry Module
@@ -235,13 +231,14 @@ module "eventbridge_iam_role" {
   }
 }
 
-
 # ------------------------------------------------------------------------------
-# 3. AWS Step Functions State Machines
+# 3. AWS Step Functions State Machines using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 
 # ServiceNow State Machine
-resource "aws_sfn_state_machine" "servicenow_orchestrator" {
+module "servicenow_state_machine" {
+  source = "cps-terraform.anthem.com/organization/step-functions/aws"
+
   name     = "${var.app_name}-servicenow-orchestrator-${var.environment}"
   role_arn = local.sfn_role_arn
 
@@ -255,10 +252,10 @@ resource "aws_sfn_state_machine" "servicenow_orchestrator" {
         Parameters = {
           JobName = local.bronze_job_name
           Arguments = {
-            "--SOURCE_SYSTEM"   = "servicenow"
-            "--TABLE_NAME"      = "incident,change_request,problem,sys_user"
-            "--SECRET_NAME"     = "data-lake/servicenow-credentials-${var.environment}"
-            "--CONFIG_S3_PATH"  = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
+            "--SOURCE_SYSTEM"  = "servicenow"
+            "--TABLE_NAME"     = "incident,change_request,problem,sys_user"
+            "--SECRET_NAME"    = "data-lake/servicenow-credentials-${var.environment}"
+            "--CONFIG_S3_PATH" = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
           }
         }
         Catch = [
@@ -365,7 +362,9 @@ resource "aws_sfn_state_machine" "servicenow_orchestrator" {
 }
 
 # Moveworks State Machine
-resource "aws_sfn_state_machine" "moveworks_orchestrator" {
+module "moveworks_state_machine" {
+  source = "cps-terraform.anthem.com/organization/step-functions/aws"
+
   name     = "${var.app_name}-moveworks-orchestrator-${var.environment}"
   role_arn = local.sfn_role_arn
 
@@ -379,10 +378,10 @@ resource "aws_sfn_state_machine" "moveworks_orchestrator" {
         Parameters = {
           JobName = local.bronze_job_name
           Arguments = {
-            "--SOURCE_SYSTEM"   = "moveworks"
-            "--TABLE_NAME"      = "interactions,users,tickets"
-            "--SECRET_NAME"     = "data-lake/moveworks-credentials-${var.environment}"
-            "--CONFIG_S3_PATH"  = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
+            "--SOURCE_SYSTEM"  = "moveworks"
+            "--TABLE_NAME"     = "interactions,users,tickets"
+            "--SECRET_NAME"    = "data-lake/moveworks-credentials-${var.environment}"
+            "--CONFIG_S3_PATH" = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
           }
         }
         Catch = [
@@ -489,7 +488,9 @@ resource "aws_sfn_state_machine" "moveworks_orchestrator" {
 }
 
 # Genesys State Machine
-resource "aws_sfn_state_machine" "genesys_orchestrator" {
+module "genesys_state_machine" {
+  source = "cps-terraform.anthem.com/organization/step-functions/aws"
+
   name     = "${var.app_name}-genesys-orchestrator-${var.environment}"
   role_arn = local.sfn_role_arn
 
@@ -503,10 +504,10 @@ resource "aws_sfn_state_machine" "genesys_orchestrator" {
         Parameters = {
           JobName = local.bronze_job_name
           Arguments = {
-            "--SOURCE_SYSTEM"   = "genesys"
-            "--TABLE_NAME"      = "conversations,users,queues"
-            "--SECRET_NAME"     = "data-lake/genesys-credentials-${var.environment}"
-            "--CONFIG_S3_PATH"  = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
+            "--SOURCE_SYSTEM"  = "genesys"
+            "--TABLE_NAME"     = "conversations,users,queues"
+            "--SECRET_NAME"    = "data-lake/genesys-credentials-${var.environment}"
+            "--CONFIG_S3_PATH" = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
           }
         }
         Catch = [
@@ -613,48 +614,54 @@ resource "aws_sfn_state_machine" "genesys_orchestrator" {
 }
 
 # ------------------------------------------------------------------------------
-# 4. Amazon EventBridge Cron Rules & Targets
+# 4. Amazon EventBridge Cron Rules & Targets using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
-resource "aws_cloudwatch_event_rule" "servicenow_cron" {
+module "servicenow_eventbridge_cron" {
+  source = "cps-terraform.anthem.com/organization/eventbridge/aws"
+
+  create              = true
   name                = "${var.app_name}-servicenow-schedule-${var.environment}"
   description         = "Triggers ServiceNow pipeline state machine on schedule."
   schedule_expression = var.schedule_expression
-  state               = "ENABLED"
+
+  targets = {
+    servicenow_target = {
+      arn      = module.servicenow_state_machine.state_machine_arn
+      role_arn = module.eventbridge_iam_role.iam_role_arn
+    }
+  }
 }
 
-resource "aws_cloudwatch_event_target" "servicenow_target" {
-  rule      = aws_cloudwatch_event_rule.servicenow_cron.name
-  target_id = "TriggerServiceNowStateMachine"
-  arn       = aws_sfn_state_machine.servicenow_orchestrator.arn
-  role_arn  = module.eventbridge_iam_role.iam_role_arn
-}
+module "moveworks_eventbridge_cron" {
+  source = "cps-terraform.anthem.com/organization/eventbridge/aws"
 
-resource "aws_cloudwatch_event_rule" "moveworks_cron" {
+  create              = true
   name                = "${var.app_name}-moveworks-schedule-${var.environment}"
   description         = "Triggers Moveworks pipeline state machine on schedule."
   schedule_expression = var.schedule_expression
-  state               = "ENABLED"
+
+  targets = {
+    moveworks_target = {
+      arn      = module.moveworks_state_machine.state_machine_arn
+      role_arn = module.eventbridge_iam_role.iam_role_arn
+    }
+  }
 }
 
-resource "aws_cloudwatch_event_target" "moveworks_target" {
-  rule      = aws_cloudwatch_event_rule.moveworks_cron.name
-  target_id = "TriggerMoveworksStateMachine"
-  arn       = aws_sfn_state_machine.moveworks_orchestrator.arn
-  role_arn  = module.eventbridge_iam_role.iam_role_arn
-}
+module "genesys_eventbridge_cron" {
+  source = "cps-terraform.anthem.com/organization/eventbridge/aws"
 
-resource "aws_cloudwatch_event_rule" "genesys_cron" {
+  create              = true
   name                = "${var.app_name}-genesys-schedule-${var.environment}"
   description         = "Triggers Genesys pipeline state machine on schedule."
   schedule_expression = var.schedule_expression
-  state               = "ENABLED"
-}
 
-resource "aws_cloudwatch_event_target" "genesys_target" {
-  rule      = aws_cloudwatch_event_rule.genesys_cron.name
-  target_id = "TriggerGenesysStateMachine"
-  arn       = aws_sfn_state_machine.genesys_orchestrator.arn
-  role_arn  = module.eventbridge_iam_role.iam_role_arn
+  targets = {
+    genesys_target = {
+      arn      = module.genesys_state_machine.state_machine_arn
+      role_arn = module.eventbridge_iam_role.iam_role_arn
+    }
+  }
 }
 
 # ------------------------------------------------------------------------------
@@ -666,16 +673,16 @@ output "sns_alert_topic_arn" {
 }
 
 output "servicenow_state_machine_arn" {
-  value       = aws_sfn_state_machine.servicenow_orchestrator.arn
+  value       = "${var.app_name}-servicenow-orchestrator-${var.environment}"
   description = "ServiceNow Step Functions State Machine ARN."
 }
 
 output "moveworks_state_machine_arn" {
-  value       = aws_sfn_state_machine.moveworks_orchestrator.arn
+  value       = "${var.app_name}-moveworks-orchestrator-${var.environment}"
   description = "Moveworks Step Functions State Machine ARN."
 }
 
 output "genesys_state_machine_arn" {
-  value       = aws_sfn_state_machine.genesys_orchestrator.arn
+  value       = "${var.app_name}-genesys-orchestrator-${var.environment}"
   description = "Genesys Step Functions State Machine ARN."
 }
