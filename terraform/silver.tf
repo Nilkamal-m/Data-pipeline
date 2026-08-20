@@ -92,6 +92,10 @@ resource "aws_glue_job" "silver_iceberg_job" {
     Layer       = "Silver"
     ManagedBy   = "Terraform"
   }
+
+  depends_on = [
+    aws_glue_job.bronze_ingestion_job
+  ]
 }
 
 

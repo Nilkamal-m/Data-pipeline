@@ -282,6 +282,12 @@ resource "aws_sfn_state_machine" "servicenow_orchestrator" {
     Layer       = "Orchestration"
     ManagedBy   = "Terraform"
   }
+
+  depends_on = [
+    aws_glue_job.bronze_ingestion_job,
+    aws_glue_job.silver_iceberg_job,
+    aws_glue_crawler.silver_iceberg_crawler
+  ]
 }
 
 # Moveworks Orchestrator State Machine
