@@ -76,8 +76,8 @@ variable "use_existing_step_functions_role" {
 
 locals {
   bucket_name         = "${var.data_lake_bucket_name}-${var.environment}"
-  sns_topic_arn       = var.use_existing_sns_topic ? "arn:aws:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${var.app_name}-alerts-topic-${var.environment}" : (length(aws_sns_topic.pipeline_alerts) > 0 ? aws_sns_topic.pipeline_alerts[0].arn : "")
-  sfn_role_arn        = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : (length(aws_iam_role.step_functions_role) > 0 ? aws_iam_role.step_functions_role[0].arn : "")
+  sns_topic_arn       = var.use_existing_sns_topic ? "arn:aws:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${var.app_name}-alerts-topic-${var.environment}" : module.sns_topic.topic_arn
+  sfn_role_arn        = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : module.step_functions_iam_role.iam_role_arn
   bronze_job_name     = "${var.app_name}-bronze-ingestion-${var.environment}"
   silver_job_name     = "${var.app_name}-silver-iceberg-etl-${var.environment}"
   silver_crawler_name = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
@@ -87,10 +87,19 @@ locals {
 # ------------------------------------------------------------------------------
 # 1. Amazon SNS Alert Topic & Email Subscription (Skips creation if use_existing_sns_topic = true)
 # ------------------------------------------------------------------------------
-resource "aws_sns_topic" "pipeline_alerts" {
-  count       = var.use_existing_sns_topic ? 0 : 1
-  name        = "${var.app_name}-alerts-topic-${var.environment}"
-  description = "SNS Alert Topic for Data Pipeline success/failure notifications."
+module "sns_topic" {
+  source  = "terraform-aws-modules/sns/aws"
+  version = "~> 6.0.0"
+
+  create = !var.use_existing_sns_topic
+  name   = "${var.app_name}-alerts-topic-${var.environment}"
+
+  subscriptions = {
+    email = {
+      protocol = "email"
+      endpoint = var.alert_email_address
+    }
+  }
 
   tags = {
     Environment = var.environment
@@ -98,48 +107,19 @@ resource "aws_sns_topic" "pipeline_alerts" {
     Layer       = "Orchestration"
     ManagedBy   = "Terraform"
   }
-}
-
-resource "aws_sns_topic_subscription" "email_alert" {
-  count     = var.use_existing_sns_topic ? 0 : 1
-  topic_arn = aws_sns_topic.pipeline_alerts[0].arn
-  protocol  = "email"
-  endpoint  = var.alert_email_address
 }
 
 
 # ------------------------------------------------------------------------------
 # 2. Step Functions & EventBridge IAM Roles & Policies (Skips creation if use_existing_step_functions_role = true)
 # ------------------------------------------------------------------------------
-resource "aws_iam_role" "step_functions_role" {
-  count = var.use_existing_step_functions_role ? 0 : 1
-  name  = "${var.app_name}-stepfunctions-role-${var.environment}"
+module "step_functions_iam_policy" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-policy"
+  version = "~> 5.30.0"
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "states.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-    Layer       = "Orchestration"
-    ManagedBy   = "Terraform"
-  }
-}
-
-resource "aws_iam_policy" "step_functions_policy" {
-  count       = var.use_existing_step_functions_role ? 0 : 1
-  name        = "${var.app_name}-stepfunctions-policy-${var.environment}"
-  description = "Execution policy for AWS Step Functions orchestrating Glue jobs and Crawlers."
+  create_policy = !var.use_existing_step_functions_role
+  name          = "${var.app_name}-stepfunctions-policy-${var.environment}"
+  description   = "Execution policy for AWS Step Functions orchestrating Glue jobs and Crawlers."
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -181,29 +161,6 @@ resource "aws_iam_policy" "step_functions_policy" {
       }
     ]
   })
-}
-
-resource "aws_iam_role_policy_attachment" "step_functions_policy_attach" {
-  count      = var.use_existing_step_functions_role ? 0 : 1
-  role       = aws_iam_role.step_functions_role[0].name
-  policy_arn = aws_iam_policy.step_functions_policy[0].arn
-}
-
-resource "aws_iam_role" "eventbridge_role" {
-  name = "${var.app_name}-eventbridge-role-${var.environment}"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "events.amazonaws.com"
-        }
-      }
-    ]
-  })
 
   tags = {
     Environment = var.environment
@@ -213,9 +170,37 @@ resource "aws_iam_role" "eventbridge_role" {
   }
 }
 
-resource "aws_iam_policy" "eventbridge_policy" {
-  name        = "${var.app_name}-eventbridge-policy-${var.environment}"
-  description = "Execution policy for EventBridge triggering Step Functions state machines."
+module "step_functions_iam_role" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role"
+  version = "~> 5.30.0"
+
+  create_role       = !var.use_existing_step_functions_role
+  role_name         = "${var.app_name}-stepfunctions-role-${var.environment}"
+  role_requires_mfa = false
+
+  trusted_role_services = [
+    "states.amazonaws.com"
+  ]
+
+  custom_role_policy_arns = [
+    module.step_functions_iam_policy.arn
+  ]
+
+  tags = {
+    Environment = var.environment
+    Application = var.app_name
+    Layer       = "Orchestration"
+    ManagedBy   = "Terraform"
+  }
+}
+
+module "eventbridge_iam_policy" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-policy"
+  version = "~> 5.30.0"
+
+  create_policy = true
+  name          = "${var.app_name}-eventbridge-policy-${var.environment}"
+  description   = "Execution policy for EventBridge triggering Step Functions state machines."
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -229,11 +214,37 @@ resource "aws_iam_policy" "eventbridge_policy" {
       }
     ]
   })
+
+  tags = {
+    Environment = var.environment
+    Application = var.app_name
+    Layer       = "Orchestration"
+    ManagedBy   = "Terraform"
+  }
 }
 
-resource "aws_iam_role_policy_attachment" "eventbridge_policy_attach" {
-  role       = aws_iam_role.eventbridge_role.name
-  policy_arn = aws_iam_policy.eventbridge_policy.arn
+module "eventbridge_iam_role" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role"
+  version = "~> 5.30.0"
+
+  create_role       = true
+  role_name         = "${var.app_name}-eventbridge-role-${var.environment}"
+  role_requires_mfa = false
+
+  trusted_role_services = [
+    "events.amazonaws.com"
+  ]
+
+  custom_role_policy_arns = [
+    module.eventbridge_iam_policy.arn
+  ]
+
+  tags = {
+    Environment = var.environment
+    Application = var.app_name
+    Layer       = "Orchestration"
+    ManagedBy   = "Terraform"
+  }
 }
 
 
@@ -627,7 +638,7 @@ resource "aws_cloudwatch_event_target" "servicenow_target" {
   rule      = aws_cloudwatch_event_rule.servicenow_cron.name
   target_id = "TriggerServiceNowStateMachine"
   arn       = aws_sfn_state_machine.servicenow_orchestrator.arn
-  role_arn  = aws_iam_role.eventbridge_role.arn
+  role_arn  = module.eventbridge_iam_role.iam_role_arn
 }
 
 resource "aws_cloudwatch_event_rule" "moveworks_cron" {
@@ -641,7 +652,7 @@ resource "aws_cloudwatch_event_target" "moveworks_target" {
   rule      = aws_cloudwatch_event_rule.moveworks_cron.name
   target_id = "TriggerMoveworksStateMachine"
   arn       = aws_sfn_state_machine.moveworks_orchestrator.arn
-  role_arn  = aws_iam_role.eventbridge_role.arn
+  role_arn  = module.eventbridge_iam_role.iam_role_arn
 }
 
 resource "aws_cloudwatch_event_rule" "genesys_cron" {
@@ -655,7 +666,7 @@ resource "aws_cloudwatch_event_target" "genesys_target" {
   rule      = aws_cloudwatch_event_rule.genesys_cron.name
   target_id = "TriggerGenesysStateMachine"
   arn       = aws_sfn_state_machine.genesys_orchestrator.arn
-  role_arn  = aws_iam_role.eventbridge_role.arn
+  role_arn  = module.eventbridge_iam_role.iam_role_arn
 }
 
 # ------------------------------------------------------------------------------

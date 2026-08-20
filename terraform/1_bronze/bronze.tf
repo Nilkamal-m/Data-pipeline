@@ -77,7 +77,7 @@ variable "use_existing_secrets" {
 locals {
   bucket_name   = "${var.data_lake_bucket_name}-${var.environment}"
   bucket_arn    = "arn:aws:s3:::${local.bucket_name}"
-  glue_role_arn = var.use_existing_iam_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}" : (length(aws_iam_role.glue_execution_role) > 0 ? aws_iam_role.glue_execution_role[0].arn : "")
+  glue_role_arn = var.use_existing_iam_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}" : module.glue_iam_role.iam_role_arn
 }
 
 
@@ -135,22 +135,14 @@ resource "aws_s3_object" "folder_bronze_script" {
 # ------------------------------------------------------------------------------
 # 2. Secrets Manager Secrets (Skips creation if use_existing_secrets = true)
 # ------------------------------------------------------------------------------
-resource "aws_secretsmanager_secret" "servicenow_secret" {
-  count       = var.use_existing_secrets ? 0 : 1
+module "servicenow_secret" {
+  source  = "terraform-aws-modules/secrets-manager/aws"
+  version = "~> 1.1.0"
+
+  create      = !var.use_existing_secrets
   name        = "data-lake/servicenow-credentials-${var.environment}"
   description = "ServiceNow OAuth 2.0 credentials (Password/Client Credentials flow)."
 
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-    Layer       = "Bronze"
-    ManagedBy   = "Terraform"
-  }
-}
-
-resource "aws_secretsmanager_secret_version" "servicenow_secret_val" {
-  count     = var.use_existing_secrets ? 0 : 1
-  secret_id = aws_secretsmanager_secret.servicenow_secret[0].id
   secret_string = jsonencode({
     grant_type    = "password"
     client_id     = "CHANGE_ME_SERVICENOW_CLIENT_ID"
@@ -159,12 +151,6 @@ resource "aws_secretsmanager_secret_version" "servicenow_secret_val" {
     password      = "CHANGE_ME_SERVICENOW_PASSWORD"
     token_url     = "https://your-instance.service-now.com/oauth_token.do"
   })
-}
-
-resource "aws_secretsmanager_secret" "moveworks_secret" {
-  count       = var.use_existing_secrets ? 0 : 1
-  name        = "data-lake/moveworks-credentials-${var.environment}"
-  description = "Moveworks OAuth 2.0 credentials (Client Credentials flow)."
 
   tags = {
     Environment = var.environment
@@ -174,9 +160,14 @@ resource "aws_secretsmanager_secret" "moveworks_secret" {
   }
 }
 
-resource "aws_secretsmanager_secret_version" "moveworks_secret_val" {
-  count     = var.use_existing_secrets ? 0 : 1
-  secret_id = aws_secretsmanager_secret.moveworks_secret[0].id
+module "moveworks_secret" {
+  source  = "terraform-aws-modules/secrets-manager/aws"
+  version = "~> 1.1.0"
+
+  create      = !var.use_existing_secrets
+  name        = "data-lake/moveworks-credentials-${var.environment}"
+  description = "Moveworks OAuth 2.0 credentials (Client Credentials flow)."
+
   secret_string = jsonencode({
     grant_type    = "client_credentials"
     client_id     = "CHANGE_ME_MOVEWORKS_CLIENT_ID"
@@ -184,12 +175,6 @@ resource "aws_secretsmanager_secret_version" "moveworks_secret_val" {
     token_url     = "https://api.moveworks.ai/rest/v1/oauth/token"
     scope         = "export:read"
   })
-}
-
-resource "aws_secretsmanager_secret" "genesys_secret" {
-  count       = var.use_existing_secrets ? 0 : 1
-  name        = "data-lake/genesys-credentials-${var.environment}"
-  description = "Genesys Cloud OAuth 2.0 credentials (Client Credentials flow)."
 
   tags = {
     Environment = var.environment
@@ -199,49 +184,40 @@ resource "aws_secretsmanager_secret" "genesys_secret" {
   }
 }
 
-resource "aws_secretsmanager_secret_version" "genesys_secret_val" {
-  count     = var.use_existing_secrets ? 0 : 1
-  secret_id = aws_secretsmanager_secret.genesys_secret[0].id
+module "genesys_secret" {
+  source  = "terraform-aws-modules/secrets-manager/aws"
+  version = "~> 1.1.0"
+
+  create      = !var.use_existing_secrets
+  name        = "data-lake/genesys-credentials-${var.environment}"
+  description = "Genesys Cloud OAuth 2.0 credentials (Client Credentials flow)."
+
   secret_string = jsonencode({
     grant_type    = "client_credentials"
     client_id     = "CHANGE_ME_GENESYS_CLIENT_ID"
     client_secret = "CHANGE_ME_GENESYS_CLIENT_SECRET"
     token_url     = "https://login.mypurecloud.com/oauth/token"
   })
+
+  tags = {
+    Environment = var.environment
+    Application = var.app_name
+    Layer       = "Bronze"
+    ManagedBy   = "Terraform"
+  }
 }
 
 
 # ------------------------------------------------------------------------------
 # 3. AWS Glue Execution IAM Role & Policies (Skips creation if use_existing_iam_role = true)
 # ------------------------------------------------------------------------------
-resource "aws_iam_role" "glue_execution_role" {
-  count = var.use_existing_iam_role ? 0 : 1
-  name  = "${var.app_name}-glue-execution-role-${var.environment}"
+module "glue_iam_policy" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-policy"
+  version = "~> 5.30.0"
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "glue.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-    ManagedBy   = "Terraform"
-  }
-}
-
-resource "aws_iam_policy" "glue_execution_policy" {
-  count       = var.use_existing_iam_role ? 0 : 1
-  name        = "${var.app_name}-glue-policy-${var.environment}"
-  description = "Execution policy for AWS Glue Data Pipeline ingestion and PySpark Iceberg ETL jobs."
+  create_policy = !var.use_existing_iam_role
+  name          = "${var.app_name}-glue-policy-${var.environment}"
+  description   = "Execution policy for AWS Glue Data Pipeline ingestion and PySpark Iceberg ETL jobs."
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -298,18 +274,36 @@ resource "aws_iam_policy" "glue_execution_policy" {
       }
     ]
   })
+
+  tags = {
+    Environment = var.environment
+    Application = var.app_name
+    ManagedBy   = "Terraform"
+  }
 }
 
-resource "aws_iam_role_policy_attachment" "glue_policy_attach" {
-  count      = var.use_existing_iam_role ? 0 : 1
-  role       = aws_iam_role.glue_execution_role[0].name
-  policy_arn = aws_iam_policy.glue_execution_policy[0].arn
-}
+module "glue_iam_role" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role"
+  version = "~> 5.30.0"
 
-resource "aws_iam_role_policy_attachment" "glue_service_role_attach" {
-  count      = var.use_existing_iam_role ? 0 : 1
-  role       = aws_iam_role.glue_execution_role[0].name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+  create_role       = !var.use_existing_iam_role
+  role_name         = "${var.app_name}-glue-execution-role-${var.environment}"
+  role_requires_mfa = false
+
+  trusted_role_services = [
+    "glue.amazonaws.com"
+  ]
+
+  custom_role_policy_arns = [
+    "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole",
+    module.glue_iam_policy.arn
+  ]
+
+  tags = {
+    Environment = var.environment
+    Application = var.app_name
+    ManagedBy   = "Terraform"
+  }
 }
 
 
