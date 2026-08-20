@@ -88,18 +88,18 @@ class ConfigLoader:
         """
         table_clean = table_name.strip()
 
-        # 1. Check table_initial_load_dates in bronze_config.json
+        # 1. Check CLI passed initial date override first
+        if cli_initial_date and cli_initial_date.strip():
+            logger.info(f"Using CLI passed initial_load_date override for table '{table_clean}': {cli_initial_date.strip()}")
+            return cli_initial_date.strip()
+
+        # 2. Check table_initial_load_dates in bronze_config.json
         config = source_config or cls.get_source_config(source_system)
         table_dates = config.get("table_initial_load_dates", {})
         if table_clean in table_dates and table_dates[table_clean] and str(table_dates[table_clean]).strip():
             date_val = str(table_dates[table_clean]).strip()
-            logger.info(f"Using configured initial_load_date for table '{table_clean}': {date_val}")
+            logger.info(f"Using configured initial_load_date from bronze_config.json for table '{table_clean}': {date_val}")
             return date_val
-
-        # 2. Check CLI passed initial date
-        if cli_initial_date and cli_initial_date.strip():
-            logger.info(f"Using CLI passed initial_load_date for table '{table_clean}': {cli_initial_date.strip()}")
-            return cli_initial_date.strip()
 
         # 3. Check global default_initial_load_date in bronze_config.json defaults
         global_default = cls.get_default_setting("default_initial_load_date", None)

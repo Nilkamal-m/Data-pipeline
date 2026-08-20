@@ -248,31 +248,32 @@ def get_last_load_date(
     source_config: Optional[dict] = None
 ) -> str:
     """
-    Fetches the last successful load timestamp for a table from S3 metadata JSON.
-    If state file does not exist, fetches table-specific initial_load_date.
-    Strictly throws ValueError if load date is NULL/missing (no arbitrary past record fallbacks).
+    Fetches the last successful load timestamp for a table from S3 metadata JSON (watermark.json).
+    ONLY if the watermark state file is NOT present in S3 does it fall back to bronze_config.json table_initial_load_dates.
+    Strictly throws ValueError if load date is NULL/missing.
     """
     s3_path = f"s3://{state_bucket}/{state_key}"
     try:
-        logger.info(f"Fetching High-Water Mark state file from '{s3_path}'")
+        logger.info(f"Checking for High-Water Mark state file at '{s3_path}'...")
         response = s3_client.get_object(Bucket=state_bucket, Key=state_key)
         state_content = response['Body'].read().decode('utf-8')
         state_data = json.loads(state_content)
         
         last_load_date = state_data.get('last_load_date')
         if last_load_date and str(last_load_date).strip():
-            logger.info(f"Retrieved High-Water Mark from '{s3_path}': {last_load_date}")
+            logger.info(f"HIGH-WATER MARK FOUND in S3 metadata ({s3_path}): '{last_load_date}' for table '{table_name}'. (Bypassing bronze_config.json initial_load_dates)")
             return str(last_load_date).strip()
 
     except ClientError as err:
         error_code = err.response.get('Error', {}).get('Code')
         if error_code in ('NoSuchKey', '404'):
-            logger.warning(f"No previous state file at '{s3_path}'. Resolving initial load date for first run...")
+            logger.info(f"Watermark state file NOT present in S3 at '{s3_path}'. Falling back to bronze_config.json 'table_initial_load_dates' for initial run...")
         else:
             logger.error(f"Error reading state file from '{s3_path}': {err}")
             raise
 
-    # Resolve table-specific initial_load_date from config/CLI (Throws ValueError if missing)
+    # Watermark NOT present in S3 -> Fall back to table_initial_load_dates in bronze_config.json
+    logger.info(f"Resolving initial load date for table '{table_name}' from bronze_config.json...")
     return ConfigLoader.get_table_initial_load_date(
         source_system=source_system,
         table_name=table_name,
