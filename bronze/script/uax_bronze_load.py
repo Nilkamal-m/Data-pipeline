@@ -494,17 +494,17 @@ def main():
 
             duration_sec = (datetime.now(timezone.utc) - table_start_time).total_seconds()
 
-            # If extraction completed successfully, atomically promote staging -> bronze
+            # If extraction completed successfully, promote staging if records exist and update High-Water Mark in S3
             if total_table_records > 0:
                 logger.info(f"Table '{table_name}' extraction succeeded ({total_table_records} records in {duration_sec:.2f}s). Promoting staging to Bronze...")
                 promote_staging_to_bronze(bronze_bucket, staging_prefix, final_partition_prefix)
-
-                # Update High-Water Mark ONLY after staging promotion succeeds
-                update_last_load_date(state_bucket, state_key, source_system, table_name, current_run_time, total_table_records)
-                logger.info(f"Table '{table_name}' successfully ingested into Bronze with High-Water Mark {current_run_time}.")
             else:
                 logger.info(f"Table '{table_name}' extraction completed cleanly with 0 new records since {last_load_date}.")
                 cleanup_failed_staging(bronze_bucket, staging_prefix)
+
+            # Create or update High-Water Mark watermark state file in S3 with current execution timestamp
+            update_last_load_date(state_bucket, state_key, source_system, table_name, current_run_time, total_table_records)
+            logger.info(f"Table '{table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with timestamp {current_run_time}.")
 
             # Report custom CloudWatch metrics
             emit_cloudwatch_metrics(
