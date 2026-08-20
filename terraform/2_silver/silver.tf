@@ -56,14 +56,9 @@ variable "use_existing_glue_database" {
   description = "If true, skips creating Glue database and reuses existing database."
 }
 
-variable "use_existing_iam_role" {
-  type        = bool
-  default     = false
-  description = "If true, skips looking up custom role and resolves standard role."
-}
-
 locals {
-  bucket_name   = "${var.data_lake_bucket_name}-${var.environment}"
+  bucket_name = "${var.data_lake_bucket_name}-${var.environment}"
+  # Reuses the single shared IAM Glue Execution Role created in 1_bronze/bronze.tf
   glue_role_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}"
   glue_db_name  = var.use_existing_glue_database ? "uax_data_lake_db_${var.environment}" : (length(aws_glue_catalog_database.silver_db) > 0 ? aws_glue_catalog_database.silver_db[0].name : "uax_data_lake_db_${var.environment}")
 }
