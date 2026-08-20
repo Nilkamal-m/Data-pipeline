@@ -1,22 +1,29 @@
-# AWS Data Pipeline - Terraform Deployment & Operational Guide (instruction.md)
+# AWS Data Pipeline - Modular Part-by-Part Terraform Deployment & Manual Testing Guide (instruction.md)
 
-This document provides a step-by-step guide for packaging code, deploying AWS infrastructure using **HashiCorp Terraform**, and executing manual tests for the **UAX Data Lake Pipeline**.
+This document provides a step-by-step guide for packaging code, deploying AWS infrastructure part-by-part using **HashiCorp Terraform** (`bronze.tf` $\rightarrow$ `silver.tf` $\rightarrow$ `step_functions.tf`), and executing manual tests for the **UAX Data Lake Pipeline**.
 
 ---
 
-## 🏗️ 1. Architecture Overview
+## 🏗️ 1. Layered Architecture Overview
 
-- **Terraform Infrastructure**: Managed under `terraform/` (`main.tf`, `iam.tf`, `step_functions.tf`, `variables.tf`, `outputs.tf`).
-- **Single S3 Data Lake Bucket**: `s3://uax-data-lake-bucket-${environment}/` containing partitioned data folders (`bronze/`, `silver/`, `metadata/`, `athena-results/`) and script folders (`bronze/script/`, `silver/script/`).
-- **Glue Bronze Python Shell Job**: Ingests REST APIs (ServiceNow, Moveworks, Genesys) and Databases (PostgreSQL, MySQL, Oracle, SQL Server).
-- **Glue Silver PySpark Iceberg ETL Job**: Deduplicates and transforms raw Bronze records into curated Apache Iceberg tables with SCD Type 1 UPSERT and SCD Type 2 history tracking.
-- **Orchestration**: 3 AWS Step Functions State Machines triggered automatically by EventBridge Cron Schedules.
+The Terraform infrastructure is divided into **3 distinct layer files** under `terraform/`:
+
+```text
+terraform/
+├── provider.tf              # Terraform AWS Provider setup
+├── variables.tf             # Input variables (environment, app_name, data_lake_bucket_name)
+├── bronze.tf                # PART 1: Core S3 Bucket, Secrets Manager Secrets, Bronze IAM Role, Bronze Glue Job
+├── silver.tf                # PART 2: Silver S3 Objects, Glue Catalog DB, Iceberg Crawler, Silver PySpark Job, Athena
+├── step_functions.tf        # PART 3: Step Functions IAM, SNS Topic, 3 State Machines, 3 EventBridge Cron Rules
+├── outputs.tf               # Layered output values
+└── terraform.tfvars.example # Example variable values file
+```
 
 ---
 
 ## 📦 2. Code Packaging & S3 Upload
 
-Before applying Terraform, package your Python dependencies into `.zip` files and upload script artifacts to S3:
+Before deploying Terraform, package your Python dependencies into `.zip` files and upload script artifacts to S3:
 
 ### Step 2.1: Zip Bronze Python Dependencies
 ```bash
@@ -48,28 +55,47 @@ aws s3 cp silver/script/config/silver_config.json s3://${DATA_LAKE_BUCKET}/silve
 
 ---
 
-## 🚀 3. Deploy Infrastructure via Terraform
+## 🚀 3. Part-by-Part Terraform Deployment
 
-### Step 3.1: Initialize & Validate Terraform
+### Step 3.1: Initialize Terraform
 ```bash
 cd terraform
-
-# Initialize Terraform AWS provider
 terraform init
-
-# Validate configuration syntax
-terraform validate
 ```
 
-### Step 3.2: Review & Apply Infrastructure Plan
+### Step 3.2: Deploy PART 1 - Core & Bronze Layer (`bronze.tf`)
+To deploy **ONLY** the Bronze layer (S3 Bucket, OAuth Secrets, Bronze Glue Job):
 ```bash
-# Review proposed resources
-terraform plan \
+terraform apply \
+  -target=aws_s3_bucket.data_lake \
+  -target=aws_secretsmanager_secret.servicenow_secret \
+  -target=aws_secretsmanager_secret.moveworks_secret \
+  -target=aws_secretsmanager_secret.genesys_secret \
+  -target=aws_iam_role.glue_execution_role \
+  -target=aws_glue_job.bronze_ingestion_job \
   -var="environment=dev" \
   -var="data_lake_bucket_name=uax-data-lake-bucket" \
-  -var="alert_email_address=your-email@company.com"
+  -var="alert_email_address=your-email@company.com" \
+  -auto-approve
+```
 
-# Deploy infrastructure to AWS
+### Step 3.3: Deploy PART 2 - Silver Layer (`silver.tf`)
+To deploy the Silver Iceberg ETL layer (Glue Catalog Database, Crawler, PySpark Iceberg ETL Job, Athena WorkGroup):
+```bash
+terraform apply \
+  -target=aws_glue_catalog_database.silver_db \
+  -target=aws_glue_crawler.silver_iceberg_crawler \
+  -target=aws_glue_job.silver_iceberg_job \
+  -target=aws_athena_workgroup.data_pipeline \
+  -var="environment=dev" \
+  -var="data_lake_bucket_name=uax-data-lake-bucket" \
+  -var="alert_email_address=your-email@company.com" \
+  -auto-approve
+```
+
+### Step 3.4: Deploy PART 3 - Step Functions & Orchestration (`step_functions.tf`)
+To deploy Orchestration (SNS Alert Topic, Step Functions State Machines, EventBridge Cron Rules):
+```bash
 terraform apply \
   -var="environment=dev" \
   -var="data_lake_bucket_name=uax-data-lake-bucket" \
@@ -80,8 +106,6 @@ terraform apply \
 ---
 
 ## 🧪 4. Manual Testing Execution Examples (AWS CLI)
-
-You can trigger manual test runs directly via AWS CLI, passing runtime parameters to test specific sources or tables:
 
 ### Example 4.1: Test ServiceNow Ingestion (Bronze Layer)
 ```bash

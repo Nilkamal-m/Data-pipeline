@@ -1,7 +1,8 @@
 # ==============================================================================
-# Terraform Outputs
+# Layered Terraform Outputs
 # ==============================================================================
 
+# Part 1: Bronze Layer Outputs
 output "data_lake_s3_bucket_name" {
   value       = aws_s3_bucket.data_lake.bucket
   description = "Single S3 Data Lake bucket name."
@@ -17,6 +18,7 @@ output "glue_bronze_ingestion_job_name" {
   description = "AWS Glue Python Shell Bronze Ingestion Job Name."
 }
 
+# Part 2: Silver Layer Outputs
 output "glue_silver_iceberg_job_name" {
   value       = aws_glue_job.silver_iceberg_job.name
   description = "AWS Glue PySpark Silver Iceberg ETL Job Name."
@@ -32,6 +34,7 @@ output "athena_workgroup_name" {
   description = "Amazon Athena WorkGroup Name."
 }
 
+# Part 3: Step Functions & Orchestration Outputs
 output "sns_alert_topic_arn" {
   value       = aws_sns_topic.pipeline_alerts.arn
   description = "Amazon SNS Alert Topic ARN."
