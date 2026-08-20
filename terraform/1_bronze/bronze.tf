@@ -115,21 +115,7 @@ module "s3_bucket" {
   }
 }
 
-# Bronze S3 Folder Structure Placeholders
-resource "aws_s3_object" "folder_bronze" {
-  bucket = local.bucket_name
-  key    = "bronze/"
-}
 
-resource "aws_s3_object" "folder_metadata" {
-  bucket = local.bucket_name
-  key    = "metadata/"
-}
-
-resource "aws_s3_object" "folder_bronze_script" {
-  bucket = local.bucket_name
-  key    = "bronze/script/"
-}
 
 
 # ------------------------------------------------------------------------------
@@ -303,15 +289,17 @@ module "glue_iam_role" {
 
 
 # ------------------------------------------------------------------------------
-# 4. AWS Glue Python Shell Ingestion Job (Bronze)
+# 4. AWS Glue Python Shell Ingestion Job using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
-resource "aws_glue_job" "bronze_ingestion_job" {
+module "bronze_glue_job" {
+  source = "cps-terraform.anthem.com/organization/glue/aws//modules/job"
+
   name         = "${var.app_name}-bronze-ingestion-${var.environment}"
   description  = "AWS Glue Python Shell Job executing Bronze REST API & DB ingestion."
   role_arn     = local.glue_role_arn
   glue_version = "3.0"
 
-  command {
+  command = {
     name            = "pythonshell"
     python_version  = "3.9"
     script_location = "s3://${local.bucket_name}/bronze/script/incremental_load_handler.py"
@@ -344,6 +332,6 @@ output "data_lake_s3_bucket_name" {
 }
 
 output "glue_bronze_ingestion_job_name" {
-  value       = aws_glue_job.bronze_ingestion_job.name
+  value       = "${var.app_name}-bronze-ingestion-${var.environment}"
   description = "AWS Glue Python Shell Bronze Ingestion Job Name."
 }
