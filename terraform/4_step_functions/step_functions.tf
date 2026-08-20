@@ -89,8 +89,7 @@ locals {
 # 1. Amazon SNS Alert Topic & Email Subscription using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "sns_topic" {
-  source  = "cps-terraform.anthem.com/organization/sns/aws"
-  version = "~> 6.0.0"
+  source = "cps-terraform.anthem.com/organization/sns/aws"
 
   create = !var.use_existing_sns_topic
   name   = "${var.app_name}-alerts-topic-${var.environment}"
@@ -115,8 +114,7 @@ module "sns_topic" {
 # 2. Step Functions & EventBridge IAM Roles & Policies using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "step_functions_iam_policy" {
-  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
-  version = "~> 5.30.0"
+  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
 
   create_policy = !var.use_existing_step_functions_role
   name          = "${var.app_name}-stepfunctions-policy-${var.environment}"
@@ -172,8 +170,7 @@ module "step_functions_iam_policy" {
 }
 
 module "step_functions_iam_role" {
-  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
-  version = "~> 5.30.0"
+  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
 
   create_role       = !var.use_existing_step_functions_role
   role_name         = "${var.app_name}-stepfunctions-role-${var.environment}"
@@ -196,8 +193,7 @@ module "step_functions_iam_role" {
 }
 
 module "eventbridge_iam_policy" {
-  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
-  version = "~> 5.30.0"
+  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
 
   create_policy = true
   name          = "${var.app_name}-eventbridge-policy-${var.environment}"
@@ -225,8 +221,7 @@ module "eventbridge_iam_policy" {
 }
 
 module "eventbridge_iam_role" {
-  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
-  version = "~> 5.30.0"
+  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
 
   create_role       = true
   role_name         = "${var.app_name}-eventbridge-role-${var.environment}"

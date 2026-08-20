@@ -86,8 +86,7 @@ locals {
 # 1. Single S3 Bucket using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "s3_bucket" {
-  source  = "cps-terraform.anthem.com/organization/s3-bucket/aws"
-  version = "~> 4.0"
+  source = "cps-terraform.anthem.com/organization/s3-bucket/aws"
 
   create_bucket = !var.use_existing_s3_bucket
   bucket        = local.bucket_name
@@ -137,8 +136,7 @@ resource "aws_s3_object" "folder_bronze_script" {
 # 2. Secrets Manager Secrets using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "servicenow_secret" {
-  source  = "cps-terraform.anthem.com/organization/secrets-manager/aws"
-  version = "~> 1.1.0"
+  source = "cps-terraform.anthem.com/organization/secrets-manager/aws"
 
   create      = !var.use_existing_secrets
   name        = "data-lake/servicenow-credentials-${var.environment}"
@@ -162,8 +160,7 @@ module "servicenow_secret" {
 }
 
 module "moveworks_secret" {
-  source  = "cps-terraform.anthem.com/organization/secrets-manager/aws"
-  version = "~> 1.1.0"
+  source = "cps-terraform.anthem.com/organization/secrets-manager/aws"
 
   create      = !var.use_existing_secrets
   name        = "data-lake/moveworks-credentials-${var.environment}"
@@ -186,8 +183,7 @@ module "moveworks_secret" {
 }
 
 module "genesys_secret" {
-  source  = "cps-terraform.anthem.com/organization/secrets-manager/aws"
-  version = "~> 1.1.0"
+  source = "cps-terraform.anthem.com/organization/secrets-manager/aws"
 
   create      = !var.use_existing_secrets
   name        = "data-lake/genesys-credentials-${var.environment}"
@@ -213,8 +209,7 @@ module "genesys_secret" {
 # 3. AWS Glue Execution IAM Role & Policies using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "glue_iam_policy" {
-  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
-  version = "~> 5.30.0"
+  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
 
   create_policy = !var.use_existing_iam_role
   name          = "${var.app_name}-glue-policy-${var.environment}"
@@ -284,8 +279,7 @@ module "glue_iam_policy" {
 }
 
 module "glue_iam_role" {
-  source  = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
-  version = "~> 5.30.0"
+  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
 
   create_role       = !var.use_existing_iam_role
   role_name         = "${var.app_name}-glue-execution-role-${var.environment}"
