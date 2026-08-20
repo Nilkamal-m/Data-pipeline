@@ -1,23 +1,21 @@
-# AWS Data Pipeline - Self-Contained 4-Folder Terraform Deployment Guide (instruction.md)
+# AWS Data Pipeline - Terraform Community Module Deployment Guide (instruction.md)
 
-This document provides a step-by-step guide for packaging code, deploying AWS infrastructure using **4 100% Self-Contained Layer Folders** (`1_bronze/`, `2_silver/`, `3_athena/`, `4_step_functions/`), and executing manual tests for the **UAX Data Lake Pipeline**.
+This document provides a step-by-step guide for packaging code, deploying AWS infrastructure using **Official AWS Community Modules (`terraform-aws-modules`)** directly in the `terraform/` path, and executing manual tests for the **HR-Datalake Pipeline**.
 
 ---
 
-## 🏗️ 1. Architecture & 4-Folder Layout
+## 🏗️ 1. Architecture & Terraform Path Layout
 
-Each layer folder is **completely standalone** and contains all its own variables, defaults, pre-existence skip toggles, resources, and outputs inside a single file. There is **NO shared/common `variables.tf` file**:
+All infrastructure configuration files reside directly inside the `/Users/nilkamalmahato/Documents/Data-pipeline/terraform` directory:
 
 ```text
 terraform/
-├── 1_bronze/
-│   └── bronze.tf          # Core S3 Bucket, Secrets Manager Secrets, Glue IAM Role, Bronze Glue Job
-├── 2_silver/
-│   └── silver.tf          # Silver S3 Objects, Glue Catalog DB, Iceberg Crawler, Silver PySpark Job
-├── 3_athena/
-│   └── athena.tf          # Athena Results S3 Object & Dedicated Athena WorkGroup
-└── 4_step_functions/
-    └── step_functions.tf  # SNS Alert Topic, Step Functions IAM Role, 3 State Machines, 3 EventBridge Cron Rules
+├── 1_bronze.tf          # S3 Bucket, Secrets Manager, Glue IAM Role (via terraform-aws-modules)
+├── 2_silver.tf          # Glue Catalog DB, Iceberg Crawler, & PySpark ETL Job
+├── 3_athena.tf          # Athena WorkGroup & query result configurations
+├── 4_step_functions.tf  # SNS Topic, Step Functions/EventBridge IAM (via terraform-aws-modules), 3 State Machines
+├── variables.tf         # Centralized variables & pre-existence safety toggles
+└── outputs.tf           # Pipeline resource ARNs and names
 ```
 
 ---
@@ -56,64 +54,38 @@ aws s3 cp silver/script/config/silver_config.json s3://${DATA_LAKE_BUCKET}/silve
 
 ---
 
-## 🚀 3. Executing Layer Folders Independently
+## 🚀 3. Executing Infrastructure from the `terraform/` Path
 
-Navigate to each folder and execute `terraform apply` directly. All variables and defaults are defined inside that folder's file:
+Navigate to the `terraform/` path and run Terraform directly:
 
-### Step 3.1: Deploy 1. Bronze Layer (`terraform/1_bronze/bronze.tf`)
 ```bash
-cd terraform/1_bronze
+cd terraform
 terraform init
 terraform apply -auto-approve
-cd ../..
 ```
 
-### Step 3.2: Deploy 2. Silver Layer (`terraform/2_silver/silver.tf`)
-```bash
-cd terraform/2_silver
-terraform init
-terraform apply -auto-approve
-cd ../..
-```
+Alternatively, you can target individual layers part-by-part from the `terraform/` directory:
 
-### Step 3.3: Deploy 3. Athena WorkGroup (`terraform/3_athena/athena.tf`)
 ```bash
-cd terraform/3_athena
-terraform init
-terraform apply -auto-approve
-cd ../..
-```
+# Deploy Bronze Layer only
+terraform apply -target=module.s3_bucket -target=module.glue_iam_role -target=aws_glue_job.bronze_ingestion_job -auto-approve
 
-### Step 3.4: Deploy 4. Step Functions & SNS (`terraform/4_step_functions/step_functions.tf`)
-```bash
-cd terraform/4_step_functions
-terraform init
-terraform apply -auto-approve
-cd ../..
+# Deploy Silver Layer
+terraform apply -target=aws_glue_catalog_database.silver_db -target=aws_glue_job.silver_iceberg_job -auto-approve
+
+# Deploy Step Functions & SNS Orchestration
+terraform apply -target=module.sns_topic -target=aws_sfn_state_machine.servicenow_orchestrator -auto-approve
 ```
 
 ---
 
 ## 🛡️ 4. Skip Pre-Existing Services (Ignore If Present)
 
-If a service already exists by name in your AWS account, pass the safety flag when running `terraform apply` in that folder to skip creating it and reuse the existing service:
+If a service already exists by name in your AWS account, pass the safety flag during `terraform apply`:
 
 ```bash
-# Example: Deploying Bronze layer using an existing S3 Bucket
-cd terraform/1_bronze
-terraform apply -var="use_existing_s3_bucket=true" -auto-approve
-
-# Example: Deploying Silver layer using an existing Glue Database
-cd terraform/2_silver
-terraform apply -var="use_existing_glue_database=true" -auto-approve
-
-# Example: Deploying Athena layer using an existing Athena Workgroup
-cd terraform/3_athena
-terraform apply -var="use_existing_athena_workgroup=true" -auto-approve
-
-# Example: Deploying Step Functions layer using an existing SNS Alert Topic
-cd terraform/4_step_functions
-terraform apply -var="use_existing_sns_topic=true" -auto-approve
+# Reusing an existing S3 Bucket and Glue IAM Role
+terraform apply -var="use_existing_s3_bucket=true" -var="use_existing_iam_role=true" -auto-approve
 ```
 
 ---
@@ -153,16 +125,4 @@ Trigger full pipeline state machine executions manually:
 # Execute ServiceNow End-to-End State Machine
 aws stepfunctions start-execution \
   --state-machine-arn "arn:aws:states:us-east-1:123456789012:stateMachine:hr-datalake-servicenow-orchestrator-dev"
-```
-
----
-
-## 🧹 7. Destroying Infrastructure
-
-To tear down resources for a specific layer:
-```bash
-cd terraform/1_bronze && terraform destroy -auto-approve
-cd terraform/2_silver && terraform destroy -auto-approve
-cd terraform/3_athena && terraform destroy -auto-approve
-cd terraform/4_step_functions && terraform destroy -auto-approve
 ```
