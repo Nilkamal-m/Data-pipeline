@@ -115,7 +115,7 @@ terraform apply -var="use_existing_glue_database=true" -auto-approve
 ### Example 5.1: Test ServiceNow Ingestion (Bronze Layer)
 ```bash
 aws glue start-job-run \
-  --job-name hr-datalake-bronze-ingestion-dev \
+  --job-name uax-datalake-bronze-ingestion-dev \
   --arguments '{
     "--SOURCE_SYSTEM": "servicenow",
     "--TABLE_NAME": "incident",
@@ -124,25 +124,18 @@ aws glue start-job-run \
   }'
 ```
 
-### Example 5.2: Test Silver PySpark Apache Iceberg Transformation
+### Example 5.2: Test Silver Iceberg Transformation
 ```bash
 aws glue start-job-run \
-  --job-name hr-datalake-silver-iceberg-etl-dev \
+  --job-name uax-datalake-silver-iceberg-etl-dev \
   --arguments '{
-    "--SOURCE_SYSTEM": "servicenow",
-    "--TABLE_NAME": "incident",
-    "--MERGE_STRATEGY": "upsert"
+    "--DATA_LAKE_BUCKET": "uax-datalake-dev-bucket",
+    "--GLUE_DATABASE": "uax-datalake-db-dev"
   }'
 ```
 
----
-
-## 🔄 6. Step Functions Orchestration Triggers
-
-Trigger full pipeline state machine executions manually:
-
+### Example 5.3: Execute Full Pipeline Orchestration
 ```bash
-# Execute ServiceNow End-to-End State Machine
 aws stepfunctions start-execution \
-  --state-machine-arn "arn:aws:states:us-east-1:123456789012:stateMachine:hr-datalake-servicenow-orchestrator-dev"
+  --state-machine-arn "arn:aws:states:us-east-1:123456789012:stateMachine:uax-datalake-servicenow-orchestrator-dev"
 ```

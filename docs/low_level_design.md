@@ -68,8 +68,7 @@ flowchart TD
 *   **Variables Defined**:
     *   `aws_region` (Default: `us-east-1`): Deployment AWS region.
     *   `environment` (Default: `dev`): Environment name used as a resource naming suffix.
-    *   `app_name` (Default: `hr-datalake`): Central project prefix.
-    *   `data_lake_bucket_name` (Default: `uax-data-lake-bucket`): Core S3 bucket identifier.
+    *   `app_name` (Default: `uax-datalake`): Central project prefix.
     *   `output_format` (Default: `parquet`): Output file format.
     *   `use_existing_s3_bucket`, `use_existing_iam_role`, `use_existing_secrets` (Default: `false`): Toggles to skip resource creation and reuse existing resources in AWS.
 *   **Key Resources Created**:
@@ -83,7 +82,7 @@ flowchart TD
 *   **Purpose**: Provisions Silver Iceberg ETL compute and schema registry catalog resources.
 *   **Why we care**: Sets up the database catalog schema where final analytical tables are queried, creates the crawler to scan Iceberg metadata, and deploys the PySpark Spark job that performs data deduplication and UPSERT execution.
 *   **Variables Defined**:
-    *   `aws_region`, `environment`, `app_name`, `data_lake_bucket_name`.
+    *   `aws_region`, `environment`, `app_name`.
     *   `use_existing_glue_database` (Default: `false`): Toggle to skip Glue Database creation.
 *   **Key Resources Created**:
     *   `aws_glue_catalog_database.silver_db`: Logical Glue Data Catalog database.
@@ -95,7 +94,7 @@ flowchart TD
 *   **Purpose**: Configures analytical query access workspaces.
 *   **Why we care**: Establishes a dedicated workgroup in Amazon Athena, enforcing query result storage isolation and logging configurations.
 *   **Variables Defined**:
-    *   `aws_region`, `environment`, `app_name`, `data_lake_bucket_name`.
+    *   `aws_region`, `environment`, `app_name`.
     *   `use_existing_athena_workgroup` (Default: `false`): Toggle to reuse workgroups.
 *   **Key Resources Created**:
     *   `aws_athena_workgroup.data_pipeline`: Analytics workgroup settings enforcing queries output to `s3://<bucket>/athena-results/`.
@@ -105,7 +104,7 @@ flowchart TD
 *   **Purpose**: Manages end-to-end cron scheduling, orchestration, and alerts.
 *   **Why we care**: Builds the automated workflow engine that coordinates Bronze extraction, Silver transformations, schema catalog updates, and failure notifications.
 *   **Variables Defined**:
-    *   `aws_region`, `environment`, `app_name`, `data_lake_bucket_name`, `alert_email_address`, `schedule_expression`.
+    *   `aws_region`, `environment`, `app_name`, `alert_email_address`, `schedule_expression`.
     *   `use_existing_sns_topic`, `use_existing_step_functions_role` (Default: `false`).
 *   **Key Resources Created**:
     *   `aws_sns_topic.pipeline_alerts`: Central notification topic.
@@ -235,7 +234,7 @@ flowchart TD
 ```text
 1. EventBridge Rule triggers the Step Function State Machine (e.g. servicenow_orchestrator).
    │
-   ├── 2. Step Functions starts AWS Glue Job (hr-datalake-bronze-ingestion-dev)
+   ├── 2. Step Functions starts AWS Glue Job (uax-datalake-bronze-ingestion-dev)
    │      │
    │      ├── a. Glue Job parses CLI parameters & loads bronze_config.json.
    │      ├── b. Calls get_secret() to retrieve credentials.
@@ -247,7 +246,7 @@ flowchart TD
    │      ├── h. Emits CloudWatch custom metrics.
    │      └── i. Updates HWM timestamp in watermark.json.
    │
-   ├── 3. Step Functions starts AWS Glue PySpark Job (hr-datalake-silver-iceberg-etl-dev)
+   ├── 3. Step Functions starts AWS Glue PySpark Job (uax-datalake-silver-iceberg-etl-dev)
    │      │
    │      ├── a. Job reads raw Parquet files from S3 bronze/ partition.
    │      ├── b. Reads silver_config.json and gets deduplication configurations.
@@ -255,7 +254,7 @@ flowchart TD
    │      ├── d. Applies data transforms (transformer.py & custom_transforms/).
    │      └── e. Performs MERGE INTO SQL to write UPSERTs or SCD2 history to Iceberg tables.
    │
-   ├── 4. Step Functions runs AWS Glue Crawler to update schemas in database uax_data_lake_db_dev.
+   ├── 4. Step Functions runs AWS Glue Crawler to update schemas in database uax-datalake-db-dev.
    │
    └── 5. Step Functions triggers SNS alert email to notify stakeholders of success or failure.
 ```
