@@ -110,22 +110,37 @@
       },
       "table_query_overrides": {}
     },
-    "vendor_s3_files": {
+    "vendor_a_s3": {
       "type": "s3_file",
-      "source_bucket": "external-vendor-data-bucket",
+      "source_bucket": "vendor-a-incoming-bucket",
       "file_prefix_template": "raw_feed/{table_name}/",
       "file_format": "csv",
       "delimiter": ",",
       "has_header": true,
       "encoding": "utf-8",
-      "default_tables": ["employee_feed", "vendor_reports"],
+      "default_tables": ["employee_feed", "orders"],
       "table_initial_load_dates": {
         "employee_feed": "2024-01-01T00:00:00Z",
-        "vendor_reports": "2024-01-01T00:00:00Z"
+        "orders": "2024-01-01T00:00:00Z"
       },
       "table_file_patterns": {
         "employee_feed": ".csv",
-        "vendor_reports": ".json"
+        "orders": ".csv"
+      }
+    },
+    "vendor_b_s3": {
+      "type": "s3_file",
+      "source_bucket": "vendor-b-partner-bucket",
+      "file_prefix_template": "json_feeds/{table_name}/",
+      "file_format": "json",
+      "default_tables": ["user_activity", "audit_logs"],
+      "table_initial_load_dates": {
+        "user_activity": "2024-01-01T00:00:00Z",
+        "audit_logs": "2024-01-01T00:00:00Z"
+      },
+      "table_file_patterns": {
+        "user_activity": ".json",
+        "audit_logs": ".json"
       }
     }
   }
