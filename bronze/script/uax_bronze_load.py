@@ -39,7 +39,12 @@ s3_client = boto3.client('s3')
 def get_secret(secret_name: str) -> dict:
     """
     Fetches API credential secret payload from AWS Secrets Manager.
+    Returns empty dict if secret_name is empty or not specified.
     """
+    if not secret_name or secret_name.strip() == "":
+        logger.info("No secret_name specified. Proceeding without Secrets Manager payload.")
+        return {}
+
     logger.info(f"Fetching secret payload for '{secret_name}' from AWS Secrets Manager...")
     secrets_client = boto3.client('secretsmanager')
     try:
@@ -49,8 +54,8 @@ def get_secret(secret_name: str) -> dict:
             raise ValueError(f"Secret '{secret_name}' contains no SecretString payload.")
         return json.loads(secret_str)
     except ClientError as err:
-        logger.error(f"Failed to fetch secret '{secret_name}': {err}")
-        raise
+        logger.warning(f"Could not fetch secret '{secret_name}' ({err}). Proceeding with empty secret dictionary.")
+        return {}
 
 
 def parse_arguments() -> dict:
@@ -393,8 +398,8 @@ def main():
     # Fetch API secret credentials from Secrets Manager
     secret_dict = get_secret(secret_name)
 
-    # Load matching connector class
-    connector_cls = get_connector(source_system)
+    # Load matching connector class (supports direct source_system or config type mapping)
+    connector_cls = get_connector(source_system, source_config)
     logger.info(f"Loaded connector class: {connector_cls.__name__}")
 
     failed_tables = []

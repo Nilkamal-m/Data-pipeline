@@ -109,6 +109,24 @@
         "records": "2024-01-01T00:00:00Z"
       },
       "table_query_overrides": {}
+    },
+    "vendor_s3_files": {
+      "type": "s3_file",
+      "source_bucket": "external-vendor-data-bucket",
+      "file_prefix_template": "raw_feed/{table_name}/",
+      "file_format": "csv",
+      "delimiter": ",",
+      "has_header": true,
+      "encoding": "utf-8",
+      "default_tables": ["employee_feed", "vendor_reports"],
+      "table_initial_load_dates": {
+        "employee_feed": "2024-01-01T00:00:00Z",
+        "vendor_reports": "2024-01-01T00:00:00Z"
+      },
+      "table_file_patterns": {
+        "employee_feed": ".csv",
+        "vendor_reports": ".json"
+      }
     }
   }
 }
