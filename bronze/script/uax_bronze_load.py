@@ -117,8 +117,8 @@ def parse_arguments() -> dict:
 
     custom_query = arg_dict.get('CUSTOM_QUERY')
     job_name = arg_dict.get('JOB_NAME', f"glue-incremental-load-{source_system_clean}")
-    secret_name = arg_dict.get('SECRET_NAME', f"data-lake/{source_system_clean}-credentials")
-    bronze_bucket = arg_dict.get('BRONZE_BUCKET', os.environ.get('BRONZE_BUCKET', 'uax-data-lake-bucket'))
+    secret_name = arg_dict.get('SECRET_NAME', '')
+    bronze_bucket = arg_dict.get('BRONZE_BUCKET', os.environ.get('BRONZE_BUCKET', 'uax-datalake-dev-bucket'))
     state_bucket = arg_dict.get('STATE_BUCKET', bronze_bucket)
     initial_load_date_cli = arg_dict.get('INITIAL_LOAD_DATE')
     s3_chunk_size = int(arg_dict.get('S3_CHUNK_SIZE') or pipeline_defaults.get('s3_chunk_size', 10000))
