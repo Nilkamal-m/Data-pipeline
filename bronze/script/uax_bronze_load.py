@@ -154,6 +154,7 @@ def parse_arguments() -> dict:
 def flatten_dict(d: dict, parent_key: str = '', sep: str = '_') -> dict:
     """
     Recursively flattens nested JSON dictionaries into a single level key-value map.
+    Supports dynamic schema evolution by flattening all nested dict keys (e.g. detail.domain -> detail_domain).
     """
     items = []
     for k, v in d.items():
@@ -161,10 +162,7 @@ def flatten_dict(d: dict, parent_key: str = '', sep: str = '_') -> dict:
         if isinstance(v, dict):
             items.extend(flatten_dict(v, new_key, sep=sep).items())
         elif isinstance(v, list):
-            if v and isinstance(v[0], dict):
-                items.append((new_key, json.dumps(v)))
-            else:
-                items.append((new_key, str(v) if v is not None else None))
+            items.append((new_key, json.dumps(v) if v is not None else None))
         else:
             items.append((new_key, v))
     return dict(items)
