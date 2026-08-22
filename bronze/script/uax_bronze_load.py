@@ -233,8 +233,8 @@ def emit_cloudwatch_metrics(
 
 
 def get_table_state_key(source_system: str, table_name: str) -> str:
-    """Returns the S3 metadata key for a given source system and table name."""
-    return f"metadata/{source_system}/{table_name}/watermark.json"
+    """Returns the S3 metadata key for a given source system and table name: metadata/bronze/<source>/<table>/watermark.json."""
+    return f"metadata/bronze/{source_system}/{table_name}/watermark.json"
 
 
 def get_last_load_date(

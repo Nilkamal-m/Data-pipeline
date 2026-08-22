@@ -3,7 +3,7 @@
     "batch_size": 1000,
     "s3_chunk_size": 10000,
     "max_retries": 3,
-    "state_prefix": "metadata",
+    "state_prefix": "metadata/bronze",
     "bronze_prefix": "bronze",
     "output_format": "parquet",
     "parquet_compression": "snappy",
