@@ -74,10 +74,9 @@ locals {
 module "kms_key" {
   source = "cps-terraform.anthem.com/DIG/kms/aws"
 
-  description             = "KMS Key for UAX Data Lake S3 Bucket and Secrets Manager PII Protection"
-  deletion_window_in_days = 30
-  enable_key_rotation     = true
-  alias                   = "alias/${var.app_name}-${var.environment}-s3-key"
+  description    = "KMS Key for UAX Data Lake S3 Bucket and Secrets Manager PII Protection"
+  kms_alias_name = "alias/${var.app_name}-${var.environment}-s3-key"
+  service_name   = ["s3", "secretsmanager"]
 
   tags = {
     Environment = var.environment
@@ -329,15 +328,44 @@ module "glue_iam_role" {
 
 
 # ------------------------------------------------------------------------------
+# 3.1 AWS Glue Security Configuration for Encryption at Rest & CloudWatch Logs
+# ------------------------------------------------------------------------------
+resource "aws_glue_security_configuration" "glue_security_config" {
+  name = "${var.app_name}-glue-secconfig-${var.environment}"
+
+  encryption_configuration {
+    cloudwatch_encryption {
+      cloudwatch_encryption_mode = "SSE-KMS"
+      kms_key_arn                = module.kms_key.key_arn
+    }
+
+    job_bookmarks_encryption {
+      job_bookmarks_encryption_mode = "CSE-KMS"
+      kms_key_arn                   = module.kms_key.key_arn
+    }
+
+    s3_encryption {
+      s3_encryption_mode = "SSE-KMS"
+      kms_key_arn        = module.kms_key.key_arn
+    }
+  }
+}
+
+
+# ------------------------------------------------------------------------------
 # 4. AWS Glue Python Shell Ingestion Job using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "bronze_glue_job" {
   source = "cps-terraform.anthem.com/DIG/glue/aws//modules/job"
 
-  name         = "${var.app_name}-bronze-ingestion-${var.environment}"
-  description  = "AWS Glue Python Shell Job executing Bronze REST API & DB ingestion."
-  role_arn     = local.glue_role_arn
-  glue_version = "3.0"
+  name                        = "${var.app_name}-bronze-ingestion-${var.environment}"
+  description                 = "AWS Glue Python Shell Job executing Bronze REST API & DB ingestion."
+  role_arn                    = local.glue_role_arn
+  glue_version                = "3.0"
+  security_configuration_name = aws_glue_security_configuration.glue_security_config.name
+  cloudwatch_kms_key_arn      = module.kms_key.key_arn
+  gluejob_kms_key_arn         = module.kms_key.key_arn
+  s3_kms_key_arn              = module.kms_key.key_arn
 
   command = {
     name            = "pythonshell"
@@ -346,13 +374,14 @@ module "bronze_glue_job" {
   }
 
   default_arguments = {
-    "--extra-py-files"        = "s3://${local.bucket_name}/bronze/script/config_loader.py,s3://${local.bucket_name}/bronze/script/connectors.zip"
-    "--CONFIG_S3_PATH"        = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
-    "--BRONZE_BUCKET"         = local.bucket_name
-    "--OUTPUT_FORMAT"         = var.output_format
-    "--CLOUDWATCH_NAMESPACE"  = "UAX/DataPipeline/Ingestion"
-    "--ERROR_HANDLING_MODE"   = "CONTINUE_ON_ERROR"
-    "--job-language"          = "python"
+    "--security-configuration" = aws_glue_security_configuration.glue_security_config.name
+    "--extra-py-files"         = "s3://${local.bucket_name}/bronze/script/config_loader.py,s3://${local.bucket_name}/bronze/script/connectors.zip"
+    "--CONFIG_S3_PATH"         = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
+    "--BRONZE_BUCKET"          = local.bucket_name
+    "--OUTPUT_FORMAT"          = var.output_format
+    "--CLOUDWATCH_NAMESPACE"   = "UAX/DataPipeline/Ingestion"
+    "--ERROR_HANDLING_MODE"    = "CONTINUE_ON_ERROR"
+    "--job-language"           = "python"
   }
 
   tags = {
