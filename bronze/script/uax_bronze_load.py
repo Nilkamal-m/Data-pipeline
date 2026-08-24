@@ -151,34 +151,64 @@ def parse_arguments() -> dict:
 # ---------------------------------------------------------
 # Helper Functions, Serialization & CloudWatch Metrics
 # ---------------------------------------------------------
-def flatten_dict(d: dict, parent_key: str = '', sep: str = '_') -> dict:
+def flatten_and_expand_record(record: dict, parent_key: str = '', sep: str = '_') -> list:
     """
-    Recursively flattens nested JSON dictionaries and arrays of objects into single-level key-value maps.
-    (e.g., detail.domain -> detail_domain, external_ids[].connector_name -> external_ids_connector_name).
+    Recursively flattens nested dictionaries and explodes arrays of objects into multiple individual rows.
+    If a record contains an array of objects (e.g. external_ids), generates N rows—one for each item in the array.
+    """
+    base_dict = {}
+    list_of_dicts = []
+    list_key_name = None
+
+    for k, v in record.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
+        if isinstance(v, dict):
+            sub_flat = flatten_dict_single(v, parent_key=new_key, sep=sep)
+            base_dict.update(sub_flat)
+        elif isinstance(v, list):
+            if v and isinstance(v[0], dict) and not list_key_name:
+                list_key_name = new_key
+                list_of_dicts = v
+            else:
+                base_dict[new_key] = json.dumps(v) if v is not None else None
+        else:
+            base_dict[new_key] = v
+
+    if not list_of_dicts:
+        return [base_dict]
+
+    expanded_rows = []
+    for item in list_of_dicts:
+        row_dict = base_dict.copy()
+        if isinstance(item, dict):
+            item_flat = flatten_dict_single(item, parent_key=list_key_name, sep=sep)
+            row_dict.update(item_flat)
+        expanded_rows.append(row_dict)
+
+    return expanded_rows
+
+
+def flatten_dict_single(d: dict, parent_key: str = '', sep: str = '_') -> dict:
+    """
+    Flattens a single dictionary object recursively.
     """
     items = []
     for k, v in d.items():
         new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
         if isinstance(v, dict):
-            items.extend(flatten_dict(v, new_key, sep=sep).items())
+            items.extend(flatten_dict_single(v, new_key, sep=sep).items())
         elif isinstance(v, list):
-            if v and isinstance(v[0], dict):
-                sub_keys = {}
-                for item in v:
-                    if isinstance(item, dict):
-                        flat_item = flatten_dict(item, parent_key=new_key, sep=sep)
-                        for sub_k, sub_v in flat_item.items():
-                            if sub_k not in sub_keys:
-                                sub_keys[sub_k] = []
-                            if sub_v is not None and str(sub_v) not in sub_keys[sub_k]:
-                                sub_keys[sub_k].append(str(sub_v))
-                for sub_k, sub_v_list in sub_keys.items():
-                    items.append((sub_k, ", ".join(sub_v_list) if sub_v_list else None))
-            else:
-                items.append((new_key, json.dumps(v) if v is not None else None))
+            items.append((new_key, json.dumps(v) if v is not None else None))
         else:
             items.append((new_key, v))
     return dict(items)
+
+
+def flatten_dict(d: dict, parent_key: str = '', sep: str = '_') -> dict:
+    """
+    Wrapper for single dictionary flattening.
+    """
+    return flatten_dict_single(d, parent_key=parent_key, sep=sep)
 
 
 def serialize_chunk_to_bytes(records_chunk: list, output_format: str = "parquet", parquet_compression: str = "snappy") -> tuple:
@@ -462,12 +492,13 @@ def main():
             # Flatten nested JSON and enrich with Audit Metadata
             for record in records_chunk:
                 if isinstance(record, dict):
-                    rec = flatten_dict(record, sep=flatten_sep) if flatten_enabled else record
-                    rec['_ingested_at'] = current_run_time
-                    rec['_source_system'] = source_system
-                    rec['_table_name'] = table_name
-                    rec['_execution_id'] = execution_id
-                    processed_chunk.append(rec)
+                    expanded_recs = flatten_and_expand_record(record, sep=flatten_sep) if flatten_enabled else [record]
+                    for rec in expanded_recs:
+                        rec['_ingested_at'] = current_run_time
+                        rec['_source_system'] = source_system
+                        rec['_table_name'] = table_name
+                        rec['_execution_id'] = execution_id
+                        processed_chunk.append(rec)
                 else:
                     processed_chunk.append(record)
 
