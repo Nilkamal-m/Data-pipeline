@@ -69,6 +69,28 @@ locals {
 
 
 # ------------------------------------------------------------------------------
+# 0. AWS KMS Customer Managed Key for S3 Data Lake & PII Protection
+# ------------------------------------------------------------------------------
+resource "aws_kms_key" "datalake_kms_key" {
+  description             = "KMS CMK Key for UAX Data Lake S3 Bucket PII Protection"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+
+  tags = {
+    Environment = var.environment
+    Application = var.app_name
+    Layer       = "Security"
+    ManagedBy   = "Terraform"
+  }
+}
+
+resource "aws_kms_alias" "datalake_kms_alias" {
+  name          = "alias/${var.app_name}-${var.environment}-s3-key"
+  target_key_id = aws_kms_key.datalake_kms_key.key_id
+}
+
+
+# ------------------------------------------------------------------------------
 # 1. Single S3 Bucket using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "s3_bucket" {
@@ -84,11 +106,12 @@ module "s3_bucket" {
   ignore_public_acls      = true
   restrict_public_buckets = true
 
-  # Server side encryption
+  # Server side encryption with KMS CMK
   server_side_encryption_configuration = {
     rule = {
       apply_server_side_encryption_by_default = {
-        sse_algorithm = "AES256"
+        kms_master_key_id = aws_kms_key.datalake_kms_key.arn
+        sse_algorithm     = "aws:kms"
       }
     }
   }
@@ -208,6 +231,18 @@ module "glue_iam_policy" {
         Resource = [
           local.bucket_arn,
           "${local.bucket_arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:GenerateDataKey",
+          "kms:DescribeKey"
+        ]
+        Resource = [
+          aws_kms_key.datalake_kms_key.arn
         ]
       },
       {
@@ -361,4 +396,9 @@ output "glue_iam_role_name" {
 output "glue_bronze_ingestion_job_name" {
   value       = "${var.app_name}-bronze-ingestion-${var.environment}"
   description = "AWS Glue Python Shell Bronze Ingestion Job Name."
+}
+
+output "kms_key_arn" {
+  value       = aws_kms_key.datalake_kms_key.arn
+  description = "AWS KMS Customer Managed Key ARN for Data Lake PII Protection."
 }
