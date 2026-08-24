@@ -74,9 +74,9 @@ locals {
 module "kms_key" {
   source = "cps-terraform.anthem.com/DIG/kms/aws"
 
-  description    = "KMS Key for UAX Data Lake S3 Bucket and Secrets Manager PII Protection"
+  description    = "KMS Key for UAX Data Lake S3 Bucket, Secrets Manager, Glue, Athena, CloudWatch Logs, SNS, and Step Functions"
   kms_alias_name = "alias/${var.app_name}-${var.environment}-s3-key"
-  service_name   = ["s3", "secretsmanager"]
+  service_name   = ["s3", "secretsmanager", "glue", "athena", "logs", "sns", "states"]
 
   tags = {
     Environment = var.environment
