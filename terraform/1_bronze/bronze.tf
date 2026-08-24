@@ -2,7 +2,7 @@
 # BRONZE LAYER TERRAFORM INFRASTRUCTURE (terraform/1_bronze/bronze.tf)
 # ==============================================================================
 # Self-contained Terraform script for Bronze Ingestion using Enterprise Registry modules.
-# Uses Enterprise Private Registry: cps-terraform.anthem.com/organization/*
+# Uses Enterprise Private Registry: cps-terraform.anthem.com/DIG/*
 # Contains all variables, S3 Bucket, Secrets Manager, IAM Roles, and Bronze Glue Job.
 # Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
@@ -69,12 +69,15 @@ locals {
 
 
 # ------------------------------------------------------------------------------
-# 0. AWS KMS Customer Managed Key for S3 Data Lake & PII Protection
+# 0. AWS KMS Customer Managed Key using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
-resource "aws_kms_key" "datalake_kms_key" {
-  description             = "KMS CMK Key for UAX Data Lake S3 Bucket PII Protection"
+module "kms_key" {
+  source = "cps-terraform.anthem.com/DIG/kms/aws"
+
+  description             = "KMS Key for UAX Data Lake S3 Bucket and Secrets Manager PII Protection"
   deletion_window_in_days = 30
   enable_key_rotation     = true
+  alias                   = "alias/${var.app_name}-${var.environment}-s3-key"
 
   tags = {
     Environment = var.environment
@@ -84,17 +87,12 @@ resource "aws_kms_key" "datalake_kms_key" {
   }
 }
 
-resource "aws_kms_alias" "datalake_kms_alias" {
-  name          = "alias/${var.app_name}-${var.environment}-s3-key"
-  target_key_id = aws_kms_key.datalake_kms_key.key_id
-}
-
 
 # ------------------------------------------------------------------------------
 # 1. Single S3 Bucket using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "s3_bucket" {
-  source = "cps-terraform.anthem.com/organization/s3-bucket/aws"
+  source = "cps-terraform.anthem.com/DIG/s3-bucket/aws"
 
   create_bucket = !var.use_existing_s3_bucket
   bucket        = local.bucket_name
@@ -110,7 +108,7 @@ module "s3_bucket" {
   server_side_encryption_configuration = {
     rule = {
       apply_server_side_encryption_by_default = {
-        kms_master_key_id = aws_kms_key.datalake_kms_key.arn
+        kms_master_key_id = module.kms_key.key_arn
         sse_algorithm     = "aws:kms"
       }
     }
@@ -129,11 +127,12 @@ module "s3_bucket" {
 # 2. Secrets Manager Secrets using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "servicenow_secret" {
-  source = "cps-terraform.anthem.com/organization/secrets-manager/aws"
+  source = "cps-terraform.anthem.com/DIG/secrets-manager/aws"
 
   create      = !var.use_existing_secrets
   name        = "${var.app_name}/servicenow-credentials-${var.environment}"
   description = "ServiceNow REST API credentials (Basic Auth)."
+  kms_key_id  = module.kms_key.key_arn
 
   secret_string = jsonencode({
     auth_type     = "basic"
@@ -155,11 +154,12 @@ module "servicenow_secret" {
 }
 
 module "moveworks_secret" {
-  source = "cps-terraform.anthem.com/organization/secrets-manager/aws"
+  source = "cps-terraform.anthem.com/DIG/secrets-manager/aws"
 
   create      = !var.use_existing_secrets
   name        = "${var.app_name}/moveworks-credentials-${var.environment}"
   description = "Moveworks REST API credentials (OAuth 2.0)."
+  kms_key_id  = module.kms_key.key_arn
 
   secret_string = jsonencode({
     auth_type     = "oauth2"
@@ -181,11 +181,12 @@ module "moveworks_secret" {
 }
 
 module "genesys_secret" {
-  source = "cps-terraform.anthem.com/organization/secrets-manager/aws"
+  source = "cps-terraform.anthem.com/DIG/secrets-manager/aws"
 
   create      = !var.use_existing_secrets
   name        = "${var.app_name}/genesys-credentials-${var.environment}"
   description = "Genesys Cloud REST API credentials (OAuth 2.0)."
+  kms_key_id  = module.kms_key.key_arn
 
   secret_string = jsonencode({
     auth_type     = "oauth2"
@@ -211,7 +212,7 @@ module "genesys_secret" {
 # 3. AWS Glue Execution IAM Role & Policies using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "glue_iam_policy" {
-  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
+  source = "cps-terraform.anthem.com/DIG/iam/aws//modules/iam-policy"
 
   create_policy = !var.use_existing_iam_role
   name          = "${var.app_name}-glue-policy-${var.environment}"
@@ -239,10 +240,12 @@ module "glue_iam_policy" {
           "kms:Decrypt",
           "kms:Encrypt",
           "kms:GenerateDataKey",
-          "kms:DescribeKey"
+          "kms:GenerateDataKeyWithoutPlaintext",
+          "kms:DescribeKey",
+          "kms:ReEncrypt*"
         ]
         Resource = [
-          aws_kms_key.datalake_kms_key.arn
+          module.kms_key.key_arn
         ]
       },
       {
@@ -302,7 +305,7 @@ module "glue_iam_policy" {
 }
 
 module "glue_iam_role" {
-  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
+  source = "cps-terraform.anthem.com/DIG/iam/aws//modules/iam-assumable-role"
 
   create_role       = !var.use_existing_iam_role
   role_name         = "${var.app_name}-glue-execution-role-${var.environment}"
@@ -329,7 +332,7 @@ module "glue_iam_role" {
 # 4. AWS Glue Python Shell Ingestion Job using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "bronze_glue_job" {
-  source = "cps-terraform.anthem.com/organization/glue/aws//modules/job"
+  source = "cps-terraform.anthem.com/DIG/glue/aws//modules/job"
 
   name         = "${var.app_name}-bronze-ingestion-${var.environment}"
   description  = "AWS Glue Python Shell Job executing Bronze REST API & DB ingestion."
@@ -399,6 +402,6 @@ output "glue_bronze_ingestion_job_name" {
 }
 
 output "kms_key_arn" {
-  value       = aws_kms_key.datalake_kms_key.arn
+  value       = module.kms_key.key_arn
   description = "AWS KMS Customer Managed Key ARN for Data Lake PII Protection."
 }
