@@ -153,8 +153,8 @@ def parse_arguments() -> dict:
 # ---------------------------------------------------------
 def flatten_dict(d: dict, parent_key: str = '', sep: str = '_') -> dict:
     """
-    Recursively flattens nested JSON dictionaries into a single level key-value map.
-    Supports dynamic schema evolution by flattening all nested dict keys (e.g. detail.domain -> detail_domain).
+    Recursively flattens nested JSON dictionaries and arrays of objects into single-level key-value maps.
+    (e.g., detail.domain -> detail_domain, external_ids[].connector_name -> external_ids_connector_name).
     """
     items = []
     for k, v in d.items():
@@ -162,7 +162,20 @@ def flatten_dict(d: dict, parent_key: str = '', sep: str = '_') -> dict:
         if isinstance(v, dict):
             items.extend(flatten_dict(v, new_key, sep=sep).items())
         elif isinstance(v, list):
-            items.append((new_key, json.dumps(v) if v is not None else None))
+            if v and isinstance(v[0], dict):
+                sub_keys = {}
+                for item in v:
+                    if isinstance(item, dict):
+                        flat_item = flatten_dict(item, parent_key=new_key, sep=sep)
+                        for sub_k, sub_v in flat_item.items():
+                            if sub_k not in sub_keys:
+                                sub_keys[sub_k] = []
+                            if sub_v is not None and str(sub_v) not in sub_keys[sub_k]:
+                                sub_keys[sub_k].append(str(sub_v))
+                for sub_k, sub_v_list in sub_keys.items():
+                    items.append((sub_k, ", ".join(sub_v_list) if sub_v_list else None))
+            else:
+                items.append((new_key, json.dumps(v) if v is not None else None))
         else:
             items.append((new_key, v))
     return dict(items)
