@@ -136,7 +136,13 @@ class HTTPClient:
             try:
                 logger.debug(f"Executing HTTP GET request (attempt {attempt}): {url}")
                 with urllib.request.urlopen(req, timeout=60) as response:
-                    res_body = response.read().decode('utf-8')
+                    raw_data = response.read()
+                    content_encoding = response.info().get('Content-Encoding')
+                    if content_encoding == 'gzip':
+                        import gzip
+                        res_body = gzip.decompress(raw_data).decode('utf-8')
+                    else:
+                        res_body = raw_data.decode('utf-8')
                     return json.loads(res_body) if res_body else {}
 
             except HTTPError as http_err:
