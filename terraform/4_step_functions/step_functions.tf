@@ -2,7 +2,7 @@
 # STEP FUNCTIONS & SNS ORCHESTRATION INFRASTRUCTURE (terraform/4_step_functions/step_functions.tf)
 # ==============================================================================
 # Self-contained Terraform script for Step Functions Orchestration & SNS Alerts.
-# Uses Enterprise Private Registry: cps-terraform.anthem.com/organization/*
+# Uses Enterprise Private Registry: cps-terraform.anthem.com/DIG/*
 # Contains all variables, SNS Topics, State Machines, and EventBridge Cron Rules.
 # Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
@@ -74,7 +74,7 @@ locals {
 # 1. Amazon SNS Alert Topic & Email Subscription using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "sns_topic" {
-  source = "cps-terraform.anthem.com/organization/sns/aws"
+  source = "cps-terraform.anthem.com/DIG/sns/aws"
 
   create = !var.use_existing_sns_topic
   name   = "${var.app_name}-alerts-topic-${var.environment}"
@@ -98,7 +98,7 @@ module "sns_topic" {
 # 2. Step Functions & EventBridge IAM Roles & Policies using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "step_functions_iam_policy" {
-  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
+  source = "cps-terraform.anthem.com/DIG/iam/aws//modules/iam-policy"
 
   create_policy = !var.use_existing_step_functions_role
   name          = "${var.app_name}-stepfunctions-policy-${var.environment}"
@@ -131,6 +131,17 @@ module "step_functions_iam_policy" {
       {
         Effect = "Allow"
         Action = [
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:GenerateDataKey",
+          "kms:GenerateDataKeyWithoutPlaintext",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "logs:CreateLogDelivery",
           "logs:GetLogDelivery",
           "logs:UpdateLogDelivery",
@@ -154,7 +165,7 @@ module "step_functions_iam_policy" {
 }
 
 module "step_functions_iam_role" {
-  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
+  source = "cps-terraform.anthem.com/DIG/iam/aws//modules/iam-assumable-role"
 
   create_role       = !var.use_existing_step_functions_role
   role_name         = "${var.app_name}-stepfunctions-role-${var.environment}"
@@ -177,7 +188,7 @@ module "step_functions_iam_role" {
 }
 
 module "eventbridge_iam_policy" {
-  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-policy"
+  source = "cps-terraform.anthem.com/DIG/iam/aws//modules/iam-policy"
 
   create_policy = true
   name          = "${var.app_name}-eventbridge-policy-${var.environment}"
@@ -205,7 +216,7 @@ module "eventbridge_iam_policy" {
 }
 
 module "eventbridge_iam_role" {
-  source = "cps-terraform.anthem.com/organization/iam/aws//modules/iam-assumable-role"
+  source = "cps-terraform.anthem.com/DIG/iam/aws//modules/iam-assumable-role"
 
   create_role       = true
   role_name         = "${var.app_name}-eventbridge-role-${var.environment}"
@@ -233,7 +244,7 @@ module "eventbridge_iam_role" {
 
 # ServiceNow State Machine
 module "servicenow_state_machine" {
-  source = "cps-terraform.anthem.com/organization/step-functions/aws"
+  source = "cps-terraform.anthem.com/DIG/step-functions/aws"
 
   name     = "${var.app_name}-servicenow-orchestrator-${var.environment}"
   role_arn = local.sfn_role_arn
@@ -359,7 +370,7 @@ module "servicenow_state_machine" {
 
 # Moveworks State Machine
 module "moveworks_state_machine" {
-  source = "cps-terraform.anthem.com/organization/step-functions/aws"
+  source = "cps-terraform.anthem.com/DIG/step-functions/aws"
 
   name     = "${var.app_name}-moveworks-orchestrator-${var.environment}"
   role_arn = local.sfn_role_arn
@@ -485,7 +496,7 @@ module "moveworks_state_machine" {
 
 # Genesys State Machine
 module "genesys_state_machine" {
-  source = "cps-terraform.anthem.com/organization/step-functions/aws"
+  source = "cps-terraform.anthem.com/DIG/step-functions/aws"
 
   name     = "${var.app_name}-genesys-orchestrator-${var.environment}"
   role_arn = local.sfn_role_arn
@@ -613,7 +624,7 @@ module "genesys_state_machine" {
 # 4. Amazon EventBridge Cron Rules & Targets using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "servicenow_eventbridge_cron" {
-  source = "cps-terraform.anthem.com/organization/eventbridge/aws"
+  source = "cps-terraform.anthem.com/DIG/eventbridge/aws"
 
   create              = true
   name                = "${var.app_name}-servicenow-schedule-${var.environment}"
@@ -629,7 +640,7 @@ module "servicenow_eventbridge_cron" {
 }
 
 module "moveworks_eventbridge_cron" {
-  source = "cps-terraform.anthem.com/organization/eventbridge/aws"
+  source = "cps-terraform.anthem.com/DIG/eventbridge/aws"
 
   create              = true
   name                = "${var.app_name}-moveworks-schedule-${var.environment}"
@@ -645,7 +656,7 @@ module "moveworks_eventbridge_cron" {
 }
 
 module "genesys_eventbridge_cron" {
-  source = "cps-terraform.anthem.com/organization/eventbridge/aws"
+  source = "cps-terraform.anthem.com/DIG/eventbridge/aws"
 
   create              = true
   name                = "${var.app_name}-genesys-schedule-${var.environment}"

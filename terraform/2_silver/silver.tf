@@ -2,7 +2,7 @@
 # SILVER LAYER TERRAFORM INFRASTRUCTURE (terraform/2_silver/silver.tf)
 # ==============================================================================
 # Self-contained Terraform script for Silver Iceberg ETL Layer.
-# Uses Enterprise Private Registry: cps-terraform.anthem.com/organization/*
+# Uses Enterprise Private Registry: cps-terraform.anthem.com/DIG/*
 # Contains all variables, Glue Catalog DB, Iceberg Crawler, and PySpark ETL Job.
 # Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
@@ -51,7 +51,7 @@ locals {
 # 1. AWS Glue Data Catalog Database using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "silver_glue_catalog_database" {
-  source = "cps-terraform.anthem.com/organization/glue/aws//modules/catalog-database"
+  source = "cps-terraform.anthem.com/DIG/glue/aws//modules/catalog-database"
 
   create      = !var.use_existing_glue_database
   name        = local.glue_db_name
@@ -62,7 +62,7 @@ module "silver_glue_catalog_database" {
 # 2. AWS Glue Iceberg Crawler using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "silver_iceberg_crawler" {
-  source = "cps-terraform.anthem.com/organization/glue/aws//modules/crawler"
+  source = "cps-terraform.anthem.com/DIG/glue/aws//modules/crawler"
 
   name          = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
   database_name = local.glue_db_name
@@ -92,7 +92,7 @@ module "silver_iceberg_crawler" {
 # 3. AWS Glue PySpark Apache Iceberg ETL Job using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "silver_iceberg_job" {
-  source = "cps-terraform.anthem.com/organization/glue/aws//modules/job"
+  source = "cps-terraform.anthem.com/DIG/glue/aws//modules/job"
 
   name              = "${var.app_name}-silver-iceberg-etl-${var.environment}"
   description       = "AWS Glue PySpark ETL Job transforming Bronze raw data into Silver Apache Iceberg tables."

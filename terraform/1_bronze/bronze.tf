@@ -55,16 +55,10 @@ variable "use_existing_iam_role" {
   description = "If true, skips creating Glue IAM role and reuses existing role."
 }
 
-variable "use_existing_secrets" {
-  type        = bool
-  default     = false
-  description = "If true, skips creating Secrets Manager secrets and reuses existing secrets."
-}
-
 locals {
   bucket_name   = "${var.app_name}-${var.environment}-bucket"
   bucket_arn    = "arn:aws:s3:::${local.bucket_name}"
-  glue_role_arn = var.use_existing_iam_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}" : module.glue_iam_role.iam_role_arn
+  glue_role_arn = module.glue_iam_role.iam_role_arn
 }
 
 
