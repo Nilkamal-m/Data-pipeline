@@ -23,6 +23,14 @@ from botocore.exceptions import ClientError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("uax_bronze_load")
+logger.setLevel(logging.INFO)
+# Ensure stdout handler exists so logs appear in AWS Glue CloudWatch logs immediately
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(console_handler)
+logging.getLogger().setLevel(logging.INFO)
 
 # Ensure script directory and Glue extraPython paths are on sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -109,72 +117,153 @@ def get_secret(secret_name: str) -> dict:
 
 def parse_arguments() -> dict:
     """
-    Parses CLI arguments passed by Step Functions or AWS Glue Job Run.
+    Parses CLI arguments passed by Step Functions, AWS Glue Job Run, or manual triggers.
+    Enforces strict 3-tier parameter precedence:
+      1. Glue CLI Argument (--KEY value or --KEY=value) [HIGHEST PRIORITY]
+      2. Config File (bronze_config.json or S3 config) [SECOND PRIORITY]
+      3. Code Hardcoded Defaults [LOWEST PRIORITY]
     """
     arg_dict = {}
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
         if arg.startswith('--'):
-            key = arg[2:]
-            val = sys.argv[i + 1] if (i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('--')) else ''
-            arg_dict[key] = val
-            i += 2
+            key_val = arg[2:]
+            if '=' in key_val:
+                k, v = key_val.split('=', 1)
+                arg_dict[k.strip()] = v.strip()
+                i += 1
+            else:
+                k = key_val.strip()
+                v = ''
+                if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('--'):
+                    v = sys.argv[i + 1].strip()
+                    i += 2
+                else:
+                    i += 1
+                arg_dict[k] = v
         else:
             i += 1
 
-    source_system = arg_dict.get('SOURCE_SYSTEM')
+    def get_cli_arg(*names, default=None):
+        """Case-insensitive CLI argument lookup helper."""
+        lower_names = [n.lower() for n in names]
+        for k, v in arg_dict.items():
+            if k.lower() in lower_names and v is not None and str(v).strip():
+                return str(v).strip()
+        return default
+
+    # 1. Source System (Required)
+    source_system = get_cli_arg('SOURCE_SYSTEM', 'source_system', 'SOURCE', 'source')
     if not source_system:
-        logger.error("Missing required parameter '--SOURCE_SYSTEM'. Please pass '--SOURCE_SYSTEM' from Step Functions.")
-        raise ValueError("Missing required argument '--SOURCE_SYSTEM'. Example usage: --SOURCE_SYSTEM servicenow")
+        logger.error("Missing required parameter '--SOURCE_SYSTEM'. Please pass '--SOURCE_SYSTEM'.")
+        raise ValueError("Missing required argument '--SOURCE_SYSTEM'. Example usage: --SOURCE_SYSTEM moveworks")
 
     source_system_clean = source_system.strip().lower()
-    config_s3_path = arg_dict.get('CONFIG_S3_PATH')
-    
+    config_s3_path = get_cli_arg('CONFIG_S3_PATH', 'config_s3_path')
+
     # Load centralized Bronze configuration
     full_config = ConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client)
     pipeline_defaults = ConfigLoader.get_pipeline_defaults(full_config)
     source_config = ConfigLoader.get_source_config(source_system_clean, full_config)
 
-    # Allow CLI parameters to dynamically override bronze_config.json values for manual testing / Step Functions
-    if arg_dict.get('BASE_URL'):
-        source_config['base_url'] = arg_dict['BASE_URL'].strip()
-        logger.info(f"CLI Parameter Override: 'base_url' -> '{source_config['base_url']}'")
+    # -------------------------------------------------------------
+    # STRICT 3-TIER PARAMETER PRECEDENCE (CLI > Config > Code Default)
+    # -------------------------------------------------------------
 
-    if arg_dict.get('BATCH_SIZE'):
-        source_config['batch_size'] = int(arg_dict['BATCH_SIZE'])
-        logger.info(f"CLI Parameter Override: 'batch_size' -> {source_config['batch_size']}")
-
-    if arg_dict.get('RESPONSE_RECORDS_KEY'):
-        source_config['response_records_key'] = arg_dict['RESPONSE_RECORDS_KEY'].strip()
-        logger.info(f"CLI Parameter Override: 'response_records_key' -> '{source_config['response_records_key']}'")
-
-    if arg_dict.get('FLATTEN_NESTED_JSON'):
-        source_config['flatten_nested_json'] = (arg_dict['FLATTEN_NESTED_JSON'].strip().lower() == 'true')
-        logger.info(f"CLI Parameter Override: 'flatten_nested_json' -> {source_config['flatten_nested_json']}")
-
-    if arg_dict.get('FLATTEN_SEPARATOR'):
-        source_config['flatten_separator'] = arg_dict['FLATTEN_SEPARATOR'].strip()
-        logger.info(f"CLI Parameter Override: 'flatten_separator' -> '{source_config['flatten_separator']}'")
-
-    # Resolve table list
-    raw_tables = arg_dict.get('TABLE_NAME') or arg_dict.get('TABLES') or arg_dict.get('TABLE_NAMES')
-    if raw_tables:
-        table_list = [t.strip() for t in raw_tables.split(',') if t.strip()]
+    # Table List: CLI parameter takes highest priority over config and code defaults
+    cli_tables = get_cli_arg('TABLE_NAME', 'table_name', 'TABLES', 'tables', 'TABLE_NAMES', 'table_names', 'TABLE', 'table')
+    if cli_tables:
+        table_list = [t.strip() for t in cli_tables.split(',') if t.strip()]
+        logger.info(f"[PARAM PRECEDENCE] Table List resolved from GLUE CLI (Priority 1): {table_list}")
+    elif source_config.get('default_tables'):
+        table_list = list(source_config['default_tables'])
+        logger.info(f"[PARAM PRECEDENCE] Table List resolved from CONFIG FILE (Priority 2): {table_list}")
     else:
-        table_list = source_config.get('default_tables', ['incident'])
+        table_list = ['conversations'] if source_system_clean == 'moveworks' else ['incident']
+        logger.info(f"[PARAM PRECEDENCE] Table List resolved from CODE DEFAULT (Priority 3): {table_list}")
 
-    custom_query = arg_dict.get('CUSTOM_QUERY')
-    job_name = arg_dict.get('JOB_NAME', f"glue-incremental-load-{source_system_clean}")
-    secret_name = arg_dict.get('SECRET_NAME', '')
-    bronze_bucket = arg_dict.get('BRONZE_BUCKET', os.environ.get('BRONZE_BUCKET', 'uax-datalake-dev-bucket'))
-    state_bucket = arg_dict.get('STATE_BUCKET', bronze_bucket)
-    initial_load_date_cli = arg_dict.get('INITIAL_LOAD_DATE')
-    s3_chunk_size = int(arg_dict.get('S3_CHUNK_SIZE') or pipeline_defaults.get('s3_chunk_size', 10000))
-    output_format = (arg_dict.get('OUTPUT_FORMAT') or pipeline_defaults.get('output_format', 'parquet')).lower()
-    parquet_compression = (arg_dict.get('PARQUET_COMPRESSION') or pipeline_defaults.get('parquet_compression', 'snappy')).lower()
-    error_handling_mode = (arg_dict.get('ERROR_HANDLING_MODE') or pipeline_defaults.get('error_handling_mode', 'CONTINUE_ON_ERROR')).upper()
-    cloudwatch_namespace = arg_dict.get('CLOUDWATCH_NAMESPACE') or pipeline_defaults.get('cloudwatch_namespace', 'UAX/DataPipeline/Ingestion')
+    # Batch Size
+    cli_batch = get_cli_arg('BATCH_SIZE', 'batch_size')
+    if cli_batch:
+        batch_size = int(cli_batch)
+        source_config['batch_size'] = batch_size
+        logger.info(f"[PARAM PRECEDENCE] 'batch_size' resolved from GLUE CLI (Priority 1): {batch_size}")
+    elif source_config.get('batch_size'):
+        batch_size = int(source_config['batch_size'])
+        logger.info(f"[PARAM PRECEDENCE] 'batch_size' resolved from CONFIG (Priority 2): {batch_size}")
+    else:
+        batch_size = int(pipeline_defaults.get('batch_size', 500 if source_system_clean == 'moveworks' else 1000))
+        source_config['batch_size'] = batch_size
+        logger.info(f"[PARAM PRECEDENCE] 'batch_size' resolved from CODE DEFAULT (Priority 3): {batch_size}")
+
+    # Base URL
+    cli_base_url = get_cli_arg('BASE_URL', 'base_url')
+    if cli_base_url:
+        source_config['base_url'] = cli_base_url
+        logger.info(f"[PARAM PRECEDENCE] 'base_url' resolved from GLUE CLI (Priority 1): {cli_base_url}")
+
+    # Secret Name
+    cli_secret = get_cli_arg('SECRET_NAME', 'secret_name')
+    if cli_secret:
+        secret_name = cli_secret
+        logger.info(f"[PARAM PRECEDENCE] 'secret_name' resolved from GLUE CLI (Priority 1): {secret_name}")
+    elif source_config.get('secret_name'):
+        secret_name = source_config['secret_name']
+        logger.info(f"[PARAM PRECEDENCE] 'secret_name' resolved from CONFIG (Priority 2): {secret_name}")
+    else:
+        secret_name = ''
+
+    # Custom Query
+    custom_query = get_cli_arg('CUSTOM_QUERY', 'custom_query')
+
+    # Initial Load Date CLI Override
+    initial_load_date_cli = get_cli_arg('INITIAL_LOAD_DATE', 'initial_load_date')
+
+    # S3 Buckets: CLI > Config > Env / Code Default
+    bronze_bucket = get_cli_arg('BRONZE_BUCKET', 'bronze_bucket', default=pipeline_defaults.get('bronze_bucket') or os.environ.get('BRONZE_BUCKET', 'uax-datalake-dev-bucket'))
+    state_bucket = get_cli_arg('STATE_BUCKET', 'state_bucket', default=pipeline_defaults.get('state_bucket') or bronze_bucket)
+
+    # S3 Chunk Size
+    cli_chunk = get_cli_arg('S3_CHUNK_SIZE', 's3_chunk_size')
+    s3_chunk_size = int(cli_chunk) if cli_chunk else int(pipeline_defaults.get('s3_chunk_size', 10000))
+
+    # Output Format & Parquet Compression
+    output_format = (get_cli_arg('OUTPUT_FORMAT', 'output_format') or pipeline_defaults.get('output_format', 'parquet')).lower()
+    parquet_compression = (get_cli_arg('PARQUET_COMPRESSION', 'parquet_compression') or pipeline_defaults.get('parquet_compression', 'snappy')).lower()
+
+    # Error Handling Mode
+    error_handling_mode = (get_cli_arg('ERROR_HANDLING_MODE', 'error_handling_mode') or pipeline_defaults.get('error_handling_mode', 'CONTINUE_ON_ERROR')).upper()
+
+    # CloudWatch Namespace
+    cloudwatch_namespace = get_cli_arg('CLOUDWATCH_NAMESPACE', 'cloudwatch_namespace') or pipeline_defaults.get('cloudwatch_namespace', 'UAX/DataPipeline/Ingestion')
+
+    # Response Records Key
+    cli_rec_key = get_cli_arg('RESPONSE_RECORDS_KEY', 'response_records_key')
+    if cli_rec_key:
+        source_config['response_records_key'] = cli_rec_key
+
+    # Flatten Nested JSON
+    cli_flatten = get_cli_arg('FLATTEN_NESTED_JSON', 'flatten_nested_json')
+    if cli_flatten is not None:
+        source_config['flatten_nested_json'] = (cli_flatten.lower() == 'true')
+    elif 'flatten_nested_json' not in source_config:
+        source_config['flatten_nested_json'] = pipeline_defaults.get('flatten_nested_json', True)
+
+    # Flatten Separator
+    cli_sep = get_cli_arg('FLATTEN_SEPARATOR', 'flatten_separator')
+    if cli_sep:
+        source_config['flatten_separator'] = cli_sep
+    elif 'flatten_separator' not in source_config:
+        source_config['flatten_separator'] = pipeline_defaults.get('flatten_separator', '_')
+
+    # Assistant-Name (for Moveworks)
+    cli_assistant = get_cli_arg('ASSISTANT_NAME', 'assistant_name')
+    if cli_assistant:
+        source_config['assistant_name'] = cli_assistant
+
+    # Job Name
+    job_name = get_cli_arg('JOB_NAME', 'job_name', default=f"glue-incremental-load-{source_system_clean}")
 
     parsed_params = {
         'JOB_NAME': job_name,
@@ -458,6 +547,44 @@ def cleanup_failed_staging(bucket_name: str, staging_prefix: str) -> None:
         logger.warning(f"Error purging failed staging artifacts at '{staging_prefix}': {err}")
 
 
+def save_execution_log(
+    state_bucket: str,
+    source_system: str,
+    execution_id: str,
+    execution_log: dict
+) -> None:
+    """
+    Persists a comprehensive JSON execution log in S3 for auditing, monitoring, and Athena querying.
+    Writes both the timestamped log and a 'latest_execution.json' pointer.
+    """
+    log_json = json.dumps(execution_log, indent=2, default=str)
+    
+    # 1. Timestamped execution log
+    log_key = f"metadata/logs/bronze/{source_system}/execution_{execution_id}.json"
+    try:
+        s3_client.put_object(
+            Bucket=state_bucket,
+            Key=log_key,
+            Body=log_json.encode('utf-8'),
+            ContentType="application/json"
+        )
+        logger.info(f"Saved Execution Audit Log to S3: s3://{state_bucket}/{log_key}")
+    except Exception as err:
+        logger.warning(f"Could not save Execution Audit Log to '{log_key}': {err}")
+
+    # 2. Latest execution pointer for quick inspection
+    latest_key = f"metadata/logs/bronze/{source_system}/latest_execution.json"
+    try:
+        s3_client.put_object(
+            Bucket=state_bucket,
+            Key=latest_key,
+            Body=log_json.encode('utf-8'),
+            ContentType="application/json"
+        )
+    except Exception as err:
+        logger.warning(f"Could not update 'latest_execution.json': {err}")
+
+
 # ---------------------------------------------------------
 # Main Execution Handler
 # ---------------------------------------------------------
@@ -494,6 +621,7 @@ def main():
     logger.info(f"Loaded connector class: {connector_cls.__name__}")
 
     failed_tables = []
+    table_stats = []
 
     # Loop through each requested table dynamically
     for table_name in table_list:
@@ -517,20 +645,34 @@ def main():
             )
         except Exception as load_date_err:
             logger.error(f"Cannot process table '{table_name}': {load_date_err}")
+            failed_tables.append((table_name, str(load_date_err)))
+            table_stats.append({
+                "table_name": table_name,
+                "status": "FAILED",
+                "date_range": {
+                    "start_date": None,
+                    "end_date": current_run_time
+                },
+                "records_fetched": 0,
+                "chunks_written": 0,
+                "duration_seconds": 0.0,
+                "s3_destination": f"s3://{bronze_bucket}/bronze/{source_system}/{table_name}/{partition_prefix}/",
+                "error_message": str(load_date_err)
+            })
             if error_handling_mode == 'HALT_ON_ERROR':
                 raise
             else:
-                failed_tables.append((table_name, str(load_date_err)))
                 continue
 
         staging_prefix = f"_staging/exec_{execution_id}/{source_system}/{table_name}/"
         final_partition_prefix = f"bronze/{source_system}/{table_name}/{partition_prefix}/"
 
         total_table_records = 0
+        parts_written = 0
 
         # Memory-safe callback function writing to isolated STAGING directory
         def chunk_writer_callback(records_chunk: list, part_num: int):
-            nonlocal total_table_records
+            nonlocal total_table_records, parts_written
             if not records_chunk:
                 return
 
@@ -553,6 +695,7 @@ def main():
 
             records_chunk = processed_chunk
             total_table_records += len(records_chunk)
+            parts_written += 1
             
             # Serialize chunk to Parquet or JSON bytes
             file_bytes, content_type, file_ext = serialize_chunk_to_bytes(
@@ -597,6 +740,35 @@ def main():
             update_last_load_date(state_bucket, state_key, source_system, table_name, current_run_time, total_table_records)
             logger.info(f"Table '{table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with timestamp {current_run_time}.")
 
+            # Record table execution details
+            table_stats.append({
+                "table_name": table_name,
+                "status": "SUCCESS",
+                "date_range": {
+                    "start_date": last_load_date,
+                    "end_date": current_run_time
+                },
+                "records_fetched": total_table_records,
+                "chunks_written": parts_written,
+                "duration_seconds": round(duration_sec, 2),
+                "s3_destination": f"s3://{bronze_bucket}/{final_partition_prefix}",
+                "error_message": None
+            })
+
+            # High-visibility table extraction summary block in CloudWatch logs
+            logger.info("\n" + "=" * 80)
+            logger.info(f" TABLE EXTRACTION SUMMARY: {table_name}")
+            logger.info("-" * 80)
+            logger.info(f" Source System    : {source_system}")
+            logger.info(f" Table Name       : {table_name}")
+            logger.info(f" Status           : SUCCESS")
+            logger.info(f" Date Range       : {last_load_date}  -->  {current_run_time}")
+            logger.info(f" Records Fetched  : {total_table_records:,}")
+            logger.info(f" Chunks Written   : {parts_written}")
+            logger.info(f" Duration         : {duration_sec:.2f}s")
+            logger.info(f" S3 Destination   : s3://{bronze_bucket}/{final_partition_prefix}")
+            logger.info("=" * 80 + "\n")
+
             # Report custom CloudWatch metrics
             emit_cloudwatch_metrics(
                 namespace=cloudwatch_namespace,
@@ -613,6 +785,30 @@ def main():
             
             # Clean up uncommitted staging artifacts
             cleanup_failed_staging(bronze_bucket, staging_prefix)
+
+            table_stats.append({
+                "table_name": table_name,
+                "status": "FAILED",
+                "date_range": {
+                    "start_date": last_load_date if 'last_load_date' in locals() else None,
+                    "end_date": current_run_time
+                },
+                "records_fetched": 0,
+                "chunks_written": 0,
+                "duration_seconds": round(duration_sec, 2),
+                "s3_destination": f"s3://{bronze_bucket}/{final_partition_prefix}",
+                "error_message": str(table_err)
+            })
+
+            logger.error("\n" + "=" * 80)
+            logger.error(f" TABLE EXTRACTION FAILED: {table_name}")
+            logger.error("-" * 80)
+            logger.error(f" Source System    : {source_system}")
+            logger.error(f" Table Name       : {table_name}")
+            logger.error(f" Status           : FAILED")
+            logger.error(f" Date Range       : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {current_run_time}")
+            logger.error(f" Error Details    : {table_err}")
+            logger.error("=" * 80 + "\n")
             
             # Report failure metric to CloudWatch
             emit_cloudwatch_metrics(
@@ -628,7 +824,92 @@ def main():
 
             if error_handling_mode == 'HALT_ON_ERROR':
                 logger.error(f"Error handling mode is HALT_ON_ERROR. Halting execution immediately.")
+                # Persist partial execution log before raising
+                halt_log = {
+                    "execution_id": execution_id,
+                    "job_name": params['JOB_NAME'],
+                    "source_system": source_system,
+                    "status": "FAILED",
+                    "start_time": current_run_time,
+                    "end_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    "duration_seconds": round((datetime.now(timezone.utc) - execution_start_utc).total_seconds(), 2),
+                    "total_records_ingested": sum(t.get('records_fetched', 0) for t in table_stats),
+                    "tables_count": len(table_list),
+                    "tables_succeeded": len(table_list) - len(failed_tables),
+                    "tables_failed": len(failed_tables),
+                    "tables": table_stats,
+                    "error": str(table_err)
+                }
+                save_execution_log(state_bucket, source_system, execution_id, halt_log)
                 raise table_err
+
+    # -------------------------------------------------------------
+    # Overall Job Execution Summary & S3 Audit Log Persistence
+    # -------------------------------------------------------------
+    execution_end_utc = datetime.now(timezone.utc)
+    total_job_duration = (execution_end_utc - execution_start_utc).total_seconds()
+    overall_status = "FAILED" if failed_tables else "SUCCESS"
+    total_records_all = sum(t.get('records_fetched', 0) for t in table_stats)
+
+    execution_log = {
+        "execution_id": execution_id,
+        "job_name": params['JOB_NAME'],
+        "source_system": source_system,
+        "status": overall_status,
+        "start_time": current_run_time,
+        "end_time": execution_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        "duration_seconds": round(total_job_duration, 2),
+        "total_records_ingested": total_records_all,
+        "tables_count": len(table_list),
+        "tables_succeeded": len(table_list) - len(failed_tables),
+        "tables_failed": len(failed_tables),
+        "tables": table_stats,
+        "parameters": {
+            "source_system": source_system,
+            "table_list": table_list,
+            "batch_size": params['SOURCE_CONFIG'].get('batch_size'),
+            "output_format": output_format,
+            "parquet_compression": parquet_compression,
+            "bronze_bucket": bronze_bucket,
+            "state_bucket": state_bucket,
+            "error_handling_mode": error_handling_mode
+        }
+    }
+
+    # Save comprehensive execution log to S3 for auditing and debugging
+    save_execution_log(
+        state_bucket=state_bucket,
+        source_system=source_system,
+        execution_id=execution_id,
+        execution_log=execution_log
+    )
+
+    # Print high-visibility overall summary to CloudWatch
+    logger.info("\n" + "=" * 80)
+    logger.info("              AWS GLUE BRONZE INGESTION EXECUTION SUMMARY")
+    logger.info("=" * 80)
+    logger.info(f" Execution ID       : {execution_id}")
+    logger.info(f" Source System      : {source_system}")
+    logger.info(f" Overall Status     : {overall_status}")
+    logger.info(f" Total Records      : {total_records_all:,}")
+    logger.info(f" Tables Processed   : {len(table_list)} (Succeeded: {len(table_list) - len(failed_tables)}, Failed: {len(failed_tables)})")
+    logger.info(f" Start Time (UTC)   : {current_run_time}")
+    logger.info(f" End Time (UTC)     : {execution_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    logger.info(f" Total Duration     : {total_job_duration:.2f}s")
+    logger.info(f" S3 Execution Log   : s3://{state_bucket}/metadata/logs/bronze/{source_system}/execution_{execution_id}.json")
+    logger.info("-" * 80)
+    logger.info(" TABLE-BY-TABLE BREAKDOWN:")
+    for t in table_stats:
+        status_icon = "[OK]" if t['status'] == 'SUCCESS' else "[FAIL]"
+        date_info = f"{t['date_range']['start_date']} to {t['date_range']['end_date']}" if t['date_range']['start_date'] else "N/A"
+        logger.info(
+            f"   {status_icon} {t['table_name']:<20} | Status: {t['status']:<7} | "
+            f"Records: {t['records_fetched']:>7,} | Date: {date_info} | "
+            f"Time: {t['duration_seconds']:>5.2f}s"
+        )
+        if t.get('error_message'):
+            logger.info(f"        -> Error: {t['error_message']}")
+    logger.info("=" * 80 + "\n")
 
     # Final summary check
     if failed_tables:
