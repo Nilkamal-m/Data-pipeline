@@ -30,29 +30,30 @@ for path in [script_dir, os.getcwd(), "/tmp/extraPython", "/tmp"]:
     if os.path.exists(path) and path not in sys.path:
         sys.path.insert(0, path)
 
-# Auto-extract connectors.zip if present in Glue runtime directories
-for candidate in [
-    os.path.join(script_dir, "connectors.zip"),
-    "/tmp/connectors.zip",
-    "connectors.zip",
-    "/tmp/extraPython/connectors.zip"
-]:
-    if os.path.exists(candidate):
-        try:
-            import zipfile
-            target_dir = os.path.join(script_dir, "connectors")
-            os.makedirs(target_dir, exist_ok=True)
-            with zipfile.ZipFile(candidate, 'r') as zf:
-                namelist = zf.namelist()
-                has_subfolder = any(name.startswith("connectors/") for name in namelist)
-                if has_subfolder:
-                    zf.extractall(script_dir)
-                else:
-                    zf.extractall(target_dir)
-            logger.info(f"Auto-extracted zip artifact '{candidate}' successfully.")
-            break
-        except Exception as ze:
-            logger.warning(f"Could not auto-extract '{candidate}': {ze}")
+# Auto-discover and extract connectors.zip across Glue script directories (e.g. /tmp/glue-python-scripts-*)
+candidate_zips = set()
+for search_dir in [script_dir, "/tmp", "/tmp/extraPython", os.getcwd()]:
+    if os.path.exists(search_dir):
+        for root, _, files in os.walk(search_dir):
+            if "connectors.zip" in files:
+                candidate_zips.add(os.path.join(root, "connectors.zip"))
+
+for candidate in candidate_zips:
+    try:
+        import zipfile
+        target_dir = os.path.join(script_dir, "connectors")
+        os.makedirs(target_dir, exist_ok=True)
+        with zipfile.ZipFile(candidate, 'r') as zf:
+            namelist = zf.namelist()
+            has_subfolder = any(name.startswith("connectors/") for name in namelist)
+            if has_subfolder:
+                zf.extractall(script_dir)
+            else:
+                zf.extractall(target_dir)
+        logger.info(f"Auto-extracted zip artifact '{candidate}' into '{script_dir}'.")
+        break
+    except Exception as ze:
+        logger.warning(f"Could not auto-extract '{candidate}': {ze}")
 
 from config_loader import ConfigLoader
 
