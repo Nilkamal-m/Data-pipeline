@@ -51,18 +51,22 @@
     },
     "moveworks": {
       "base_url": "https://api.moveworks.ai",
+      "assistant_name": "acmecorp-conversations-rest-api",
       "api_endpoint_template": "/export/v1/records/{table_name}",
-      "query_param_template": "$filter=updated_at gt '{last_load_date}'",
-      "default_delta_filter": "updated_at gt '{last_load_date}'",
-      "default_tables": ["interactions", "users", "tickets"],
+      "default_delta_filter": "last_updated_time gt '{last_load_date}'",
+      "default_tables": ["conversations", "interactions", "users"],
       "response_records_key": "value",
+      "orderby": "last_updated_time desc",
       "table_initial_load_dates": {
+        "conversations": "2024-01-01T00:00:00Z",
         "interactions": "2024-01-01T00:00:00Z",
         "users": "2024-01-01T00:00:00Z",
         "tickets": "2024-01-01T00:00:00Z"
       },
       "table_query_overrides": {},
-      "custom_table_endpoints": {}
+      "custom_table_endpoints": {
+        "tickets": "/export/v1/records/conversations"
+      }
     },
     "postgresql": {
       "connection_type": "database",

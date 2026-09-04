@@ -133,9 +133,16 @@ class ConfigLoader:
 
         if custom_query_cli and custom_query_cli.strip():
             cli_query = custom_query_cli.strip()
-            if "sys_updated_on" not in cli_query and "updated_at" not in cli_query:
-                delta_part = f"sys_updated_on>={last_load_date}" if source_system == 'servicenow' else f"updated_at gt '{last_load_date}'"
-                final_filter = f"{cli_query}^{delta_part}" if source_system == 'servicenow' else f"{cli_query} and {delta_part}"
+            if "sys_updated_on" not in cli_query and "updated_at" not in cli_query and "last_updated_time" not in cli_query:
+                if source_system == 'servicenow':
+                    delta_part = f"sys_updated_on>={last_load_date}"
+                    final_filter = f"{cli_query}^{delta_part}"
+                elif source_system == 'moveworks':
+                    delta_part = f"last_updated_time gt '{last_load_date}'"
+                    final_filter = f"{cli_query} and {delta_part}"
+                else:
+                    delta_part = f"updated_at gt '{last_load_date}'"
+                    final_filter = f"{cli_query} and {delta_part}"
             else:
                 final_filter = cli_query.replace("{last_load_date}", last_load_date)
             logger.info(f"Using CLI Custom Query override for table '{table_clean}': {final_filter}")

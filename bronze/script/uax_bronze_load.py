@@ -100,6 +100,7 @@ def get_secret(secret_name: str) -> dict:
         "client_id": "YOUR_MOVEWORKS_CLIENT_ID_HERE",
         "client_secret": "YOUR_MOVEWORKS_CLIENT_SECRET_HERE",
         "token_url": "https://api.moveworks.ai/oauth/v1/token",
+        "assistant_name": _val('assistant_name', 'acmecorp-conversations-rest-api'),
         "scope": _val('scope', 'export:read'),
         "username": _val('username', ''),
         "password": _val('password', '')

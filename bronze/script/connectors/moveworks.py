@@ -64,6 +64,17 @@ class MoveworksConnector:
         # Mandatory 10-second delay between API calls for rate limiting
         api_delay_seconds = int(config.get('api_delay_seconds') or secret_dict.get('api_delay_seconds') or 10)
 
+        # Resolve Assistant-Name header (mandatory for Moveworks Assistant API)
+        assistant_name = (
+            secret_dict.get('assistant_name') or
+            secret_dict.get('Assistant-Name') or
+            config.get('assistant_name') or
+            'acmecorp-conversations-rest-api'
+        )
+        custom_headers = {}
+        if assistant_name:
+            custom_headers['Assistant-Name'] = str(assistant_name).strip()
+
         target_entity = table_name.strip()
         records_buffer = []
         all_records = []
@@ -73,42 +84,38 @@ class MoveworksConnector:
         page_count = 0
         has_more = True
 
-        # Resolve delta query filter (e.g., updated_at gt '...' or created_time ge '...')
+        # Resolve delta query filter (e.g., last_updated_time gt '...' or custom filter)
         query_filter = ConfigLoader.get_table_query_filter('moveworks', table_name, last_load_date, custom_query, config)
 
         logger.info(
-            f"Extracting Moveworks entity '{target_entity}' from '{base_url}' "
-            f"(Max records/call: {limit}, 10s rate-limit delay, chunk threshold: {s3_chunk_size})..."
+            f"Extracting Moveworks entity '{target_entity}' from '{base_url}' via endpoint '{endpoint}' "
+            f"(Assistant-Name: '{assistant_name}', Max records/call: {limit}, 10s delay, chunk threshold: {s3_chunk_size})..."
         )
+
+        # Base endpoint URL (e.g. https://api.moveworks.ai/export/v1/records/{table_name} or /assistant/v1/...)
+        url = f"{base_url.rstrip('/')}{endpoint}"
 
         while has_more:
             page_count += 1
 
-            # Construct query dictionary
-            querystring = {
-                "$filter": query_filter,
+            # Simplified query parameters matching Moveworks API specification
+            query_params = {
+                "$count": "true",
+                "$orderby": "last_updated_time desc",
                 "$top": str(limit),
                 "$skip": str(skip)
             }
+            if query_filter and str(query_filter).strip():
+                query_params["$filter"] = str(query_filter).strip()
 
-            if config.get('enable_count', True):
-                querystring["$count"] = "true"
-
-            if config.get('orderby'):
-                querystring["$orderby"] = config['orderby']
-
-            if config.get('select'):
-                querystring["$select"] = config['select']
-
-            # Encode query string parameters cleanly using urllib.parse.urlencode
-            encoded_query = urllib.parse.urlencode(querystring, safe='$:')
-            full_url = f"{base_url}{endpoint}?{encoded_query}"
-
-            logger.info(f"Moveworks entity '{target_entity}' [Page {page_count}, $skip={skip}]: Executing GET request...")
+            # Construct full URL with encoded parameters
+            full_url = url + "?" + urllib.parse.urlencode(query_params)
+            logger.info(f"Fetching Moveworks records [Page {page_count}, $skip={skip}] from: {full_url}")
 
             response = HTTPClient.get(
                 url=full_url,
-                secret_dict=secret_dict
+                secret_dict=secret_dict,
+                headers=custom_headers
             )
 
             # Resolve records array from response payload

@@ -7,9 +7,10 @@ import urllib.parse
 # ==============================================================================
 CLIENT_ID = "YOUR_CLIENT_ID_HERE"
 CLIENT_SECRET = "YOUR_CLIENT_SECRET_HERE"
-TOKEN_URL = "https://api.moveworks.ai/rest/v1/oauth/token"
+TOKEN_URL = "https://api.moveworks.ai/oauth/v1/token"
 BASE_URL = "https://api.moveworks.ai"
-ENTITY_NAME = "tickets"
+ENTITY_NAME = "conversations"
+ASSISTANT_NAME = "acmecorp-conversations-rest-api"
 # ==============================================================================
 
 
@@ -39,12 +40,18 @@ def get_oauth_token():
 
 def fetch_moveworks_data(access_token):
     """Step 2: Fetch Records from Moveworks API using Bearer Token"""
-    url = f"{BASE_URL.rstrip('/')}/export/v1/records/{ENTITY_NAME}?$limit=5"
-    print(f"\n2. Fetching records from: {url}")
+    query_params = {
+        "$count": "true",
+        "$orderby": "last_updated_time desc"
+    }
+    url = f"{BASE_URL.rstrip('/')}/assistant/v1/{ENTITY_NAME}"
+    full_url = url + "?" + urllib.parse.urlencode(query_params)
+    print(f"\n2. Fetching records from: {full_url}")
 
     req = urllib.request.Request(
-        url,
+        full_url,
         headers={
+            "Assistant-Name": ASSISTANT_NAME,
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json"
         },
