@@ -11,26 +11,11 @@ Payload Schema (JSON):
     "job_name": "uax-datalake-bronze-ingestion-dev",   # Optional explicit job name override
     "source_system": "servicenow",                      # Required (servicenow, moveworks, genesys)
     "table_name": "incident",                          # Optional (e.g. "incident" or "incident,sys_user")
-    
-    # Bronze specific options
-    "secret_name": "uax-datalake/servicenow-credentials-dev",
-    "bronze_bucket": "uax-datalake-dev-bucket",
-    "custom_query": "",
-    "initial_load_date": "2024-01-01T00:00:00Z",
-    "batch_size": "1000",
-    "base_url": "",
-    "output_format": "parquet",
-    
-    # Silver specific options
-    "data_lake_bucket": "uax-datalake-dev-bucket",
-    "glue_database": "uax-datalake-db-dev",
-    "silver_config_s3_path": "s3://uax-datalake-dev-bucket/silver/script/config/silver_config.json",
-    
-    # Execution & Monitoring control
-    "error_handling_mode": "CONTINUE_ON_ERROR",
-    "wait_until_completion": true,
-    "poll_interval_seconds": 10,
-    "timeout_seconds": 600
+    "secret_name": "uax-datalake/servicenow-credentials-dev", # Optional secret name override
+    "custom_query": "",                                 # Optional custom query
+    "wait_until_completion": true,                     # Optional: true (default) or false
+    "poll_interval_seconds": 10,                        # Optional polling interval in seconds
+    "timeout_seconds": 600                              # Optional maximum polling timeout
 }
 """
 
@@ -80,44 +65,19 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
     
     glue_args['--SOURCE_SYSTEM'] = str(source_system).strip().lower()
 
-    # Dynamic parameter mappings for both Bronze & Silver Glue jobs
+    # Parameter mappings matching Step Functions requirements
     param_mappings = {
-        # Table list
         'table_name': '--TABLE_NAME',
         'tables': '--TABLE_NAME',
         'TABLE_NAME': '--TABLE_NAME',
-        
-        # Bronze options
         'secret_name': '--SECRET_NAME',
         'SECRET_NAME': '--SECRET_NAME',
-        'bronze_bucket': '--BRONZE_BUCKET',
-        'BRONZE_BUCKET': '--BRONZE_BUCKET',
-        'state_bucket': '--STATE_BUCKET',
-        'STATE_BUCKET': '--STATE_BUCKET',
         'custom_query': '--CUSTOM_QUERY',
         'CUSTOM_QUERY': '--CUSTOM_QUERY',
-        'initial_load_date': '--INITIAL_LOAD_DATE',
-        'INITIAL_LOAD_DATE': '--INITIAL_LOAD_DATE',
-        'batch_size': '--BATCH_SIZE',
-        'BATCH_SIZE': '--BATCH_SIZE',
-        'base_url': '--BASE_URL',
-        'BASE_URL': '--BASE_URL',
-        'output_format': '--OUTPUT_FORMAT',
-        'OUTPUT_FORMAT': '--OUTPUT_FORMAT',
         'config_s3_path': '--CONFIG_S3_PATH',
         'CONFIG_S3_PATH': '--CONFIG_S3_PATH',
-
-        # Silver options
-        'data_lake_bucket': '--DATA_LAKE_BUCKET',
-        'DATA_LAKE_BUCKET': '--DATA_LAKE_BUCKET',
-        'glue_database': '--GLUE_DATABASE',
-        'GLUE_DATABASE': '--GLUE_DATABASE',
         'silver_config_s3_path': '--SILVER_CONFIG_S3_PATH',
-        'SILVER_CONFIG_S3_PATH': '--SILVER_CONFIG_S3_PATH',
-
-        # Common options
-        'error_handling_mode': '--ERROR_HANDLING_MODE',
-        'ERROR_HANDLING_MODE': '--ERROR_HANDLING_MODE'
+        'SILVER_CONFIG_S3_PATH': '--SILVER_CONFIG_S3_PATH'
     }
 
     for event_key, glue_arg_key in param_mappings.items():

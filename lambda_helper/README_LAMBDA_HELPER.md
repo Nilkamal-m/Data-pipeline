@@ -62,32 +62,28 @@ To re-use the existing Glue IAM Execution Role (`uax-datalake-glue-execution-rol
   "source_system": "servicenow",
   "table_name": "incident",
   "secret_name": "uax-datalake/servicenow-credentials-dev",
-  "bronze_bucket": "uax-datalake-dev-bucket",
-  "wait_until_completion": true,
-  "poll_interval_seconds": 10
-}
-```
-
-#### Payload B: ServiceNow Bronze Multi-Table (`incident,sys_user`)
-```json
-{
-  "layer": "bronze",
-  "source_system": "servicenow",
-  "table_name": "incident,sys_user",
-  "secret_name": "uax-datalake/servicenow-credentials-dev",
-  "bronze_bucket": "uax-datalake-dev-bucket",
   "wait_until_completion": true
 }
 ```
 
-#### Payload C: Moveworks Bronze Ingestion (OAuth 2.0)
+#### Payload B: Moveworks Bronze Ingestion (`interactions`)
 ```json
 {
   "layer": "bronze",
   "source_system": "moveworks",
-  "table_name": "analytics",
+  "table_name": "interactions",
   "secret_name": "uax-datalake/moveworks-credentials-dev",
-  "bronze_bucket": "uax-datalake-dev-bucket",
+  "wait_until_completion": true
+}
+```
+
+#### Payload C: Genesys Bronze Ingestion (`conversations`)
+```json
+{
+  "layer": "bronze",
+  "source_system": "genesys",
+  "table_name": "conversations",
+  "secret_name": "uax-datalake/genesys-credentials-dev",
   "wait_until_completion": true
 }
 ```
@@ -102,33 +98,26 @@ To re-use the existing Glue IAM Execution Role (`uax-datalake-glue-execution-rol
   "layer": "silver",
   "source_system": "servicenow",
   "table_name": "incident",
-  "data_lake_bucket": "uax-datalake-dev-bucket",
-  "glue_database": "uax-datalake-db-dev",
-  "wait_until_completion": true,
-  "poll_interval_seconds": 10
-}
-```
-
-#### Payload E: Moveworks Silver Iceberg ETL (`analytics`)
-```json
-{
-  "layer": "silver",
-  "source_system": "moveworks",
-  "table_name": "analytics",
-  "data_lake_bucket": "uax-datalake-dev-bucket",
-  "glue_database": "uax-datalake-db-dev",
   "wait_until_completion": true
 }
 ```
 
-#### Payload F: Genesys Silver Iceberg ETL (`users`)
+#### Payload E: Moveworks Silver Iceberg ETL (`interactions`)
+```json
+{
+  "layer": "silver",
+  "source_system": "moveworks",
+  "table_name": "interactions",
+  "wait_until_completion": true
+}
+```
+
+#### Payload F: Genesys Silver Iceberg ETL (`conversations`)
 ```json
 {
   "layer": "silver",
   "source_system": "genesys",
-  "table_name": "users",
-  "data_lake_bucket": "uax-datalake-dev-bucket",
-  "glue_database": "uax-datalake-db-dev",
+  "table_name": "conversations",
   "wait_until_completion": true
 }
 ```
