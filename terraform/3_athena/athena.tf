@@ -2,7 +2,6 @@
 # ATHENA TERRAFORM INFRASTRUCTURE (terraform/3_athena/athena.tf)
 # ==============================================================================
 # Self-contained Terraform script for Athena Query Engine Workgroup.
-# Uses Enterprise Private Registry: cps-terraform.anthem.com/DIG/*
 # Contains all variables and Athena WorkGroup.
 # Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
@@ -50,7 +49,7 @@ locals {
 # 1. Amazon Athena WorkGroup using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "athena_workgroup" {
-  source = "cps-terraform.anthem.com/DIG/athena/aws//modules/workgroup"
+  source = "athena/aws//modules/workgroup"
 
   create      = !var.use_existing_athena_workgroup
   name        = local.athena_wg_name

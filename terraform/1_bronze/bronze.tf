@@ -1,8 +1,7 @@
 # ==============================================================================
 # BRONZE LAYER TERRAFORM INFRASTRUCTURE (terraform/1_bronze/bronze.tf)
 # ==============================================================================
-# Self-contained Terraform script for Bronze Ingestion using Enterprise Registry modules.
-# Uses Enterprise Private Registry: cps-terraform.anthem.com/DIG/*
+# Self-contained Terraform script for Bronze Ingestion.
 # Contains all variables, S3 Bucket, Secrets Manager, IAM Roles, and Bronze Glue Job.
 # Includes pre-existence check logic to skip creating resources if already present.
 # ==============================================================================
@@ -66,7 +65,7 @@ locals {
 # 0. AWS KMS Customer Managed Key using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "kms_key" {
-  source = "cps-terraform.anthem.com/DIG/kms/aws"
+  source = "kms/aws"
 
   description    = "KMS Key for UAX Data Lake S3 Bucket, Secrets Manager, Glue, Athena, CloudWatch Logs, SNS, and Step Functions"
   kms_alias_name = "alias/${var.app_name}-${var.environment}-s3-key"
@@ -85,7 +84,7 @@ module "kms_key" {
 # 1. Single S3 Bucket using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "s3_bucket" {
-  source = "cps-terraform.anthem.com/DIG/s3-bucket/aws"
+  source = "s3-bucket/aws"
 
   create_bucket = !var.use_existing_s3_bucket
   bucket        = local.bucket_name
@@ -120,7 +119,7 @@ module "s3_bucket" {
 # 2. Secrets Manager Secrets using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "servicenow_secret" {
-  source = "cps-terraform.anthem.com/DIG/secrets-manager/aws"
+  source = "secrets-manager/aws"
 
   create      = !var.use_existing_secrets
   name        = "${var.app_name}/servicenow-credentials-${var.environment}"
@@ -147,7 +146,7 @@ module "servicenow_secret" {
 }
 
 module "moveworks_secret" {
-  source = "cps-terraform.anthem.com/DIG/secrets-manager/aws"
+  source = "secrets-manager/aws"
 
   create      = !var.use_existing_secrets
   name        = "${var.app_name}/moveworks-credentials-${var.environment}"
@@ -174,7 +173,7 @@ module "moveworks_secret" {
 }
 
 module "genesys_secret" {
-  source = "cps-terraform.anthem.com/DIG/secrets-manager/aws"
+  source = "secrets-manager/aws"
 
   create      = !var.use_existing_secrets
   name        = "${var.app_name}/genesys-credentials-${var.environment}"
@@ -205,7 +204,7 @@ module "genesys_secret" {
 # 3. AWS IAM Execution Role & Policies for Glue and Lambda Helper
 # ------------------------------------------------------------------------------
 module "glue_iam_policy" {
-  source = "cps-terraform.anthem.com/DIG/iam/aws//modules/iam-policy"
+  source = "iam/aws//modules/iam-policy"
 
   create_policy = !var.use_existing_iam_role
   name          = "${var.app_name}-glue-policy-${var.environment}"
@@ -303,7 +302,7 @@ module "glue_iam_policy" {
 }
 
 module "glue_iam_role" {
-  source = "cps-terraform.anthem.com/DIG/iam/aws//modules/iam-assumable-role"
+  source = "iam/aws//modules/iam-assumable-role"
 
   create_role       = !var.use_existing_iam_role
   role_name         = "${var.app_name}-glue-execution-role-${var.environment}"
@@ -356,7 +355,7 @@ resource "aws_glue_security_configuration" "glue_security_config" {
 # 4. AWS Glue Python Shell Ingestion Job using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "bronze_glue_job" {
-  source = "cps-terraform.anthem.com/DIG/glue/aws//modules/job"
+  source = "glue/aws//modules/job"
 
   name                        = "${var.app_name}-bronze-ingestion-${var.environment}"
   description                 = "AWS Glue Python Shell Job executing Bronze REST API & DB ingestion."

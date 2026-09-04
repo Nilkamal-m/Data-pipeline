@@ -39,23 +39,31 @@ s3_client = boto3.client('s3')
 def get_secret(secret_name: str) -> dict:
     """
     Fetches API credential secret payload from AWS Secrets Manager.
-    Returns empty dict if secret_name is empty or not specified.
+    Returns dictionary with optional manual hardcoded fallbacks using .get('key', 'default_val').
     """
-    if not secret_name or secret_name.strip() == "":
-        logger.info("No secret_name specified. Proceeding without Secrets Manager payload.")
-        return {}
+    sec_payload = {}
+    if secret_name and secret_name.strip():
+        logger.info(f"Fetching secret payload for '{secret_name}' from AWS Secrets Manager...")
+        secrets_client = boto3.client('secretsmanager')
+        try:
+            response = secrets_client.get_secret_value(SecretId=secret_name)
+            secret_str = response.get('SecretString')
+            if secret_str:
+                sec_payload = json.loads(secret_str)
+        except ClientError as err:
+            logger.warning(f"Could not fetch secret '{secret_name}' ({err}). Proceeding with manual fallbacks.")
 
-    logger.info(f"Fetching secret payload for '{secret_name}' from AWS Secrets Manager...")
-    secrets_client = boto3.client('secretsmanager')
-    try:
-        response = secrets_client.get_secret_value(SecretId=secret_name)
-        secret_str = response.get('SecretString')
-        if not secret_str:
-            raise ValueError(f"Secret '{secret_name}' contains no SecretString payload.")
-        return json.loads(secret_str)
-    except ClientError as err:
-        logger.warning(f"Could not fetch secret '{secret_name}' ({err}). Proceeding with empty secret dictionary.")
-        return {}
+    # Populate credentials using .get(key, default_fallback)
+    return {
+        "auth_type": sec_payload.get('auth_type') or "oauth2",
+        "grant_type": sec_payload.get('grant_type') or "client_credentials",
+        "client_id": sec_payload.get('client_id') or "YOUR_MOVEWORKS_CLIENT_ID_HERE",
+        "client_secret": sec_payload.get('client_secret') or "YOUR_MOVEWORKS_CLIENT_SECRET_HERE",
+        "token_url": sec_payload.get('token_url') or "https://api.moveworks.ai/rest/v1/oauth/token",
+        "scope": sec_payload.get('scope') or "export:read",
+        "username": sec_payload.get('username') or "",
+        "password": sec_payload.get('password') or ""
+    }
 
 
 def parse_arguments() -> dict:
