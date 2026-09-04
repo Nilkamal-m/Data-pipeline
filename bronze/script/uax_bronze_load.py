@@ -265,6 +265,13 @@ def parse_arguments() -> dict:
     # Job Name
     job_name = get_cli_arg('JOB_NAME', 'job_name', default=f"glue-incremental-load-{source_system_clean}")
 
+    # Bronze Data Prefix: CLI > Config > Code Default ('bronze/data')
+    bronze_data_prefix = (
+        get_cli_arg('BRONZE_DATA_PREFIX', 'bronze_data_prefix', 'BRONZE_PREFIX', 'bronze_prefix')
+        or pipeline_defaults.get('bronze_data_prefix')
+        or pipeline_defaults.get('bronze_prefix', 'bronze/data')
+    ).strip('/')
+
     parsed_params = {
         'JOB_NAME': job_name,
         'SOURCE_SYSTEM': source_system_clean,
@@ -273,6 +280,7 @@ def parse_arguments() -> dict:
         'SECRET_NAME': secret_name,
         'BRONZE_BUCKET': bronze_bucket,
         'STATE_BUCKET': state_bucket,
+        'BRONZE_DATA_PREFIX': bronze_data_prefix,
         'INITIAL_LOAD_DATE_CLI': initial_load_date_cli,
         'S3_CHUNK_SIZE': s3_chunk_size,
         'OUTPUT_FORMAT': output_format,
@@ -597,6 +605,7 @@ def main():
     secret_name = params['SECRET_NAME']
     bronze_bucket = params['BRONZE_BUCKET']
     state_bucket = params['STATE_BUCKET']
+    bronze_data_prefix = params.get('BRONZE_DATA_PREFIX', 'bronze/data')
     initial_load_date_cli = params['INITIAL_LOAD_DATE_CLI']
     s3_chunk_size = params['S3_CHUNK_SIZE']
     output_format = params['OUTPUT_FORMAT']
@@ -656,7 +665,7 @@ def main():
                 "records_fetched": 0,
                 "chunks_written": 0,
                 "duration_seconds": 0.0,
-                "s3_destination": f"s3://{bronze_bucket}/bronze/{source_system}/{table_name}/{partition_prefix}/",
+                "s3_destination": f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/{partition_prefix}/",
                 "error_message": str(load_date_err)
             })
             if error_handling_mode == 'HALT_ON_ERROR':
@@ -665,7 +674,7 @@ def main():
                 continue
 
         staging_prefix = f"_staging/exec_{execution_id}/{source_system}/{table_name}/"
-        final_partition_prefix = f"bronze/{source_system}/{table_name}/{partition_prefix}/"
+        final_partition_prefix = f"{bronze_data_prefix}/{source_system}/{table_name}/{partition_prefix}/"
 
         total_table_records = 0
         parts_written = 0

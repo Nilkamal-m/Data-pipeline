@@ -70,7 +70,7 @@ module "silver_iceberg_crawler" {
 
   s3_target = [
     {
-      path = "s3://${local.bucket_name}/silver/"
+      path = "s3://${local.bucket_name}/silver/data/"
     }
   ]
 

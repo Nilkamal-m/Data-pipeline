@@ -39,43 +39,89 @@ logger = logging.getLogger("DynamicSilverIcebergETL")
 def parse_spark_arguments() -> dict:
     """
     Parses CLI arguments passed by Step Functions or AWS Glue Job Run dynamically.
+    Enforces 3-tier precedence: 1. Glue CLI Argument -> 2. Config File -> 3. Code Default
     """
     arg_dict = {}
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
         if arg.startswith('--'):
-            key = arg[2:]
-            val = sys.argv[i + 1] if (i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('--')) else ''
-            arg_dict[key] = val
-            i += 2
+            arg_content = arg[2:]
+            if '=' in arg_content:
+                key, val = arg_content.split('=', 1)
+                arg_dict[key.strip()] = val.strip()
+                i += 1
+            elif i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('--'):
+                arg_dict[arg_content.strip()] = sys.argv[i + 1].strip()
+                i += 2
+            else:
+                arg_dict[arg_content.strip()] = ''
+                i += 1
         else:
             i += 1
 
-    source_system = arg_dict.get('SOURCE_SYSTEM')
+    def get_cli_arg(*names, default=None):
+        for name in names:
+            if name in arg_dict and arg_dict[name] is not None and str(arg_dict[name]).strip() != '':
+                return str(arg_dict[name]).strip()
+            for k, v in arg_dict.items():
+                if k.lower() == name.lower() and v is not None and str(v).strip() != '':
+                    return str(v).strip()
+        return default
+
+    config_s3_path = get_cli_arg('SILVER_CONFIG_S3_PATH', 'silver_config_s3_path', 'CONFIG_S3_PATH', 'config_s3_path')
+
+    # Load Silver centralized configuration file
+    s3_client = boto3.client('s3') if config_s3_path else None
+    silver_full_config = SilverConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client)
+    defaults_cfg = silver_full_config.get('silver_defaults', {})
+
+    source_system = get_cli_arg('SOURCE_SYSTEM', 'source_system')
     if not source_system:
         logger.error("Missing required parameter '--SOURCE_SYSTEM'. Example: --SOURCE_SYSTEM servicenow")
         raise ValueError("Missing required parameter '--SOURCE_SYSTEM'.")
 
     source_system_clean = source_system.strip().lower()
-    data_lake_bucket = arg_dict.get('DATA_LAKE_BUCKET', os.environ.get('DATA_LAKE_BUCKET', 'uax-data-lake-bucket'))
-    glue_database = arg_dict.get('GLUE_DATABASE', f"uax_data_lake_db_dev")
-    config_s3_path = arg_dict.get('SILVER_CONFIG_S3_PATH')
 
-    # Load Silver centralized configuration file
-    s3_client = boto3.client('s3') if config_s3_path else None
-    silver_full_config = SilverConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client)
+    # Data Lake Bucket: CLI > Config > Env > Default
+    data_lake_bucket = get_cli_arg(
+        'DATA_LAKE_BUCKET', 'data_lake_bucket',
+        'BRONZE_BUCKET', 'bronze_bucket',
+        default=defaults_cfg.get('data_lake_bucket') or os.environ.get('DATA_LAKE_BUCKET', 'uax-datalake-dev-bucket')
+    )
 
-    # Resolve dynamic table list
-    raw_tables = arg_dict.get('TABLE_NAME') or arg_dict.get('TABLES') or arg_dict.get('TABLE_NAMES')
+    # Glue Database: CLI > Config > Default
+    glue_database = get_cli_arg(
+        'GLUE_DATABASE', 'glue_database',
+        default=defaults_cfg.get('glue_database', 'uax-datalake-db-dev')
+    )
+
+    # Bronze Data Prefix: CLI > Config > Default ('bronze/data')
+    bronze_data_prefix = (
+        get_cli_arg('BRONZE_DATA_PREFIX', 'bronze_data_prefix', 'BRONZE_PREFIX', 'bronze_prefix')
+        or defaults_cfg.get('bronze_data_prefix')
+        or defaults_cfg.get('bronze_prefix', 'bronze/data')
+    ).strip('/')
+
+    # Silver Data Prefix: CLI > Config > Default ('silver/data')
+    silver_data_prefix = (
+        get_cli_arg('SILVER_DATA_PREFIX', 'silver_data_prefix', 'SILVER_PREFIX', 'silver_prefix')
+        or defaults_cfg.get('silver_data_prefix')
+        or defaults_cfg.get('silver_prefix', 'silver/data')
+    ).strip('/')
+
+    # Resolve dynamic table list: CLI overrides config default tables
+    raw_tables = get_cli_arg('TABLE_NAME', 'table_name', 'TABLES', 'tables', 'TABLE_NAMES', 'table_names')
     if raw_tables:
         table_list = [t.strip() for t in raw_tables.split(',') if t.strip()]
+        logger.info(f"Using CLI parameter table override: {table_list}")
     else:
         table_list = SilverConfigLoader.get_default_tables(source_system_clean, silver_full_config)
         if not table_list:
             table_list = ['incident']
+        logger.info(f"Using config default tables: {table_list}")
 
-    job_name = arg_dict.get('JOB_NAME', f"glue-silver-iceberg-etl-{source_system_clean}")
+    job_name = get_cli_arg('JOB_NAME', 'job_name', default=f"glue-silver-iceberg-etl-{source_system_clean}")
 
     return {
         'JOB_NAME': job_name,
@@ -83,6 +129,8 @@ def parse_spark_arguments() -> dict:
         'TABLE_LIST': table_list,
         'DATA_LAKE_BUCKET': data_lake_bucket,
         'GLUE_DATABASE': glue_database,
+        'BRONZE_DATA_PREFIX': bronze_data_prefix,
+        'SILVER_DATA_PREFIX': silver_data_prefix,
         'SILVER_FULL_CONFIG': silver_full_config,
         'ARG_DICT': arg_dict
     }
@@ -204,6 +252,8 @@ def main():
     table_list = params['TABLE_LIST']
     bucket_name = params['DATA_LAKE_BUCKET']
     glue_database = params['GLUE_DATABASE']
+    bronze_data_prefix = params.get('BRONZE_DATA_PREFIX', 'bronze/data')
+    silver_data_prefix = params.get('SILVER_DATA_PREFIX', 'silver/data')
     silver_full_config = params['SILVER_FULL_CONFIG']
 
     # Initialize Spark & Glue Contexts configured for Apache Iceberg
@@ -215,6 +265,7 @@ def main():
 
     logger.info(f"Starting Silver Apache Iceberg ETL Run for '{source_system}' tables: {table_list}")
     logger.info(f"Data Lake Bucket: 's3://{bucket_name}/', Glue Database: '{glue_database}'")
+    logger.info(f"Bronze Data Prefix: '{bronze_data_prefix}', Silver Data Prefix: '{silver_data_prefix}'")
 
     failed_tables = []
 
@@ -224,9 +275,9 @@ def main():
         logger.info(f" Silver ETL Processing Table: '{table_clean}' (Source: '{source_system}')")
         logger.info(f"========================================================")
 
-        bronze_path = f"s3://{bucket_name}/bronze/{source_system}/{table_clean}/"
+        bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{table_clean}/"
         silver_table_name = f"{glue_database}.silver_{source_system}_{table_clean}"
-        silver_location = f"s3://{bucket_name}/silver/{source_system}/{table_clean}/"
+        silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{table_clean}/"
 
         table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
         defaults_cfg = silver_full_config.get('silver_defaults', {})
@@ -243,8 +294,17 @@ def main():
             try:
                 df_bronze = spark.read.option("mergeSchema", "true").parquet(bronze_path)
             except Exception as read_err:
-                logger.warning(f"Could not read Parquet at '{bronze_path}' ({read_err}). Reading JSON format...")
-                df_bronze = spark.read.json(bronze_path)
+                logger.warning(f"Could not read Parquet at '{bronze_path}' ({read_err}). Trying JSON or legacy path...")
+                try:
+                    df_bronze = spark.read.json(bronze_path)
+                except Exception:
+                    # Fallback check for legacy bronze path without /data/
+                    legacy_bronze_path = f"s3://{bucket_name}/bronze/{source_system}/{table_clean}/"
+                    logger.info(f"Checking legacy bronze path: '{legacy_bronze_path}'")
+                    try:
+                        df_bronze = spark.read.option("mergeSchema", "true").parquet(legacy_bronze_path)
+                    except Exception:
+                        df_bronze = spark.read.json(legacy_bronze_path)
 
             # Allow CLI Arguments to dynamically override silver_config.json settings for manual testing / Step Functions
             cli_args = params.get('ARG_DICT', {})
@@ -254,8 +314,18 @@ def main():
             dedup_strategy = (cli_args.get('DEDUPLICATION_STRATEGY') or table_cfg.get('deduplication_strategy') or defaults_cfg.get('deduplication', {}).get('strategy', 'latest_by_order_column')).lower()
 
             if df_bronze.rdd.isEmpty():
-                logger.warning(f"No records found in Bronze layer at '{bronze_path}'. Skipping Silver table write.")
-                continue
+                legacy_bronze_path = f"s3://{bucket_name}/bronze/{source_system}/{table_clean}/"
+                try:
+                    df_legacy = spark.read.option("mergeSchema", "true").parquet(legacy_bronze_path)
+                    if not df_legacy.rdd.isEmpty():
+                        logger.info(f"Found records in legacy Bronze path: '{legacy_bronze_path}'")
+                        df_bronze = df_legacy
+                    else:
+                        logger.warning(f"No records found in Bronze layer at '{bronze_path}'. Skipping Silver table write.")
+                        continue
+                except Exception:
+                    logger.warning(f"No records found in Bronze layer at '{bronze_path}'. Skipping Silver table write.")
+                    continue
 
             columns = df_bronze.columns
 

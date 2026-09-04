@@ -3,6 +3,8 @@
     "target_format": "iceberg",
     "merge_strategy": "upsert",
     "scd_type": "scd1",
+    "bronze_data_prefix": "bronze/data",
+    "silver_data_prefix": "silver/data",
     "scd_type2_config": {
       "valid_from_column": "_valid_from",
       "valid_to_column": "_valid_to",

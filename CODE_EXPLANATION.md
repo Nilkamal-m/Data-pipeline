@@ -33,7 +33,7 @@ Traditional data ingestion pipelines suffer from three common issues:
 ### 💡 How Our Code Solves These Problems:
 *   **100% Config-Driven**: All endpoints, tables, formats, buckets, and watermarks are defined in `bronze_config.json`. Adding a new REST API or S3 vendor requires **zero code changes**—only a JSON block update.
 *   **Memory-Safe Chunking Callback**: Records are processed in memory chunks (e.g. 10,000 records) and immediately written to S3, releasing RAM immediately.
-*   **Atomic Staging Promotion**: Files are written to `_staging/exec_<ID>/` first. If extraction succeeds, files are atomically promoted to `bronze/`. If extraction fails, staging files are purged, keeping S3 100% clean.
+*   **Atomic Staging Promotion**: Files are written to `_staging/exec_<ID>/` first. If extraction succeeds, files are atomically promoted to `bronze/data/`. If extraction fails, staging files are purged, keeping S3 100% clean.
 *   **Strict High-Water Mark (HWM) Enforcement**: Prevents accidental ingestion of entire historical datasets by throwing an explicit error if initial load dates are missing/null.
 
 ---
@@ -67,7 +67,7 @@ The primary driver script executed by AWS Glue Python Shell.
 
 6. **`promote_staging_to_bronze(...)` & `cleanup_failed_staging(...)`**:
    *   **Why**: Guarantees ACID-like atomic execution on S3.
-   *   **How it Works**: Copies files from `_staging/` to `bronze/<source>/<table_name>/year=YYYY/month=MM/day=DD/` using `s3_client.copy_object()`, then deletes staging keys.
+   *   **How it Works**: Copies files from `_staging/` to `bronze/data/<source>/<table_name>/year=YYYY/month=MM/day=DD/` using `s3_client.copy_object()`, then deletes staging keys.
 
 ---
 

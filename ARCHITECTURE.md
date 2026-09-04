@@ -39,26 +39,26 @@ This document details the low-level technical architecture, connector design, st
                +------------------------------+------------------------------+
                                               |
                                               v
-               +-------------------------------------------------------------+
-               |             RAW BRONZE PARQUET DATA (S3)                    |
-               |      s3://uax-datalake-dev-bucket/bronze/<source>/<table/   |
-               +------------------------------+------------------------------+
-                                              |
-                                              v
-               +-------------------------------------------------------------+
-               |            SILVER ICEBERG ETL ENGINE (AWS GLUE)             |
-               |                (silver_iceberg_etl.py)                      |
-               |                                                             |
-               |   1. Deduplicates Raw Bronze Parquet Records                |
-               |   2. Applies Business Transformations                       |
-               |   3. Executes SQL MERGE INTO (UPSERT / SCD2 History)        |
-               +------------------------------+------------------------------+
-                                              |
-                                              v
-               +-------------------------------------------------------------+
-               |            SILVER APACHE ICEBERG DATA LAKE (S3)             |
-               |      s3://uax-datalake-dev-bucket/silver/<table_name>/      |
-               +------------------------------+------------------------------+
+                +-------------------------------------------------------------+
+                |             RAW BRONZE PARQUET DATA (S3)                    |
+                |   s3://uax-datalake-dev-bucket/bronze/data/<source>/<table/ |
+                +------------------------------+------------------------------+
+                                               |
+                                               v
+                +-------------------------------------------------------------+
+                |            SILVER ICEBERG ETL ENGINE (AWS GLUE)             |
+                |                (silver_iceberg_etl.py)                      |
+                |                                                             |
+                |   1. Deduplicates Raw Bronze Parquet Records                |
+                |   2. Applies Business Transformations                       |
+                |   3. Executes SQL MERGE INTO (UPSERT / SCD2 History)        |
+                +------------------------------+------------------------------+
+                                               |
+                                               v
+                +-------------------------------------------------------------+
+                |            SILVER APACHE ICEBERG DATA LAKE (S3)             |
+                |   s3://uax-datalake-dev-bucket/silver/data/<table_name>/    |
+                +------------------------------+------------------------------+
                                               |
                      +------------------------+------------------------+
                      |                                                 |
@@ -111,7 +111,7 @@ The Bronze Layer is designed around a **Factory Pattern** connecting multiple so
 
 5. **Atomic Promotion**:
    - Copies staging objects to final Bronze partition:
-     `s3://<bucket>/bronze/<source>/<table_name>/year=YYYY/month=MM/day=DD/`
+     `s3://<bucket>/bronze/data/<source>/<table_name>/year=YYYY/month=MM/day=DD/`
    - Deletes staging files.
 
 6. **State & Metrics Update**:
@@ -127,14 +127,14 @@ The Silver Layer converts Bronze raw Parquet files into ACID-compliant **Apache 
 ### Key Components:
 1. **`silver_iceberg_etl.py`**:
    - PySpark Glue 4.0 job configured with Apache Iceberg extensions (`IcebergSparkSessionExtensions`).
-   - Reads raw Bronze files from `s3://<bucket>/bronze/<source>/<table_name>/`.
+   - Reads raw Bronze files from `s3://<bucket>/bronze/data/<source>/<table_name>/`.
 2. **`transformer.py`**:
    - Deduplicates records using PySpark window functions `ROW_NUMBER() OVER (PARTITION BY primary_key ORDER BY updated_at DESC)`.
    - Applies schema casting, null replacements, and timestamp normalizations.
 3. **`silver_config.json`**:
    - Configures table-specific merge strategies (`upsert`, `insert_only`, `scd2`).
 4. **AWS Glue Iceberg Crawler**:
-   - Crawls `s3://<bucket>/silver/` to keep Glue Data Catalog schemas up-to-date.
+   - Crawls `s3://<bucket>/silver/data/` to keep Glue Data Catalog schemas up-to-date.
 
 ---
 
