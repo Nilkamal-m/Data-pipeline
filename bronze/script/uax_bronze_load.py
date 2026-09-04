@@ -21,17 +21,51 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from botocore.exceptions import ClientError
 
-# Ensure script directory is on sys.path for ConfigLoader & Connector imports
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("uax_bronze_load")
+
+# Ensure script directory and Glue extraPython paths are on sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
-for path in [script_dir, os.getcwd(), "/tmp/extraPython"]:
+for path in [script_dir, os.getcwd(), "/tmp/extraPython", "/tmp"]:
     if os.path.exists(path) and path not in sys.path:
         sys.path.insert(0, path)
 
-from config_loader import ConfigLoader
-from connectors import get_connector
+# Auto-extract connectors.zip if present in Glue runtime directories
+for candidate in [
+    os.path.join(script_dir, "connectors.zip"),
+    "/tmp/connectors.zip",
+    "connectors.zip",
+    "/tmp/extraPython/connectors.zip"
+]:
+    if os.path.exists(candidate):
+        try:
+            import zipfile
+            target_dir = os.path.join(script_dir, "connectors")
+            os.makedirs(target_dir, exist_ok=True)
+            with zipfile.ZipFile(candidate, 'r') as zf:
+                namelist = zf.namelist()
+                has_subfolder = any(name.startswith("connectors/") for name in namelist)
+                if has_subfolder:
+                    zf.extractall(script_dir)
+                else:
+                    zf.extractall(target_dir)
+            logger.info(f"Auto-extracted zip artifact '{candidate}' successfully.")
+            break
+        except Exception as ze:
+            logger.warning(f"Could not auto-extract '{candidate}': {ze}")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("uax_bronze_load")
+from config_loader import ConfigLoader
+
+try:
+    from connectors import get_connector
+except ModuleNotFoundError:
+    # Resilient fallback if connectors module files are unzipped directly at sys.path root
+    try:
+        import connectors
+        get_connector = getattr(connectors, 'get_connector')
+    except Exception as err:
+        logger.error(f"Failed to import 'connectors' package. Current sys.path: {sys.path}")
+        raise ModuleNotFoundError(f"Cannot find 'connectors' module in sys.path: {err}")
 
 s3_client = boto3.client('s3')
 
