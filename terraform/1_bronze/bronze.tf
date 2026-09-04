@@ -202,14 +202,14 @@ module "genesys_secret" {
 
 
 # ------------------------------------------------------------------------------
-# 3. AWS Glue Execution IAM Role & Policies using Enterprise Private Registry Module
+# 3. AWS IAM Execution Role & Policies for Glue and Lambda Helper
 # ------------------------------------------------------------------------------
 module "glue_iam_policy" {
   source = "cps-terraform.anthem.com/DIG/iam/aws//modules/iam-policy"
 
   create_policy = !var.use_existing_iam_role
   name          = "${var.app_name}-glue-policy-${var.environment}"
-  description   = "Execution policy for AWS Glue Data Pipeline ingestion and PySpark Iceberg ETL jobs."
+  description   = "Execution policy for AWS Glue ingestion, PySpark Iceberg ETL jobs, and Helper Lambda trigger."
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -266,7 +266,8 @@ module "glue_iam_policy" {
           "logs:PutLogEvents"
         ]
         Resource = [
-          "arn:aws:logs:${var.aws_region}:*:log-group:/aws-glue/jobs/${var.app_name}*",
+          "arn:aws:logs:${var.aws_region}:*:log-group:/aws-glue/jobs/*",
+          "arn:aws:logs:${var.aws_region}:*:log-group:/aws/lambda/${var.app_name}*",
           "arn:aws:logs:${var.aws_region}:*:log-group:${var.app_name}*"
         ]
       },
@@ -283,7 +284,11 @@ module "glue_iam_policy" {
           "glue:BatchCreatePartition",
           "glue:BatchGetPartition",
           "glue:GetPartition",
-          "glue:GetPartitions"
+          "glue:GetPartitions",
+          "glue:StartJobRun",
+          "glue:GetJobRun",
+          "glue:GetJobRuns",
+          "glue:BatchStopJobRun"
         ]
         Resource = "*"
       }
@@ -305,7 +310,8 @@ module "glue_iam_role" {
   role_requires_mfa = false
 
   trusted_role_services = [
-    "glue.amazonaws.com"
+    "glue.amazonaws.com",
+    "lambda.amazonaws.com"
   ]
 
   custom_role_policy_arns = [
