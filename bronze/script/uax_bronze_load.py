@@ -88,16 +88,21 @@ def get_secret(secret_name: str) -> dict:
         except ClientError as err:
             logger.warning(f"Could not fetch secret '{secret_name}' ({err}). Proceeding with manual fallbacks.")
 
-    # Populate credentials using .get(key, default_fallback)
+    def _val(key: str, default: str) -> str:
+        v = sec_payload.get(key)
+        if v and str(v).strip() and not str(v).startswith("CHANGE_ME") and not str(v).startswith("YOUR_"):
+            return str(v).strip()
+        return default
+
     return {
-        "auth_type": sec_payload.get('auth_type') or "oauth2",
-        "grant_type": sec_payload.get('grant_type') or "client_credentials",
-        "client_id": sec_payload.get('client_id') or "YOUR_MOVEWORKS_CLIENT_ID_HERE",
-        "client_secret": sec_payload.get('client_secret') or "YOUR_MOVEWORKS_CLIENT_SECRET_HERE",
-        "token_url": sec_payload.get('token_url') or "https://api.moveworks.ai/rest/v1/oauth/token",
-        "scope": sec_payload.get('scope') or "export:read",
-        "username": sec_payload.get('username') or "",
-        "password": sec_payload.get('password') or ""
+        "auth_type": "oauth2",
+        "grant_type": "client_credentials",
+        "client_id": "YOUR_MOVEWORKS_CLIENT_ID_HERE",
+        "client_secret": "YOUR_MOVEWORKS_CLIENT_SECRET_HERE",
+        "token_url": "https://api.moveworks.ai/oauth/v1/token",
+        "scope": _val('scope', 'export:read'),
+        "username": _val('username', ''),
+        "password": _val('password', '')
     }
 
 
