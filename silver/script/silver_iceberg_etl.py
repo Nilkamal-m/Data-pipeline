@@ -16,6 +16,7 @@ import os
 import json
 import logging
 import boto3
+from datetime import datetime, timezone
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -32,8 +33,56 @@ for path in [script_dir, os.getcwd(), "/tmp/extraPython"]:
 from silver_config_loader import SilverConfigLoader
 from transformer import SilverTransformer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ------------------------------------------------------------------------------
+# High-Performance, Non-Duplicating CloudWatch Log Configuration
+# ------------------------------------------------------------------------------
+class FlushStreamHandler(logging.StreamHandler):
+    """Guarantees immediate line flush to avoid AWS Glue / CloudWatch line interleaving."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
+class CleanLogFormatter(logging.Formatter):
+    """
+    Clean, modern log formatter optimized for AWS CloudWatch console viewing.
+    - Eliminates duplicate handlers & line collisions.
+    - Standardized timestamp [YYYY-MM-DD HH:MM:SS UTC] and 5-char aligned severity.
+    """
+    def format(self, record):
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        level = record.levelname.ljust(5)
+        msg = record.getMessage()
+
+        if "\n" in msg:
+            lines = msg.split("\n")
+            first_line = f"{ts} | {level} | {lines[0]}"
+            rest = "\n".join(lines[1:])
+            return f"{first_line}\n{rest}"
+
+        return f"{ts} | {level} | {msg}"
+
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+for h in list(root_logger.handlers):
+    root_logger.removeHandler(h)
+
+stdout_handler = FlushStreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.INFO)
+stdout_handler.setFormatter(CleanLogFormatter())
+root_logger.addHandler(stdout_handler)
+
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 logger = logging.getLogger("DynamicSilverIcebergETL")
+logger.setLevel(logging.INFO)
+logger.propagate = True
 
 
 def parse_spark_arguments() -> dict:
@@ -263,21 +312,47 @@ def main():
     job = Job(glueContext)
     job.init(job_name, params['ARG_DICT'])
 
-    logger.info(f"Starting Silver Apache Iceberg ETL Run for '{source_system}' tables: {table_list}")
-    logger.info(f"Data Lake Bucket: 's3://{bucket_name}/', Glue Database: '{glue_database}'")
-    logger.info(f"Bronze Data Prefix: '{bronze_data_prefix}', Silver Data Prefix: '{silver_data_prefix}'")
+    execution_start_utc = datetime.now(timezone.utc)
+    current_run_time = execution_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    start_banner = (
+        f"[JOB START] SILVER ICEBERG ETL | Source: {source_system.upper()} | Tables: {', '.join(table_list)}\n"
+        "+================================================================================+\n"
+        "|                 UAX DATA LAKE - SILVER ICEBERG ETL ENGINE                      |\n"
+        "+================================================================================+\n"
+        f"|  Job Name           : {job_name:<57}|\n"
+        f"|  Source System      : {source_system.upper():<57}|\n"
+        f"|  Target Tables      : {', '.join(table_list):<57}|\n"
+        f"|  Data Lake Bucket   : {f's3://{bucket_name}/':<57}|\n"
+        f"|  Glue Database      : {glue_database:<57}|\n"
+        f"|  Bronze Data Prefix : {bronze_data_prefix:<57}|\n"
+        f"|  Silver Data Prefix : {silver_data_prefix:<57}|\n"
+        f"|  Start Time (UTC)   : {current_run_time:<57}|\n"
+        "+================================================================================+"
+    )
+    logger.info(start_banner)
 
     failed_tables = []
+    table_stats = []
 
-    for table_name in table_list:
+    for table_idx, table_name in enumerate(table_list, start=1):
         table_clean = table_name.strip().lower()
-        logger.info(f"\n========================================================")
-        logger.info(f" Silver ETL Processing Table: '{table_clean}' (Source: '{source_system}')")
-        logger.info(f"========================================================")
+        table_start_time = datetime.now(timezone.utc)
 
         bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{table_clean}/"
         silver_table_name = f"{glue_database}.silver_{source_system}_{table_clean}"
         silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{table_clean}/"
+
+        table_header = (
+            f"[TABLE START] {table_clean} [{table_idx}/{len(table_list)}] | Source: {source_system} | Database: {glue_database}\n"
+            "+--------------------------------------------------------------------------------+\n"
+            f"| >>> [{table_idx}/{len(table_list)}] SILVER PROCESSING: {table_clean.upper()} (Source: {source_system})\n"
+            f"|     Target Table       : {silver_table_name}\n"
+            f"|     Silver Location    : {silver_location}\n"
+            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            "+--------------------------------------------------------------------------------+"
+        )
+        logger.info(table_header)
 
         table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
         defaults_cfg = silver_full_config.get('silver_defaults', {})
@@ -379,20 +454,111 @@ def main():
                     .option("path", silver_location) \
                     .saveAsTable(silver_table_name)
 
-            logger.info(f"Successfully populated Silver Iceberg table: '{silver_table_name}' using SCD Type '{scd_type.upper()}'")
+            table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
+            table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            table_stats.append({
+                "table_name": table_clean,
+                "status": "SUCCESS",
+                "scd_type": scd_type.upper(),
+                "merge_strategy": merge_strategy.upper(),
+                "duration_seconds": round(table_duration, 2),
+                "error_message": None
+            })
+
+            summary_card = (
+                f"[TABLE SUMMARY] {table_clean} | SUCCESS | SCD: {scd_type.upper()} | Merge: {merge_strategy.upper()} | Duration: {table_duration:.2f}s\n"
+                "+================================================================================+\n"
+                f"|  SILVER TABLE COMPLETED: {table_clean} [SUCCESS]\n"
+                "+--------------------------------------------------------------------------------+\n"
+                f"|  * Source System    : {source_system}\n"
+                f"|  * Table Name       : {table_clean}\n"
+                f"|  * Target Iceberg   : {silver_table_name}\n"
+                f"|  * SCD Type         : {scd_type.upper()}\n"
+                f"|  * Merge Strategy   : {merge_strategy.upper()}\n"
+                f"|  * Deduplication PK : {pk_keys}\n"
+                f"|  * Order By Columns : {order_cols}\n"
+                f"|  * Table Duration   : {table_duration:.2f}s\n"
+                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"|  * End Time (UTC)   : {table_end_time_str}\n"
+                f"|  * Silver Location  : {silver_location}\n"
+                "+================================================================================+"
+            )
+            logger.info(summary_card)
 
         except Exception as err:
-            logger.error(f"FAILURE during Silver Iceberg ETL for table '{table_clean}': {err}")
+            table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
+            failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            table_stats.append({
+                "table_name": table_clean,
+                "status": "FAILED",
+                "scd_type": scd_type.upper(),
+                "merge_strategy": merge_strategy.upper(),
+                "duration_seconds": round(table_duration, 2),
+                "error_message": str(err)
+            })
+            failed_card = (
+                f"[TABLE FAILED] {table_clean} | FAILED | Duration: {table_duration:.2f}s | Error: {str(err)[:60]}\n"
+                "+================================================================================+\n"
+                f"|  SILVER TABLE FAILED: {table_clean} [FAILED]\n"
+                "+--------------------------------------------------------------------------------+\n"
+                f"|  * Source System    : {source_system}\n"
+                f"|  * Table Name       : {table_clean}\n"
+                f"|  * Status           : FAILED\n"
+                f"|  * Error Details    : {err}\n"
+                f"|  * Table Duration   : {table_duration:.2f}s\n"
+                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"|  * Failed At (UTC)  : {failed_time_str}\n"
+                "+================================================================================+"
+            )
+            logger.error(failed_card)
             failed_tables.append((table_clean, str(err)))
 
     job.commit()
+
+    execution_end_utc = datetime.now(timezone.utc)
+    total_job_duration = (execution_end_utc - execution_start_utc).total_seconds()
+    overall_status = "FAILED" if failed_tables else "SUCCESS"
+
+    breakdown_lines = []
+    for t in table_stats:
+        status_tag = "[OK]  " if t['status'] == 'SUCCESS' else "[FAIL]"
+        breakdown_lines.append(
+            f"|  {status_tag} {t['table_name']:<20} | SCD: {t['scd_type']:<5} | Merge: {t['merge_strategy']:<10} | Time: {t['duration_seconds']:>6.2f}s | Status: {t['status']}"
+        )
+        if t.get('error_message'):
+            breakdown_lines.append(f"|         └── Error: {t['error_message']}")
+
+    breakdown_str = "\n".join(breakdown_lines)
+
+    overall_card = (
+        f"[JOB REPORT] SILVER ICEBERG ETL | Status: {overall_status} | Tables: {len(table_list) - len(failed_tables)}/{len(table_list)} | Duration: {total_job_duration:.2f}s\n"
+        "+================================================================================+\n"
+        "|                  SILVER ICEBERG ETL FINAL EXECUTION REPORT                     |\n"
+        "+================================================================================+\n"
+        f"|  Job Name              : {job_name}\n"
+        f"|  Source System         : {source_system.upper()}\n"
+        f"|  Overall Job Status    : {overall_status}\n"
+        f"|  Total Tables          : {len(table_list)} (Succeeded: {len(table_list) - len(failed_tables)}, Failed: {len(failed_tables)})\n"
+        f"|  Glue Database         : {glue_database}\n"
+        f"|  Start Time (UTC)      : {current_run_time}\n"
+        f"|  End Time (UTC)        : {execution_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        f"|  Total Job Duration    : {total_job_duration:.2f}s\n"
+        "+--------------------------------------------------------------------------------+\n"
+        "|  TABLE EXECUTION BREAKDOWN:\n"
+        f"{breakdown_str}\n"
+        "+--------------------------------------------------------------------------------+\n"
+        "|  S3 PERSISTENCE LOCATIONS:\n"
+        f"|  * Silver Tables Path  : s3://{bucket_name}/{silver_data_prefix}/{source_system}/\n"
+        "+================================================================================+"
+    )
+    logger.info(overall_card)
 
     if failed_tables:
         err_summary = f"Silver Iceberg ETL completed with failures in {len(failed_tables)} table(s): {[t[0] for t in failed_tables]}"
         logger.error(err_summary)
         raise RuntimeError(err_summary)
 
-    logger.info("\nAll Silver Apache Iceberg ETL transformations completed successfully.")
+    logger.info("All Silver Apache Iceberg ETL transformations completed successfully.")
 
 
 if __name__ == "__main__":

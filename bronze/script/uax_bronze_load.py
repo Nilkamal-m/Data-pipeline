@@ -21,16 +21,60 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from botocore.exceptions import ClientError
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ------------------------------------------------------------------------------
+# High-Performance, Non-Duplicating CloudWatch Log Configuration
+# ------------------------------------------------------------------------------
+class FlushStreamHandler(logging.StreamHandler):
+    """Guarantees immediate line flush to avoid AWS Glue / CloudWatch line interleaving."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
+class CleanLogFormatter(logging.Formatter):
+    """
+    Clean, modern log formatter optimized for AWS CloudWatch console viewing.
+    - Eliminates duplicate handlers & line collisions.
+    - Provides standardized timestamp [YYYY-MM-DD HH:MM:SS UTC] and 5-char aligned severity.
+    - If the message has multiple lines (e.g. ASCII cards/banners), the first line carries
+      the full summary line for CloudWatch collapsed list view, and following lines preserve
+      clean ASCII box indentation.
+    """
+    def format(self, record):
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        level = record.levelname.ljust(5)
+        msg = record.getMessage()
+
+        if "\n" in msg:
+            lines = msg.split("\n")
+            first_line = f"{ts} | {level} | {lines[0]}"
+            rest = "\n".join(lines[1:])
+            return f"{first_line}\n{rest}"
+
+        return f"{ts} | {level} | {msg}"
+
+
+# Configure single unified handler on root logger to avoid duplicate log outputs in AWS Glue
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+for h in list(root_logger.handlers):
+    root_logger.removeHandler(h)
+
+stdout_handler = FlushStreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.INFO)
+stdout_handler.setFormatter(CleanLogFormatter())
+root_logger.addHandler(stdout_handler)
+
+# Force stdout line buffering in Python environment if available
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 logger = logging.getLogger("uax_bronze_load")
 logger.setLevel(logging.INFO)
-# Ensure stdout handler exists so logs appear in AWS Glue CloudWatch logs immediately
-if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logger.addHandler(console_handler)
-logging.getLogger().setLevel(logging.INFO)
+logger.propagate = True
 
 # Ensure script directory and Glue extraPython paths are on sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -619,8 +663,23 @@ def main():
     execution_id = execution_start_utc.strftime('%Y%m%d_%H%M%S')
     partition_prefix = execution_start_utc.strftime('year=%Y/month=%m/day=%d')
 
-    logger.info(f"Starting execution run '{execution_id}' for '{source_system}' tables {table_list} at {current_run_time}")
-    logger.info(f"Output Format: '{output_format.upper()}' (Compression: '{parquet_compression}'), Error Policy: '{error_handling_mode}'")
+    start_banner = (
+        f"[JOB START] UAX BRONZE INGESTION | Source: {source_system.upper()} | Tables: {', '.join(table_list)} | Mode: {error_handling_mode}\n"
+        "+================================================================================+\n"
+        "|                  UAX DATA LAKE - BRONZE INGESTION ENGINE                       |\n"
+        "+================================================================================+\n"
+        f"|  Execution ID       : {execution_id:<57}|\n"
+        f"|  Source System      : {source_system.upper():<57}|\n"
+        f"|  Target Tables      : {', '.join(table_list):<57}|\n"
+        f"|  Output Format      : {f'{output_format.upper()} (Compression: {parquet_compression})':<57}|\n"
+        f"|  Error Handling     : {error_handling_mode:<57}|\n"
+        f"|  Bronze Bucket      : {f's3://{bronze_bucket}/':<57}|\n"
+        f"|  Bronze Data Path   : {f's3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/':<57}|\n"
+        f"|  State S3 Bucket    : {f's3://{state_bucket}/':<57}|\n"
+        f"|  Start Time (UTC)   : {current_run_time:<57}|\n"
+        "+================================================================================+"
+    )
+    logger.info(start_banner)
 
     # Fetch API secret credentials from Secrets Manager
     secret_dict = get_secret(secret_name)
@@ -633,12 +692,17 @@ def main():
     table_stats = []
 
     # Loop through each requested table dynamically
-    for table_name in table_list:
+    for table_idx, table_name in enumerate(table_list, start=1):
         table_start_time = datetime.now(timezone.utc)
-        logger.info(f"\n========================================================")
-        logger.info(f" Processing Table: '{table_name}' (Source: '{source_system}')")
-        logger.info(f" Execution ID: '{execution_id}'")
-        logger.info(f"========================================================")
+        table_header = (
+            f"[TABLE START] {table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {current_run_time}\n"
+            "+--------------------------------------------------------------------------------+\n"
+            f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {table_name.upper()} (Source: {source_system})\n"
+            f"|     Execution ID       : {execution_id}\n"
+            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            "+--------------------------------------------------------------------------------+"
+        )
+        logger.info(table_header)
 
         state_key = get_table_state_key(source_system, table_name)
         
@@ -765,18 +829,26 @@ def main():
             })
 
             # High-visibility table extraction summary block in CloudWatch logs
-            logger.info("\n" + "=" * 80)
-            logger.info(f" TABLE EXTRACTION SUMMARY: {table_name}")
-            logger.info("-" * 80)
-            logger.info(f" Source System    : {source_system}")
-            logger.info(f" Table Name       : {table_name}")
-            logger.info(f" Status           : SUCCESS")
-            logger.info(f" Date Range       : {last_load_date}  -->  {current_run_time}")
-            logger.info(f" Records Fetched  : {total_table_records:,}")
-            logger.info(f" Chunks Written   : {parts_written}")
-            logger.info(f" Duration         : {duration_sec:.2f}s")
-            logger.info(f" S3 Destination   : s3://{bronze_bucket}/{final_partition_prefix}")
-            logger.info("=" * 80 + "\n")
+            table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            summary_card = (
+                f"[TABLE SUMMARY] {table_name} | SUCCESS | Records: {total_table_records:,} | Chunks: {parts_written} | Duration: {duration_sec:.2f}s | Range: {last_load_date} -> {current_run_time}\n"
+                "+================================================================================+\n"
+                f"|  TABLE EXTRACTION COMPLETED: {table_name} [SUCCESS]\n"
+                "+--------------------------------------------------------------------------------+\n"
+                f"|  * Source System    : {source_system}\n"
+                f"|  * Table Name       : {table_name}\n"
+                f"|  * Status           : SUCCESS\n"
+                f"|  * Extraction Range : {last_load_date}  -->  {current_run_time}\n"
+                f"|  * Records Ingested : {total_table_records:,}\n"
+                f"|  * Chunks Written   : {parts_written}\n"
+                f"|  * Table Duration   : {duration_sec:.2f}s\n"
+                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"|  * End Time (UTC)   : {table_end_time_str}\n"
+                f"|  * Watermark S3 Key : {state_key}\n"
+                f"|  * S3 Destination   : s3://{bronze_bucket}/{final_partition_prefix}\n"
+                "+================================================================================+"
+            )
+            logger.info(summary_card)
 
             # Report custom CloudWatch metrics
             emit_cloudwatch_metrics(
@@ -809,15 +881,23 @@ def main():
                 "error_message": str(table_err)
             })
 
-            logger.error("\n" + "=" * 80)
-            logger.error(f" TABLE EXTRACTION FAILED: {table_name}")
-            logger.error("-" * 80)
-            logger.error(f" Source System    : {source_system}")
-            logger.error(f" Table Name       : {table_name}")
-            logger.error(f" Status           : FAILED")
-            logger.error(f" Date Range       : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {current_run_time}")
-            logger.error(f" Error Details    : {table_err}")
-            logger.error("=" * 80 + "\n")
+            failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            failed_card = (
+                f"[TABLE FAILED] {table_name} | FAILED | Duration: {duration_sec:.2f}s | Error: {str(table_err)[:60]}\n"
+                "+================================================================================+\n"
+                f"|  TABLE EXTRACTION FAILED: {table_name} [FAILED]\n"
+                "+--------------------------------------------------------------------------------+\n"
+                f"|  * Source System    : {source_system}\n"
+                f"|  * Table Name       : {table_name}\n"
+                f"|  * Status           : FAILED\n"
+                f"|  * Extraction Range : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {current_run_time}\n"
+                f"|  * Error Details    : {table_err}\n"
+                f"|  * Table Duration   : {duration_sec:.2f}s\n"
+                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"|  * Failed At (UTC)  : {failed_time_str}\n"
+                "+================================================================================+"
+            )
+            logger.error(failed_card)
             
             # Report failure metric to CloudWatch
             emit_cloudwatch_metrics(
@@ -894,31 +974,43 @@ def main():
     )
 
     # Print high-visibility overall summary to CloudWatch
-    logger.info("\n" + "=" * 80)
-    logger.info("              AWS GLUE BRONZE INGESTION EXECUTION SUMMARY")
-    logger.info("=" * 80)
-    logger.info(f" Execution ID       : {execution_id}")
-    logger.info(f" Source System      : {source_system}")
-    logger.info(f" Overall Status     : {overall_status}")
-    logger.info(f" Total Records      : {total_records_all:,}")
-    logger.info(f" Tables Processed   : {len(table_list)} (Succeeded: {len(table_list) - len(failed_tables)}, Failed: {len(failed_tables)})")
-    logger.info(f" Start Time (UTC)   : {current_run_time}")
-    logger.info(f" End Time (UTC)     : {execution_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}")
-    logger.info(f" Total Duration     : {total_job_duration:.2f}s")
-    logger.info(f" S3 Execution Log   : s3://{state_bucket}/metadata/logs/bronze/{source_system}/execution_{execution_id}.json")
-    logger.info("-" * 80)
-    logger.info(" TABLE-BY-TABLE BREAKDOWN:")
+    breakdown_lines = []
     for t in table_stats:
-        status_icon = "[OK]" if t['status'] == 'SUCCESS' else "[FAIL]"
-        date_info = f"{t['date_range']['start_date']} to {t['date_range']['end_date']}" if t['date_range']['start_date'] else "N/A"
-        logger.info(
-            f"   {status_icon} {t['table_name']:<20} | Status: {t['status']:<7} | "
-            f"Records: {t['records_fetched']:>7,} | Date: {date_info} | "
-            f"Time: {t['duration_seconds']:>5.2f}s"
+        status_tag = "[OK]  " if t['status'] == 'SUCCESS' else "[FAIL]"
+        breakdown_lines.append(
+            f"|  {status_tag} {t['table_name']:<20} | Records: {t['records_fetched']:>8,} | "
+            f"Chunks: {t['chunks_written']:>2} | Time: {t['duration_seconds']:>6.2f}s | Status: {t['status']}"
         )
         if t.get('error_message'):
-            logger.info(f"        -> Error: {t['error_message']}")
-    logger.info("=" * 80 + "\n")
+            breakdown_lines.append(f"|         └── Error: {t['error_message']}")
+
+    breakdown_str = "\n".join(breakdown_lines)
+
+    overall_card = (
+        f"[JOB REPORT] UAX BRONZE INGESTION | Status: {overall_status} | Records: {total_records_all:,} | Tables: {len(table_list) - len(failed_tables)}/{len(table_list)} | Duration: {total_job_duration:.2f}s\n"
+        "+================================================================================+\n"
+        "|                  BRONZE INGESTION FINAL EXECUTION REPORT                       |\n"
+        "+================================================================================+\n"
+        f"|  Execution ID          : {execution_id}\n"
+        f"|  Source System         : {source_system.upper()}\n"
+        f"|  Overall Job Status    : {overall_status}\n"
+        f"|  Total Tables          : {len(table_list)} (Succeeded: {len(table_list) - len(failed_tables)}, Failed: {len(failed_tables)})\n"
+        f"|  Total Records Ingested: {total_records_all:,}\n"
+        f"|  Start Time (UTC)      : {current_run_time}\n"
+        f"|  End Time (UTC)        : {execution_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        f"|  Total Job Duration    : {total_job_duration:.2f}s\n"
+        "+--------------------------------------------------------------------------------+\n"
+        "|  TABLE EXECUTION BREAKDOWN:\n"
+        f"{breakdown_str}\n"
+        "+--------------------------------------------------------------------------------+\n"
+        "|  S3 PERSISTENCE LOCATIONS:\n"
+        f"|  * Raw Data Path       : s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/\n"
+        f"|  * Watermark State     : s3://{state_bucket}/metadata/bronze/{source_system}/\n"
+        f"|  * S3 Execution Log    : s3://{state_bucket}/metadata/logs/bronze/{source_system}/execution_{execution_id}.json\n"
+        f"|  * Latest Log Pointer  : s3://{state_bucket}/metadata/logs/bronze/{source_system}/latest_execution.json\n"
+        "+================================================================================+"
+    )
+    logger.info(overall_card)
 
     # Final summary check
     if failed_tables:
@@ -926,7 +1018,7 @@ def main():
         logger.error(summary_msg)
         raise RuntimeError(summary_msg)
 
-    logger.info("\nAll requested table extractions completed successfully.")
+    logger.info("All requested table extractions completed successfully.")
 
 
 if __name__ == "__main__":
