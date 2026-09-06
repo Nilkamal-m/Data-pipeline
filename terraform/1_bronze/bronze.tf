@@ -406,7 +406,7 @@ module "bronze_crawler" {
   name          = local.bronze_crawler_name
   database_name = local.glue_db_name
   role          = local.glue_role_arn
-  table_prefix  = "bronze_"
+  table_prefix  = "raw_tbl_"
   description   = "Crawls Bronze raw data partitions (s3://${local.bucket_name}/bronze/data/) into AWS Glue Data Catalog."
 
   s3_target = [

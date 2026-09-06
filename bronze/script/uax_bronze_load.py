@@ -331,7 +331,7 @@ def parse_arguments() -> dict:
 
     glue_table_prefix = (
         get_cli_arg('GLUE_TABLE_PREFIX', 'glue_table_prefix', 'TABLE_PREFIX', 'table_prefix')
-        or catalog_config.get('table_prefix', 'bronze_')
+        or catalog_config.get('table_prefix', 'raw_tbl_')
     )
 
     bronze_crawler_name = (
@@ -351,7 +351,7 @@ def parse_arguments() -> dict:
 
     watermark_table_name = (
         get_cli_arg('WATERMARK_TABLE_NAME', 'watermark_table_name')
-        or catalog_config.get('watermark_table_name', 'bronze_watermarks')
+        or catalog_config.get('watermark_table_name', 'raw_tbl_watermarks')
     )
 
     parsed_params = {
@@ -734,7 +734,7 @@ def sync_bronze_catalog_table(
 ) -> str:
     """
     Creates/updates AWS Glue Data Catalog table for Bronze raw data and registers the execution partition.
-    Naming format: <database_name>.<table_prefix><table_name> (e.g. uax_datalake_db_dev.bronze_interactions).
+    Naming format: <database_name>.<table_prefix><table_name> (e.g. uax-datalake-db-dev.raw_tbl_incident).
     Location: s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/
     Partition: year=YYYY/month=MM/day=DD
     """
@@ -982,14 +982,14 @@ def main():
     execution_id = execution_start_utc.strftime('%Y%m%d_%H%M%S')
     partition_prefix = execution_start_utc.strftime('year=%Y/month=%m/day=%d')
 
-    # Glue Catalog & Crawler Configuration (Option B: Unified Lake Database with bronze_ Table Prefix)
+    # Glue Catalog & Crawler Configuration (Option B: Unified Lake Database with raw_tbl_ Table Prefix)
     glue_catalog_enabled = params.get('GLUE_CATALOG_ENABLED', True)
     glue_database_name = params.get('GLUE_DATABASE_NAME', 'uax-datalake-db-dev')
-    glue_table_prefix = params.get('GLUE_TABLE_PREFIX', 'bronze_')
+    glue_table_prefix = params.get('GLUE_TABLE_PREFIX', 'raw_tbl_')
     bronze_crawler_name = params.get('BRONZE_CRAWLER_NAME', 'uax-datalake-bronze-crawler-dev')
     trigger_crawler = params.get('TRIGGER_CRAWLER', True)
     sync_watermark_table = params.get('SYNC_WATERMARK_TABLE', True)
-    watermark_table_name = params.get('WATERMARK_TABLE_NAME', 'bronze_watermarks')
+    watermark_table_name = params.get('WATERMARK_TABLE_NAME', 'raw_tbl_watermarks')
 
     start_banner = (
         f"[JOB START] UAX BRONZE INGESTION | Source: {source_system.upper()} | Tables: {', '.join(table_list)} | Mode: {error_handling_mode}\n"

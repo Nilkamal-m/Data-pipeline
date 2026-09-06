@@ -14,11 +14,11 @@
     "glue_catalog": {
       "enabled": true,
       "database_name": "uax-datalake-db-dev",
-      "table_prefix": "bronze_",
+      "table_prefix": "raw_tbl_",
       "crawler_name": "uax-datalake-bronze-crawler-dev",
       "trigger_crawler": true,
       "sync_watermark_table": true,
-      "watermark_table_name": "bronze_watermarks"
+      "watermark_table_name": "raw_tbl_watermarks"
     }
   },
   "source_systems": {
