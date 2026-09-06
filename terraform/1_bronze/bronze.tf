@@ -458,8 +458,6 @@ module "bronze_glue_job" {
     "--OUTPUT_FORMAT"          = var.output_format
     "--CLOUDWATCH_NAMESPACE"   = "UAX/DataPipeline/Ingestion"
     "--ERROR_HANDLING_MODE"    = "CONTINUE_ON_ERROR"
-    "--GLUE_DATABASE"          = local.glue_db_name
-    "--BRONZE_CRAWLER_NAME"    = local.bronze_crawler_name
     "--job-language"           = "python"
   }
 
