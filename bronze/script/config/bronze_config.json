@@ -10,7 +10,16 @@
     "flatten_nested_json": true,
     "flatten_separator": "_",
     "error_handling_mode": "CONTINUE_ON_ERROR",
-    "cloudwatch_namespace": "UAX/DataPipeline/Ingestion"
+    "cloudwatch_namespace": "UAX/DataPipeline/Ingestion",
+    "glue_catalog": {
+      "enabled": true,
+      "database_name": "uax-datalake-db-dev",
+      "table_prefix": "bronze_",
+      "crawler_name": "uax-datalake-bronze-crawler-dev",
+      "trigger_crawler": true,
+      "sync_watermark_table": true,
+      "watermark_table_name": "bronze_watermarks"
+    }
   },
   "source_systems": {
     "servicenow": {

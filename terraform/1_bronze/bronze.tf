@@ -54,10 +54,24 @@ variable "use_existing_iam_role" {
   description = "If true, skips creating Glue IAM role and reuses existing role."
 }
 
+variable "use_existing_secrets" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating Secrets Manager secrets and reuses existing secrets."
+}
+
+variable "use_existing_glue_database" {
+  type        = bool
+  default     = false
+  description = "If true, skips creating Glue database and reuses existing database."
+}
+
 locals {
-  bucket_name   = "${var.app_name}-${var.environment}-bucket"
-  bucket_arn    = "arn:aws:s3:::${local.bucket_name}"
-  glue_role_arn = module.glue_iam_role.iam_role_arn
+  bucket_name         = "${var.app_name}-${var.environment}-bucket"
+  bucket_arn          = "arn:aws:s3:::${local.bucket_name}"
+  glue_role_arn       = module.glue_iam_role.iam_role_arn
+  glue_db_name        = "${var.app_name}-db-${var.environment}"
+  bronze_crawler_name = "${var.app_name}-bronze-crawler-${var.environment}"
 }
 
 
@@ -273,17 +287,37 @@ module "glue_iam_policy" {
       {
         Effect = "Allow"
         Action = [
+          "states:StartExecution",
+          "states:StopExecution",
+          "states:DescribeExecution",
+          "states:GetExecutionHistory",
+          "states:ListExecutions"
+        ]
+        Resource = [
+          "arn:aws:states:${var.aws_region}:*:stateMachine:${var.app_name}-*",
+          "arn:aws:states:${var.aws_region}:*:execution:${var.app_name}-*:*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "glue:GetDatabase",
           "glue:GetDatabases",
+          "glue:CreateDatabase",
           "glue:CreateTable",
           "glue:GetTable",
           "glue:GetTables",
           "glue:UpdateTable",
           "glue:DeleteTable",
           "glue:BatchCreatePartition",
+          "glue:CreatePartition",
           "glue:BatchGetPartition",
           "glue:GetPartition",
           "glue:GetPartitions",
+          "glue:UpdatePartition",
+          "glue:StartCrawler",
+          "glue:GetCrawler",
+          "glue:GetCrawlerMetrics",
           "glue:StartJobRun",
           "glue:GetJobRun",
           "glue:GetJobRuns",
@@ -352,6 +386,50 @@ resource "aws_glue_security_configuration" "glue_security_config" {
 
 
 # ------------------------------------------------------------------------------
+# 3.2 AWS Glue Data Catalog Database using Enterprise Private Registry Module
+# ------------------------------------------------------------------------------
+module "bronze_glue_catalog_database" {
+  source = "glue/aws//modules/catalog-database"
+
+  create      = !var.use_existing_glue_database
+  name        = local.glue_db_name
+  description = "AWS Glue Data Catalog Database for Bronze raw and Silver Iceberg Tables."
+}
+
+
+# ------------------------------------------------------------------------------
+# 3.3 AWS Glue Bronze Crawler using Enterprise Private Registry Module
+# ------------------------------------------------------------------------------
+module "bronze_crawler" {
+  source = "glue/aws//modules/crawler"
+
+  name          = local.bronze_crawler_name
+  database_name = local.glue_db_name
+  role          = local.glue_role_arn
+  table_prefix  = "bronze_"
+  description   = "Crawls Bronze raw data partitions (s3://${local.bucket_name}/bronze/data/) into AWS Glue Data Catalog."
+
+  s3_target = [
+    {
+      path = "s3://${local.bucket_name}/bronze/data/"
+    }
+  ]
+
+  schema_change_policy = {
+    delete_behavior = "LOG"
+    update_behavior = "UPDATE_IN_DATABASE"
+  }
+
+  tags = {
+    Environment = var.environment
+    Application = var.app_name
+    Layer       = "Bronze"
+    ManagedBy   = "Terraform"
+  }
+}
+
+
+# ------------------------------------------------------------------------------
 # 4. AWS Glue Python Shell Ingestion Job using Enterprise Private Registry Module
 # ------------------------------------------------------------------------------
 module "bronze_glue_job" {
@@ -380,6 +458,8 @@ module "bronze_glue_job" {
     "--OUTPUT_FORMAT"          = var.output_format
     "--CLOUDWATCH_NAMESPACE"   = "UAX/DataPipeline/Ingestion"
     "--ERROR_HANDLING_MODE"    = "CONTINUE_ON_ERROR"
+    "--GLUE_DATABASE"          = local.glue_db_name
+    "--BRONZE_CRAWLER_NAME"    = local.bronze_crawler_name
     "--job-language"           = "python"
   }
 
@@ -432,4 +512,14 @@ output "glue_bronze_ingestion_job_name" {
 output "kms_key_arn" {
   value       = module.kms_key.key_arn
   description = "AWS KMS Customer Managed Key ARN for Data Lake PII Protection."
+}
+
+output "glue_database_name" {
+  value       = local.glue_db_name
+  description = "AWS Glue Data Catalog Database Name."
+}
+
+output "bronze_crawler_name" {
+  value       = local.bronze_crawler_name
+  description = "AWS Glue Bronze Crawler Name."
 }

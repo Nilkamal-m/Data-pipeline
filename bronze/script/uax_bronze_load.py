@@ -121,6 +121,7 @@ except ModuleNotFoundError:
         raise ModuleNotFoundError(f"Cannot find 'connectors' module in sys.path: {err}")
 
 s3_client = boto3.client('s3')
+glue_client = boto3.client('glue')
 
 
 def get_secret(secret_name: str) -> dict:
@@ -316,6 +317,43 @@ def parse_arguments() -> dict:
         or pipeline_defaults.get('bronze_prefix', 'bronze/data')
     ).strip('/')
 
+    # Glue Catalog & Crawler Configuration (Option B: Unified Lake Database with bronze_ Table Prefix)
+    catalog_config = pipeline_defaults.get('glue_catalog', {})
+    glue_catalog_enabled = (
+        get_cli_arg('SYNC_GLUE_CATALOG', 'sync_glue_catalog', 'GLUE_CATALOG_ENABLED', 'glue_catalog_enabled')
+        or str(catalog_config.get('enabled', True))
+    ).lower() == 'true'
+
+    glue_database_name = (
+        get_cli_arg('GLUE_DATABASE', 'glue_database', 'GLUE_DB_NAME', 'glue_db_name')
+        or catalog_config.get('database_name', 'uax-datalake-db-dev')
+    )
+
+    glue_table_prefix = (
+        get_cli_arg('GLUE_TABLE_PREFIX', 'glue_table_prefix', 'TABLE_PREFIX', 'table_prefix')
+        or catalog_config.get('table_prefix', 'bronze_')
+    )
+
+    bronze_crawler_name = (
+        get_cli_arg('BRONZE_CRAWLER_NAME', 'bronze_crawler_name', 'CRAWLER_NAME', 'crawler_name')
+        or catalog_config.get('crawler_name', 'uax-datalake-bronze-crawler-dev')
+    )
+
+    trigger_crawler = (
+        get_cli_arg('TRIGGER_CRAWLER', 'trigger_crawler')
+        or str(catalog_config.get('trigger_crawler', True))
+    ).lower() == 'true'
+
+    sync_watermark_table = (
+        get_cli_arg('SYNC_WATERMARK_TABLE', 'sync_watermark_table')
+        or str(catalog_config.get('sync_watermark_table', True))
+    ).lower() == 'true'
+
+    watermark_table_name = (
+        get_cli_arg('WATERMARK_TABLE_NAME', 'watermark_table_name')
+        or catalog_config.get('watermark_table_name', 'bronze_watermarks')
+    )
+
     parsed_params = {
         'JOB_NAME': job_name,
         'SOURCE_SYSTEM': source_system_clean,
@@ -331,7 +369,15 @@ def parse_arguments() -> dict:
         'PARQUET_COMPRESSION': parquet_compression,
         'ERROR_HANDLING_MODE': error_handling_mode,
         'CLOUDWATCH_NAMESPACE': cloudwatch_namespace,
-        'SOURCE_CONFIG': source_config
+        'GLUE_CATALOG_ENABLED': glue_catalog_enabled,
+        'GLUE_DATABASE_NAME': glue_database_name,
+        'GLUE_TABLE_PREFIX': glue_table_prefix,
+        'BRONZE_CRAWLER_NAME': bronze_crawler_name,
+        'TRIGGER_CRAWLER': trigger_crawler,
+        'SYNC_WATERMARK_TABLE': sync_watermark_table,
+        'WATERMARK_TABLE_NAME': watermark_table_name,
+        'SOURCE_CONFIG': source_config,
+        'PIPELINE_DEFAULTS': pipeline_defaults
     }
 
     logger.info(f"Resolved Parameters: {json.dumps({k: v for k, v in parsed_params.items() if k != 'SOURCE_CONFIG'})}")
@@ -637,6 +683,278 @@ def save_execution_log(
         logger.warning(f"Could not update 'latest_execution.json': {err}")
 
 
+# ------------------------------------------------------------------------------
+# AWS Glue Data Catalog & Crawler Management
+# ------------------------------------------------------------------------------
+def infer_glue_column_type(val: Any) -> str:
+    """Infers AWS Glue Data Catalog column type from a sample Python data value."""
+    if isinstance(val, bool):
+        return 'boolean'
+    elif isinstance(val, int):
+        return 'bigint'
+    elif isinstance(val, float):
+        return 'double'
+    elif isinstance(val, (dict, list)):
+        return 'string'
+    return 'string'
+
+
+def ensure_glue_database(database_name: str) -> None:
+    """Ensures the target database exists in AWS Glue Data Catalog."""
+    try:
+        glue_client.get_database(Name=database_name)
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code')
+        if code in ('EntityNotFoundException', 'NoSuchEntityException'):
+            try:
+                glue_client.create_database(
+                    DatabaseInput={
+                        'Name': database_name,
+                        'Description': 'AWS Glue Data Catalog Database for UAX Data Lake Bronze & Silver Layers'
+                    }
+                )
+                logger.info(f"Created AWS Glue Catalog Database: '{database_name}'")
+            except ClientError as ce:
+                if ce.response.get('Error', {}).get('Code') != 'AlreadyExistsException':
+                    logger.warning(f"Could not create Glue database '{database_name}': {ce}")
+        else:
+            logger.warning(f"Could not check Glue database '{database_name}': {e}")
+
+
+def sync_bronze_catalog_table(
+    database_name: str,
+    table_prefix: str,
+    source_system: str,
+    table_name: str,
+    bronze_bucket: str,
+    bronze_data_prefix: str,
+    partition_date: datetime,
+    sample_record: Optional[dict] = None,
+    output_format: str = "parquet"
+) -> str:
+    """
+    Creates/updates AWS Glue Data Catalog table for Bronze raw data and registers the execution partition.
+    Naming format: <database_name>.<table_prefix><table_name> (e.g. uax_datalake_db_dev.bronze_interactions).
+    Location: s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/
+    Partition: year=YYYY/month=MM/day=DD
+    """
+    catalog_table_name = f"{table_prefix}{table_name}"
+    table_location = f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/"
+    
+    year_str = partition_date.strftime('%Y')
+    month_str = partition_date.strftime('%m')
+    day_str = partition_date.strftime('%d')
+    partition_location = f"{table_location}year={year_str}/month={month_str}/day={day_str}/"
+
+    is_parquet = (output_format.lower() == 'parquet')
+    input_fmt = 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat' if is_parquet else 'org.apache.hadoop.mapred.TextInputFormat'
+    output_fmt = 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat' if is_parquet else 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+    serde_lib = 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe' if is_parquet else 'org.openx.data.jsonserde.JsonSerDe'
+
+    # Build schema columns from sample record if available
+    columns = []
+    if sample_record and isinstance(sample_record, dict):
+        for k, v in sample_record.items():
+            clean_k = str(k).strip().lower().replace(" ", "_").replace("-", "_")
+            if clean_k not in ('year', 'month', 'day'):
+                columns.append({'Name': clean_k, 'Type': infer_glue_column_type(v)})
+
+    if not columns:
+        columns = [
+            {'Name': 'payload', 'Type': 'string'},
+            {'Name': '_ingested_at', 'Type': 'string'},
+            {'Name': '_source_system', 'Type': 'string'},
+            {'Name': '_table_name', 'Type': 'string'},
+            {'Name': '_execution_id', 'Type': 'string'}
+        ]
+
+    partition_keys = [
+        {'Name': 'year', 'Type': 'string'},
+        {'Name': 'month', 'Type': 'string'},
+        {'Name': 'day', 'Type': 'string'}
+    ]
+
+    storage_desc = {
+        'Columns': columns,
+        'Location': table_location,
+        'InputFormat': input_fmt,
+        'OutputFormat': output_fmt,
+        'Compressed': is_parquet,
+        'NumberOfBuckets': -1,
+        'SerdeInfo': {
+            'SerializationLibrary': serde_lib,
+            'Parameters': {'serialization.format': '1'}
+        }
+    }
+
+    ensure_glue_database(database_name)
+
+    # 1. Ensure Table exists in Glue Catalog
+    try:
+        glue_client.get_table(DatabaseName=database_name, Name=catalog_table_name)
+        logger.info(f"Glue Catalog Table verified: {database_name}.{catalog_table_name}")
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code')
+        if code in ('EntityNotFoundException', 'NoSuchEntityException'):
+            try:
+                glue_client.create_table(
+                    DatabaseName=database_name,
+                    TableInput={
+                        'Name': catalog_table_name,
+                        'Description': f"Bronze raw data table for {source_system}/{table_name}",
+                        'PartitionKeys': partition_keys,
+                        'TableType': 'EXTERNAL_TABLE',
+                        'Parameters': {
+                            'EXTERNAL': 'TRUE',
+                            'has_encrypted_data': 'true',
+                            'classification': output_format.lower()
+                        },
+                        'StorageDescriptor': storage_desc
+                    }
+                )
+                logger.info(f"Created AWS Glue Catalog Table: {database_name}.{catalog_table_name} at '{table_location}'")
+            except ClientError as ce:
+                if ce.response.get('Error', {}).get('Code') != 'AlreadyExistsException':
+                    logger.warning(f"Failed to create Glue Catalog table '{catalog_table_name}': {ce}")
+        else:
+            logger.warning(f"Error checking table '{catalog_table_name}': {e}")
+
+    # 2. Register/Update the Partition for this execution run
+    partition_storage = dict(storage_desc)
+    partition_storage['Location'] = partition_location
+    try:
+        glue_client.create_partition(
+            DatabaseName=database_name,
+            TableName=catalog_table_name,
+            PartitionInput={
+                'Values': [year_str, month_str, day_str],
+                'StorageDescriptor': partition_storage,
+                'Parameters': {}
+            }
+        )
+        logger.info(f"Registered Glue Catalog Partition: {database_name}.{catalog_table_name} [year={year_str}, month={month_str}, day={day_str}] -> '{partition_location}'")
+    except ClientError as pe:
+        code = pe.response.get('Error', {}).get('Code')
+        if code == 'AlreadyExistsException':
+            try:
+                glue_client.update_partition(
+                    DatabaseName=database_name,
+                    TableName=catalog_table_name,
+                    PartitionValueList=[year_str, month_str, day_str],
+                    PartitionInput={
+                        'Values': [year_str, month_str, day_str],
+                        'StorageDescriptor': partition_storage,
+                        'Parameters': {}
+                    }
+                )
+                logger.info(f"Updated existing Glue Catalog Partition: {database_name}.{catalog_table_name} [year={year_str}, month={month_str}, day={day_str}]")
+            except Exception as ue:
+                logger.warning(f"Could not update partition: {ue}")
+        else:
+            logger.warning(f"Could not register partition in Glue Catalog: {pe}")
+
+    return f"{database_name}.{catalog_table_name}"
+
+
+def sync_watermark_catalog_table(
+    database_name: str,
+    watermark_table_name: str,
+    state_bucket: str,
+    state_prefix: str = "metadata/bronze"
+) -> str:
+    """
+    Creates/Ensures an Athena-queryable AWS Glue Catalog table for all Bronze High-Water Mark state files.
+    Location: s3://{state_bucket}/{state_prefix}/
+    Using recursive directory scanning so all watermark.json files across sources and tables are queried.
+    Query in Athena: SELECT * FROM <database_name>.<watermark_table_name>;
+    """
+    clean_prefix = state_prefix.strip('/')
+    watermark_location = f"s3://{state_bucket}/{clean_prefix}/"
+
+    columns = [
+        {'Name': 'source_system', 'Type': 'string'},
+        {'Name': 'table_name', 'Type': 'string'},
+        {'Name': 'last_load_date', 'Type': 'string'},
+        {'Name': 'last_status', 'Type': 'string'},
+        {'Name': 'records_ingested', 'Type': 'bigint'},
+        {'Name': 'updated_at', 'Type': 'string'}
+    ]
+
+    storage_desc = {
+        'Columns': columns,
+        'Location': watermark_location,
+        'InputFormat': 'org.apache.hadoop.mapred.TextInputFormat',
+        'OutputFormat': 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+        'Compressed': False,
+        'NumberOfBuckets': -1,
+        'SerdeInfo': {
+            'SerializationLibrary': 'org.openx.data.jsonserde.JsonSerDe',
+            'Parameters': {
+                'ignore.malformed.json': 'true',
+                'mapping.source_system': 'source_system',
+                'mapping.table_name': 'table_name',
+                'mapping.last_load_date': 'last_load_date',
+                'mapping.last_status': 'last_status',
+                'mapping.records_ingested': 'records_ingested',
+                'mapping.updated_at': 'updated_at'
+            }
+        }
+    }
+
+    ensure_glue_database(database_name)
+
+    try:
+        glue_client.get_table(DatabaseName=database_name, Name=watermark_table_name)
+        logger.info(f"Watermark Catalog Table verified: {database_name}.{watermark_table_name}")
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code')
+        if code in ('EntityNotFoundException', 'NoSuchEntityException'):
+            try:
+                glue_client.create_table(
+                    DatabaseName=database_name,
+                    TableInput={
+                        'Name': watermark_table_name,
+                        'Description': 'Athena queryable table for all Bronze High-Water Mark state files',
+                        'TableType': 'EXTERNAL_TABLE',
+                        'Parameters': {
+                            'EXTERNAL': 'TRUE',
+                            'classification': 'json',
+                            'recursive.directories': 'true'
+                        },
+                        'StorageDescriptor': storage_desc
+                    }
+                )
+                logger.info(f"Created Athena Watermark Catalog Table: {database_name}.{watermark_table_name} at '{watermark_location}'")
+            except ClientError as ce:
+                if ce.response.get('Error', {}).get('Code') != 'AlreadyExistsException':
+                    logger.warning(f"Failed to create Watermark Catalog table '{watermark_table_name}': {ce}")
+        else:
+            logger.warning(f"Error checking Watermark table '{watermark_table_name}': {e}")
+
+    return f"{database_name}.{watermark_table_name}"
+
+
+def trigger_glue_crawler(crawler_name: str) -> None:
+    """
+    Triggers AWS Glue Crawler if configured. Handles already-running crawler gracefully.
+    """
+    if not crawler_name or not crawler_name.strip():
+        return
+
+    c_name = crawler_name.strip()
+    try:
+        glue_client.start_crawler(Name=c_name)
+        logger.info(f"Triggered AWS Glue Crawler '{c_name}' to crawl latest table partitions.")
+    except ClientError as ce:
+        err_code = ce.response.get('Error', {}).get('Code')
+        if err_code == 'CrawlerRunningException':
+            logger.info(f"Glue Crawler '{c_name}' is already RUNNING. Latest data will be cataloged.")
+        elif err_code in ('EntityNotFoundException', 'NoSuchEntityException'):
+            logger.info(f"Glue Crawler '{c_name}' not yet provisioned. Table & partition are already synced via Glue Catalog API.")
+        else:
+            logger.warning(f"Could not trigger Glue Crawler '{c_name}': {ce}")
+
+
 # ---------------------------------------------------------
 # Main Execution Handler
 # ---------------------------------------------------------
@@ -657,11 +975,21 @@ def main():
     error_handling_mode = params['ERROR_HANDLING_MODE']
     cloudwatch_namespace = params['CLOUDWATCH_NAMESPACE']
     source_config = params['SOURCE_CONFIG']
+    pipeline_defaults = params.get('PIPELINE_DEFAULTS', {})
     
     execution_start_utc = datetime.now(timezone.utc)
     current_run_time = execution_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
     execution_id = execution_start_utc.strftime('%Y%m%d_%H%M%S')
     partition_prefix = execution_start_utc.strftime('year=%Y/month=%m/day=%d')
+
+    # Glue Catalog & Crawler Configuration (Option B: Unified Lake Database with bronze_ Table Prefix)
+    glue_catalog_enabled = params.get('GLUE_CATALOG_ENABLED', True)
+    glue_database_name = params.get('GLUE_DATABASE_NAME', 'uax-datalake-db-dev')
+    glue_table_prefix = params.get('GLUE_TABLE_PREFIX', 'bronze_')
+    bronze_crawler_name = params.get('BRONZE_CRAWLER_NAME', 'uax-datalake-bronze-crawler-dev')
+    trigger_crawler = params.get('TRIGGER_CRAWLER', True)
+    sync_watermark_table = params.get('SYNC_WATERMARK_TABLE', True)
+    watermark_table_name = params.get('WATERMARK_TABLE_NAME', 'bronze_watermarks')
 
     start_banner = (
         f"[JOB START] UAX BRONZE INGESTION | Source: {source_system.upper()} | Tables: {', '.join(table_list)} | Mode: {error_handling_mode}\n"
@@ -676,6 +1004,10 @@ def main():
         f"|  Bronze Bucket      : {f's3://{bronze_bucket}/':<57}|\n"
         f"|  Bronze Data Path   : {f's3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/':<57}|\n"
         f"|  State S3 Bucket    : {f's3://{state_bucket}/':<57}|\n"
+        f"|  Glue Database      : {glue_database_name:<57}|\n"
+        f"|  Catalog Prefix     : {glue_table_prefix:<57}|\n"
+        f"|  Bronze Crawler     : {bronze_crawler_name if bronze_crawler_name else 'N/A':<57}|\n"
+        f"|  Watermark Athena   : {watermark_table_name:<57}|\n"
         f"|  Start Time (UTC)   : {current_run_time:<57}|\n"
         "+================================================================================+"
     )
@@ -742,12 +1074,16 @@ def main():
 
         total_table_records = 0
         parts_written = 0
+        first_sample_record = None
 
         # Memory-safe callback function writing to isolated STAGING directory
         def chunk_writer_callback(records_chunk: list, part_num: int):
-            nonlocal total_table_records, parts_written
+            nonlocal total_table_records, parts_written, first_sample_record
             if not records_chunk:
                 return
+
+            if first_sample_record is None and records_chunk:
+                first_sample_record = records_chunk[0]
 
             flatten_enabled = source_config.get('flatten_nested_json', True)
             flatten_sep = source_config.get('flatten_separator', '_')
@@ -805,6 +1141,23 @@ def main():
             if total_table_records > 0:
                 logger.info(f"Table '{table_name}' extraction succeeded ({total_table_records} records in {duration_sec:.2f}s). Promoting staging to Bronze...")
                 promote_staging_to_bronze(bronze_bucket, staging_prefix, final_partition_prefix)
+
+                # Sync table schema and execution partition to Glue Data Catalog directly
+                if glue_catalog_enabled:
+                    sync_bronze_catalog_table(
+                        database_name=glue_database_name,
+                        table_prefix=glue_table_prefix,
+                        source_system=source_system,
+                        table_name=table_name,
+                        bronze_bucket=bronze_bucket,
+                        bronze_data_prefix=bronze_data_prefix,
+                        partition_date=execution_start_utc,
+                        sample_record=first_sample_record,
+                        output_format=output_format
+                    )
+                    # Trigger Glue Crawler if configured to crawl latest table folder
+                    if trigger_crawler and bronze_crawler_name:
+                        trigger_glue_crawler(bronze_crawler_name)
             else:
                 logger.info(f"Table '{table_name}' extraction completed cleanly with 0 new records since {last_load_date}.")
                 cleanup_failed_staging(bronze_bucket, staging_prefix)
@@ -812,6 +1165,15 @@ def main():
             # Create or update High-Water Mark watermark state file in S3 with current execution timestamp
             update_last_load_date(state_bucket, state_key, source_system, table_name, current_run_time, total_table_records)
             logger.info(f"Table '{table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with timestamp {current_run_time}.")
+
+            # Ensure Athena-queryable Watermark Catalog Table is synced
+            if glue_catalog_enabled and sync_watermark_table:
+                sync_watermark_catalog_table(
+                    database_name=glue_database_name,
+                    watermark_table_name=watermark_table_name,
+                    state_bucket=state_bucket,
+                    state_prefix=source_config.get('state_prefix') or pipeline_defaults.get('state_prefix', 'metadata/bronze')
+                )
 
             # Record table execution details
             table_stats.append({
@@ -830,6 +1192,7 @@ def main():
 
             # High-visibility table extraction summary block in CloudWatch logs
             table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            catalog_table_display = f"{glue_database_name}.{glue_table_prefix}{table_name}" if glue_catalog_enabled else "N/A"
             summary_card = (
                 f"[TABLE SUMMARY] {table_name} | SUCCESS | Records: {total_table_records:,} | Chunks: {parts_written} | Duration: {duration_sec:.2f}s | Range: {last_load_date} -> {current_run_time}\n"
                 "+================================================================================+\n"
@@ -844,6 +1207,7 @@ def main():
                 f"|  * Table Duration   : {duration_sec:.2f}s\n"
                 f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
                 f"|  * End Time (UTC)   : {table_end_time_str}\n"
+                f"|  * Catalog Table    : {catalog_table_display}\n"
                 f"|  * Watermark S3 Key : {state_key}\n"
                 f"|  * S3 Destination   : s3://{bronze_bucket}/{final_partition_prefix}\n"
                 "+================================================================================+"
@@ -1008,6 +1372,12 @@ def main():
         f"|  * Watermark State     : s3://{state_bucket}/metadata/bronze/{source_system}/\n"
         f"|  * S3 Execution Log    : s3://{state_bucket}/metadata/logs/bronze/{source_system}/execution_{execution_id}.json\n"
         f"|  * Latest Log Pointer  : s3://{state_bucket}/metadata/logs/bronze/{source_system}/latest_execution.json\n"
+        "+--------------------------------------------------------------------------------+\n"
+        "|  GLUE CATALOG & ATHENA INTEGRATION:\n"
+        f"|  * Glue Database       : {glue_database_name}\n"
+        f"|  * Catalog Tables      : {glue_database_name}.{glue_table_prefix}<tablename>\n"
+        f"|  * Watermark Athena Tbl: {glue_database_name}.{watermark_table_name}\n"
+        f"|  * Bronze Crawler      : {bronze_crawler_name if bronze_crawler_name else 'N/A'}\n"
         "+================================================================================+"
     )
     logger.info(overall_card)
