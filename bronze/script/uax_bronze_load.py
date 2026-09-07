@@ -772,21 +772,20 @@ def sync_bronze_catalog_table(
     bronze_data_prefix: str,
     partition_date: datetime,
     sample_record: Optional[dict] = None,
-    output_format: str = "parquet"
+    output_format: str = "parquet",
+    ingested_at: Optional[str] = None
 ) -> str:
     """
     Creates/updates AWS Glue Data Catalog table for Bronze raw data and registers the execution partition.
     Naming format: <database_name>.<table_prefix><table_name> (e.g. uax-datalake-db-dev.raw_tbl_incident).
     Location: s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/
-    Partition: year=YYYY/month=MM/day=DD
+    Partition: _ingested_at=<ISO_TIMESTAMP> (Single partition on _ingested_at)
     """
     catalog_table_name = f"{table_prefix}{table_name}"
     table_location = f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/"
     
-    year_str = partition_date.strftime('%Y')
-    month_str = partition_date.strftime('%m')
-    day_str = partition_date.strftime('%d')
-    partition_location = f"{table_location}year={year_str}/month={month_str}/day={day_str}/"
+    ingested_at_str = ingested_at or partition_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+    partition_location = f"{table_location}_ingested_at={ingested_at_str}/"
 
     is_parquet = (output_format.lower() == 'parquet')
     input_fmt = 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat' if is_parquet else 'org.apache.hadoop.mapred.TextInputFormat'
@@ -798,22 +797,27 @@ def sync_bronze_catalog_table(
     if sample_record and isinstance(sample_record, dict):
         for k, v in sample_record.items():
             clean_k = str(k).strip().lower().replace(" ", "_").replace("-", "_")
-            if clean_k not in ('year', 'month', 'day'):
+            # Partition keys must NOT be declared in StorageDescriptor.Columns in AWS Glue Data Catalog
+            if clean_k not in ('_ingested_at', 'year', 'month', 'day'):
                 columns.append({'Name': clean_k, 'Type': infer_glue_column_type(v)})
+
+    # Ensure technical audit columns (_source_system, _table_name, _execution_id) are present
+    existing_col_names = {c['Name'] for c in columns}
+    for audit_col in ('_source_system', '_table_name', '_execution_id'):
+        if audit_col not in existing_col_names:
+            columns.append({'Name': audit_col, 'Type': 'string'})
 
     if not columns:
         columns = [
             {'Name': 'payload', 'Type': 'string'},
-            {'Name': '_ingested_at', 'Type': 'string'},
             {'Name': '_source_system', 'Type': 'string'},
             {'Name': '_table_name', 'Type': 'string'},
             {'Name': '_execution_id', 'Type': 'string'}
         ]
 
+    # Single partition on _ingested_at
     partition_keys = [
-        {'Name': 'year', 'Type': 'string'},
-        {'Name': 'month', 'Type': 'string'},
-        {'Name': 'day', 'Type': 'string'}
+        {'Name': '_ingested_at', 'Type': 'string'}
     ]
 
     storage_desc = {
@@ -831,10 +835,23 @@ def sync_bronze_catalog_table(
 
     ensure_glue_database(database_name)
 
-    # 1. Ensure Table exists in Glue Catalog
+    # 1. Ensure Table exists in Glue Catalog with single partition key ['_ingested_at']
     try:
-        glue_client.get_table(DatabaseName=database_name, Name=catalog_table_name)
-        logger.info(f"Glue Catalog Table verified: {database_name}.{catalog_table_name}")
+        existing_table = glue_client.get_table(DatabaseName=database_name, Name=catalog_table_name)
+        current_pkeys = [pk.get('Name') for pk in existing_table.get('Table', {}).get('PartitionKeys', [])]
+        if current_pkeys != ['_ingested_at']:
+            logger.info(
+                f"Existing table '{catalog_table_name}' has outdated partition keys {current_pkeys}. "
+                f"Recreating Glue Catalog table with single partition key ['_ingested_at']..."
+            )
+            try:
+                glue_client.delete_table(DatabaseName=database_name, Name=catalog_table_name)
+                logger.info(f"Deleted outdated Glue Catalog table: {database_name}.{catalog_table_name}")
+            except Exception as del_err:
+                logger.warning(f"Could not delete old table {catalog_table_name}: {del_err}")
+            raise ClientError({'Error': {'Code': 'EntityNotFoundException'}}, 'GetTable')
+        else:
+            logger.info(f"Glue Catalog Table verified: {database_name}.{catalog_table_name} with partition key ['_ingested_at']")
     except ClientError as e:
         code = e.response.get('Error', {}).get('Code')
         if code in ('EntityNotFoundException', 'NoSuchEntityException'):
@@ -854,14 +871,14 @@ def sync_bronze_catalog_table(
                         'StorageDescriptor': storage_desc
                     }
                 )
-                logger.info(f"Created AWS Glue Catalog Table: {database_name}.{catalog_table_name} at '{table_location}'")
+                logger.info(f"Created AWS Glue Catalog Table: {database_name}.{catalog_table_name} at '{table_location}' with partition key ['_ingested_at']")
             except ClientError as ce:
                 if ce.response.get('Error', {}).get('Code') != 'AlreadyExistsException':
                     logger.warning(f"Failed to create Glue Catalog table '{catalog_table_name}': {ce}")
         else:
             logger.warning(f"Error checking table '{catalog_table_name}': {e}")
 
-    # 2. Register/Update the Partition for this execution run
+    # 2. Register/Update the Single Partition for this execution run (_ingested_at)
     partition_storage = dict(storage_desc)
     partition_storage['Location'] = partition_location
     try:
@@ -869,12 +886,12 @@ def sync_bronze_catalog_table(
             DatabaseName=database_name,
             TableName=catalog_table_name,
             PartitionInput={
-                'Values': [year_str, month_str, day_str],
+                'Values': [ingested_at_str],
                 'StorageDescriptor': partition_storage,
                 'Parameters': {}
             }
         )
-        logger.info(f"Registered Glue Catalog Partition: {database_name}.{catalog_table_name} [year={year_str}, month={month_str}, day={day_str}] -> '{partition_location}'")
+        logger.info(f"Registered Glue Catalog Partition: {database_name}.{catalog_table_name} [_ingested_at={ingested_at_str}] -> '{partition_location}'")
     except ClientError as pe:
         code = pe.response.get('Error', {}).get('Code')
         if code == 'AlreadyExistsException':
@@ -882,14 +899,14 @@ def sync_bronze_catalog_table(
                 glue_client.update_partition(
                     DatabaseName=database_name,
                     TableName=catalog_table_name,
-                    PartitionValueList=[year_str, month_str, day_str],
+                    PartitionValueList=[ingested_at_str],
                     PartitionInput={
-                        'Values': [year_str, month_str, day_str],
+                        'Values': [ingested_at_str],
                         'StorageDescriptor': partition_storage,
                         'Parameters': {}
                     }
                 )
-                logger.info(f"Updated existing Glue Catalog Partition: {database_name}.{catalog_table_name} [year={year_str}, month={month_str}, day={day_str}]")
+                logger.info(f"Updated existing Glue Catalog Partition: {database_name}.{catalog_table_name} [_ingested_at={ingested_at_str}]")
             except Exception as ue:
                 logger.warning(f"Could not update partition: {ue}")
         else:
@@ -1022,7 +1039,7 @@ def main():
     execution_start_utc = datetime.now(timezone.utc)
     current_run_time = execution_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
     execution_id = execution_start_utc.strftime('%Y%m%d_%H%M%S')
-    partition_prefix = execution_start_utc.strftime('year=%Y/month=%m/day=%d')
+    partition_prefix = f"_ingested_at={current_run_time}"
 
     # Glue Catalog & Crawler Configuration (Unified Lake Database with raw_tbl_ Table Prefix)
     glue_catalog_enabled = params.get('GLUE_CATALOG_ENABLED', True)
@@ -1124,9 +1141,6 @@ def main():
             if not records_chunk:
                 return
 
-            if first_sample_record is None and records_chunk:
-                first_sample_record = records_chunk[0]
-
             flatten_enabled = source_config.get('flatten_nested_json', True)
             flatten_sep = source_config.get('flatten_separator', '_')
 
@@ -1145,6 +1159,8 @@ def main():
                     processed_chunk.append(record)
 
             records_chunk = processed_chunk
+            if first_sample_record is None and records_chunk:
+                first_sample_record = records_chunk[0]
             total_table_records += len(records_chunk)
             parts_written += 1
             
@@ -1195,7 +1211,8 @@ def main():
                         bronze_data_prefix=bronze_data_prefix,
                         partition_date=execution_start_utc,
                         sample_record=first_sample_record,
-                        output_format=output_format
+                        output_format=output_format,
+                        ingested_at=current_run_time
                     )
                     # Trigger Glue Crawler if configured to crawl latest table folder
                     if trigger_crawler and bronze_crawler_name:
