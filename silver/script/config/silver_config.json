@@ -5,17 +5,27 @@
     "scd_type": "scd1",
     "bronze_data_prefix": "bronze/data",
     "silver_data_prefix": "silver/data",
+    "technical_columns": {
+      "is_deleted_column": "_is_deleted",
+      "inserted_at_column": "_inserted_at",
+      "updated_at_column": "_updated_at",
+      "valid_from_column": "_valid_from",
+      "valid_to_column": "_valid_to",
+      "is_current_column": "_is_current",
+      "high_date_value": "9999-01-01 00:00:00"
+    },
     "scd_type2_config": {
       "valid_from_column": "_valid_from",
       "valid_to_column": "_valid_to",
-      "is_current_column": "_is_current"
+      "is_current_column": "_is_current",
+      "high_date_value": "9999-01-01 00:00:00"
     },
-    "glue_database": "uax_data_lake_db",
+    "glue_database": "uax-datalake-db-dev",
     "deduplication": {
       "enabled": true,
       "strategy": "latest_by_order_column",
-      "default_pk_column": "sys_id",
-      "default_order_column": "_ingested_at"
+      "default_nkey": "sys_id",
+      "default_order_column": "sys_updated_on"
     }
   },
   "source_systems": {
@@ -23,7 +33,7 @@
       "default_tables": ["incident", "change_request", "problem", "sys_user"],
       "table_configs": {
         "incident": {
-          "primary_key": "sys_id",
+          "nkey": "sys_id",
           "deduplication_keys": ["sys_id"],
           "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
           "merge_strategy": "upsert",
@@ -39,9 +49,9 @@
           "custom_transform_script": "custom_transforms/servicenow_incident.py"
         },
         "change_request": {
-          "primary_key": "sys_id",
+          "nkey": "sys_id",
           "deduplication_keys": ["sys_id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd2",
           "deduplication_strategy": "latest_by_order_column",
@@ -53,9 +63,9 @@
           "custom_transform_script": ""
         },
         "problem": {
-          "primary_key": "sys_id",
+          "nkey": "sys_id",
           "deduplication_keys": ["sys_id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -67,9 +77,9 @@
           "custom_transform_script": ""
         },
         "sys_user": {
-          "primary_key": "sys_id",
+          "nkey": "sys_id",
           "deduplication_keys": ["sys_id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -86,9 +96,9 @@
       "default_tables": ["conversations", "users", "queues"],
       "table_configs": {
         "conversations": {
-          "primary_key": "id",
+          "nkey": "id",
           "deduplication_keys": ["id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["conversation_end", "conversation_start", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -100,9 +110,9 @@
           "custom_transform_script": ""
         },
         "users": {
-          "primary_key": "id",
+          "nkey": "id",
           "deduplication_keys": ["id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["date_modified", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -114,9 +124,9 @@
           "custom_transform_script": ""
         },
         "queues": {
-          "primary_key": "id",
+          "nkey": "id",
           "deduplication_keys": ["id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["date_modified", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -133,9 +143,9 @@
       "default_tables": ["interactions", "users", "tickets"],
       "table_configs": {
         "interactions": {
-          "primary_key": "id",
+          "nkey": "id",
           "deduplication_keys": ["id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["last_updated_time", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -147,9 +157,9 @@
           "custom_transform_script": ""
         },
         "users": {
-          "primary_key": "id",
+          "nkey": "id",
           "deduplication_keys": ["id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["last_updated_time", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -161,9 +171,9 @@
           "custom_transform_script": ""
         },
         "tickets": {
-          "primary_key": "id",
+          "nkey": "id",
           "deduplication_keys": ["id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["last_updated_time", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -180,9 +190,9 @@
       "default_tables": ["orders", "order_items", "customers"],
       "table_configs": {
         "orders": {
-          "primary_key": "order_id",
+          "nkey": "order_id",
           "deduplication_keys": ["order_id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["updated_at", "order_date", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -194,9 +204,9 @@
           "custom_transform_script": ""
         },
         "order_items": {
-          "primary_key": ["order_id", "item_id"],
+          "nkey": ["order_id", "item_id"],
           "deduplication_keys": ["order_id", "item_id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["updated_at", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -208,9 +218,9 @@
           "custom_transform_script": ""
         },
         "customers": {
-          "primary_key": "customer_id",
+          "nkey": "customer_id",
           "deduplication_keys": ["customer_id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["updated_at", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd2",
           "deduplication_strategy": "latest_by_order_column",
@@ -227,9 +237,37 @@
       "default_tables": ["transactions", "users", "accounts"],
       "table_configs": {
         "transactions": {
-          "primary_key": "transaction_id",
+          "nkey": "transaction_id",
           "deduplication_keys": ["transaction_id"],
-          "deduplication_order_by": ["_ingested_at"],
+          "deduplication_order_by": ["transaction_time", "updated_at", "_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "users": {
+          "nkey": "user_id",
+          "deduplication_keys": ["user_id"],
+          "deduplication_order_by": ["updated_at", "_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "drop_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": ""
+        },
+        "accounts": {
+          "nkey": "account_id",
+          "deduplication_keys": ["account_id"],
+          "deduplication_order_by": ["updated_at", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",

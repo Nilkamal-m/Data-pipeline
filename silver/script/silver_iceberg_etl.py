@@ -22,7 +22,10 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import SparkSession
 from pyspark.sql.window import Window
-from pyspark.sql.functions import col, row_number, coalesce, lit, current_timestamp, cast
+from pyspark.sql.functions import (
+    col, row_number, coalesce, lit, current_timestamp, cast,
+    to_timestamp, sha2, concat_ws, when, upper
+)
 
 # Ensure script directory is on sys.path for SilverConfigLoader & SilverTransformer imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -185,11 +188,55 @@ def parse_spark_arguments() -> dict:
     }
 
 
-def perform_deduplication(df, pk_keys, order_cols, strategy='latest_by_order_column'):
+def quote_iceberg_table(table_name: str) -> str:
     """
-    Performs windowed deduplication supporting single or composite primary keys and multi-column ordering.
+    Escapes database and table identifiers with backticks for Spark SQL syntax safety (e.g. `db-name`.`tbl-name`).
     """
-    pk_cols = [col(k) for k in (pk_keys if isinstance(pk_keys, list) else [pk_keys])]
+    parts = table_name.split('.')
+    return '.'.join([f"`{p}`" for p in parts])
+
+
+def get_payload_columns(all_columns: list, nkeys) -> list:
+    """
+    Returns sorted list of non-key, non-technical business payload columns used for runtime change detection.
+    Technical audit columns and natural keys are excluded so changes to timestamps do not trigger false diffs.
+    """
+    technical_cols = {
+        '_is_deleted', '_inserted_at', '_updated_at',
+        '_valid_from', '_valid_to', '_is_current',
+        '_ingested_at', '_transformed_at', 'row_num', '__runtime_hash'
+    }
+    nkey_set = set(nkeys if isinstance(nkeys, list) else [nkeys])
+    return sorted([c for c in all_columns if c not in nkey_set and c not in technical_cols])
+
+
+def build_runtime_hash_expr(payload_cols: list, prefix: str = "") -> str:
+    """
+    Builds a Spark SQL string expression for runtime SHA-256 hashing across payload columns.
+    Example: sha2(concat_ws('||', coalesce(cast(prefix.`col1` as string), '<NULL>'), ...), 256)
+    Calculated strictly in runtime memory/temp views and never stored in the Iceberg table.
+    """
+    if not payload_cols:
+        return "sha2('', 256)"
+    pfx = f"{prefix}." if prefix else ""
+    coalesced = [f"coalesce(cast({pfx}`{c}` as string), '<NULL>')" for c in payload_cols]
+    return f"sha2(concat_ws('||', {', '.join(coalesced)}), 256)"
+
+
+def perform_deduplication(df, nkeys, order_cols, strategy='latest_by_order_column'):
+    """
+    Performs windowed in-batch deduplication supporting single or composite natural keys and multi-column ordering.
+    Drops exact full-row duplicate records and keeps the latest state per natural key.
+    """
+    # 1. Drop exact duplicate rows in the incoming batch
+    initial_count = df.count()
+    df = df.dropDuplicates()
+    after_drop_dup = df.count()
+    if initial_count != after_drop_dup:
+        logger.info(f"Dropped {initial_count - after_drop_dup} exact duplicate row(s) from incoming batch.")
+
+    # 2. Window by Natural Key (Nkey) ordered by business update timestamp DESC
+    nkey_cols = [col(k) for k in (nkeys if isinstance(nkeys, list) else [nkeys])]
     order_col_list = order_cols if isinstance(order_cols, list) else [order_cols]
 
     if strategy == 'earliest_by_order_column':
@@ -197,101 +244,181 @@ def perform_deduplication(df, pk_keys, order_cols, strategy='latest_by_order_col
     else:
         order_directions = [col(c).desc() for c in order_col_list]
 
-    window_spec = Window.partitionBy(*pk_cols).orderBy(*order_directions)
+    window_spec = Window.partitionBy(*nkey_cols).orderBy(*order_directions)
     return df.withColumn("row_num", row_number().over(window_spec)) \
              .filter(col("row_num") == 1) \
              .drop("row_num")
 
 
-def execute_iceberg_scd1_upsert(spark, df, silver_table_name, silver_location, pk_keys):
+def execute_iceberg_scd1_upsert(spark, df, silver_table_name, silver_location, nkeys, order_cols):
     """
     Executes SCD Type 1 (UPSERT via Spark SQL MERGE INTO) on Apache Iceberg table.
-    Overwrites modified records to maintain current state.
+    - Compares runtime payload hash to detect genuine business changes.
+    - Exact duplicate records are ignored (no redundant rewrite).
+    - Backdated loads (source.order_col < target.order_col) are ignored to protect newer data.
+    - Preserves target._inserted_at while updating target._updated_at = current_timestamp().
     """
-    temp_view = f"incoming_batch_{silver_table_name.replace('.', '_')}"
-    df.createOrReplaceTempView(temp_view)
+    quoted_table = quote_iceberg_table(silver_table_name)
+    nkey_list = nkeys if isinstance(nkeys, list) else [nkeys]
+    order_col_name = order_cols[0] if isinstance(order_cols, list) else order_cols
 
     table_exists = spark.catalog.tableExists(silver_table_name)
 
     if not table_exists:
-        logger.info(f"Target Iceberg table '{silver_table_name}' does not exist. Creating table...")
+        logger.info(f"Target Iceberg table '{silver_table_name}' does not exist. Creating table with initial data...")
         df.write \
           .format("iceberg") \
           .mode("append") \
           .option("path", silver_location) \
           .saveAsTable(silver_table_name)
     else:
-        logger.info(f"Executing SCD Type 1 MERGE INTO (UPSERT) on '{silver_table_name}'...")
-        if isinstance(pk_keys, list):
-            join_condition = " AND ".join([f"target.{k} = source.{k}" for k in pk_keys])
-        else:
-            join_condition = f"target.{pk_keys} = source.{pk_keys}"
+        logger.info(f"Executing SCD Type 1 Runtime-Hash MERGE INTO (UPSERT) on '{silver_table_name}'...")
+        payload_cols = get_payload_columns(df.columns, nkey_list)
+        logger.info(f"Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
+
+        temp_view = f"incoming_scd1_{silver_table_name.replace('.', '_').replace('-', '_')}"
+        df.createOrReplaceTempView(temp_view)
+
+        join_conditions = [f"target.`{k}` = source.`{k}`" for k in nkey_list]
+        join_condition = " AND ".join(join_conditions)
+
+        source_hash_expr = build_runtime_hash_expr(payload_cols, prefix="source")
+        target_hash_expr = build_runtime_hash_expr(payload_cols, prefix="target")
+
+        # Non-key, non-technical columns to update
+        business_update_cols = [c for c in df.columns if c not in ('_inserted_at', '_updated_at') and c not in nkey_list]
+        update_set_items = [f"target.`{c}` = source.`{c}`" for c in business_update_cols]
+        update_set_items.append("target.`_updated_at` = current_timestamp()")
+        update_set_clause = ",\n          ".join(update_set_items)
+
+        # Columns to insert for new records
+        insert_cols = [c for c in df.columns if c not in ('_inserted_at', '_updated_at')] + ['_inserted_at', '_updated_at']
+        insert_cols_str = ", ".join([f"`{c}`" for c in insert_cols])
+        insert_vals_str = ", ".join([f"source.`{c}`" if c not in ('_inserted_at', '_updated_at') else "current_timestamp()" for c in insert_cols])
+
+        # Backdate protection: only update if source order_col >= target order_col (or target order_col is null)
+        order_col_check = ""
+        if order_col_name in df.columns:
+            order_col_check = f"AND (source.`{order_col_name}` >= target.`{order_col_name}` OR target.`{order_col_name}` IS NULL)"
 
         merge_sql = f"""
-        MERGE INTO {silver_table_name} AS target
+        MERGE INTO {quoted_table} AS target
         USING {temp_view} AS source
         ON {join_condition}
-        WHEN MATCHED THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
+        WHEN MATCHED AND (
+            target.`_is_deleted` != source.`_is_deleted` OR
+            {target_hash_expr} != {source_hash_expr}
+        ) {order_col_check} THEN UPDATE SET
+          {update_set_clause}
+        WHEN NOT MATCHED THEN INSERT
+          ({insert_cols_str})
+        VALUES
+          ({insert_vals_str})
         """
-        logger.info(f"Running Spark SQL MERGE INTO Query:\n{merge_sql}")
+        logger.info(f"Running Spark SQL SCD1 MERGE INTO Query on {quoted_table}...")
         spark.sql(merge_sql)
 
 
-def execute_iceberg_scd2(spark, df, silver_table_name, silver_location, pk_keys, order_cols, scd2_cfg):
+def execute_iceberg_scd2(spark, df, silver_table_name, silver_location, nkeys, order_cols, scd2_cfg):
     """
     Executes SCD Type 2 (Slowly Changing Dimension Type 2) on Apache Iceberg table.
-    Tracks historical change history with _valid_from, _valid_to, and _is_current.
+    Tracks historical change history with _valid_from, _valid_to, _is_current ('Y'/'N'), and _is_deleted ('Y'/'N').
+    - Uses high-date ('9999-01-01 00:00:00') as default _valid_to for active records.
+    - Runtime change detection ensures duplicate records NEVER spawn false versions.
+    - Backdated loads cannot expire active records if they are older than the active version.
     """
+    quoted_table = quote_iceberg_table(silver_table_name)
+    nkey_list = nkeys if isinstance(nkeys, list) else [nkeys]
+    order_col_name = order_cols[0] if isinstance(order_cols, list) else order_cols
+
     valid_from_col = scd2_cfg.get('valid_from_column', '_valid_from')
     valid_to_col = scd2_cfg.get('valid_to_column', '_valid_to')
     is_current_col = scd2_cfg.get('is_current_column', '_is_current')
-
-    order_col_name = order_cols[0] if isinstance(order_cols, list) else order_cols
-
-    # Enrich incoming batch with SCD Type 2 tracking columns
-    incoming_df = df.withColumn(valid_from_col, col(order_col_name)) \
-                    .withColumn(valid_to_col, lit(None).cast("timestamp")) \
-                    .withColumn(is_current_col, lit(True))
+    high_date_val = scd2_cfg.get('high_date_value', '9999-01-01 00:00:00')
 
     table_exists = spark.catalog.tableExists(silver_table_name)
 
+    # Base SCD2 columns for incoming batch
+    incoming_df = df.withColumn(valid_from_col, coalesce(col(order_col_name).cast("timestamp"), current_timestamp())) \
+                    .withColumn(valid_to_col, to_timestamp(lit(high_date_val))) \
+                    .withColumn(is_current_col, lit('Y'))
+
     if not table_exists:
-        logger.info(f"SCD Type 2: Target table '{silver_table_name}' does not exist. Creating initial table...")
+        logger.info(f"SCD Type 2: Target table '{silver_table_name}' does not exist. Creating initial table with high-date '{high_date_val}'...")
         incoming_df.write \
                    .format("iceberg") \
                    .mode("append") \
                    .option("path", silver_location) \
                    .saveAsTable(silver_table_name)
     else:
-        logger.info(f"SCD Type 2: Expiring matching target rows and inserting new versions for '{silver_table_name}'...")
-        temp_view = f"scd2_incoming_{silver_table_name.replace('.', '_')}"
+        logger.info(f"Executing SCD Type 2 Runtime-Hash Change Detection on '{silver_table_name}'...")
+        payload_cols = get_payload_columns(df.columns, nkey_list)
+        logger.info(f"SCD2 Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
+
+        temp_view = f"scd2_incoming_{silver_table_name.replace('.', '_').replace('-', '_')}"
         incoming_df.createOrReplaceTempView(temp_view)
 
-        if isinstance(pk_keys, list):
-            join_condition = " AND ".join([f"target.{k} = source.{k}" for k in pk_keys])
-        else:
-            join_condition = f"target.{pk_keys} = source.{pk_keys}"
+        join_conditions = [f"target.`{k}` = source.`{k}`" for k in nkey_list]
+        join_condition = " AND ".join(join_conditions)
 
-        # 1. Expire existing active target records matching incoming primary keys
+        source_hash_expr = build_runtime_hash_expr(payload_cols, prefix="source")
+        target_hash_expr = build_runtime_hash_expr(payload_cols, prefix="target")
+
+        # 1. Expire existing active target records ONLY when:
+        #    a) Record exists and target._is_current = 'Y'
+        #    b) Payload hash differs OR _is_deleted differs (data actually changed)
+        #    c) Incoming record timestamp is >= target._valid_from (not backdated)
         expire_sql = f"""
-        MERGE INTO {silver_table_name} AS target
+        MERGE INTO {quoted_table} AS target
         USING {temp_view} AS source
-        ON {join_condition} AND target.{is_current_col} = true
-        WHEN MATCHED THEN UPDATE SET
-          target.{is_current_col} = false,
-          target.{valid_to_col} = source.{valid_from_col}
+        ON {join_condition} AND target.`{is_current_col}` = 'Y'
+        WHEN MATCHED AND (
+            target.`_is_deleted` != source.`_is_deleted` OR
+            {target_hash_expr} != {source_hash_expr}
+        ) AND (
+            source.`{valid_from_col}` >= target.`{valid_from_col}` OR target.`{valid_from_col}` IS NULL
+        ) THEN UPDATE SET
+          target.`{is_current_col}` = 'N',
+          target.`{valid_to_col}` = source.`{valid_from_col}`,
+          target.`_updated_at` = current_timestamp()
         """
-        logger.info(f"Executing SCD Type 2 Target Expiration MERGE INTO:\n{expire_sql}")
+        logger.info(f"Executing SCD Type 2 Target Expiration MERGE INTO on {quoted_table}...")
         spark.sql(expire_sql)
 
-        # 2. Append new incoming records as current active versions
-        logger.info(f"Appending new active SCD Type 2 versions to '{silver_table_name}'...")
-        incoming_df.write \
-                   .format("iceberg") \
-                   .mode("append") \
-                   .option("path", silver_location) \
-                   .saveAsTable(silver_table_name)
+        # 2. Append new incoming records ONLY if:
+        #    a) They are completely new (do not exist in active target at all), OR
+        #    b) They represent a genuine change over the prior active version (and are newer than prior version)
+        active_target_view = f"scd2_active_{silver_table_name.replace('.', '_').replace('-', '_')}"
+        spark.sql(f"SELECT * FROM {quoted_table} WHERE `{is_current_col}` = 'Y'").createOrReplaceTempView(active_target_view)
+
+        target_active_hash = build_runtime_hash_expr(payload_cols, prefix="act")
+        source_inc_hash = build_runtime_hash_expr(payload_cols, prefix="inc")
+        active_join_conditions = [f"act.`{k}` = inc.`{k}`" for k in nkey_list]
+        active_join_cond = " AND ".join(active_join_conditions)
+
+        changed_and_new_sql = f"""
+        SELECT inc.*
+        FROM {temp_view} AS inc
+        LEFT JOIN {active_target_view} AS act
+          ON {active_join_cond}
+        WHERE act.`{nkey_list[0]}` IS NULL
+           OR (
+               (act.`_is_deleted` != inc.`_is_deleted` OR {target_active_hash} != {source_inc_hash})
+               AND (inc.`{valid_from_col}` >= act.`{valid_from_col}` OR act.`{valid_from_col}` IS NULL)
+           )
+        """
+        changed_or_new_df = spark.sql(changed_and_new_sql)
+        num_new_versions = changed_or_new_df.count()
+        logger.info(f"SCD Type 2: Appending {num_new_versions} genuine new/updated version(s) to '{silver_table_name}'...")
+
+        if num_new_versions > 0:
+            changed_or_new_df.write \
+                             .format("iceberg") \
+                             .mode("append") \
+                             .option("path", silver_location) \
+                             .saveAsTable(silver_table_name)
+        else:
+            logger.info(f"SCD Type 2: 0 changed records found in incoming batch. No duplicate versions appended.")
 
 
 def main():
@@ -404,28 +531,46 @@ def main():
 
             columns = df_bronze.columns
 
-            # Dynamically resolve Deduplication Keys from CLI override -> config (fallback to primary_key)
-            cli_pk = cli_args.get('DEDUPLICATION_KEYS') or cli_args.get('PRIMARY_KEY')
-            if cli_pk:
-                pk_keys = [k.strip() for k in cli_pk.split(',')] if ',' in cli_pk else cli_pk.strip()
-                logger.info(f"CLI Parameter Override: 'deduplication_keys' -> {pk_keys}")
+            # Dynamically resolve Natural Key (Nkey) from CLI override -> config (fallback to primary_key)
+            cli_nkey = cli_args.get('NKEY') or cli_args.get('NKEYS') or cli_args.get('DEDUPLICATION_KEYS') or cli_args.get('PRIMARY_KEY')
+            if cli_nkey:
+                raw_nkeys = [k.strip() for k in cli_nkey.split(',')] if ',' in cli_nkey else [cli_nkey.strip()]
+                nkeys = [k for k in raw_nkeys if k in columns] or [columns[0]]
+                logger.info(f"CLI Parameter Override: 'nkey' -> {nkeys}")
             else:
-                pk_keys = table_cfg.get('deduplication_keys') or table_cfg.get('primary_key') or ("sys_id" if "sys_id" in columns else ("id" if "id" in columns else columns[0]))
-            
+                cfg_nkey = table_cfg.get('nkey') or table_cfg.get('deduplication_keys') or table_cfg.get('primary_key')
+                if cfg_nkey:
+                    raw_nkeys = cfg_nkey if isinstance(cfg_nkey, list) else [cfg_nkey]
+                    nkeys = [k for k in raw_nkeys if k in columns]
+                    if not nkeys:
+                        nkeys = ["sys_id"] if "sys_id" in columns else (["id"] if "id" in columns else [columns[0]])
+                else:
+                    nkeys = ["sys_id"] if "sys_id" in columns else (["id"] if "id" in columns else [columns[0]])
+
             # Dynamically resolve Deduplication Order-By Columns from CLI override -> config
             cli_order = cli_args.get('DEDUPLICATION_ORDER_BY') or cli_args.get('ORDER_BY')
             if cli_order:
-                order_cols = [c.strip() for c in cli_order.split(',')] if ',' in cli_order else cli_order.strip()
+                raw_orders = [c.strip() for c in cli_order.split(',')] if ',' in cli_order else [cli_order.strip()]
+                order_cols = [c for c in raw_orders if c in columns] or [columns[0]]
                 logger.info(f"CLI Parameter Override: 'deduplication_order_by' -> {order_cols}")
             else:
-                order_cols = table_cfg.get('deduplication_order_by') or table_cfg.get('order_by') or ("_ingested_at" if "_ingested_at" in columns else ("sys_updated_on" if "sys_updated_on" in columns else columns[0]))
+                cfg_order = table_cfg.get('deduplication_order_by') or table_cfg.get('order_by')
+                if cfg_order:
+                    raw_orders = cfg_order if isinstance(cfg_order, list) else [cfg_order]
+                    order_cols = [c for c in raw_orders if c in columns]
+                    if not order_cols:
+                        order_cols = [c for c in ["sys_updated_on", "last_updated_time", "updated_at", "date_modified", "_ingested_at"] if c in columns] or [columns[0]]
+                else:
+                    order_cols = [c for c in ["sys_updated_on", "last_updated_time", "updated_at", "date_modified", "_ingested_at"] if c in columns]
+                    if not order_cols:
+                        order_cols = [columns[0]]
 
-            logger.info(f"Deduplicating table '{table_clean}': PK={pk_keys}, OrderBy={order_cols}, Strategy='{dedup_strategy}'")
+            logger.info(f"Deduplicating table '{table_clean}': Nkey={nkeys}, OrderBy={order_cols}, Strategy='{dedup_strategy}'")
 
-            # Perform Deduplication
-            df_dedup = perform_deduplication(df_bronze, pk_keys, order_cols, dedup_strategy)
+            # 1. Perform in-batch deduplication (drops exact duplicates & keeps latest per Nkey)
+            df_dedup = perform_deduplication(df_bronze, nkeys, order_cols, dedup_strategy)
 
-            # Apply Declarative and Custom File Transformations
+            # 2. Apply Declarative transformations & technical audit columns (_is_deleted, _inserted_at, _updated_at)
             df_transformed = SilverTransformer.apply_transformations(
                 df=df_dedup,
                 source_system=source_system,
@@ -436,11 +581,11 @@ def main():
 
             logger.info(f"Target Iceberg Table: '{silver_table_name}', SCD Type: '{scd_type.upper()}', Merge Strategy: '{merge_strategy.upper()}'")
 
-            # Execute SCD Type 2 or SCD Type 1 / Append / Overwrite
+            # 3. Execute SCD Type 2 or SCD Type 1 / Append / Overwrite
             if scd_type == 'scd2':
-                execute_iceberg_scd2(spark, df_transformed, silver_table_name, silver_location, pk_keys, order_cols, scd2_cfg)
+                execute_iceberg_scd2(spark, df_transformed, silver_table_name, silver_location, nkeys, order_cols, scd2_cfg)
             elif merge_strategy in ('upsert', 'merge_into'):
-                execute_iceberg_scd1_upsert(spark, df_transformed, silver_table_name, silver_location, pk_keys)
+                execute_iceberg_scd1_upsert(spark, df_transformed, silver_table_name, silver_location, nkeys, order_cols)
             elif merge_strategy == 'overwrite':
                 df_transformed.write \
                     .format("iceberg") \
@@ -475,7 +620,7 @@ def main():
                 f"|  * Target Iceberg   : {silver_table_name}\n"
                 f"|  * SCD Type         : {scd_type.upper()}\n"
                 f"|  * Merge Strategy   : {merge_strategy.upper()}\n"
-                f"|  * Deduplication PK : {pk_keys}\n"
+                f"|  * Natural Key Nkey : {nkeys}\n"
                 f"|  * Order By Columns : {order_cols}\n"
                 f"|  * Table Duration   : {table_duration:.2f}s\n"
                 f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"

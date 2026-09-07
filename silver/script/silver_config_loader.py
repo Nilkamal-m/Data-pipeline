@@ -75,8 +75,26 @@ class SilverConfigLoader:
     @classmethod
     def get_table_config(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Retrieves table-specific configuration (primary_key, order_by).
+        Retrieves table-specific configuration (nkey, order_by, scd_type, etc.).
         """
         source_cfg = cls.get_source_config(source_system, config_dict)
         table_configs = source_cfg.get("table_configs", {})
         return table_configs.get(table_name.strip().lower(), {})
+
+    @classmethod
+    def get_nkey(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None):
+        """
+        Retrieves natural key (nkey) for a table with fallback to deduplication_keys or primary_key.
+        Returns a string or list of strings.
+        """
+        table_cfg = cls.get_table_config(source_system, table_name, config_dict)
+        return table_cfg.get('nkey') or table_cfg.get('deduplication_keys') or table_cfg.get('primary_key')
+
+    @classmethod
+    def get_technical_columns(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Retrieves technical columns configuration from silver_defaults.
+        """
+        config = config_dict or cls._config_cache or cls.load_config()
+        defaults = config.get("silver_defaults", {})
+        return defaults.get("technical_columns", {})

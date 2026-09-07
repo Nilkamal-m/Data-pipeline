@@ -16,14 +16,15 @@ import logging
 import importlib.util
 from typing import Dict, Any, Optional
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, expr
+from pyspark.sql.functions import col, expr, lit, when, current_timestamp, upper
 
 logger = logging.getLogger(__name__)
 
 
 class SilverTransformer:
     """
-    Applies both declarative transformations and custom Python transformation files to Silver DataFrames.
+    Applies declarative transformations, technical audit columns (_is_deleted, _inserted_at, _updated_at),
+    and custom Python transformation files to Silver DataFrames.
     """
 
     @classmethod
@@ -37,6 +38,7 @@ class SilverTransformer:
     ) -> DataFrame:
         """
         Executes all configured declarative and custom file transformations for a table.
+        Enriches DataFrame with technical audit columns: _is_deleted ('Y'/'N'), _inserted_at, and _updated_at.
         """
         logger.info(f"Applying transformations for '{source_system}.{table_name}'...")
 
@@ -78,6 +80,52 @@ class SilverTransformer:
         custom_script_path = table_cfg.get('custom_transform_script') or table_cfg.get('custom_transform_file')
         if custom_script_path:
             df = cls._apply_custom_script(df, custom_script_path, spark)
+
+        # 7. Enrich Technical Audit Columns: _is_deleted ('Y'/'N'), _inserted_at, _updated_at
+        df = cls._enrich_technical_columns(df)
+
+        return df
+
+    @classmethod
+    def _enrich_technical_columns(cls, df: DataFrame) -> DataFrame:
+        """
+        Guarantees that standard technical audit columns are consistently attached:
+        - _is_deleted: 'Y' if soft-deleted / inactive, otherwise 'N'.
+        - _inserted_at: Initialized with current_timestamp().
+        - _updated_at: Initialized with current_timestamp().
+        """
+        cols = df.columns
+
+        # Detect source deletion column if present
+        if "_is_deleted" in cols:
+            # Normalize existing _is_deleted to 'Y' or 'N'
+            df = df.withColumn(
+                "_is_deleted",
+                when(upper(col("_is_deleted").cast("string")).isin("Y", "TRUE", "1"), lit("Y")).otherwise(lit("N"))
+            )
+        elif "sys_is_deleted" in cols:
+            df = df.withColumn(
+                "_is_deleted",
+                when(upper(col("sys_is_deleted").cast("string")).isin("Y", "TRUE", "1"), lit("Y")).otherwise(lit("N"))
+            )
+        elif "is_deleted" in cols:
+            df = df.withColumn(
+                "_is_deleted",
+                when(upper(col("is_deleted").cast("string")).isin("Y", "TRUE", "1"), lit("Y")).otherwise(lit("N"))
+            )
+        elif "deleted" in cols:
+            df = df.withColumn(
+                "_is_deleted",
+                when(upper(col("deleted").cast("string")).isin("Y", "TRUE", "1"), lit("Y")).otherwise(lit("N"))
+            )
+        else:
+            df = df.withColumn("_is_deleted", lit("N"))
+
+        # Technical timestamp columns
+        if "_inserted_at" not in cols:
+            df = df.withColumn("_inserted_at", current_timestamp())
+
+        df = df.withColumn("_updated_at", current_timestamp())
 
         return df
 
