@@ -192,7 +192,11 @@ def parse_spark_arguments() -> dict:
     else:
         table_list = SilverConfigLoader.get_default_tables(source_system_clean, silver_full_config)
         if not table_list:
-            table_list = ['incident']
+            raise ValueError(
+                f"CRITICAL CONFIG ERROR: 'default_tables' is missing or empty for source system '{source_system_clean}' "
+                f"in silver_config.json (source_systems.{source_system_clean}.default_tables) and was not provided via CLI (--TABLE_NAME). "
+                f"Please configure at least one Bronze source table (e.g. 'raw_tbl_incident') in silver_config.json."
+            )
         logger.info(f"Using config default tables: {table_list}")
 
     job_name = get_cli_arg('JOB_NAME', 'job_name', default=f"glue-silver-etl-{source_system_clean}")
@@ -731,19 +735,21 @@ def main():
 
     for table_idx, table_name in enumerate(table_list, start=1):
         table_clean = table_name.strip().lower()
+        base_table_name = table_clean[len("raw_tbl_"):] if table_clean.startswith("raw_tbl_") else table_clean
+        bronze_table_name = table_clean if table_clean.startswith("raw_tbl_") else f"raw_tbl_{table_clean}"
         table_start_time = datetime.now(timezone.utc)
 
         table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
         defaults_cfg = silver_full_config.get('silver_defaults', {})
         scd2_cfg = defaults_cfg.get('scd_type2_config', {})
 
-        target_table_name = table_cfg.get('target_table_name') or f"{table_prefix}{table_clean}"
+        target_table_name = table_cfg.get('target_table_name') or f"{table_prefix}{base_table_name}"
         silver_table_name = f"{glue_database}.{target_table_name}"
-        bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{table_clean}/"
-        silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{table_clean}/"
+        bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
+        silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{base_table_name}/"
 
         # Resolve High-Water Mark state key & last load date
-        state_key = get_silver_watermark_key(source_system, table_clean, metadata_prefix)
+        state_key = get_silver_watermark_key(source_system, base_table_name, metadata_prefix)
         last_load_date = None
         if watermark_enabled and not full_refresh:
             last_load_date = get_silver_last_load_date(
@@ -755,10 +761,11 @@ def main():
             )
 
         table_header = (
-            f"[TABLE START] {table_clean} [{table_idx}/{len(table_list)}] | Source: {source_system} | Database: {glue_database}\n"
+            f"[TABLE START] {bronze_table_name} -> {target_table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Database: {glue_database}\n"
             "+--------------------------------------------------------------------------------+\n"
-            f"| >>> [{table_idx}/{len(table_list)}] SILVER PROCESSING: {table_clean.upper()} (Source: {source_system})\n"
-            f"|     Target Table       : {silver_table_name}\n"
+            f"| >>> [{table_idx}/{len(table_list)}] SILVER PROCESSING: {bronze_table_name.upper()} -> {target_table_name.upper()} (Source: {source_system})\n"
+            f"|     Bronze Source Table: {glue_database}.{bronze_table_name}\n"
+            f"|     Target Silver Table: {silver_table_name}\n"
             f"|     Silver Location    : {silver_location}\n"
             f"|     Watermark State Key: {state_key if watermark_enabled else 'DISABLED'}\n"
             f"|     Last Watermark     : {last_load_date or ('INITIAL_FULL_LOAD' if watermark_enabled else 'DISABLED')}\n"
@@ -773,22 +780,30 @@ def main():
         dedup_strategy = table_cfg.get('deduplication_strategy') or defaults_cfg.get('deduplication', {}).get('strategy', 'latest_by_order_column')
 
         try:
-            logger.info(f"Reading raw Bronze data from: '{bronze_path}'")
+            logger.info(f"Reading raw Bronze data for '{bronze_table_name}' from Glue Catalog (`{glue_database}`.`{bronze_table_name}`) or S3 ('{bronze_path}')...")
 
             try:
-                df_bronze = spark.read.option("mergeSchema", "true").parquet(bronze_path)
-            except Exception as read_err:
-                logger.warning(f"Could not read Parquet at '{bronze_path}' ({read_err}). Trying JSON or legacy path...")
+                # 1. Primary: Read directly from Bronze Glue Catalog external table
+                df_bronze = spark.read.table(f"`{glue_database}`.`{bronze_table_name}`")
+                logger.info(f"Successfully loaded Bronze data from Glue Catalog table `{glue_database}`.`{bronze_table_name}`")
+            except Exception as cat_err:
+                logger.info(f"Glue Catalog table `{glue_database}`.`{bronze_table_name}` not directly queryable ({cat_err}). Reading from S3 Parquet: '{bronze_path}'...")
                 try:
-                    df_bronze = spark.read.json(bronze_path)
-                except Exception:
-                    # Fallback check for legacy bronze path without /data/
-                    legacy_bronze_path = f"s3://{bucket_name}/bronze/{source_system}/{table_clean}/"
-                    logger.info(f"Checking legacy bronze path: '{legacy_bronze_path}'")
+                    df_bronze = spark.read.option("mergeSchema", "true").parquet(bronze_path)
+                except Exception as read_err:
+                    logger.warning(f"Could not read Parquet at '{bronze_path}' ({read_err}). Trying JSON or alternate paths...")
                     try:
-                        df_bronze = spark.read.option("mergeSchema", "true").parquet(legacy_bronze_path)
+                        df_bronze = spark.read.json(bronze_path)
                     except Exception:
-                        df_bronze = spark.read.json(legacy_bronze_path)
+                        alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{table_clean}/"
+                        try:
+                            df_bronze = spark.read.option("mergeSchema", "true").parquet(alt_bronze_path)
+                        except Exception:
+                            legacy_bronze_path = f"s3://{bucket_name}/bronze/{source_system}/{base_table_name}/"
+                            try:
+                                df_bronze = spark.read.option("mergeSchema", "true").parquet(legacy_bronze_path)
+                            except Exception:
+                                df_bronze = spark.read.json(legacy_bronze_path)
 
             # Apply Incremental High-Water Mark Filter if watermark is present
             if last_load_date and watermark_enabled and not full_refresh:
@@ -796,7 +811,7 @@ def main():
                     logger.info(f"Applying Silver Watermark filter: `{watermark_column}` > '{last_load_date}' for table '{target_table_name}'...")
                     df_bronze = df_bronze.filter(col(watermark_column) > lit(last_load_date))
                 else:
-                    logger.warning(f"Watermark column '{watermark_column}' not found in Bronze table '{table_clean}'. Reading all available records.")
+                    logger.warning(f"Watermark column '{watermark_column}' not found in Bronze table '{bronze_table_name}'. Reading all available records.")
 
             batch_count = df_bronze.count()
             logger.info(f"Incoming Bronze records to process for '{target_table_name}': {batch_count}")
@@ -843,35 +858,57 @@ def main():
             cli_nkey = cli_args.get('NKEY') or cli_args.get('NKEYS') or cli_args.get('DEDUPLICATION_KEYS') or cli_args.get('PRIMARY_KEY')
             if cli_nkey:
                 raw_nkeys = [k.strip() for k in cli_nkey.split(',')] if ',' in cli_nkey else [cli_nkey.strip()]
-                nkeys = [k for k in raw_nkeys if k in columns] or [columns[0]]
+                nkeys = [k for k in raw_nkeys if k in columns]
+                if not nkeys:
+                    raise ValueError(
+                        f"CRITICAL CONFIG ERROR: CLI parameter override for nkey '{cli_nkey}' does not match any column in table '{bronze_table_name}'. "
+                        f"Available columns: {columns}"
+                    )
                 logger.info(f"CLI Parameter Override: 'nkey' -> {nkeys}")
             else:
                 cfg_nkey = table_cfg.get('nkey') or table_cfg.get('deduplication_keys') or table_cfg.get('primary_key')
-                if cfg_nkey:
-                    raw_nkeys = cfg_nkey if isinstance(cfg_nkey, list) else [cfg_nkey]
-                    nkeys = [k for k in raw_nkeys if k in columns]
-                    if not nkeys:
-                        nkeys = ["sys_id"] if "sys_id" in columns else (["id"] if "id" in columns else [columns[0]])
-                else:
-                    nkeys = ["sys_id"] if "sys_id" in columns else (["id"] if "id" in columns else [columns[0]])
+                if not cfg_nkey:
+                    raise ValueError(
+                        f"CRITICAL CONFIG ERROR: 'nkey' (natural/deduplication key) is missing for table '{bronze_table_name}' in silver_config.json "
+                        f"(source_systems.{source_system}.table_configs.{table_clean}.nkey). "
+                        f"Please specify the key column in silver_config.json or pass --NKEY via CLI."
+                    )
+                raw_nkeys = cfg_nkey if isinstance(cfg_nkey, list) else [cfg_nkey]
+                nkeys = [k for k in raw_nkeys if k in columns]
+                if not nkeys:
+                    raise ValueError(
+                        f"CRITICAL CONFIG ERROR: Configured nkey '{raw_nkeys}' does not match any column in Bronze table '{bronze_table_name}'. "
+                        f"Check silver_config.json (source_systems.{source_system}.table_configs.{table_clean}.nkey). "
+                        f"Available columns: {columns}"
+                    )
 
             # Dynamically resolve Deduplication Order-By Columns from CLI override -> config
             cli_order = cli_args.get('DEDUPLICATION_ORDER_BY') or cli_args.get('ORDER_BY')
             if cli_order:
                 raw_orders = [c.strip() for c in cli_order.split(',')] if ',' in cli_order else [cli_order.strip()]
-                order_cols = [c for c in raw_orders if c in columns] or [columns[0]]
+                order_cols = [c for c in raw_orders if c in columns]
+                if not order_cols:
+                    raise ValueError(
+                        f"CRITICAL CONFIG ERROR: CLI parameter override for deduplication_order_by '{cli_order}' does not match any column in table '{bronze_table_name}'. "
+                        f"Available columns: {columns}"
+                    )
                 logger.info(f"CLI Parameter Override: 'deduplication_order_by' -> {order_cols}")
             else:
                 cfg_order = table_cfg.get('deduplication_order_by') or table_cfg.get('order_by')
-                if cfg_order:
-                    raw_orders = cfg_order if isinstance(cfg_order, list) else [cfg_order]
-                    order_cols = [c for c in raw_orders if c in columns]
-                    if not order_cols:
-                        order_cols = [c for c in ["sys_updated_on", "last_updated_time", "updated_at", "date_modified", "_ingested_at"] if c in columns] or [columns[0]]
-                else:
-                    order_cols = [c for c in ["sys_updated_on", "last_updated_time", "updated_at", "date_modified", "_ingested_at"] if c in columns]
-                    if not order_cols:
-                        order_cols = [columns[0]]
+                if not cfg_order:
+                    raise ValueError(
+                        f"CRITICAL CONFIG ERROR: 'deduplication_order_by' is missing for table '{bronze_table_name}' in silver_config.json "
+                        f"(source_systems.{source_system}.table_configs.{table_clean}.deduplication_order_by). "
+                        f"Please specify the ordering column in silver_config.json or pass --DEDUPLICATION_ORDER_BY via CLI."
+                    )
+                raw_orders = cfg_order if isinstance(cfg_order, list) else [cfg_order]
+                order_cols = [c for c in raw_orders if c in columns]
+                if not order_cols:
+                    raise ValueError(
+                        f"CRITICAL CONFIG ERROR: Configured deduplication_order_by '{raw_orders}' does not match any column in Bronze table '{bronze_table_name}'. "
+                        f"Check silver_config.json (source_systems.{source_system}.table_configs.{table_clean}.deduplication_order_by). "
+                        f"Available columns: {columns}"
+                    )
 
             logger.info(f"Deduplicating table '{table_clean}': Nkey={nkeys}, OrderBy={order_cols}, Strategy='{dedup_strategy}'")
 
@@ -914,7 +951,7 @@ def main():
             else:
                 new_watermark = current_run_time
 
-            # Update High-Water Mark state in S3 (table_name='tbl_<table_clean>')
+            # Update High-Water Mark state in S3 (table_name='tbl_<base_table_name>')
             if watermark_enabled:
                 update_silver_watermark(
                     s3_client=s3_client,
@@ -939,7 +976,7 @@ def main():
             table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
             table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             table_stats.append({
-                "table_name": table_clean,
+                "table_name": target_table_name,
                 "status": "SUCCESS",
                 "scd_type": scd_type.upper(),
                 "merge_strategy": merge_strategy.upper(),
@@ -949,13 +986,13 @@ def main():
             })
 
             summary_card = (
-                f"[TABLE SUMMARY] {table_clean} | SUCCESS | SCD: {scd_type.upper()} | Merge: {merge_strategy.upper()} | Duration: {table_duration:.2f}s\n"
+                f"[TABLE SUMMARY] {bronze_table_name} -> {target_table_name} | SUCCESS | SCD: {scd_type.upper()} | Merge: {merge_strategy.upper()} | Duration: {table_duration:.2f}s\n"
                 "+================================================================================+\n"
-                f"|  SILVER TABLE COMPLETED: {table_clean} [SUCCESS]\n"
+                f"|  SILVER TABLE COMPLETED: {target_table_name} [SUCCESS]\n"
                 "+--------------------------------------------------------------------------------+\n"
                 f"|  * Source System    : {source_system}\n"
-                f"|  * Table Name       : {table_clean}\n"
-                f"|  * Target Iceberg   : {silver_table_name}\n"
+                f"|  * Bronze Table     : {glue_database}.{bronze_table_name}\n"
+                f"|  * Target Silver    : {silver_table_name}\n"
                 f"|  * SCD Type         : {scd_type.upper()}\n"
                 f"|  * Merge Strategy   : {merge_strategy.upper()}\n"
                 f"|  * Natural Key Nkey : {nkeys}\n"
@@ -976,7 +1013,7 @@ def main():
             table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
             failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             table_stats.append({
-                "table_name": table_clean,
+                "table_name": target_table_name,
                 "status": "FAILED",
                 "scd_type": scd_type.upper(),
                 "merge_strategy": merge_strategy.upper(),
@@ -985,12 +1022,13 @@ def main():
                 "error_message": str(err)
             })
             failed_card = (
-                f"[TABLE FAILED] {table_clean} | FAILED | Duration: {table_duration:.2f}s | Error: {str(err)[:60]}\n"
+                f"[TABLE FAILED] {bronze_table_name} -> {target_table_name} | FAILED | Duration: {table_duration:.2f}s | Error: {str(err)[:60]}\n"
                 "+================================================================================+\n"
-                f"|  SILVER TABLE FAILED: {table_clean} [FAILED]\n"
+                f"|  SILVER TABLE FAILED: {target_table_name} [FAILED]\n"
                 "+--------------------------------------------------------------------------------+\n"
                 f"|  * Source System    : {source_system}\n"
-                f"|  * Table Name       : {table_clean}\n"
+                f"|  * Bronze Table     : {glue_database}.{bronze_table_name}\n"
+                f"|  * Target Table     : {silver_table_name}\n"
                 f"|  * Status           : FAILED\n"
                 f"|  * Error Details    : {err}\n"
                 f"|  * Table Duration   : {table_duration:.2f}s\n"
@@ -999,7 +1037,7 @@ def main():
                 "+================================================================================+"
             )
             logger.error(failed_card)
-            failed_tables.append((table_clean, str(err)))
+            failed_tables.append((target_table_name, str(err)))
 
     job.commit()
 

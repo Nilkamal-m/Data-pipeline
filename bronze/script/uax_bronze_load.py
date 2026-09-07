@@ -225,8 +225,11 @@ def parse_arguments() -> dict:
         table_list = list(source_config['default_tables'])
         logger.info(f"[PARAM PRECEDENCE] Table List resolved from CONFIG FILE (Priority 2): {table_list}")
     else:
-        table_list = ['conversations'] if source_system_clean == 'moveworks' else ['incident']
-        logger.info(f"[PARAM PRECEDENCE] Table List resolved from CODE DEFAULT (Priority 3): {table_list}")
+        raise ValueError(
+            f"CRITICAL CONFIG ERROR: 'default_tables' is missing or empty for source system '{source_system_clean}' "
+            f"in bronze_config.json (source_systems.{source_system_clean}.default_tables) and was not provided via CLI "
+            f"(--TABLE_NAME). Please configure at least one target table in bronze_config.json."
+        )
 
     # Batch Size
     cli_batch = get_cli_arg('BATCH_SIZE', 'batch_size')

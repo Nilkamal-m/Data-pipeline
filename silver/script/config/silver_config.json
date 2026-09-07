@@ -39,9 +39,9 @@
   },
   "source_systems": {
     "servicenow": {
-      "default_tables": ["incident", "change_request", "problem", "sys_user"],
+      "default_tables": ["raw_tbl_incident", "raw_tbl_change_request", "raw_tbl_problem", "raw_tbl_sys_user"],
       "table_configs": {
-        "incident": {
+        "raw_tbl_incident": {
           "nkey": "sys_id",
           "deduplication_keys": ["sys_id"],
           "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
@@ -57,7 +57,7 @@
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/servicenow_incident.py"
         },
-        "change_request": {
+        "raw_tbl_change_request": {
           "nkey": "sys_id",
           "deduplication_keys": ["sys_id"],
           "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
@@ -71,7 +71,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "problem": {
+        "raw_tbl_problem": {
           "nkey": "sys_id",
           "deduplication_keys": ["sys_id"],
           "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
@@ -85,7 +85,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "sys_user": {
+        "raw_tbl_sys_user": {
           "nkey": "sys_id",
           "deduplication_keys": ["sys_id"],
           "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
@@ -102,9 +102,9 @@
       }
     },
     "genesys": {
-      "default_tables": ["conversations", "users", "queues"],
+      "default_tables": ["raw_tbl_conversations", "raw_tbl_users", "raw_tbl_queues"],
       "table_configs": {
-        "conversations": {
+        "raw_tbl_conversations": {
           "nkey": "id",
           "deduplication_keys": ["id"],
           "deduplication_order_by": ["conversation_end", "conversation_start", "_ingested_at"],
@@ -118,7 +118,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "users": {
+        "raw_tbl_users": {
           "nkey": "id",
           "deduplication_keys": ["id"],
           "deduplication_order_by": ["date_modified", "_ingested_at"],
@@ -132,7 +132,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "queues": {
+        "raw_tbl_queues": {
           "nkey": "id",
           "deduplication_keys": ["id"],
           "deduplication_order_by": ["date_modified", "_ingested_at"],
@@ -149,9 +149,9 @@
       }
     },
     "moveworks": {
-      "default_tables": ["interactions", "users", "tickets"],
+      "default_tables": ["raw_tbl_interactions", "raw_tbl_users", "raw_tbl_tickets"],
       "table_configs": {
-        "interactions": {
+        "raw_tbl_interactions": {
           "nkey": "id",
           "deduplication_keys": ["id"],
           "deduplication_order_by": ["last_updated_time", "_ingested_at"],
@@ -165,7 +165,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "users": {
+        "raw_tbl_users": {
           "nkey": "id",
           "deduplication_keys": ["id"],
           "deduplication_order_by": ["last_updated_time", "_ingested_at"],
@@ -179,7 +179,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "tickets": {
+        "raw_tbl_tickets": {
           "nkey": "id",
           "deduplication_keys": ["id"],
           "deduplication_order_by": ["last_updated_time", "_ingested_at"],
@@ -196,9 +196,9 @@
       }
     },
     "postgresql": {
-      "default_tables": ["orders", "order_items", "customers"],
+      "default_tables": ["raw_tbl_orders", "raw_tbl_order_items", "raw_tbl_customers"],
       "table_configs": {
-        "orders": {
+        "raw_tbl_orders": {
           "nkey": "order_id",
           "deduplication_keys": ["order_id"],
           "deduplication_order_by": ["updated_at", "order_date", "_ingested_at"],
@@ -212,7 +212,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "order_items": {
+        "raw_tbl_order_items": {
           "nkey": ["order_id", "item_id"],
           "deduplication_keys": ["order_id", "item_id"],
           "deduplication_order_by": ["updated_at", "_ingested_at"],
@@ -226,7 +226,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "customers": {
+        "raw_tbl_customers": {
           "nkey": "customer_id",
           "deduplication_keys": ["customer_id"],
           "deduplication_order_by": ["updated_at", "_ingested_at"],
@@ -243,9 +243,9 @@
       }
     },
     "mysql": {
-      "default_tables": ["transactions", "users", "accounts"],
+      "default_tables": ["raw_tbl_transactions", "raw_tbl_users", "raw_tbl_accounts"],
       "table_configs": {
-        "transactions": {
+        "raw_tbl_transactions": {
           "nkey": "transaction_id",
           "deduplication_keys": ["transaction_id"],
           "deduplication_order_by": ["transaction_time", "updated_at", "_ingested_at"],
@@ -259,7 +259,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "users": {
+        "raw_tbl_users": {
           "nkey": "user_id",
           "deduplication_keys": ["user_id"],
           "deduplication_order_by": ["updated_at", "_ingested_at"],
@@ -273,7 +273,7 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "accounts": {
+        "raw_tbl_accounts": {
           "nkey": "account_id",
           "deduplication_keys": ["account_id"],
           "deduplication_order_by": ["updated_at", "_ingested_at"],

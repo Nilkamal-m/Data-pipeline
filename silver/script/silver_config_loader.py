@@ -76,10 +76,22 @@ class SilverConfigLoader:
     def get_table_config(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Retrieves table-specific configuration (nkey, order_by, scd_type, etc.).
+        Supports lookup by raw_tbl_<table_name> or base <table_name>.
         """
         source_cfg = cls.get_source_config(source_system, config_dict)
         table_configs = source_cfg.get("table_configs", {})
-        return table_configs.get(table_name.strip().lower(), {})
+        clean = table_name.strip().lower()
+        if clean in table_configs:
+            return table_configs[clean]
+        if clean.startswith("raw_tbl_"):
+            base = clean[len("raw_tbl_"):]
+            if base in table_configs:
+                return table_configs[base]
+        else:
+            prefixed = f"raw_tbl_{clean}"
+            if prefixed in table_configs:
+                return table_configs[prefixed]
+        return {}
 
     @classmethod
     def get_nkey(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None):
@@ -144,12 +156,14 @@ class SilverConfigLoader:
         Resolves the full Silver Iceberg table identifier (e.g. uax-datalake-db-dev.tbl_incident).
         Allows table-specific override via 'target_table_name' in table_configs.
         Pulls table_prefix and glue_database from centralized config if not provided.
+        Strips 'raw_tbl_' prefix from input table_name so output is always tbl_<base_name>.
         """
         prefix = table_prefix or cls.get_table_prefix(config_dict)
         db = glue_database or cls.get_glue_database(config_dict)
         table_cfg = cls.get_table_config(source_system, table_name, config_dict)
         table_clean = table_name.strip().lower()
-        target_name = table_cfg.get("target_table_name") or f"{prefix}{table_clean}"
+        base_name = table_clean[len("raw_tbl_"):] if table_clean.startswith("raw_tbl_") else table_clean
+        target_name = table_cfg.get("target_table_name") or f"{prefix}{base_name}"
         return f"{db}.{target_name}"
 
     @classmethod
