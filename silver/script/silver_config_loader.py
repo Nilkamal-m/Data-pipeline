@@ -98,3 +98,30 @@ class SilverConfigLoader:
         config = config_dict or cls._config_cache or cls.load_config()
         defaults = config.get("silver_defaults", {})
         return defaults.get("technical_columns", {})
+
+    @classmethod
+    def get_table_prefix(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Retrieves table prefix for Silver layer tables (default: 'tbl_').
+        """
+        config = config_dict or cls._config_cache or cls.load_config()
+        defaults = config.get("silver_defaults", {})
+        return defaults.get("table_prefix", "tbl_")
+
+    @classmethod
+    def get_silver_table_name(
+        cls,
+        source_system: str,
+        table_name: str,
+        glue_database: str,
+        table_prefix: str = "tbl_",
+        config_dict: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Resolves the full Silver Iceberg table identifier (e.g. uax-datalake-db-dev.tbl_incident).
+        Allows table-specific override via 'target_table_name' in table_configs.
+        """
+        table_cfg = cls.get_table_config(source_system, table_name, config_dict)
+        table_clean = table_name.strip().lower()
+        target_name = table_cfg.get("target_table_name") or f"{table_prefix}{table_clean}"
+        return f"{glue_database}.{target_name}"

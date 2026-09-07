@@ -1,6 +1,7 @@
 {
   "silver_defaults": {
     "target_format": "iceberg",
+    "table_prefix": "tbl_",
     "merge_strategy": "upsert",
     "scd_type": "scd1",
     "bronze_data_prefix": "bronze/data",

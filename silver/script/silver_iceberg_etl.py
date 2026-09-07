@@ -162,6 +162,12 @@ def parse_spark_arguments() -> dict:
         or defaults_cfg.get('silver_prefix', 'silver/data')
     ).strip('/')
 
+    # Table Prefix: CLI > Config > Default ('tbl_')
+    table_prefix = (
+        get_cli_arg('TABLE_PREFIX', 'table_prefix', 'SILVER_TABLE_PREFIX', 'silver_table_prefix')
+        or defaults_cfg.get('table_prefix', 'tbl_')
+    )
+
     # Resolve dynamic table list: CLI overrides config default tables
     raw_tables = get_cli_arg('TABLE_NAME', 'table_name', 'TABLES', 'tables', 'TABLE_NAMES', 'table_names')
     if raw_tables:
@@ -181,6 +187,7 @@ def parse_spark_arguments() -> dict:
         'TABLE_LIST': table_list,
         'DATA_LAKE_BUCKET': data_lake_bucket,
         'GLUE_DATABASE': glue_database,
+        'TABLE_PREFIX': table_prefix,
         'BRONZE_DATA_PREFIX': bronze_data_prefix,
         'SILVER_DATA_PREFIX': silver_data_prefix,
         'SILVER_FULL_CONFIG': silver_full_config,
@@ -428,6 +435,7 @@ def main():
     table_list = params['TABLE_LIST']
     bucket_name = params['DATA_LAKE_BUCKET']
     glue_database = params['GLUE_DATABASE']
+    table_prefix = params.get('TABLE_PREFIX', 'tbl_')
     bronze_data_prefix = params.get('BRONZE_DATA_PREFIX', 'bronze/data')
     silver_data_prefix = params.get('SILVER_DATA_PREFIX', 'silver/data')
     silver_full_config = params['SILVER_FULL_CONFIG']
@@ -452,6 +460,7 @@ def main():
         f"|  Target Tables      : {', '.join(table_list):<57}|\n"
         f"|  Data Lake Bucket   : {f's3://{bucket_name}/':<57}|\n"
         f"|  Glue Database      : {glue_database:<57}|\n"
+        f"|  Table Prefix       : {table_prefix:<57}|\n"
         f"|  Bronze Data Prefix : {bronze_data_prefix:<57}|\n"
         f"|  Silver Data Prefix : {silver_data_prefix:<57}|\n"
         f"|  Start Time (UTC)   : {current_run_time:<57}|\n"
@@ -466,8 +475,13 @@ def main():
         table_clean = table_name.strip().lower()
         table_start_time = datetime.now(timezone.utc)
 
+        table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
+        defaults_cfg = silver_full_config.get('silver_defaults', {})
+        scd2_cfg = defaults_cfg.get('scd_type2_config', {})
+
+        target_table_name = table_cfg.get('target_table_name') or f"{table_prefix}{table_clean}"
+        silver_table_name = f"{glue_database}.{target_table_name}"
         bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{table_clean}/"
-        silver_table_name = f"{glue_database}.silver_{source_system}_{table_clean}"
         silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{table_clean}/"
 
         table_header = (
@@ -480,10 +494,6 @@ def main():
             "+--------------------------------------------------------------------------------+"
         )
         logger.info(table_header)
-
-        table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
-        defaults_cfg = silver_full_config.get('silver_defaults', {})
-        scd2_cfg = defaults_cfg.get('scd_type2_config', {})
 
         # Resolve Merge Strategy, SCD Type & Deduplication settings
         scd_type = (table_cfg.get('scd_type') or defaults_cfg.get('scd_type', 'scd1')).lower()

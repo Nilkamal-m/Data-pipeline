@@ -74,6 +74,8 @@ module "silver_iceberg_crawler" {
     }
   ]
 
+  table_prefix = "tbl_"
+
   schema_change_policy = {
     delete_behavior = "LOG"
     update_behavior = "UPDATE_IN_DATABASE"
@@ -112,6 +114,7 @@ module "silver_iceberg_job" {
     "--conf"                   = "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
     "--DATA_LAKE_BUCKET"       = local.bucket_name
     "--GLUE_DATABASE"          = local.glue_db_name
+    "--TABLE_PREFIX"           = "tbl_"
     "--job-language"           = "python"
   }
 
