@@ -102,29 +102,55 @@ class SilverConfigLoader:
     @classmethod
     def get_table_prefix(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
         """
-        Retrieves table prefix for Silver layer tables (default: 'tbl_').
+        Retrieves table prefix for Silver layer tables from centralized silver_defaults.
+        Raises ValueError if table_prefix is missing or empty.
         """
         config = config_dict or cls._config_cache or cls.load_config()
         defaults = config.get("silver_defaults", {})
-        return defaults.get("table_prefix", "tbl_")
+        prefix = defaults.get("table_prefix")
+        if not prefix or not str(prefix).strip():
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: 'table_prefix' is missing or empty in silver_config.json "
+                "(silver_defaults.table_prefix). Please configure it (e.g. 'tbl_')."
+            )
+        return str(prefix).strip()
+
+    @classmethod
+    def get_glue_database(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Retrieves glue_database for Silver layer tables from centralized silver_defaults.
+        Raises ValueError if glue_database is missing or empty.
+        """
+        config = config_dict or cls._config_cache or cls.load_config()
+        defaults = config.get("silver_defaults", {})
+        db = defaults.get("glue_database")
+        if not db or not str(db).strip():
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: 'glue_database' is missing or empty in silver_config.json "
+                "(silver_defaults.glue_database). Please configure it (e.g. 'uax-datalake-db-dev')."
+            )
+        return str(db).strip()
 
     @classmethod
     def get_silver_table_name(
         cls,
         source_system: str,
         table_name: str,
-        glue_database: str,
-        table_prefix: str = "tbl_",
+        glue_database: Optional[str] = None,
+        table_prefix: Optional[str] = None,
         config_dict: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         Resolves the full Silver Iceberg table identifier (e.g. uax-datalake-db-dev.tbl_incident).
         Allows table-specific override via 'target_table_name' in table_configs.
+        Pulls table_prefix and glue_database from centralized config if not provided.
         """
+        prefix = table_prefix or cls.get_table_prefix(config_dict)
+        db = glue_database or cls.get_glue_database(config_dict)
         table_cfg = cls.get_table_config(source_system, table_name, config_dict)
         table_clean = table_name.strip().lower()
-        target_name = table_cfg.get("target_table_name") or f"{table_prefix}{table_clean}"
-        return f"{glue_database}.{target_name}"
+        target_name = table_cfg.get("target_table_name") or f"{prefix}{table_clean}"
+        return f"{db}.{target_name}"
 
     @classmethod
     def get_watermark_config(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -148,4 +174,19 @@ class SilverConfigLoader:
         Returns whether watermark tracking is enabled.
         """
         return cls.get_watermark_config(config_dict).get("enabled", True)
+
+    @classmethod
+    def get_watermark_table_name(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Retrieves watermark_table_name from silver_defaults.watermark.
+        Raises ValueError if watermark_table_name is missing or empty.
+        """
+        wm_cfg = cls.get_watermark_config(config_dict)
+        tbl_name = wm_cfg.get("watermark_table_name")
+        if not tbl_name or not str(tbl_name).strip():
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: 'watermark_table_name' is missing or empty in silver_config.json "
+                "(silver_defaults.watermark.watermark_table_name). Please configure it (e.g. 'tbl_watermarks')."
+            )
+        return str(tbl_name).strip()
 

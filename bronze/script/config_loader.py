@@ -191,3 +191,54 @@ class ConfigLoader:
         """Retrieves a specific setting from pipeline_defaults with fallback."""
         defaults = cls.get_pipeline_defaults(config_dict)
         return defaults.get(key, fallback_value)
+
+    @classmethod
+    def get_glue_catalog_config(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Retrieves glue_catalog configuration from pipeline_defaults."""
+        defaults = cls.get_pipeline_defaults(config_dict)
+        return defaults.get("glue_catalog", {})
+
+    @classmethod
+    def get_table_prefix(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Retrieves the centralized table_prefix configured under glue_catalog.
+        Raises ValueError if table_prefix is missing or empty.
+        """
+        catalog_cfg = cls.get_glue_catalog_config(config_dict)
+        prefix = catalog_cfg.get("table_prefix")
+        if not prefix or not str(prefix).strip():
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: 'table_prefix' is missing or empty in bronze_config.json "
+                "(pipeline_defaults.glue_catalog.table_prefix). Please configure it (e.g. 'raw_tbl_')."
+            )
+        return str(prefix).strip()
+
+    @classmethod
+    def get_glue_database(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Retrieves the centralized database_name configured under glue_catalog.
+        Raises ValueError if database_name is missing or empty.
+        """
+        catalog_cfg = cls.get_glue_catalog_config(config_dict)
+        db = catalog_cfg.get("database_name")
+        if not db or not str(db).strip():
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: 'database_name' is missing or empty in bronze_config.json "
+                "(pipeline_defaults.glue_catalog.database_name). Please configure it (e.g. 'uax-datalake-db-dev')."
+            )
+        return str(db).strip()
+
+    @classmethod
+    def get_watermark_table_name(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Retrieves the centralized watermark_table_name configured under glue_catalog.
+        Raises ValueError if watermark_table_name is missing or empty.
+        """
+        catalog_cfg = cls.get_glue_catalog_config(config_dict)
+        wm = catalog_cfg.get("watermark_table_name")
+        if not wm or not str(wm).strip():
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: 'watermark_table_name' is missing or empty in bronze_config.json "
+                "(pipeline_defaults.glue_catalog.watermark_table_name). Please configure it (e.g. 'raw_tbl_watermarks')."
+            )
+        return str(wm).strip()

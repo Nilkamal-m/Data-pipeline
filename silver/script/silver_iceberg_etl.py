@@ -144,11 +144,18 @@ def parse_spark_arguments() -> dict:
         default=defaults_cfg.get('data_lake_bucket') or os.environ.get('DATA_LAKE_BUCKET', 'uax-datalake-dev-bucket')
     )
 
-    # Glue Database: CLI > Config > Default
-    glue_database = get_cli_arg(
-        'GLUE_DATABASE', 'glue_database',
-        default=defaults_cfg.get('glue_database', 'uax-datalake-db-dev')
+    # Glue Database: CLI > Config (Required)
+    glue_database = (
+        get_cli_arg('GLUE_DATABASE', 'glue_database', 'GLUE_DB_NAME', 'glue_db_name')
+        or defaults_cfg.get('glue_database')
     )
+    if not glue_database or not str(glue_database).strip():
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: 'glue_database' is missing or empty in silver_config.json "
+            "(silver_defaults.glue_database) and was not provided via CLI. "
+            "Please configure 'glue_database' (e.g. 'uax-datalake-db-dev')."
+        )
+    glue_database = str(glue_database).strip()
 
     # Bronze Data Prefix: CLI > Config > Default ('bronze/data')
     bronze_data_prefix = (
@@ -164,11 +171,18 @@ def parse_spark_arguments() -> dict:
         or defaults_cfg.get('silver_prefix', 'silver/data')
     ).strip('/')
 
-    # Table Prefix: CLI > Config > Default ('tbl_')
+    # Table Prefix: CLI > Config (Required)
     table_prefix = (
         get_cli_arg('TABLE_PREFIX', 'table_prefix', 'SILVER_TABLE_PREFIX', 'silver_table_prefix')
-        or defaults_cfg.get('table_prefix', 'tbl_')
+        or defaults_cfg.get('table_prefix')
     )
+    if not table_prefix or not str(table_prefix).strip():
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: 'table_prefix' is missing or empty in silver_config.json "
+            "(silver_defaults.table_prefix) and was not provided via CLI. "
+            "Please configure 'table_prefix' (e.g. 'tbl_')."
+        )
+    table_prefix = str(table_prefix).strip()
 
     # Resolve dynamic table list: CLI overrides config default tables
     raw_tables = get_cli_arg('TABLE_NAME', 'table_name', 'TABLES', 'tables', 'TABLE_NAMES', 'table_names')
@@ -212,11 +226,19 @@ def parse_spark_arguments() -> dict:
     else:
         sync_watermark_table = bool(watermark_cfg.get('sync_watermark_table', True))
 
-    # Watermark Table Name: CLI > Config > 'tbl_watermarks'
+    # Watermark Table Name: CLI > Config
     watermark_table_name = (
         get_cli_arg('WATERMARK_TABLE_NAME', 'watermark_table_name')
-        or watermark_cfg.get('watermark_table_name', 'tbl_watermarks')
+        or watermark_cfg.get('watermark_table_name')
     )
+    if sync_watermark_table and (not watermark_table_name or not str(watermark_table_name).strip()):
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: 'watermark_table_name' is missing or empty in silver_config.json "
+            "(silver_defaults.watermark.watermark_table_name) and was not provided via CLI. "
+            "Please configure 'watermark_table_name' (e.g. 'tbl_watermarks')."
+        )
+    if watermark_table_name:
+        watermark_table_name = str(watermark_table_name).strip()
 
     # Metadata Prefix: Config > 'metadata/silver'
     metadata_prefix = watermark_cfg.get('metadata_prefix', 'metadata/silver').strip('/')
@@ -304,6 +326,9 @@ def update_silver_watermark(
     Writes/Updates the Silver High-Water Mark JSON metadata file in S3 upon successful Iceberg write.
     The 'table_name' field is formatted as 'tbl_<tablename>' (e.g. tbl_incident).
     """
+    if not table_name or not str(table_name).strip():
+        raise ValueError("CRITICAL ERROR: 'table_name' must be provided and non-empty when updating Silver watermark.")
+
     if not s3_client:
         logger.warning("s3_client not available. Skipping Silver watermark update.")
         return
@@ -653,7 +678,7 @@ def main():
     table_list = params['TABLE_LIST']
     bucket_name = params['DATA_LAKE_BUCKET']
     glue_database = params['GLUE_DATABASE']
-    table_prefix = params.get('TABLE_PREFIX', 'tbl_')
+    table_prefix = params['TABLE_PREFIX']
     bronze_data_prefix = params.get('BRONZE_DATA_PREFIX', 'bronze/data')
     silver_data_prefix = params.get('SILVER_DATA_PREFIX', 'silver/data')
     silver_full_config = params['SILVER_FULL_CONFIG']
@@ -663,7 +688,7 @@ def main():
     full_refresh = params.get('FULL_REFRESH', False)
     watermark_column = params.get('WATERMARK_COLUMN', '_ingested_at')
     sync_watermark_table = params.get('SYNC_WATERMARK_TABLE', True)
-    watermark_table_name = params.get('WATERMARK_TABLE_NAME', 'tbl_watermarks')
+    watermark_table_name = params.get('WATERMARK_TABLE_NAME')
     metadata_prefix = params.get('METADATA_PREFIX', 'metadata/silver')
 
     # Initialize Spark, Glue, and Boto3 Clients

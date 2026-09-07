@@ -317,7 +317,7 @@ def parse_arguments() -> dict:
         or pipeline_defaults.get('bronze_prefix', 'bronze/data')
     ).strip('/')
 
-    # Glue Catalog & Crawler Configuration (Option B: Unified Lake Database with bronze_ Table Prefix)
+    # Glue Catalog & Crawler Configuration (Option B: Unified Lake Database with raw_tbl_ Table Prefix)
     catalog_config = pipeline_defaults.get('glue_catalog', {})
     glue_catalog_enabled = (
         get_cli_arg('SYNC_GLUE_CATALOG', 'sync_glue_catalog', 'GLUE_CATALOG_ENABLED', 'glue_catalog_enabled')
@@ -326,17 +326,32 @@ def parse_arguments() -> dict:
 
     glue_database_name = (
         get_cli_arg('GLUE_DATABASE', 'glue_database', 'GLUE_DB_NAME', 'glue_db_name')
-        or catalog_config.get('database_name', 'uax-datalake-db-dev')
+        or catalog_config.get('database_name')
     )
+    if glue_catalog_enabled and (not glue_database_name or not str(glue_database_name).strip()):
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: 'database_name' is missing or empty in bronze_config.json "
+            "(pipeline_defaults.glue_catalog.database_name) and was not provided via CLI. "
+            "Please configure 'database_name' (e.g. 'uax-datalake-db-dev')."
+        )
+    if glue_database_name:
+        glue_database_name = str(glue_database_name).strip()
 
     glue_table_prefix = (
         get_cli_arg('GLUE_TABLE_PREFIX', 'glue_table_prefix', 'TABLE_PREFIX', 'table_prefix')
-        or catalog_config.get('table_prefix', 'raw_tbl_')
+        or catalog_config.get('table_prefix')
     )
+    if not glue_table_prefix or not str(glue_table_prefix).strip():
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: 'table_prefix' is missing or empty in bronze_config.json "
+            "(pipeline_defaults.glue_catalog.table_prefix) and was not provided via CLI. "
+            "Please configure 'table_prefix' (e.g. 'raw_tbl_')."
+        )
+    glue_table_prefix = str(glue_table_prefix).strip()
 
     bronze_crawler_name = (
         get_cli_arg('BRONZE_CRAWLER_NAME', 'bronze_crawler_name', 'CRAWLER_NAME', 'crawler_name')
-        or catalog_config.get('crawler_name', 'uax-datalake-bronze-crawler-dev')
+        or catalog_config.get('crawler_name')
     )
 
     trigger_crawler = (
@@ -351,8 +366,16 @@ def parse_arguments() -> dict:
 
     watermark_table_name = (
         get_cli_arg('WATERMARK_TABLE_NAME', 'watermark_table_name')
-        or catalog_config.get('watermark_table_name', 'raw_tbl_watermarks')
+        or catalog_config.get('watermark_table_name')
     )
+    if sync_watermark_table and (not watermark_table_name or not str(watermark_table_name).strip()):
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: 'watermark_table_name' is missing or empty in bronze_config.json "
+            "(pipeline_defaults.glue_catalog.watermark_table_name) and was not provided via CLI. "
+            "Please configure 'watermark_table_name' (e.g. 'raw_tbl_watermarks')."
+        )
+    if watermark_table_name:
+        watermark_table_name = str(watermark_table_name).strip()
 
     parsed_params = {
         'JOB_NAME': job_name,
@@ -559,14 +582,30 @@ def get_last_load_date(
     )
 
 
-def update_last_load_date(state_bucket: str, state_key: str, source_system: str, table_name: str, current_run_time: str, total_records: int) -> None:
+def update_last_load_date(
+    state_bucket: str,
+    state_key: str,
+    source_system: str,
+    table_name: str,
+    current_run_time: str,
+    total_records: int,
+    table_prefix: str
+) -> None:
     """
     Writes/Updates the High-Water Mark JSON metadata file for a specific table in S3.
+    Formats table_name with the centralized table_prefix (e.g. raw_tbl_incident).
     """
+    if not table_prefix or not str(table_prefix).strip():
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: 'table_prefix' must be provided and non-empty for update_last_load_date. "
+            "Please ensure 'table_prefix' is configured in bronze_config.json or passed via CLI."
+        )
     s3_path = f"s3://{state_bucket}/{state_key}"
+    prefix = str(table_prefix).strip()
+    formatted_table_name = table_name if table_name.startswith(prefix) else f"{prefix}{table_name}"
     state_payload = {
         "source_system": source_system,
-        "table_name": table_name,
+        "table_name": formatted_table_name,
         "last_load_date": current_run_time,
         "last_status": "SUCCESS",
         "records_ingested": total_records,
@@ -982,14 +1021,14 @@ def main():
     execution_id = execution_start_utc.strftime('%Y%m%d_%H%M%S')
     partition_prefix = execution_start_utc.strftime('year=%Y/month=%m/day=%d')
 
-    # Glue Catalog & Crawler Configuration (Option B: Unified Lake Database with raw_tbl_ Table Prefix)
+    # Glue Catalog & Crawler Configuration (Unified Lake Database with raw_tbl_ Table Prefix)
     glue_catalog_enabled = params.get('GLUE_CATALOG_ENABLED', True)
-    glue_database_name = params.get('GLUE_DATABASE_NAME', 'uax-datalake-db-dev')
-    glue_table_prefix = params.get('GLUE_TABLE_PREFIX', 'raw_tbl_')
-    bronze_crawler_name = params.get('BRONZE_CRAWLER_NAME', 'uax-datalake-bronze-crawler-dev')
+    glue_database_name = params.get('GLUE_DATABASE_NAME')
+    glue_table_prefix = params['GLUE_TABLE_PREFIX']
+    bronze_crawler_name = params.get('BRONZE_CRAWLER_NAME')
     trigger_crawler = params.get('TRIGGER_CRAWLER', True)
     sync_watermark_table = params.get('SYNC_WATERMARK_TABLE', True)
-    watermark_table_name = params.get('WATERMARK_TABLE_NAME', 'raw_tbl_watermarks')
+    watermark_table_name = params.get('WATERMARK_TABLE_NAME')
 
     start_banner = (
         f"[JOB START] UAX BRONZE INGESTION | Source: {source_system.upper()} | Tables: {', '.join(table_list)} | Mode: {error_handling_mode}\n"
@@ -1163,7 +1202,7 @@ def main():
                 cleanup_failed_staging(bronze_bucket, staging_prefix)
 
             # Create or update High-Water Mark watermark state file in S3 with current execution timestamp
-            update_last_load_date(state_bucket, state_key, source_system, table_name, current_run_time, total_table_records)
+            update_last_load_date(state_bucket, state_key, source_system, table_name, current_run_time, total_table_records, table_prefix=glue_table_prefix)
             logger.info(f"Table '{table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with timestamp {current_run_time}.")
 
             # Ensure Athena-queryable Watermark Catalog Table is synced
