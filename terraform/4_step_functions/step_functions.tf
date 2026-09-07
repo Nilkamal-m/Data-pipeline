@@ -65,7 +65,7 @@ locals {
   sns_topic_arn       = var.use_existing_sns_topic ? "arn:aws:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${var.app_name}-alerts-topic-${var.environment}" : module.sns_topic.topic_arn
   sfn_role_arn        = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : module.step_functions_iam_role.iam_role_arn
   bronze_job_name     = "${var.app_name}-bronze-ingestion-${var.environment}"
-  silver_job_name     = "${var.app_name}-silver-iceberg-etl-${var.environment}"
+  silver_job_name     = "${var.app_name}-silver-etl-${var.environment}"
   silver_crawler_name = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
 }
 

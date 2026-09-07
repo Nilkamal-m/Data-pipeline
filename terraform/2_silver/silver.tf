@@ -95,7 +95,7 @@ module "silver_iceberg_crawler" {
 module "silver_iceberg_job" {
   source = "glue/aws//modules/job"
 
-  name              = "${var.app_name}-silver-iceberg-etl-${var.environment}"
+  name              = "${var.app_name}-silver-etl-${var.environment}"
   description       = "AWS Glue PySpark ETL Job transforming Bronze raw data into Silver Apache Iceberg tables."
   role_arn          = local.glue_role_arn
   glue_version      = "4.0"
@@ -142,6 +142,11 @@ output "glue_silver_iceberg_crawler_name" {
 }
 
 output "glue_silver_iceberg_job_name" {
-  value       = "${var.app_name}-silver-iceberg-etl-${var.environment}"
+  value       = "${var.app_name}-silver-etl-${var.environment}"
   description = "AWS Glue PySpark Silver Iceberg ETL Job Name."
+}
+
+output "glue_silver_job_name" {
+  value       = "${var.app_name}-silver-etl-${var.environment}"
+  description = "AWS Glue PySpark Silver ETL Job Name."
 }

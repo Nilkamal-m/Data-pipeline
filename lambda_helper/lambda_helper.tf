@@ -132,7 +132,7 @@ resource "aws_lambda_function" "glue_trigger_lambda" {
   environment {
     variables = {
       DEFAULT_BRONZE_JOB = "${var.app_name}-bronze-ingestion-${var.environment}"
-      DEFAULT_SILVER_JOB = "${var.app_name}-silver-iceberg-etl-${var.environment}"
+      DEFAULT_SILVER_JOB = "${var.app_name}-silver-etl-${var.environment}"
       ENVIRONMENT        = var.environment
     }
   }

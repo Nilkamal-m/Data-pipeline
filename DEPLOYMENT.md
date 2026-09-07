@@ -188,7 +188,7 @@ aws stepfunctions start-execution \
 
 Verify logs in CloudWatch Log Groups:
 - `/aws-glue/jobs/uax-datalake-bronze-ingestion-dev`
-- `/aws-glue/jobs/uax-datalake-silver-iceberg-etl-dev`
+- `/aws-glue/jobs/uax-datalake-silver-etl-dev`
 
 ---
 

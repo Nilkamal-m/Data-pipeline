@@ -195,7 +195,7 @@ def parse_spark_arguments() -> dict:
             table_list = ['incident']
         logger.info(f"Using config default tables: {table_list}")
 
-    job_name = get_cli_arg('JOB_NAME', 'job_name', default=f"glue-silver-iceberg-etl-{source_system_clean}")
+    job_name = get_cli_arg('JOB_NAME', 'job_name', default=f"glue-silver-etl-{source_system_clean}")
 
     watermark_cfg = defaults_cfg.get('watermark', {})
 

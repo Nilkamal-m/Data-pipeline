@@ -152,6 +152,6 @@ To re-use the existing Glue IAM Execution Role (`uax-datalake-glue-execution-rol
 ```json
 {
   "statusCode": 500,
-  "body": "{\"job_name\": \"uax-datalake-silver-iceberg-etl-dev\", \"job_run_id\": \"jr_9876543210fedcba\", \"job_status\": \"FAILED\", \"execution_time_seconds\": 18, \"source_system\": \"servicenow\", \"table_name\": \"incident\", \"cloudwatch_log_group\": \"/aws-glue/jobs/output\", \"error_message\": \"AnalysisException: Table uax-datalake-db-dev.servicenow_incident does not exist\"}"
+  "body": "{\"job_name\": \"uax-datalake-silver-etl-dev\", \"job_run_id\": \"jr_9876543210fedcba\", \"job_status\": \"FAILED\", \"execution_time_seconds\": 18, \"source_system\": \"servicenow\", \"table_name\": \"incident\", \"cloudwatch_log_group\": \"/aws-glue/jobs/output\", \"error_message\": \"AnalysisException: Table uax-datalake-db-dev.servicenow_incident does not exist\"}"
 }
 ```

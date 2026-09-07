@@ -35,7 +35,7 @@ glue_client = boto3.client('glue')
 TERMINAL_STATES = {'SUCCEEDED', 'FAILED', 'STOPPED', 'TIMEOUT'}
 
 DEFAULT_BRONZE_JOB = 'uax-datalake-bronze-ingestion-dev'
-DEFAULT_SILVER_JOB = 'uax-datalake-silver-iceberg-etl-dev'
+DEFAULT_SILVER_JOB = 'uax-datalake-silver-etl-dev'
 
 
 def resolve_job_name(event: Dict[str, Any]) -> str:
