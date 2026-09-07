@@ -16,7 +16,9 @@ import os
 import json
 import logging
 import boto3
+from botocore.exceptions import ClientError
 from datetime import datetime, timezone
+from typing import Optional
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -24,7 +26,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.window import Window
 from pyspark.sql.functions import (
     col, row_number, coalesce, lit, current_timestamp, cast,
-    to_timestamp, sha2, concat_ws, when, upper
+    to_timestamp, sha2, concat_ws, when, upper, max as spark_max
 )
 
 # Ensure script directory is on sys.path for SilverConfigLoader & SilverTransformer imports
@@ -181,6 +183,44 @@ def parse_spark_arguments() -> dict:
 
     job_name = get_cli_arg('JOB_NAME', 'job_name', default=f"glue-silver-iceberg-etl-{source_system_clean}")
 
+    watermark_cfg = defaults_cfg.get('watermark', {})
+
+    # Watermark Enabled: CLI > Config > True
+    cli_wm_enabled = get_cli_arg('WATERMARK_ENABLED', 'watermark_enabled')
+    if cli_wm_enabled is not None:
+        watermark_enabled = str(cli_wm_enabled).strip().lower() in ('true', '1', 'yes')
+    else:
+        watermark_enabled = bool(watermark_cfg.get('enabled', True))
+
+    # Full Refresh Toggle: CLI > Config > False (if True, ignores watermark and scans all Bronze)
+    cli_full_refresh = get_cli_arg('FULL_REFRESH', 'full_refresh')
+    if cli_full_refresh is not None:
+        full_refresh = str(cli_full_refresh).strip().lower() in ('true', '1', 'yes')
+    else:
+        full_refresh = bool(watermark_cfg.get('full_refresh', False))
+
+    # Watermark Column: CLI > Config > '_ingested_at'
+    watermark_column = (
+        get_cli_arg('WATERMARK_COLUMN', 'watermark_column')
+        or watermark_cfg.get('watermark_column', '_ingested_at')
+    )
+
+    # Sync Watermark Table: CLI > Config > True
+    cli_sync_watermark = get_cli_arg('SYNC_WATERMARK_TABLE', 'sync_watermark_table')
+    if cli_sync_watermark is not None:
+        sync_watermark_table = str(cli_sync_watermark).strip().lower() in ('true', '1', 'yes')
+    else:
+        sync_watermark_table = bool(watermark_cfg.get('sync_watermark_table', True))
+
+    # Watermark Table Name: CLI > Config > 'tbl_watermarks'
+    watermark_table_name = (
+        get_cli_arg('WATERMARK_TABLE_NAME', 'watermark_table_name')
+        or watermark_cfg.get('watermark_table_name', 'tbl_watermarks')
+    )
+
+    # Metadata Prefix: Config > 'metadata/silver'
+    metadata_prefix = watermark_cfg.get('metadata_prefix', 'metadata/silver').strip('/')
+
     return {
         'JOB_NAME': job_name,
         'SOURCE_SYSTEM': source_system_clean,
@@ -190,9 +230,187 @@ def parse_spark_arguments() -> dict:
         'TABLE_PREFIX': table_prefix,
         'BRONZE_DATA_PREFIX': bronze_data_prefix,
         'SILVER_DATA_PREFIX': silver_data_prefix,
+        'WATERMARK_ENABLED': watermark_enabled,
+        'FULL_REFRESH': full_refresh,
+        'WATERMARK_COLUMN': watermark_column,
+        'SYNC_WATERMARK_TABLE': sync_watermark_table,
+        'WATERMARK_TABLE_NAME': watermark_table_name,
+        'METADATA_PREFIX': metadata_prefix,
         'SILVER_FULL_CONFIG': silver_full_config,
         'ARG_DICT': arg_dict
     }
+
+
+def get_silver_watermark_key(source_system: str, table_clean: str, metadata_prefix: str = "metadata/silver") -> str:
+    """
+    Returns the S3 metadata key for a Silver table watermark state file.
+    Example: metadata/silver/servicenow/incident/watermark.json
+    """
+    clean_prefix = metadata_prefix.strip('/')
+    return f"{clean_prefix}/{source_system}/{table_clean}/watermark.json"
+
+
+def get_silver_last_load_date(
+    s3_client,
+    bucket: str,
+    state_key: str,
+    table_display: str,
+    full_refresh: bool = False
+) -> Optional[str]:
+    """
+    Retrieves the last processed watermark timestamp from S3 metadata JSON.
+    Returns None if full_refresh is requested or if the watermark state file does not exist.
+    """
+    if full_refresh:
+        logger.info(f"FULL REFRESH requested for '{table_display}'. Bypassing watermark state.")
+        return None
+
+    if not s3_client:
+        return None
+
+    s3_path = f"s3://{bucket}/{state_key}"
+    try:
+        logger.info(f"Checking for Silver High-Water Mark state file at '{s3_path}'...")
+        response = s3_client.get_object(Bucket=bucket, Key=state_key)
+        state_content = response['Body'].read().decode('utf-8')
+        state_data = json.loads(state_content)
+        last_load_date = state_data.get('last_load_date')
+        if last_load_date and str(last_load_date).strip():
+            logger.info(f"SILVER HIGH-WATER MARK FOUND ({s3_path}): '{last_load_date}' for table '{table_display}'.")
+            return str(last_load_date).strip()
+    except ClientError as err:
+        code = err.response.get('Error', {}).get('Code')
+        if code in ('NoSuchKey', '404'):
+            logger.info(f"Silver watermark state file NOT present in S3 at '{s3_path}'. Performing initial full load...")
+        else:
+            logger.warning(f"Error reading Silver watermark from '{s3_path}': {err}. Defaulting to full load.")
+    except Exception as err:
+        logger.warning(f"Unexpected error checking watermark for '{table_display}': {err}. Defaulting to full load.")
+
+    return None
+
+
+def update_silver_watermark(
+    s3_client,
+    bucket: str,
+    state_key: str,
+    source_system: str,
+    table_name: str,
+    new_watermark: str,
+    total_records: int,
+    current_run_time: str
+) -> None:
+    """
+    Writes/Updates the Silver High-Water Mark JSON metadata file in S3 upon successful Iceberg write.
+    The 'table_name' field is formatted as 'tbl_<tablename>' (e.g. tbl_incident).
+    """
+    if not s3_client:
+        logger.warning("s3_client not available. Skipping Silver watermark update.")
+        return
+
+    s3_path = f"s3://{bucket}/{state_key}"
+    state_payload = {
+        "source_system": source_system,
+        "table_name": table_name,
+        "last_load_date": new_watermark,
+        "last_status": "SUCCESS",
+        "records_processed": total_records,
+        "updated_at": current_run_time
+    }
+
+    try:
+        logger.info(f"Updating Silver watermark at '{s3_path}' with payload: {state_payload}")
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=state_key,
+            Body=json.dumps(state_payload, indent=2).encode('utf-8'),
+            ContentType="application/json"
+        )
+        logger.info(f"Successfully updated Silver S3 watermark at '{s3_path}'")
+    except Exception as err:
+        logger.warning(f"Failed to update Silver watermark at '{s3_path}': {err}")
+
+
+def sync_silver_watermark_catalog_table(
+    glue_client,
+    database_name: str,
+    watermark_table_name: str,
+    bucket: str,
+    metadata_prefix: str = "metadata/silver"
+) -> str:
+    """
+    Creates or ensures an Athena-queryable AWS Glue Catalog external table for all Silver High-Water Mark state files.
+    Location: s3://{bucket}/{metadata_prefix}/
+    Using recursive directory scanning so all watermark.json files across sources and tables can be queried in Athena:
+    SELECT * FROM <database_name>.<watermark_table_name>;
+    """
+    if not glue_client:
+        return f"{database_name}.{watermark_table_name}"
+
+    clean_prefix = metadata_prefix.strip('/')
+    watermark_location = f"s3://{bucket}/{clean_prefix}/"
+
+    columns = [
+        {'Name': 'source_system', 'Type': 'string'},
+        {'Name': 'table_name', 'Type': 'string'},
+        {'Name': 'last_load_date', 'Type': 'string'},
+        {'Name': 'last_status', 'Type': 'string'},
+        {'Name': 'records_processed', 'Type': 'bigint'},
+        {'Name': 'updated_at', 'Type': 'string'}
+    ]
+
+    storage_desc = {
+        'Columns': columns,
+        'Location': watermark_location,
+        'InputFormat': 'org.apache.hadoop.mapred.TextInputFormat',
+        'OutputFormat': 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+        'Compressed': False,
+        'NumberOfBuckets': -1,
+        'SerdeInfo': {
+            'SerializationLibrary': 'org.openx.data.jsonserde.JsonSerDe',
+            'Parameters': {
+                'ignore.malformed.json': 'true',
+                'mapping.source_system': 'source_system',
+                'mapping.table_name': 'table_name',
+                'mapping.last_load_date': 'last_load_date',
+                'mapping.last_status': 'last_status',
+                'mapping.records_processed': 'records_processed',
+                'mapping.updated_at': 'updated_at'
+            }
+        }
+    }
+
+    try:
+        glue_client.get_table(DatabaseName=database_name, Name=watermark_table_name)
+        logger.info(f"Silver Watermark Catalog Table verified: {database_name}.{watermark_table_name}")
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code')
+        if code in ('EntityNotFoundException', 'NoSuchEntityException'):
+            try:
+                glue_client.create_table(
+                    DatabaseName=database_name,
+                    TableInput={
+                        'Name': watermark_table_name,
+                        'Description': 'Athena queryable table for all Silver High-Water Mark state files',
+                        'TableType': 'EXTERNAL_TABLE',
+                        'Parameters': {
+                            'EXTERNAL': 'TRUE',
+                            'classification': 'json',
+                            'recursive.directories': 'true'
+                        },
+                        'StorageDescriptor': storage_desc
+                    }
+                )
+                logger.info(f"Created Athena Silver Watermark Catalog Table: {database_name}.{watermark_table_name} at '{watermark_location}'")
+            except ClientError as ce:
+                if ce.response.get('Error', {}).get('Code') != 'AlreadyExistsException':
+                    logger.warning(f"Failed to create Silver Watermark Catalog table '{watermark_table_name}': {ce}")
+        else:
+            logger.warning(f"Error checking Silver Watermark table '{watermark_table_name}': {e}")
+    except Exception as err:
+        logger.warning(f"Unexpected error syncing Silver Watermark table '{watermark_table_name}': {err}")
+
+    return f"{database_name}.{watermark_table_name}"
 
 
 def quote_iceberg_table(table_name: str) -> str:
@@ -440,12 +658,23 @@ def main():
     silver_data_prefix = params.get('SILVER_DATA_PREFIX', 'silver/data')
     silver_full_config = params['SILVER_FULL_CONFIG']
 
-    # Initialize Spark & Glue Contexts configured for Apache Iceberg
+    # Watermark Parameters
+    watermark_enabled = params.get('WATERMARK_ENABLED', True)
+    full_refresh = params.get('FULL_REFRESH', False)
+    watermark_column = params.get('WATERMARK_COLUMN', '_ingested_at')
+    sync_watermark_table = params.get('SYNC_WATERMARK_TABLE', True)
+    watermark_table_name = params.get('WATERMARK_TABLE_NAME', 'tbl_watermarks')
+    metadata_prefix = params.get('METADATA_PREFIX', 'metadata/silver')
+
+    # Initialize Spark, Glue, and Boto3 Clients
     sc = SparkContext()
     glueContext = GlueContext(sc)
     spark = glueContext.spark_session
     job = Job(glueContext)
     job.init(job_name, params['ARG_DICT'])
+
+    s3_client = boto3.client('s3')
+    glue_client = boto3.client('glue')
 
     execution_start_utc = datetime.now(timezone.utc)
     current_run_time = execution_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -463,6 +692,10 @@ def main():
         f"|  Table Prefix       : {table_prefix:<57}|\n"
         f"|  Bronze Data Prefix : {bronze_data_prefix:<57}|\n"
         f"|  Silver Data Prefix : {silver_data_prefix:<57}|\n"
+        f"|  Watermark Enabled  : {str(watermark_enabled):<57}|\n"
+        f"|  Watermark Column   : {watermark_column:<57}|\n"
+        f"|  Watermark Athena   : {watermark_table_name:<57}|\n"
+        f"|  Full Refresh       : {str(full_refresh):<57}|\n"
         f"|  Start Time (UTC)   : {current_run_time:<57}|\n"
         "+================================================================================+"
     )
@@ -484,12 +717,26 @@ def main():
         bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{table_clean}/"
         silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{table_clean}/"
 
+        # Resolve High-Water Mark state key & last load date
+        state_key = get_silver_watermark_key(source_system, table_clean, metadata_prefix)
+        last_load_date = None
+        if watermark_enabled and not full_refresh:
+            last_load_date = get_silver_last_load_date(
+                s3_client=s3_client,
+                bucket=bucket_name,
+                state_key=state_key,
+                table_display=target_table_name,
+                full_refresh=full_refresh
+            )
+
         table_header = (
             f"[TABLE START] {table_clean} [{table_idx}/{len(table_list)}] | Source: {source_system} | Database: {glue_database}\n"
             "+--------------------------------------------------------------------------------+\n"
             f"| >>> [{table_idx}/{len(table_list)}] SILVER PROCESSING: {table_clean.upper()} (Source: {source_system})\n"
             f"|     Target Table       : {silver_table_name}\n"
             f"|     Silver Location    : {silver_location}\n"
+            f"|     Watermark State Key: {state_key if watermark_enabled else 'DISABLED'}\n"
+            f"|     Last Watermark     : {last_load_date or ('INITIAL_FULL_LOAD' if watermark_enabled else 'DISABLED')}\n"
             f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
             "+--------------------------------------------------------------------------------+"
         )
@@ -518,26 +765,52 @@ def main():
                     except Exception:
                         df_bronze = spark.read.json(legacy_bronze_path)
 
+            # Apply Incremental High-Water Mark Filter if watermark is present
+            if last_load_date and watermark_enabled and not full_refresh:
+                if watermark_column in df_bronze.columns:
+                    logger.info(f"Applying Silver Watermark filter: `{watermark_column}` > '{last_load_date}' for table '{target_table_name}'...")
+                    df_bronze = df_bronze.filter(col(watermark_column) > lit(last_load_date))
+                else:
+                    logger.warning(f"Watermark column '{watermark_column}' not found in Bronze table '{table_clean}'. Reading all available records.")
+
+            batch_count = df_bronze.count()
+            logger.info(f"Incoming Bronze records to process for '{target_table_name}': {batch_count}")
+
+            if batch_count == 0:
+                table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
+                table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                table_stats.append({
+                    "table_name": table_clean,
+                    "status": "SKIPPED_UP_TO_DATE",
+                    "scd_type": scd_type.upper(),
+                    "merge_strategy": merge_strategy.upper(),
+                    "duration_seconds": round(table_duration, 2),
+                    "records_processed": 0,
+                    "error_message": None
+                })
+                skipped_card = (
+                    f"[TABLE SKIPPED] {table_clean} | UP TO DATE | Duration: {table_duration:.2f}s\n"
+                    "+================================================================================+\n"
+                    f"|  SILVER TABLE SKIPPED: {table_clean} [UP TO DATE]\n"
+                    "+--------------------------------------------------------------------------------+\n"
+                    f"|  * Source System    : {source_system}\n"
+                    f"|  * Table Name       : {table_clean} ({target_table_name})\n"
+                    f"|  * Target Iceberg   : {silver_table_name}\n"
+                    f"|  * Last Watermark   : {last_load_date}\n"
+                    f"|  * New Records      : 0\n"
+                    f"|  * Status           : Table is already up to date. Skipping Iceberg write.\n"
+                    f"|  * Table Duration   : {table_duration:.2f}s\n"
+                    "+================================================================================+"
+                )
+                logger.info(skipped_card)
+                continue
+
             # Allow CLI Arguments to dynamically override silver_config.json settings for manual testing / Step Functions
             cli_args = params.get('ARG_DICT', {})
             merge_strategy = (cli_args.get('MERGE_STRATEGY') or table_cfg.get('merge_strategy') or defaults_cfg.get('merge_strategy', 'upsert')).lower()
             scd_type = (cli_args.get('SCD_TYPE') or table_cfg.get('scd_type') or defaults_cfg.get('scd_type', 'scd1')).lower()
             scd2_cfg = table_cfg.get('scd2_config') or defaults_cfg.get('scd2_defaults', {})
             dedup_strategy = (cli_args.get('DEDUPLICATION_STRATEGY') or table_cfg.get('deduplication_strategy') or defaults_cfg.get('deduplication', {}).get('strategy', 'latest_by_order_column')).lower()
-
-            if df_bronze.rdd.isEmpty():
-                legacy_bronze_path = f"s3://{bucket_name}/bronze/{source_system}/{table_clean}/"
-                try:
-                    df_legacy = spark.read.option("mergeSchema", "true").parquet(legacy_bronze_path)
-                    if not df_legacy.rdd.isEmpty():
-                        logger.info(f"Found records in legacy Bronze path: '{legacy_bronze_path}'")
-                        df_bronze = df_legacy
-                    else:
-                        logger.warning(f"No records found in Bronze layer at '{bronze_path}'. Skipping Silver table write.")
-                        continue
-                except Exception:
-                    logger.warning(f"No records found in Bronze layer at '{bronze_path}'. Skipping Silver table write.")
-                    continue
 
             columns = df_bronze.columns
 
@@ -609,6 +882,35 @@ def main():
                     .option("path", silver_location) \
                     .saveAsTable(silver_table_name)
 
+            # Determine new watermark timestamp from processed Bronze records
+            if watermark_column in df_bronze.columns:
+                max_val = df_bronze.select(spark_max(col(watermark_column))).collect()[0][0]
+                new_watermark = str(max_val) if max_val is not None else current_run_time
+            else:
+                new_watermark = current_run_time
+
+            # Update High-Water Mark state in S3 (table_name='tbl_<table_clean>')
+            if watermark_enabled:
+                update_silver_watermark(
+                    s3_client=s3_client,
+                    bucket=bucket_name,
+                    state_key=state_key,
+                    source_system=source_system,
+                    table_name=target_table_name,
+                    new_watermark=new_watermark,
+                    total_records=batch_count,
+                    current_run_time=current_run_time
+                )
+
+                if sync_watermark_table:
+                    sync_silver_watermark_catalog_table(
+                        glue_client=glue_client,
+                        database_name=glue_database,
+                        watermark_table_name=watermark_table_name,
+                        bucket=bucket_name,
+                        metadata_prefix=metadata_prefix
+                    )
+
             table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
             table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             table_stats.append({
@@ -617,6 +919,7 @@ def main():
                 "scd_type": scd_type.upper(),
                 "merge_strategy": merge_strategy.upper(),
                 "duration_seconds": round(table_duration, 2),
+                "records_processed": batch_count,
                 "error_message": None
             })
 
@@ -632,6 +935,10 @@ def main():
                 f"|  * Merge Strategy   : {merge_strategy.upper()}\n"
                 f"|  * Natural Key Nkey : {nkeys}\n"
                 f"|  * Order By Columns : {order_cols}\n"
+                f"|  * Records Ingested : {batch_count}\n"
+                f"|  * Last Watermark   : {last_load_date or ('INITIAL_FULL_LOAD' if watermark_enabled else 'DISABLED')}\n"
+                f"|  * New Watermark    : {new_watermark if watermark_enabled else 'DISABLED'}\n"
+                f"|  * Watermark S3 Key : {state_key if watermark_enabled else 'DISABLED'}\n"
                 f"|  * Table Duration   : {table_duration:.2f}s\n"
                 f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
                 f"|  * End Time (UTC)   : {table_end_time_str}\n"
@@ -649,6 +956,7 @@ def main():
                 "scd_type": scd_type.upper(),
                 "merge_strategy": merge_strategy.upper(),
                 "duration_seconds": round(table_duration, 2),
+                "records_processed": 0,
                 "error_message": str(err)
             })
             failed_card = (
@@ -676,9 +984,10 @@ def main():
 
     breakdown_lines = []
     for t in table_stats:
-        status_tag = "[OK]  " if t['status'] == 'SUCCESS' else "[FAIL]"
+        status_tag = "[OK]  " if t['status'] == 'SUCCESS' else ("[SKIP]" if t['status'] == 'SKIPPED_UP_TO_DATE' else "[FAIL]")
+        records_str = f"Records: {t.get('records_processed', 0):>5}"
         breakdown_lines.append(
-            f"|  {status_tag} {t['table_name']:<20} | SCD: {t['scd_type']:<5} | Merge: {t['merge_strategy']:<10} | Time: {t['duration_seconds']:>6.2f}s | Status: {t['status']}"
+            f"|  {status_tag} {t['table_name']:<20} | SCD: {t['scd_type']:<5} | Merge: {t['merge_strategy']:<10} | {records_str} | Time: {t['duration_seconds']:>6.2f}s | Status: {t['status']}"
         )
         if t.get('error_message'):
             breakdown_lines.append(f"|         └── Error: {t['error_message']}")
@@ -704,6 +1013,8 @@ def main():
         "+--------------------------------------------------------------------------------+\n"
         "|  S3 PERSISTENCE LOCATIONS:\n"
         f"|  * Silver Tables Path  : s3://{bucket_name}/{silver_data_prefix}/{source_system}/\n"
+        f"|  * Watermark State     : s3://{bucket_name}/{metadata_prefix}/{source_system}/\n"
+        f"|  * Watermark Athena Tbl: {glue_database}.{watermark_table_name}\n"
         "+================================================================================+"
     )
     logger.info(overall_card)

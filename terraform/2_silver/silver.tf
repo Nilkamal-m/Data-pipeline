@@ -115,6 +115,8 @@ module "silver_iceberg_job" {
     "--DATA_LAKE_BUCKET"       = local.bucket_name
     "--GLUE_DATABASE"          = local.glue_db_name
     "--TABLE_PREFIX"           = "tbl_"
+    "--WATERMARK_TABLE_NAME"   = "tbl_watermarks"
+    "--FULL_REFRESH"           = "false"
     "--job-language"           = "python"
   }
 

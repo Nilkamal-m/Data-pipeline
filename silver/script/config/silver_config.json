@@ -27,6 +27,14 @@
       "strategy": "latest_by_order_column",
       "default_nkey": "sys_id",
       "default_order_column": "sys_updated_on"
+    },
+    "watermark": {
+      "enabled": true,
+      "metadata_prefix": "metadata/silver",
+      "watermark_column": "_ingested_at",
+      "sync_watermark_table": true,
+      "watermark_table_name": "tbl_watermarks",
+      "full_refresh": false
     }
   },
   "source_systems": {

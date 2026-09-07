@@ -125,3 +125,27 @@ class SilverConfigLoader:
         table_clean = table_name.strip().lower()
         target_name = table_cfg.get("target_table_name") or f"{table_prefix}{table_clean}"
         return f"{glue_database}.{target_name}"
+
+    @classmethod
+    def get_watermark_config(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Retrieves watermark configuration from silver_defaults.
+        """
+        config = config_dict or cls._config_cache or cls.load_config()
+        defaults = config.get("silver_defaults", {})
+        return defaults.get("watermark", {
+            "enabled": True,
+            "metadata_prefix": "metadata/silver",
+            "watermark_column": "_ingested_at",
+            "sync_watermark_table": True,
+            "watermark_table_name": "tbl_watermarks",
+            "full_refresh": False
+        })
+
+    @classmethod
+    def is_watermark_enabled(cls, config_dict: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Returns whether watermark tracking is enabled.
+        """
+        return cls.get_watermark_config(config_dict).get("enabled", True)
+
