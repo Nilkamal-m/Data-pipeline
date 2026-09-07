@@ -15,7 +15,7 @@ This document provides a low-level, component-by-component architectural and tec
    - [connectors/s3_file.py (File Ingestion Connector)](#connectorss3_filepy)
    - [connectors/database.py (JDBC Connector)](#connectorsdatabasepy)
 3. [Silver Apache Iceberg ETL Deep Dive (`silver/script/`)](#3-silver-apache-iceberg-etl-deep-dive)
-   - [silver_iceberg_etl.py (PySpark Driver)](#silver_iceberg_etlpy)
+   - [uax_silver_etl.py (PySpark Driver)](#uax_silver_etlpy)
    - [transformer.py (Deduplication & Window Functions)](#transformerpy)
 4. [Configuration Schemas Explained Line-by-Line](#4-configuration-schemas-explained-line-by-line)
    - [bronze_config.json](#bronze_configjson)
@@ -134,7 +134,7 @@ File-based ingestion connector for external S3 buckets.
 
 ## 3. Silver Apache Iceberg ETL Deep Dive
 
-### `silver_iceberg_etl.py` & `transformer.py`
+### `uax_silver_etl.py` & `transformer.py`
 
 1. **Apache Iceberg Integration**:
    - Uses PySpark configured with `org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions`.

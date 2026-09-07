@@ -53,7 +53,7 @@ Data-pipeline/
 │       │   └── silver_config.json      # Silver configuration, deduplication & merge settings
 │       ├── custom_transforms/          # Table-specific custom PySpark transformation scripts
 │       ├── silver_config_loader.py     # Silver configuration loader module
-│       ├── silver_iceberg_etl.py       # Main PySpark Iceberg ETL script
+│       ├── uax_silver_etl.py           # Main PySpark Iceberg ETL script
 │       └── transformer.py              # Core PySpark DataFrame transformer
 ├── terraform/                          # 100% Module-based Terraform Infrastructure
 │   ├── 1_bronze/
@@ -114,7 +114,7 @@ aws s3 cp bronze/script/connectors.zip s3://${DATA_LAKE_BUCKET}/bronze/script/co
 aws s3 cp bronze/script/config/bronze_config.json s3://${DATA_LAKE_BUCKET}/bronze/script/config/bronze_config.json
 
 # Upload Silver Scripts & Config
-aws s3 cp silver/script/silver_iceberg_etl.py s3://${DATA_LAKE_BUCKET}/silver/script/silver_iceberg_etl.py
+aws s3 cp silver/script/uax_silver_etl.py s3://${DATA_LAKE_BUCKET}/silver/script/uax_silver_etl.py
 aws s3 cp silver/script/silver_config_loader.py s3://${DATA_LAKE_BUCKET}/silver/script/silver_config_loader.py
 aws s3 cp silver/script/transformer.py s3://${DATA_LAKE_BUCKET}/silver/script/transformer.py
 aws s3 cp silver/script/config/silver_config.json s3://${DATA_LAKE_BUCKET}/silver/script/config/silver_config.json

@@ -104,7 +104,7 @@ module "silver_iceberg_job" {
 
   command = {
     name            = "glueetl"
-    script_location = "s3://${local.bucket_name}/silver/script/silver_iceberg_etl.py"
+    script_location = "s3://${local.bucket_name}/silver/script/uax_silver_etl.py"
   }
 
   default_arguments = {

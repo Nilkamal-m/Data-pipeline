@@ -47,7 +47,7 @@ This document details the low-level technical architecture, connector design, st
                                                v
                 +-------------------------------------------------------------+
                 |            SILVER ICEBERG ETL ENGINE (AWS GLUE)             |
-                |                (silver_iceberg_etl.py)                      |
+                |                   (uax_silver_etl.py)                       |
                 |                                                             |
                 |   1. Deduplicates Raw Bronze Parquet Records                |
                 |   2. Applies Business Transformations                       |
@@ -125,7 +125,7 @@ The Bronze Layer is designed around a **Factory Pattern** connecting multiple so
 The Silver Layer converts Bronze raw Parquet files into ACID-compliant **Apache Iceberg** analytical tables.
 
 ### Key Components:
-1. **`silver_iceberg_etl.py`**:
+1. **`uax_silver_etl.py`**:
    - PySpark Glue 4.0 job configured with Apache Iceberg extensions (`IcebergSparkSessionExtensions`).
    - Reads raw Bronze files from `s3://<bucket>/bronze/data/<source>/<table_name>/`.
 2. **`transformer.py`**:
@@ -159,7 +159,7 @@ Step Functions State Machines coordinate the pipeline steps:
         +---> (On Failure) ---> [Send SNS Alert Email]
         │
         v
-[Task 2: Execute Silver PySpark ETL Job (silver_iceberg_etl.py)]
+[Task 2: Execute Silver PySpark ETL Job (uax_silver_etl.py)]
         │
         +---> (On Failure) ---> [Send SNS Alert Email]
         │
