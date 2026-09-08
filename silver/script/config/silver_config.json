@@ -152,9 +152,9 @@
       "default_tables": ["raw_tbl_interactions", "raw_tbl_users", "raw_tbl_tickets"],
       "table_configs": {
         "raw_tbl_interactions": {
-          "nkey": "id",
-          "deduplication_keys": ["id"],
-          "deduplication_order_by": ["last_updated_time", "_ingested_at"],
+          "nkey": ["id", "interaction_id"],
+          "deduplication_keys": ["id", "interaction_id"],
+          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -166,9 +166,9 @@
           "custom_transform_script": ""
         },
         "raw_tbl_users": {
-          "nkey": "id",
-          "deduplication_keys": ["id"],
-          "deduplication_order_by": ["last_updated_time", "_ingested_at"],
+          "nkey": ["id", "user_id"],
+          "deduplication_keys": ["id", "user_id"],
+          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -180,9 +180,9 @@
           "custom_transform_script": ""
         },
         "raw_tbl_tickets": {
-          "nkey": "id",
-          "deduplication_keys": ["id"],
-          "deduplication_order_by": ["last_updated_time", "_ingested_at"],
+          "nkey": ["id", "ticket_id"],
+          "deduplication_keys": ["id", "ticket_id"],
+          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",

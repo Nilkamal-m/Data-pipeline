@@ -20,6 +20,7 @@ from botocore.exceptions import ClientError
 from datetime import datetime, timezone
 from typing import Optional
 from pyspark.context import SparkContext
+from pyspark.conf import SparkConf
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import SparkSession
@@ -444,10 +445,34 @@ def sync_silver_watermark_catalog_table(
 
 def quote_iceberg_table(table_name: str) -> str:
     """
-    Escapes database and table identifiers with backticks for Spark SQL syntax safety (e.g. `db-name`.`tbl-name`).
+    Escapes database and table identifiers with backticks for Spark SQL syntax safety (e.g. `glue_catalog`.`db-name`.`tbl-name`).
     """
     parts = table_name.split('.')
-    return '.'.join([f"`{p}`" for p in parts])
+    return '.'.join([f"`{p.strip('`')}`" for p in parts])
+
+
+def check_iceberg_table_exists(spark, glue_client, database_name: str, table_name: str) -> bool:
+    """
+    Safely checks whether an Iceberg table exists in the AWS Glue Data Catalog.
+    Uses AWS Glue API directly first to avoid Spark SQL catalog parser issues with hyphens.
+    """
+    if glue_client:
+        try:
+            glue_client.get_table(DatabaseName=database_name, Name=table_name)
+            return True
+        except ClientError as e:
+            if e.response.get('Error', {}).get('Code') in ('EntityNotFoundException', 'NoSuchEntityException'):
+                return False
+            logger.warning(f"Error checking Glue catalog for table {database_name}.{table_name}: {e}")
+        except Exception as e:
+            logger.warning(f"Unexpected error checking Glue catalog for table {database_name}.{table_name}: {e}")
+
+    try:
+        quoted = quote_iceberg_table(f"glue_catalog.{database_name}.{table_name}")
+        spark.sql(f"DESCRIBE TABLE {quoted}")
+        return True
+    except Exception:
+        return False
 
 
 def get_payload_columns(all_columns: list, nkeys) -> list:
@@ -504,7 +529,7 @@ def perform_deduplication(df, nkeys, order_cols, strategy='latest_by_order_colum
              .drop("row_num")
 
 
-def execute_iceberg_scd1_upsert(spark, df, silver_table_name, silver_location, nkeys, order_cols):
+def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_table_name: str, df, silver_table_name: str, silver_location: str, nkeys, order_cols):
     """
     Executes SCD Type 1 (UPSERT via Spark SQL MERGE INTO) on Apache Iceberg table.
     - Compares runtime payload hash to detect genuine business changes.
@@ -516,21 +541,21 @@ def execute_iceberg_scd1_upsert(spark, df, silver_table_name, silver_location, n
     nkey_list = nkeys if isinstance(nkeys, list) else [nkeys]
     order_col_name = order_cols[0] if isinstance(order_cols, list) else order_cols
 
-    table_exists = spark.catalog.tableExists(silver_table_name)
+    table_exists = check_iceberg_table_exists(spark, glue_client, database_name, target_table_name)
 
     if not table_exists:
-        logger.info(f"Target Iceberg table '{silver_table_name}' does not exist. Creating table with initial data...")
+        logger.info(f"Target Iceberg table '{quoted_table}' does not exist. Creating table with initial data...")
         df.write \
           .format("iceberg") \
           .mode("append") \
           .option("path", silver_location) \
-          .saveAsTable(silver_table_name)
+          .saveAsTable(quoted_table)
     else:
-        logger.info(f"Executing SCD Type 1 Runtime-Hash MERGE INTO (UPSERT) on '{silver_table_name}'...")
+        logger.info(f"Executing SCD Type 1 Runtime-Hash MERGE INTO (UPSERT) on '{quoted_table}'...")
         payload_cols = get_payload_columns(df.columns, nkey_list)
         logger.info(f"Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
 
-        temp_view = f"incoming_scd1_{silver_table_name.replace('.', '_').replace('-', '_')}"
+        temp_view = f"incoming_scd1_{target_table_name.replace('.', '_').replace('-', '_')}"
         df.createOrReplaceTempView(temp_view)
 
         join_conditions = [f"target.`{k}` = source.`{k}`" for k in nkey_list]
@@ -573,7 +598,7 @@ def execute_iceberg_scd1_upsert(spark, df, silver_table_name, silver_location, n
         spark.sql(merge_sql)
 
 
-def execute_iceberg_scd2(spark, df, silver_table_name, silver_location, nkeys, order_cols, scd2_cfg):
+def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_name: str, df, silver_table_name: str, silver_location: str, nkeys, order_cols, scd2_cfg):
     """
     Executes SCD Type 2 (Slowly Changing Dimension Type 2) on Apache Iceberg table.
     Tracks historical change history with _valid_from, _valid_to, _is_current ('Y'/'N'), and _is_deleted ('Y'/'N').
@@ -590,7 +615,7 @@ def execute_iceberg_scd2(spark, df, silver_table_name, silver_location, nkeys, o
     is_current_col = scd2_cfg.get('is_current_column', '_is_current')
     high_date_val = scd2_cfg.get('high_date_value', '9999-01-01 00:00:00')
 
-    table_exists = spark.catalog.tableExists(silver_table_name)
+    table_exists = check_iceberg_table_exists(spark, glue_client, database_name, target_table_name)
 
     # Base SCD2 columns for incoming batch
     incoming_df = df.withColumn(valid_from_col, coalesce(col(order_col_name).cast("timestamp"), current_timestamp())) \
@@ -598,18 +623,18 @@ def execute_iceberg_scd2(spark, df, silver_table_name, silver_location, nkeys, o
                     .withColumn(is_current_col, lit('Y'))
 
     if not table_exists:
-        logger.info(f"SCD Type 2: Target table '{silver_table_name}' does not exist. Creating initial table with high-date '{high_date_val}'...")
+        logger.info(f"SCD Type 2: Target table '{quoted_table}' does not exist. Creating initial table with high-date '{high_date_val}'...")
         incoming_df.write \
                    .format("iceberg") \
                    .mode("append") \
                    .option("path", silver_location) \
-                   .saveAsTable(silver_table_name)
+                   .saveAsTable(quoted_table)
     else:
-        logger.info(f"Executing SCD Type 2 Runtime-Hash Change Detection on '{silver_table_name}'...")
+        logger.info(f"Executing SCD Type 2 Runtime-Hash Change Detection on '{quoted_table}'...")
         payload_cols = get_payload_columns(df.columns, nkey_list)
         logger.info(f"SCD2 Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
 
-        temp_view = f"scd2_incoming_{silver_table_name.replace('.', '_').replace('-', '_')}"
+        temp_view = f"scd2_incoming_{target_table_name.replace('.', '_').replace('-', '_')}"
         incoming_df.createOrReplaceTempView(temp_view)
 
         join_conditions = [f"target.`{k}` = source.`{k}`" for k in nkey_list]
@@ -642,7 +667,7 @@ def execute_iceberg_scd2(spark, df, silver_table_name, silver_location, nkeys, o
         # 2. Append new incoming records ONLY if:
         #    a) They are completely new (do not exist in active target at all), OR
         #    b) They represent a genuine change over the prior active version (and are newer than prior version)
-        active_target_view = f"scd2_active_{silver_table_name.replace('.', '_').replace('-', '_')}"
+        active_target_view = f"scd2_active_{target_table_name.replace('.', '_').replace('-', '_')}"
         spark.sql(f"SELECT * FROM {quoted_table} WHERE `{is_current_col}` = 'Y'").createOrReplaceTempView(active_target_view)
 
         target_active_hash = build_runtime_hash_expr(payload_cols, prefix="act")
@@ -663,14 +688,14 @@ def execute_iceberg_scd2(spark, df, silver_table_name, silver_location, nkeys, o
         """
         changed_or_new_df = spark.sql(changed_and_new_sql)
         num_new_versions = changed_or_new_df.count()
-        logger.info(f"SCD Type 2: Appending {num_new_versions} genuine new/updated version(s) to '{silver_table_name}'...")
+        logger.info(f"SCD Type 2: Appending {num_new_versions} genuine new/updated version(s) to '{quoted_table}'...")
 
         if num_new_versions > 0:
             changed_or_new_df.write \
                              .format("iceberg") \
                              .mode("append") \
                              .option("path", silver_location) \
-                             .saveAsTable(silver_table_name)
+                             .saveAsTable(quoted_table)
         else:
             logger.info(f"SCD Type 2: 0 changed records found in incoming batch. No duplicate versions appended.")
 
@@ -696,7 +721,14 @@ def main():
     metadata_prefix = params.get('METADATA_PREFIX', 'metadata/silver')
 
     # Initialize Spark, Glue, and Boto3 Clients
-    sc = SparkContext()
+    conf = SparkConf()
+    conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    conf.set("spark.sql.catalog.glue_catalog.warehouse", f"s3://{bucket_name}/{silver_data_prefix}/")
+    conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+
+    sc = SparkContext.getOrCreate(conf=conf)
     glueContext = GlueContext(sc)
     spark = glueContext.spark_session
     job = Job(glueContext)
@@ -744,7 +776,7 @@ def main():
         scd2_cfg = defaults_cfg.get('scd_type2_config', {})
 
         target_table_name = table_cfg.get('target_table_name') or f"{table_prefix}{base_table_name}"
-        silver_table_name = f"{glue_database}.{target_table_name}"
+        silver_table_name = f"glue_catalog.{glue_database}.{target_table_name}"
         bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
         silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{base_table_name}/"
 
@@ -803,7 +835,16 @@ def main():
                             try:
                                 df_bronze = spark.read.option("mergeSchema", "true").parquet(legacy_bronze_path)
                             except Exception:
-                                df_bronze = spark.read.json(legacy_bronze_path)
+                                try:
+                                    df_bronze = spark.read.json(legacy_bronze_path)
+                                except Exception as final_read_err:
+                                    raise FileNotFoundError(
+                                        f"Bronze source data for '{bronze_table_name}' was not found in Glue Catalog "
+                                        f"(`{glue_database}`.`{bronze_table_name}`) nor at S3 locations "
+                                        f"('{bronze_path}', '{alt_bronze_path}', '{legacy_bronze_path}'). "
+                                        f"Please ensure the Bronze ingestion job has run for source system '{source_system}' "
+                                        f"and table '{base_table_name}'. (Underlying error: {final_read_err})"
+                                    )
 
             # Apply Incremental High-Water Mark Filter if watermark is present
             if last_load_date and watermark_enabled and not full_refresh:
@@ -927,22 +968,44 @@ def main():
             logger.info(f"Target Iceberg Table: '{silver_table_name}', SCD Type: '{scd_type.upper()}', Merge Strategy: '{merge_strategy.upper()}'")
 
             # 3. Execute SCD Type 2 or SCD Type 1 / Append / Overwrite
+            quoted_iceberg_table = quote_iceberg_table(silver_table_name)
             if scd_type == 'scd2':
-                execute_iceberg_scd2(spark, df_transformed, silver_table_name, silver_location, nkeys, order_cols, scd2_cfg)
+                execute_iceberg_scd2(
+                    spark=spark,
+                    glue_client=glue_client,
+                    database_name=glue_database,
+                    target_table_name=target_table_name,
+                    df=df_transformed,
+                    silver_table_name=silver_table_name,
+                    silver_location=silver_location,
+                    nkeys=nkeys,
+                    order_cols=order_cols,
+                    scd2_cfg=scd2_cfg
+                )
             elif merge_strategy in ('upsert', 'merge_into'):
-                execute_iceberg_scd1_upsert(spark, df_transformed, silver_table_name, silver_location, nkeys, order_cols)
+                execute_iceberg_scd1_upsert(
+                    spark=spark,
+                    glue_client=glue_client,
+                    database_name=glue_database,
+                    target_table_name=target_table_name,
+                    df=df_transformed,
+                    silver_table_name=silver_table_name,
+                    silver_location=silver_location,
+                    nkeys=nkeys,
+                    order_cols=order_cols
+                )
             elif merge_strategy == 'overwrite':
                 df_transformed.write \
                     .format("iceberg") \
                     .mode("overwrite") \
                     .option("path", silver_location) \
-                    .saveAsTable(silver_table_name)
+                    .saveAsTable(quoted_iceberg_table)
             else:
                 df_transformed.write \
                     .format("iceberg") \
                     .mode("append") \
                     .option("path", silver_location) \
-                    .saveAsTable(silver_table_name)
+                    .saveAsTable(quoted_iceberg_table)
 
             # Determine new watermark timestamp from processed Bronze records
             if watermark_column in df_bronze.columns:
@@ -1083,7 +1146,11 @@ def main():
     logger.info(overall_card)
 
     if failed_tables:
-        err_summary = f"Silver Iceberg ETL completed with failures in {len(failed_tables)} table(s): {[t[0] for t in failed_tables]}"
+        err_details = "\n".join([f"  * Table '{t[0]}': {t[1]}" for t in failed_tables])
+        err_summary = (
+            f"Silver Iceberg ETL completed with failures in {len(failed_tables)} table(s):\n"
+            f"{err_details}"
+        )
         logger.error(err_summary)
         raise RuntimeError(err_summary)
 
