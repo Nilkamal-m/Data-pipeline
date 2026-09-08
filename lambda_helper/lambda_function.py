@@ -105,6 +105,10 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
     # Parameter mappings for Bronze Ingestion and Silver Iceberg ETL
     param_mappings = {
         # Common parameters
+        'conf': '--conf',
+        '--conf': '--conf',
+        'CONF': '--conf',
+        '--CONF': '--conf',
         'secret_name': '--SECRET_NAME',
         'SECRET_NAME': '--SECRET_NAME',
         'custom_query': '--CUSTOM_QUERY',
