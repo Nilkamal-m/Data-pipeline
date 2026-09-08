@@ -1,0 +1,235 @@
+# AWS Glue Helper Lambda (Bronze & Silver Jobs)
+
+This helper Lambda function allows engineers to trigger and synchronously monitor **Bronze (REST API Ingestion)** and **Silver (PySpark Iceberg ETL)** AWS Glue jobs directly via the AWS Lambda Console, AWS CLI, or SDKs without requiring direct access to the AWS Glue Console.
+
+---
+
+## 1. Supported Glue Jobs
+
+| Layer | Job Name | Engine | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Bronze** | `uax-datalake-bronze-ingestion-dev` | Python Shell 3.9 | Ingests raw API / DB data into S3 partitioned by `_ingested_at=<ISO_TIMESTAMP>` and registers Glue Catalog external tables. |
+| **Silver** | `uax-datalake-silver-etl-dev` | Glue PySpark 4.0 | Deduplicates Bronze raw data, applies audit columns (`_is_deleted`, `_is_current`, `_updated_at`, `_inserted_at`), and merges into Iceberg tables (`tbl_<name>`). |
+
+*(Job names automatically resolve via environment variables `DEFAULT_BRONZE_JOB` and `DEFAULT_SILVER_JOB`, or can be explicitly overridden in the event payload via `"job_name"`).*
+
+---
+
+## 2. Event Payload Parameters Reference
+
+| Parameter | Type | Required | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `layer` | string | Optional | `"bronze"` | Target layer: `"bronze"` or `"silver"`. |
+| `job_name` | string | Optional | Auto-resolved | Explicit Glue job name override (e.g. `uax-datalake-silver-etl-dev`). |
+| `source_system` | string | **Required** | - | Source system name (`servicenow`, `moveworks`, `genesys`, `postgresql`, `mysql`). |
+| `table_name` | string | Optional | Config defaults | Comma-separated table list (e.g., `"incident"` or `"raw_tbl_incident"` or `"incident,change_request"`). |
+| `secret_name` | string | Optional | Config defaults | AWS Secrets Manager secret ARN or name override for credentials. |
+| `custom_query` | string | Optional | Config defaults | Custom SQL query or API filter override. |
+| `full_refresh` | boolean | Optional | `false` | For Silver: If `true`, ignores the watermark and processes all historical Bronze data. |
+| `watermark_enabled`| boolean | Optional | `true` | For Silver: If `true`, filters Bronze data by incremental watermark (`_ingested_at > last_watermark`). |
+| `initial_load_date`| string | Optional | Config defaults | For Bronze: Overrides the starting delta extraction timestamp (e.g., `"2024-01-01T00:00:00Z"`). |
+| `wait_until_completion` | boolean | Optional | `true` | If `true`, Lambda waits and polls status until completion. If `false`, fires asynchronously and returns HTTP 202 immediately. |
+| `poll_interval_seconds` | integer | Optional | `10` | Polling interval in seconds. |
+| `timeout_seconds` | integer | Optional | `540` | Maximum wait duration before Lambda exits (Default: 9 minutes). |
+| `arguments` | object | Optional | `{}` | Key-value dictionary to pass any arbitrary custom Glue CLI arguments (e.g. `{"--CONF": "..."}`). |
+
+---
+
+## 3. Sample Test Events (JSON Payloads)
+
+### A. Bronze Layer Test Payloads
+
+#### 1. ServiceNow Bronze Ingestion (`incident`)
+```json
+{
+  "layer": "bronze",
+  "source_system": "servicenow",
+  "table_name": "incident",
+  "secret_name": "uax-datalake/servicenow-credentials-dev",
+  "wait_until_completion": true
+}
+```
+
+#### 2. Moveworks Bronze Ingestion (`interactions`)
+```json
+{
+  "layer": "bronze",
+  "source_system": "moveworks",
+  "table_name": "interactions",
+  "secret_name": "uax-datalake/moveworks-credentials-dev",
+  "wait_until_completion": true
+}
+```
+
+#### 3. Genesys Bronze Ingestion (`conversations`)
+```json
+{
+  "layer": "bronze",
+  "source_system": "genesys",
+  "table_name": "conversations",
+  "secret_name": "uax-datalake/genesys-credentials-dev",
+  "wait_until_completion": true
+}
+```
+
+#### 4. Relational Database Bronze Ingestion (`orders`)
+```json
+{
+  "layer": "bronze",
+  "source_system": "postgresql",
+  "table_name": "orders",
+  "secret_name": "uax-datalake/postgresql-credentials-dev",
+  "wait_until_completion": true
+}
+```
+
+---
+
+### B. Silver Layer Test Payloads (Apache Iceberg ETL)
+
+#### 5. ServiceNow Silver Iceberg ETL (`raw_tbl_incident`)
+```json
+{
+  "layer": "silver",
+  "source_system": "servicenow",
+  "table_name": "raw_tbl_incident",
+  "wait_until_completion": true
+}
+```
+
+#### 6. ServiceNow Silver Full Refresh (Scans entire Bronze table)
+```json
+{
+  "layer": "silver",
+  "source_system": "servicenow",
+  "table_name": "raw_tbl_incident",
+  "full_refresh": true,
+  "wait_until_completion": true
+}
+```
+
+#### 7. Moveworks Silver Iceberg ETL (`raw_tbl_interactions`)
+```json
+{
+  "layer": "silver",
+  "source_system": "moveworks",
+  "table_name": "raw_tbl_interactions",
+  "wait_until_completion": true
+}
+```
+
+#### 8. Genesys Silver Iceberg ETL (`raw_tbl_conversations`)
+```json
+{
+  "layer": "silver",
+  "source_system": "genesys",
+  "table_name": "raw_tbl_conversations",
+  "wait_until_completion": true
+}
+```
+
+---
+
+### C. Asynchronous Execution (Fire and Forget)
+
+#### 9. Trigger Job and Return Immediately
+```json
+{
+  "layer": "bronze",
+  "source_system": "servicenow",
+  "table_name": "incident",
+  "wait_until_completion": false
+}
+```
+
+---
+
+## 4. Example Responses
+
+### A. Successful Synchronous Execution (HTTP 200)
+```json
+{
+  "statusCode": 200,
+  "body": "{\"job_name\": \"uax-datalake-bronze-ingestion-dev\", \"job_run_id\": \"jr_1234567890abcdef\", \"job_status\": \"SUCCEEDED\", \"execution_time_seconds\": 45, \"source_system\": \"servicenow\", \"table_name\": \"incident\", \"cloudwatch_log_group\": \"/aws-glue/jobs/output\", \"error_message\": null}"
+}
+```
+
+### B. Successful Asynchronous Trigger (HTTP 202)
+```json
+{
+  "statusCode": 202,
+  "body": "{\"message\": \"Glue job started asynchronously.\", \"job_name\": \"uax-datalake-silver-etl-dev\", \"job_run_id\": \"jr_9876543210fedcba\", \"status\": \"STARTING\", \"arguments\": {\"--SOURCE_SYSTEM\": \"servicenow\", \"--TABLE_NAME\": \"raw_tbl_incident\"}}"
+}
+```
+
+### C. Failed Execution (HTTP 500)
+```json
+{
+  "statusCode": 500,
+  "body": "{\"job_name\": \"uax-datalake-silver-etl-dev\", \"job_run_id\": \"jr_abcdef1234567890\", \"job_status\": \"FAILED\", \"execution_time_seconds\": 22, \"source_system\": \"servicenow\", \"table_name\": \"raw_tbl_incident\", \"cloudwatch_log_group\": \"/aws-glue/jobs/output\", \"error_message\": \"CRITICAL CONFIG ERROR: 'nkey' is missing for table 'raw_tbl_incident' in silver_config.json\"}"
+}
+```
+
+---
+
+## 5. How to Test in AWS Lambda Console
+
+1. Open **AWS Lambda Console** &rarr; Functions &rarr; Select `uax-datalake-glue-job-trigger-dev`.
+2. Select the **Test** tab.
+3. Paste any sample payload from **Section 3** above into the Event JSON editor.
+4. Click **Test**.
+5. Inspect the execution logs and JSON output card directly in the console.
+
+---
+
+## 6. IAM Role Setup & Permissions
+
+To re-use the existing Glue IAM Execution Role (`uax-datalake-glue-execution-role-dev`) for the Lambda function:
+
+1. Ensure `lambda.amazonaws.com` is added to the IAM Role's **Trust Relationship**:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": [
+          "glue.amazonaws.com",
+          "lambda.amazonaws.com"
+        ]
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+2. Ensure the policy attached to the role includes permissions to trigger and monitor Glue jobs:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "glue:StartJobRun",
+        "glue:GetJobRun",
+        "glue:GetJobRuns",
+        "glue:BatchStopJobRun"
+      ],
+      "Resource": "arn:aws:glue:*:*:job/uax-datalake-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:*:*:log-group:/aws/lambda/*"
+    }
+  ]
+}
+```
+
