@@ -186,7 +186,12 @@ def parse_spark_arguments() -> dict:
     table_prefix = str(table_prefix).strip()
 
     # Resolve dynamic table list: CLI overrides config default tables
-    raw_tables = get_cli_arg('TABLE_NAME', 'table_name', 'TABLES', 'tables', 'TABLE_NAMES', 'table_names')
+    raw_tables = get_cli_arg(
+        'SOURCE_TABLE_NAME', 'source_table_name',
+        'TABLE_NAME', 'table_name',
+        'TABLES', 'tables',
+        'TABLE_NAMES', 'table_names'
+    )
     if raw_tables:
         table_list = [t.strip() for t in raw_tables.split(',') if t.strip()]
         logger.info(f"Using CLI parameter table override: {table_list}")
@@ -195,7 +200,7 @@ def parse_spark_arguments() -> dict:
         if not table_list:
             raise ValueError(
                 f"CRITICAL CONFIG ERROR: 'default_tables' is missing or empty for source system '{source_system_clean}' "
-                f"in silver_config.json (source_systems.{source_system_clean}.default_tables) and was not provided via CLI (--TABLE_NAME). "
+                f"in silver_config.json (source_systems.{source_system_clean}.default_tables) and was not provided via CLI (--SOURCE_TABLE_NAME). "
                 f"Please configure at least one Bronze source table (e.g. 'raw_tbl_incident') in silver_config.json."
             )
         logger.info(f"Using config default tables: {table_list}")

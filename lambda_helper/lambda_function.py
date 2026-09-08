@@ -14,7 +14,7 @@ Payload Schema (JSON):
     "layer": "bronze",                                 # Optional: "bronze" or "silver" (Defaults to "bronze")
     "job_name": "uax-datalake-bronze-ingestion-dev",   # Optional explicit job name override
     "source_system": "servicenow",                     # Required: servicenow, moveworks, genesys, postgresql, mysql
-    "table_name": "incident",                         # Optional: "incident" or "raw_tbl_incident" or "incident,sys_user"
+    "source_table_name": "incident",                   # Optional: single string ("incident"), list (["incident", "sys_user"]), or comma-separated ("incident,sys_user")
     "secret_name": "uax-datalake/servicenow-credentials-dev", # Optional secret name override
     "custom_query": "",                                # Optional custom query override
     "full_refresh": false,                             # Optional for Silver: true to ignore watermarks
@@ -45,23 +45,10 @@ DEFAULT_BRONZE_JOB = os.environ.get('DEFAULT_BRONZE_JOB', 'uax-datalake-bronze-i
 DEFAULT_SILVER_JOB = os.environ.get('DEFAULT_SILVER_JOB', 'uax-datalake-silver-etl-dev')
 
 
-def resolve_job_name(event: Dict[str, Any]) -> str:
-    """
-    Resolves target Glue job name based on explicit 'job_name' or 'layer' ('bronze' / 'silver').
-    """
-    if event.get('job_name') or event.get('JOB_NAME'):
-        return str(event.get('job_name') or event.get('JOB_NAME')).strip()
-    
-    layer = str(event.get('layer', 'bronze')).strip().lower()
-    if layer in ('silver', 'silver_etl', 'iceberg'):
-        return DEFAULT_SILVER_JOB
-    return DEFAULT_BRONZE_JOB
-
-
 def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
     """
-    Translates input event parameters into Glue argument dictionary format with '--' prefix.
-    Supports arguments for both Bronze ingestion and Silver PySpark Iceberg ETL jobs.
+    Constructs CLI arguments dictionary passed to AWS Glue start_job_run API.
+    Supports both Bronze Ingestion and Silver Iceberg ETL parameters.
     """
     glue_args = {}
 
@@ -75,12 +62,49 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
     
     glue_args['--SOURCE_SYSTEM'] = str(source_system).strip().lower()
 
+    # Source Table Name(s) resolution
+    # Supports:
+    #   - String: "raw_tbl_interactions"
+    #   - List/Array: ["raw_tbl_interactions", "raw_tbl_conversations"]
+    #   - Comma-separated string: "raw_tbl_interactions, raw_tbl_conversations"
+    raw_source_tables = (
+        event.get('source_table_name')
+        if event.get('source_table_name') is not None
+        else event.get('SOURCE_TABLE_NAME')
+        if event.get('SOURCE_TABLE_NAME') is not None
+        else event.get('source_table_names')
+        if event.get('source_table_names') is not None
+        else event.get('SOURCE_TABLE_NAMES')
+        if event.get('SOURCE_TABLE_NAMES') is not None
+        else event.get('table_name')
+        if event.get('table_name') is not None
+        else event.get('TABLE_NAME')
+        if event.get('TABLE_NAME') is not None
+        else event.get('tables')
+        if event.get('tables') is not None
+        else event.get('TABLES')
+    )
+
+    if raw_source_tables is not None:
+        if isinstance(raw_source_tables, (list, tuple, set)):
+            # If passed as a JSON array / Python list: ["raw_tbl_interactions", "raw_tbl_conversations"]
+            cleaned_tables = [str(t).strip() for t in raw_source_tables if str(t).strip()]
+            formatted_tables = ','.join(cleaned_tables)
+        elif isinstance(raw_source_tables, str):
+            # If passed as a single table or comma-separated string: "raw_tbl_interactions, raw_tbl_conversations"
+            cleaned_tables = [t.strip() for t in raw_source_tables.split(',') if t.strip()]
+            formatted_tables = ','.join(cleaned_tables)
+        else:
+            formatted_tables = str(raw_source_tables).strip()
+
+        if formatted_tables:
+            glue_args['--SOURCE_TABLE_NAME'] = formatted_tables
+            # Dual-populate --TABLE_NAME so downstream Glue jobs accept either parameter
+            glue_args['--TABLE_NAME'] = formatted_tables
+
     # Parameter mappings for Bronze Ingestion and Silver Iceberg ETL
     param_mappings = {
         # Common parameters
-        'table_name': '--TABLE_NAME',
-        'tables': '--TABLE_NAME',
-        'TABLE_NAME': '--TABLE_NAME',
         'secret_name': '--SECRET_NAME',
         'SECRET_NAME': '--SECRET_NAME',
         'custom_query': '--CUSTOM_QUERY',
@@ -155,68 +179,74 @@ def poll_glue_job_run(job_name: str, run_id: str, poll_interval: int, timeout_se
     while True:
         elapsed = int(time.time() - start_time)
         if elapsed > timeout_seconds:
-            logger.warning(f"Polling timed out after {elapsed}s. Glue job is still executing in background.")
+            raise TimeoutError(
+                f"Glue job '{job_name}' run '{run_id}' exceeded timeout limit of {timeout_seconds}s. "
+                f"Job is still running in AWS Glue."
+            )
+
+        response = glue_client.get_job_run(JobName=job_name, RunId=run_id, PredecessorsIncluded=False)
+        job_run = response.get('JobRun', {})
+        state = job_run.get('JobRunState', 'UNKNOWN')
+        error_msg = job_run.get('ErrorMessage')
+        exec_seconds = job_run.get('ExecutionTime', elapsed)
+
+        logger.info(f"[{elapsed}s] Job '{job_name}' state: {state}")
+
+        if state in TERMINAL_STATES:
             return {
-                'JobState': 'POLL_TIMEOUT',
-                'ExecutionTimeSeconds': elapsed,
-                'ErrorMessage': f"Lambda monitoring timed out after {timeout_seconds} seconds. Glue Job ID '{run_id}' continues running in AWS Glue."
+                'JobState': state,
+                'ExecutionTimeSeconds': exec_seconds,
+                'ErrorMessage': error_msg,
+                'LogGroupName': job_run.get('LogGroupName', '/aws-glue/jobs/output'),
+                'CompletedOn': str(job_run.get('CompletedOn', ''))
             }
-
-        try:
-            response = glue_client.get_job_run(JobName=job_name, RunId=run_id, PredecessorsIncluded=False)
-            job_run = response.get('JobRun', {})
-            state = job_run.get('JobRunState', 'UNKNOWN')
-            execution_time = job_run.get('ExecutionTime', elapsed)
-            error_message = job_run.get('ErrorMessage', '')
-            log_group = job_run.get('LogGroupName', '')
-
-            logger.info(f"Glue Job Status [{elapsed}s elapsed]: State='{state}'")
-
-            if state in TERMINAL_STATES:
-                return {
-                    'JobState': state,
-                    'ExecutionTimeSeconds': execution_time,
-                    'ErrorMessage': error_message,
-                    'LogGroupName': log_group
-                }
-
-        except ClientError as err:
-            logger.error(f"Error fetching Glue job run status: {err}")
-            raise
 
         time.sleep(poll_interval)
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    AWS Lambda entry point.
+    Main Lambda entrypoint.
     """
-    logger.info(f"Received Lambda event payload: {json.dumps(event)}")
+    logger.info(f"Received invocation event: {json.dumps(event, default=str)}")
 
     try:
-        # Resolve target Glue Job Name (Bronze or Silver)
-        job_name = resolve_job_name(event)
-        
-        # Build Glue command-line arguments (--SOURCE_SYSTEM, --TABLE_NAME, etc.)
-        glue_args = build_glue_arguments(event)
-        
-        logger.info(f"Triggering Glue Job '{job_name}' with Arguments: {json.dumps(glue_args)}")
+        # Layer resolution: "bronze" or "silver"
+        layer = str(event.get('layer', 'bronze')).strip().lower()
 
-        # Trigger Glue Job execution via boto3 SDK
-        start_response = glue_client.start_job_run(
+        # Job Name resolution: explicit override > environment defaults
+        job_name = event.get('job_name')
+        if not job_name:
+            if layer == 'silver':
+                job_name = DEFAULT_SILVER_JOB
+            elif layer == 'bronze':
+                job_name = DEFAULT_BRONZE_JOB
+            else:
+                raise ValueError(f"Invalid layer '{layer}'. Expected 'bronze' or 'silver'.")
+
+        # Build Glue command-line arguments (--SOURCE_SYSTEM, --SOURCE_TABLE_NAME, etc.)
+        glue_args = build_glue_arguments(event)
+        logger.info(f"Triggering Glue Job: '{job_name}' with arguments: {json.dumps(glue_args)}")
+
+        # Trigger Glue Job Run
+        run_response = glue_client.start_job_run(
             JobName=job_name,
             Arguments=glue_args
         )
-        
-        run_id = start_response.get('JobRunId')
-        logger.info(f"Glue Job successfully triggered! JobRunId: '{run_id}'")
+        run_id = run_response['JobRunId']
+        logger.info(f"Successfully started Glue Job '{job_name}' with RunId: {run_id}")
 
-        # Parse polling control flags
+        # Execution mode: Synchronous (wait_until_completion=True) or Asynchronous (wait_until_completion=False)
         wait_until_completion = event.get('wait_until_completion', True)
+        if isinstance(wait_until_completion, str):
+            wait_until_completion = wait_until_completion.strip().lower() in ('true', '1', 'yes')
+
         poll_interval = int(event.get('poll_interval_seconds', 10))
-        timeout_seconds = int(event.get('timeout_seconds', 540))  # Default 9 mins
+        timeout_seconds = int(event.get('timeout_seconds', 540))
 
         if not wait_until_completion:
+            # Asynchronous return (HTTP 202 Accepted)
+            logger.info("Asynchronous mode selected. Returning 202 Accepted immediately.")
             return {
                 'statusCode': 202,
                 'body': json.dumps({
@@ -246,7 +276,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'job_status': job_state,
             'execution_time_seconds': final_result.get('ExecutionTimeSeconds', 0),
             'source_system': glue_args.get('--SOURCE_SYSTEM'),
-            'table_name': glue_args.get('--TABLE_NAME', 'ALL_CONFIGURED'),
+            'source_table_name': glue_args.get('--SOURCE_TABLE_NAME', 'ALL_CONFIGURED'),
             'cloudwatch_log_group': final_result.get('LogGroupName', '/aws-glue/jobs/output'),
             'error_message': final_result.get('ErrorMessage', '') if not is_success else None
         }

@@ -217,7 +217,7 @@ def parse_arguments() -> dict:
     # -------------------------------------------------------------
 
     # Table List: CLI parameter takes highest priority over config and code defaults
-    cli_tables = get_cli_arg('TABLE_NAME', 'table_name', 'TABLES', 'tables', 'TABLE_NAMES', 'table_names', 'TABLE', 'table')
+    cli_tables = get_cli_arg('SOURCE_TABLE_NAME', 'source_table_name', 'TABLE_NAME', 'table_name', 'TABLES', 'tables', 'TABLE_NAMES', 'table_names', 'TABLE', 'table')
     if cli_tables:
         table_list = [t.strip() for t in cli_tables.split(',') if t.strip()]
         logger.info(f"[PARAM PRECEDENCE] Table List resolved from GLUE CLI (Priority 1): {table_list}")
@@ -228,7 +228,7 @@ def parse_arguments() -> dict:
         raise ValueError(
             f"CRITICAL CONFIG ERROR: 'default_tables' is missing or empty for source system '{source_system_clean}' "
             f"in bronze_config.json (source_systems.{source_system_clean}.default_tables) and was not provided via CLI "
-            f"(--TABLE_NAME). Please configure at least one target table in bronze_config.json."
+            f"(--SOURCE_TABLE_NAME). Please configure at least one target table in bronze_config.json."
         )
 
     # Batch Size

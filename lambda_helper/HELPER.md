@@ -22,7 +22,7 @@ This helper Lambda function allows engineers to trigger and synchronously monito
 | `layer` | string | Optional | `"bronze"` | Target layer: `"bronze"` or `"silver"`. |
 | `job_name` | string | Optional | Auto-resolved | Explicit Glue job name override (e.g. `uax-datalake-silver-etl-dev`). |
 | `source_system` | string | **Required** | - | Source system name (`servicenow`, `moveworks`, `genesys`, `postgresql`, `mysql`). |
-| `table_name` | string | Optional | Config defaults | Comma-separated table list (e.g., `"incident"` or `"raw_tbl_incident"` or `"incident,change_request"`). |
+| `source_table_name` | string \| list | Optional | Config defaults | Target table name(s) to process. Accepts a **single string** (`"raw_tbl_interactions"`), a **JSON list** (`["raw_tbl_interactions", "raw_tbl_users"]`), or a **comma-separated string** (`"raw_tbl_interactions,raw_tbl_users"`). For Bronze: `"incident"` or `["incident", "sys_user"]`; for Silver: `"raw_tbl_incident"` or `["raw_tbl_interactions", "raw_tbl_events"]`. |
 | `secret_name` | string | Optional | Config defaults | AWS Secrets Manager secret ARN or name override for credentials. |
 | `custom_query` | string | Optional | Config defaults | Custom SQL query or API filter override. |
 | `full_refresh` | boolean | Optional | `false` | For Silver: If `true`, ignores the watermark and processes all historical Bronze data. |
@@ -33,51 +33,65 @@ This helper Lambda function allows engineers to trigger and synchronously monito
 | `timeout_seconds` | integer | Optional | `540` | Maximum wait duration before Lambda exits (Default: 9 minutes). |
 | `arguments` | object | Optional | `{}` | Key-value dictionary to pass any arbitrary custom Glue CLI arguments (e.g. `{"--CONF": "..."}`). |
 
+> [!TIP]
+> **Passing Multiple Tables**: You can pass `source_table_name` as a JSON array (`["tbl_1", "tbl_2"]`) or a comma-delimited string (`"tbl_1, tbl_2"`). The Lambda helper automatically formats it into the standard Glue CLI argument format.
+
 ---
 
 ## 3. Sample Test Events (JSON Payloads)
 
 ### A. Bronze Layer Test Payloads
 
-#### 1. ServiceNow Bronze Ingestion (`incident`)
+#### 1. ServiceNow Bronze Ingestion — Single Table (`incident`)
 ```json
 {
   "layer": "bronze",
   "source_system": "servicenow",
-  "table_name": "incident",
+  "source_table_name": "incident",
   "secret_name": "uax-datalake/servicenow-credentials-dev",
   "wait_until_completion": true
 }
 ```
 
-#### 2. Moveworks Bronze Ingestion (`interactions`)
+#### 2. ServiceNow Bronze Ingestion — List of Tables (`["incident", "sys_user"]`)
+```json
+{
+  "layer": "bronze",
+  "source_system": "servicenow",
+  "source_table_name": ["incident", "sys_user"],
+  "secret_name": "uax-datalake/servicenow-credentials-dev",
+  "wait_until_completion": true
+}
+```
+
+#### 3. Moveworks Bronze Ingestion (`interactions`)
 ```json
 {
   "layer": "bronze",
   "source_system": "moveworks",
-  "table_name": "interactions",
+  "source_table_name": "interactions",
   "secret_name": "uax-datalake/moveworks-credentials-dev",
   "wait_until_completion": true
 }
 ```
 
-#### 3. Genesys Bronze Ingestion (`conversations`)
+#### 4. Genesys Bronze Ingestion (`conversations`)
 ```json
 {
   "layer": "bronze",
   "source_system": "genesys",
-  "table_name": "conversations",
+  "source_table_name": "conversations",
   "secret_name": "uax-datalake/genesys-credentials-dev",
   "wait_until_completion": true
 }
 ```
 
-#### 4. Relational Database Bronze Ingestion (`orders`)
+#### 5. Relational Database Bronze Ingestion (`orders`)
 ```json
 {
   "layer": "bronze",
   "source_system": "postgresql",
-  "table_name": "orders",
+  "source_table_name": "orders",
   "secret_name": "uax-datalake/postgresql-credentials-dev",
   "wait_until_completion": true
 }
@@ -87,43 +101,53 @@ This helper Lambda function allows engineers to trigger and synchronously monito
 
 ### B. Silver Layer Test Payloads (Apache Iceberg ETL)
 
-#### 5. ServiceNow Silver Iceberg ETL (`raw_tbl_incident`)
+#### 6. ServiceNow Silver Iceberg ETL — Single Table (`raw_tbl_incident`)
 ```json
 {
   "layer": "silver",
   "source_system": "servicenow",
-  "table_name": "raw_tbl_incident",
+  "source_table_name": "raw_tbl_incident",
   "wait_until_completion": true
 }
 ```
 
-#### 6. ServiceNow Silver Full Refresh (Scans entire Bronze table)
+#### 7. Moveworks Silver Iceberg ETL — Single Table (`raw_tbl_interactions`)
+```json
+{
+  "layer": "silver",
+  "source_system": "moveworks",
+  "source_table_name": "raw_tbl_interactions",
+  "wait_until_completion": true
+}
+```
+
+#### 8. Moveworks Silver Iceberg ETL — List of Tables (`["raw_tbl_interactions", "raw_tbl_events"]`)
+```json
+{
+  "layer": "silver",
+  "source_system": "moveworks",
+  "source_table_name": ["raw_tbl_interactions", "raw_tbl_events"],
+  "wait_until_completion": true
+}
+```
+
+#### 9. ServiceNow Silver Full Refresh (Scans entire Bronze table)
 ```json
 {
   "layer": "silver",
   "source_system": "servicenow",
-  "table_name": "raw_tbl_incident",
+  "source_table_name": "raw_tbl_incident",
   "full_refresh": true,
   "wait_until_completion": true
 }
 ```
 
-#### 7. Moveworks Silver Iceberg ETL (`raw_tbl_interactions`)
-```json
-{
-  "layer": "silver",
-  "source_system": "moveworks",
-  "table_name": "raw_tbl_interactions",
-  "wait_until_completion": true
-}
-```
-
-#### 8. Genesys Silver Iceberg ETL (`raw_tbl_conversations`)
+#### 10. Genesys Silver Iceberg ETL (`raw_tbl_conversations`)
 ```json
 {
   "layer": "silver",
   "source_system": "genesys",
-  "table_name": "raw_tbl_conversations",
+  "source_table_name": "raw_tbl_conversations",
   "wait_until_completion": true
 }
 ```
@@ -132,12 +156,12 @@ This helper Lambda function allows engineers to trigger and synchronously monito
 
 ### C. Asynchronous Execution (Fire and Forget)
 
-#### 9. Trigger Job and Return Immediately
+#### 11. Trigger Job and Return Immediately
 ```json
 {
-  "layer": "bronze",
-  "source_system": "servicenow",
-  "table_name": "incident",
+  "layer": "silver",
+  "source_system": "moveworks",
+  "source_table_name": "raw_tbl_interactions",
   "wait_until_completion": false
 }
 ```
@@ -150,7 +174,7 @@ This helper Lambda function allows engineers to trigger and synchronously monito
 ```json
 {
   "statusCode": 200,
-  "body": "{\"job_name\": \"uax-datalake-bronze-ingestion-dev\", \"job_run_id\": \"jr_1234567890abcdef\", \"job_status\": \"SUCCEEDED\", \"execution_time_seconds\": 45, \"source_system\": \"servicenow\", \"table_name\": \"incident\", \"cloudwatch_log_group\": \"/aws-glue/jobs/output\", \"error_message\": null}"
+  "body": "{\"job_name\": \"uax-datalake-silver-etl-dev\", \"job_run_id\": \"jr_1234567890abcdef\", \"job_status\": \"SUCCEEDED\", \"execution_time_seconds\": 45, \"source_system\": \"moveworks\", \"source_table_name\": \"raw_tbl_interactions\", \"cloudwatch_log_group\": \"/aws-glue/jobs/output\", \"error_message\": null}"
 }
 ```
 
@@ -158,7 +182,7 @@ This helper Lambda function allows engineers to trigger and synchronously monito
 ```json
 {
   "statusCode": 202,
-  "body": "{\"message\": \"Glue job started asynchronously.\", \"job_name\": \"uax-datalake-silver-etl-dev\", \"job_run_id\": \"jr_9876543210fedcba\", \"status\": \"STARTING\", \"arguments\": {\"--SOURCE_SYSTEM\": \"servicenow\", \"--TABLE_NAME\": \"raw_tbl_incident\"}}"
+  "body": "{\"message\": \"Glue job started asynchronously.\", \"job_name\": \"uax-datalake-silver-etl-dev\", \"job_run_id\": \"jr_9876543210fedcba\", \"status\": \"STARTING\", \"arguments\": {\"--SOURCE_SYSTEM\": \"moveworks\", \"--SOURCE_TABLE_NAME\": \"raw_tbl_interactions\", \"--TABLE_NAME\": \"raw_tbl_interactions\"}}"
 }
 ```
 
@@ -166,7 +190,7 @@ This helper Lambda function allows engineers to trigger and synchronously monito
 ```json
 {
   "statusCode": 500,
-  "body": "{\"job_name\": \"uax-datalake-silver-etl-dev\", \"job_run_id\": \"jr_abcdef1234567890\", \"job_status\": \"FAILED\", \"execution_time_seconds\": 22, \"source_system\": \"servicenow\", \"table_name\": \"raw_tbl_incident\", \"cloudwatch_log_group\": \"/aws-glue/jobs/output\", \"error_message\": \"CRITICAL CONFIG ERROR: 'nkey' is missing for table 'raw_tbl_incident' in silver_config.json\"}"
+  "body": "{\"job_name\": \"uax-datalake-silver-etl-dev\", \"job_run_id\": \"jr_abcdef1234567890\", \"job_status\": \"FAILED\", \"execution_time_seconds\": 22, \"source_system\": \"moveworks\", \"source_table_name\": \"raw_tbl_interactions\", \"cloudwatch_log_group\": \"/aws-glue/jobs/output\", \"error_message\": \"...\"}"
 }
 ```
 
