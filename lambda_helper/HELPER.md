@@ -27,6 +27,8 @@ This helper Lambda function allows engineers to trigger and synchronously monito
 | `custom_query` | string | Optional | Config defaults | Custom SQL query or API filter override. |
 | `full_refresh` | boolean | Optional | `false` | For Silver: If `true`, ignores the watermark and processes all historical Bronze data. |
 | `watermark_enabled`| boolean | Optional | `true` | For Silver: If `true`, filters Bronze data by incremental watermark (`_ingested_at > last_watermark`). |
+| `crawler_name` | string | Optional | Auto-resolved | AWS Glue Crawler name override to trigger after load (e.g. `uax-datalake-silver-iceberg-crawler-dev`). |
+| `trigger_crawler` | boolean | Optional | `auto` | If `true`, triggers the Glue crawler on completion (automatically triggered if a new table was created or schema changed). |
 | `initial_load_date`| string | Optional | Config defaults | For Bronze: Overrides the starting delta extraction timestamp (e.g., `"2024-01-01T00:00:00Z"`). |
 | `wait_until_completion` | boolean | Optional | `true` | If `true`, Lambda waits and polls status until completion. If `false`, fires asynchronously and returns HTTP 202 immediately. |
 | `poll_interval_seconds` | integer | Optional | `10` | Polling interval in seconds. |

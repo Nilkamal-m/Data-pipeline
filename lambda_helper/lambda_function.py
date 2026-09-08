@@ -130,6 +130,10 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         'ERROR_HANDLING_MODE': '--ERROR_HANDLING_MODE',
         'trigger_crawler': '--TRIGGER_CRAWLER',
         'TRIGGER_CRAWLER': '--TRIGGER_CRAWLER',
+        'crawler_name': '--CRAWLER_NAME',
+        'CRAWLER_NAME': '--CRAWLER_NAME',
+        'silver_crawler_name': '--SILVER_CRAWLER_NAME',
+        'SILVER_CRAWLER_NAME': '--SILVER_CRAWLER_NAME',
         # Silver specific parameters
         'silver_config_s3_path': '--SILVER_CONFIG_S3_PATH',
         'SILVER_CONFIG_S3_PATH': '--SILVER_CONFIG_S3_PATH',

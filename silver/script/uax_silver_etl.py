@@ -253,6 +253,21 @@ def parse_spark_arguments() -> dict:
     # Metadata Prefix: Config > 'metadata/silver'
     metadata_prefix = watermark_cfg.get('metadata_prefix', 'metadata/silver').strip('/')
 
+    # Crawler Parameters: CLI > Config
+    crawler_name = (
+        get_cli_arg('CRAWLER_NAME', 'crawler_name', 'SILVER_CRAWLER_NAME', 'silver_crawler_name')
+        or defaults_cfg.get('crawler_name')
+        or defaults_cfg.get('silver_crawler_name')
+    )
+    if crawler_name:
+        crawler_name = str(crawler_name).strip()
+
+    cli_trigger_crawler = get_cli_arg('TRIGGER_CRAWLER', 'trigger_crawler')
+    if cli_trigger_crawler is not None:
+        trigger_crawler = str(cli_trigger_crawler).strip().lower() in ('true', '1', 'yes')
+    else:
+        trigger_crawler = None
+
     return {
         'JOB_NAME': job_name,
         'SOURCE_SYSTEM': source_system_clean,
@@ -268,9 +283,12 @@ def parse_spark_arguments() -> dict:
         'SYNC_WATERMARK_TABLE': sync_watermark_table,
         'WATERMARK_TABLE_NAME': watermark_table_name,
         'METADATA_PREFIX': metadata_prefix,
+        'CRAWLER_NAME': crawler_name,
+        'TRIGGER_CRAWLER': trigger_crawler,
         'SILVER_FULL_CONFIG': silver_full_config,
         'ARG_DICT': arg_dict
     }
+
 
 
 def get_silver_watermark_key(source_system: str, table_clean: str, metadata_prefix: str = "metadata/silver") -> str:
@@ -480,6 +498,34 @@ def check_iceberg_table_exists(spark, glue_client, database_name: str, table_nam
         return False
 
 
+def trigger_silver_iceberg_crawler(glue_client, crawler_name: str):
+    """
+    Triggers the Silver Iceberg Glue Crawler to sync the Glue Data Catalog with newly created/updated Iceberg tables.
+    Safely handles running crawlers or non-existent crawler names without failing the ETL job.
+    """
+    if not glue_client or not crawler_name:
+        return
+    try:
+        crawler = glue_client.get_crawler(Name=crawler_name)
+        status = crawler.get('Crawler', {}).get('State')
+        if status in ('READY', 'STOPPED'):
+            glue_client.start_crawler(Name=crawler_name)
+            logger.info(f"Successfully triggered Silver Iceberg Crawler: '{crawler_name}'")
+        else:
+            logger.info(f"Silver Iceberg Crawler '{crawler_name}' is currently in state '{status}'. Skipping trigger.")
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code')
+        if code == 'CrawlerRunningException':
+            logger.info(f"Silver Iceberg Crawler '{crawler_name}' is already running.")
+        elif code == 'EntityNotFoundException':
+            logger.warning(f"Silver Iceberg Crawler '{crawler_name}' does not exist. Skipping.")
+        else:
+            logger.warning(f"Failed to start Silver Iceberg Crawler '{crawler_name}': {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error triggering crawler '{crawler_name}': {e}")
+
+
+
 def get_payload_columns(all_columns: list, nkeys) -> list:
     """
     Returns sorted list of non-key, non-technical business payload columns used for runtime change detection.
@@ -534,6 +580,33 @@ def perform_deduplication(df, nkeys, order_cols, strategy='latest_by_order_colum
              .drop("row_num")
 
 
+def sync_iceberg_table_schema(spark, quoted_table: str, incoming_df) -> bool:
+    """
+    Compares incoming DataFrame schema with existing target Iceberg table schema.
+    If incoming batch has new columns, dynamically executes 'ALTER TABLE <tbl> ADD COLUMNS (...)'
+    to capture schema changes and automatically update the Iceberg table definition.
+    Returns True if schema was evolved, False otherwise.
+    """
+    try:
+        target_df = spark.table(quoted_table)
+        target_field_names = {f.name.lower() for f in target_df.schema.fields}
+        new_columns = []
+        for field in incoming_df.schema.fields:
+            if field.name.lower() not in target_field_names:
+                new_columns.append(f"`{field.name}` {field.dataType.simpleString()}")
+
+        if new_columns:
+            alter_sql = f"ALTER TABLE {quoted_table} ADD COLUMNS ({', '.join(new_columns)})"
+            logger.info(f"[SCHEMA EVOLUTION] Detected {len(new_columns)} new column(s) for '{quoted_table}'. Executing: {alter_sql}")
+            spark.sql(alter_sql)
+            logger.info(f"[SCHEMA EVOLUTION] Successfully updated table schema for '{quoted_table}'.")
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"[SCHEMA EVOLUTION] Schema sync check for '{quoted_table}' encountered: {e}. Proceeding with write...")
+        return False
+
+
 def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_table_name: str, df, silver_table_name: str, silver_location: str, nkeys, order_cols):
     """
     Executes SCD Type 1 (UPSERT via Spark SQL MERGE INTO) on Apache Iceberg table.
@@ -541,6 +614,7 @@ def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_t
     - Exact duplicate records are ignored (no redundant rewrite).
     - Backdated loads (source.order_col < target.order_col) are ignored to protect newer data.
     - Preserves target._inserted_at while updating target._updated_at = current_timestamp().
+    Returns tuple: (is_new_table: bool, schema_evolved: bool)
     """
     quoted_table = quote_iceberg_table(silver_table_name)
     nkey_list = nkeys if isinstance(nkeys, list) else [nkeys]
@@ -550,12 +624,26 @@ def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_t
 
     if not table_exists:
         logger.info(f"Target Iceberg table '{quoted_table}' does not exist. Creating table with initial data...")
-        df.write \
-          .format("iceberg") \
-          .mode("append") \
-          .option("path", silver_location) \
-          .saveAsTable(quoted_table)
+        temp_view = f"init_{target_table_name.replace('.', '_').replace('-', '_')}"
+        df.createOrReplaceTempView(temp_view)
+        try:
+            spark.sql(f"""
+                CREATE TABLE IF NOT EXISTS {quoted_table}
+                USING iceberg
+                LOCATION '{silver_location}'
+                AS SELECT * FROM {temp_view}
+            """)
+            logger.info(f"Successfully created initial Iceberg table '{quoted_table}' via Spark SQL CTAS.")
+        except Exception as ctas_err:
+            logger.warning(f"Spark SQL CTAS failed ({ctas_err}), falling back to DataFrameWriter...")
+            df.write \
+              .format("iceberg") \
+              .mode("append") \
+              .option("path", silver_location) \
+              .saveAsTable(quoted_table)
+        return True, False
     else:
+        schema_evolved = sync_iceberg_table_schema(spark, quoted_table, df)
         logger.info(f"Executing SCD Type 1 Runtime-Hash MERGE INTO (UPSERT) on '{quoted_table}'...")
         payload_cols = get_payload_columns(df.columns, nkey_list)
         logger.info(f"Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
@@ -601,6 +689,7 @@ def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_t
         """
         logger.info(f"Running Spark SQL SCD1 MERGE INTO Query on {quoted_table}...")
         spark.sql(merge_sql)
+        return False, schema_evolved
 
 
 def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_name: str, df, silver_table_name: str, silver_location: str, nkeys, order_cols, scd2_cfg):
@@ -629,12 +718,26 @@ def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_na
 
     if not table_exists:
         logger.info(f"SCD Type 2: Target table '{quoted_table}' does not exist. Creating initial table with high-date '{high_date_val}'...")
-        incoming_df.write \
-                   .format("iceberg") \
-                   .mode("append") \
-                   .option("path", silver_location) \
-                   .saveAsTable(quoted_table)
+        temp_view = f"scd2_init_{target_table_name.replace('.', '_').replace('-', '_')}"
+        incoming_df.createOrReplaceTempView(temp_view)
+        try:
+            spark.sql(f"""
+                CREATE TABLE IF NOT EXISTS {quoted_table}
+                USING iceberg
+                LOCATION '{silver_location}'
+                AS SELECT * FROM {temp_view}
+            """)
+            logger.info(f"Successfully created initial SCD2 Iceberg table '{quoted_table}' via Spark SQL CTAS.")
+        except Exception as ctas_err:
+            logger.warning(f"Spark SQL CTAS failed ({ctas_err}), falling back to DataFrameWriter...")
+            incoming_df.write \
+                       .format("iceberg") \
+                       .mode("append") \
+                       .option("path", silver_location) \
+                       .saveAsTable(quoted_table)
+        return True, False
     else:
+        schema_evolved = sync_iceberg_table_schema(spark, quoted_table, incoming_df)
         logger.info(f"Executing SCD Type 2 Runtime-Hash Change Detection on '{quoted_table}'...")
         payload_cols = get_payload_columns(df.columns, nkey_list)
         logger.info(f"SCD2 Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
@@ -696,13 +799,20 @@ def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_na
         logger.info(f"SCD Type 2: Appending {num_new_versions} genuine new/updated version(s) to '{quoted_table}'...")
 
         if num_new_versions > 0:
-            changed_or_new_df.write \
-                             .format("iceberg") \
-                             .mode("append") \
-                             .option("path", silver_location) \
-                             .saveAsTable(quoted_table)
+            temp_append_view = f"scd2_append_{target_table_name.replace('.', '_').replace('-', '_')}"
+            changed_or_new_df.createOrReplaceTempView(temp_append_view)
+            try:
+                spark.sql(f"INSERT INTO {quoted_table} SELECT * FROM {temp_append_view}")
+            except Exception as ins_err:
+                logger.warning(f"Spark SQL INSERT INTO failed ({ins_err}), falling back to DataFrameWriter...")
+                changed_or_new_df.write \
+                                 .format("iceberg") \
+                                 .mode("append") \
+                                 .option("path", silver_location) \
+                                 .saveAsTable(quoted_table)
         else:
             logger.info(f"SCD Type 2: 0 changed records found in incoming batch. No duplicate versions appended.")
+        return False, schema_evolved
 
 
 def main():
@@ -732,10 +842,24 @@ def main():
     conf.set("spark.sql.catalog.glue_catalog.warehouse", f"s3://{bucket_name}/{silver_data_prefix}/")
     conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
     conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    conf.set("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true")
+    conf.set("spark.sql.catalog.glue_catalog.skip-name-validation", "true")
+    conf.set("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true")
+    conf.set("spark.sql.defaultCatalog", "glue_catalog")
+    conf.set("spark.sql.iceberg.schema-evolution", "true")
+    conf.set("spark.sql.iceberg.check-nullability", "false")
 
     sc = SparkContext.getOrCreate(conf=conf)
     glueContext = GlueContext(sc)
     spark = glueContext.spark_session
+
+    # Ensure runtime SparkSession also bypasses Glue catalog name validation for database names with hyphens
+    spark.conf.set("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true")
+    spark.conf.set("spark.sql.catalog.glue_catalog.skip-name-validation", "true")
+    spark.conf.set("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true")
+    spark.conf.set("spark.sql.defaultCatalog", "glue_catalog")
+    spark.conf.set("spark.sql.iceberg.schema-evolution", "true")
+    spark.conf.set("spark.sql.iceberg.check-nullability", "false")
     job = Job(glueContext)
     job.init(job_name, params['ARG_DICT'])
 
@@ -769,6 +893,8 @@ def main():
 
     failed_tables = []
     table_stats = []
+    tables_created = 0
+    schemas_evolved = 0
 
     for table_idx, table_name in enumerate(table_list, start=1):
         table_clean = table_name.strip().lower()
@@ -962,8 +1088,10 @@ def main():
 
             # 3. Execute SCD Type 2 or SCD Type 1 / Append / Overwrite
             quoted_iceberg_table = quote_iceberg_table(silver_table_name)
+            table_is_new = False
+            schema_evolved = False
             if scd_type == 'scd2':
-                execute_iceberg_scd2(
+                table_is_new, schema_evolved = execute_iceberg_scd2(
                     spark=spark,
                     glue_client=glue_client,
                     database_name=glue_database,
@@ -976,7 +1104,7 @@ def main():
                     scd2_cfg=scd2_cfg
                 )
             elif merge_strategy in ('upsert', 'merge_into'):
-                execute_iceberg_scd1_upsert(
+                table_is_new, schema_evolved = execute_iceberg_scd1_upsert(
                     spark=spark,
                     glue_client=glue_client,
                     database_name=glue_database,
@@ -988,17 +1116,66 @@ def main():
                     order_cols=order_cols
                 )
             elif merge_strategy == 'overwrite':
-                df_transformed.write \
-                    .format("iceberg") \
-                    .mode("overwrite") \
-                    .option("path", silver_location) \
-                    .saveAsTable(quoted_iceberg_table)
+                table_exists = check_iceberg_table_exists(spark, glue_client, glue_database, target_table_name)
+                if not table_exists:
+                    logger.info(f"Target Iceberg table '{quoted_iceberg_table}' does not exist. Initializing table via Spark SQL CTAS...")
+                    temp_view = f"init_{target_table_name.replace('.', '_').replace('-', '_')}"
+                    df_transformed.createOrReplaceTempView(temp_view)
+                    try:
+                        spark.sql(f"""
+                            CREATE TABLE IF NOT EXISTS {quoted_iceberg_table}
+                            USING iceberg
+                            LOCATION '{silver_location}'
+                            AS SELECT * FROM {temp_view}
+                        """)
+                    except Exception as ctas_err:
+                        logger.warning(f"Spark SQL CTAS failed ({ctas_err}), falling back to DataFrameWriter...")
+                        df_transformed.write \
+                            .format("iceberg") \
+                            .mode("append") \
+                            .option("path", silver_location) \
+                            .saveAsTable(quoted_iceberg_table)
+                    table_is_new = True
+                else:
+                    schema_evolved = sync_iceberg_table_schema(spark, quoted_iceberg_table, df_transformed)
+                    df_transformed.write \
+                        .format("iceberg") \
+                        .mode("overwrite") \
+                        .option("path", silver_location) \
+                        .saveAsTable(quoted_iceberg_table)
             else:
-                df_transformed.write \
-                    .format("iceberg") \
-                    .mode("append") \
-                    .option("path", silver_location) \
-                    .saveAsTable(quoted_iceberg_table)
+                table_exists = check_iceberg_table_exists(spark, glue_client, glue_database, target_table_name)
+                if not table_exists:
+                    logger.info(f"Target Iceberg table '{quoted_iceberg_table}' does not exist. Initializing table via Spark SQL CTAS...")
+                    temp_view = f"init_{target_table_name.replace('.', '_').replace('-', '_')}"
+                    df_transformed.createOrReplaceTempView(temp_view)
+                    try:
+                        spark.sql(f"""
+                            CREATE TABLE IF NOT EXISTS {quoted_iceberg_table}
+                            USING iceberg
+                            LOCATION '{silver_location}'
+                            AS SELECT * FROM {temp_view}
+                        """)
+                    except Exception as ctas_err:
+                        logger.warning(f"Spark SQL CTAS failed ({ctas_err}), falling back to DataFrameWriter...")
+                        df_transformed.write \
+                            .format("iceberg") \
+                            .mode("append") \
+                            .option("path", silver_location) \
+                            .saveAsTable(quoted_iceberg_table)
+                    table_is_new = True
+                else:
+                    schema_evolved = sync_iceberg_table_schema(spark, quoted_iceberg_table, df_transformed)
+                    df_transformed.write \
+                        .format("iceberg") \
+                        .mode("append") \
+                        .option("path", silver_location) \
+                        .saveAsTable(quoted_iceberg_table)
+
+            if table_is_new:
+                tables_created += 1
+            if schema_evolved:
+                schemas_evolved += 1
 
             # Determine new watermark timestamp from processed Bronze records
             if watermark_column in df_bronze.columns:
@@ -1094,6 +1271,34 @@ def main():
             )
             logger.error(failed_card)
             failed_tables.append((target_table_name, str(err)))
+
+    # Trigger Silver Iceberg Crawler if:
+    # 1. Explicitly requested via --TRIGGER_CRAWLER / TRIGGER_CRAWLER = true
+    # 2. Explicitly provided --CRAWLER_NAME parameter (and TRIGGER_CRAWLER is not explicitly false)
+    # 3. Any new Iceberg table was created for the first time (tables_created > 0)
+    # 4. Any table schema was evolved with new columns (schemas_evolved > 0)
+    cli_trigger_crawler = params.get('TRIGGER_CRAWLER')
+    cli_crawler_name = params.get('CRAWLER_NAME') or params.get('ARG_DICT', {}).get('CRAWLER_NAME') or params.get('ARG_DICT', {}).get('SILVER_CRAWLER_NAME')
+
+    should_trigger_crawler = False
+    if cli_trigger_crawler is not None:
+        should_trigger_crawler = cli_trigger_crawler
+    elif cli_crawler_name:
+        should_trigger_crawler = True
+    elif tables_created > 0 or schemas_evolved > 0:
+        should_trigger_crawler = True
+
+    if should_trigger_crawler:
+        crawler_name = (
+            cli_crawler_name
+            or f"{glue_database.replace('-db-', '-silver-iceberg-crawler-').replace('-db', '-silver-iceberg-crawler')}"
+        )
+        logger.info(
+            f"Triggering Silver Iceberg Crawler '{crawler_name}' "
+            f"(tables_created: {tables_created}, schemas_evolved: {schemas_evolved}, "
+            f"cli_crawler: {cli_crawler_name}, trigger_param: {cli_trigger_crawler})..."
+        )
+        trigger_silver_iceberg_crawler(glue_client, crawler_name)
 
     job.commit()
 
