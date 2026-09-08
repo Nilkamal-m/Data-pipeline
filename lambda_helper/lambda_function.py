@@ -17,8 +17,8 @@ Supported Operations:
 
 Athena Query Payload Schema (JSON):
 {
-    "query": "SELECT * FROM uax_datalake_db_dev.raw_tbl_incident LIMIT 10", # Required SQL query (pass <database>.<table_name> directly in query)
-    "max_results": 50,                                                      # Optional: maximum rows to display in log (default: 50)
+    "query": "SELECT * FROM uax_datalake_db_dev.raw_tbl_incident",          # Required SQL query (all records shown by default)
+    "max_results": null,                                                    # Optional: max rows to retrieve (default: null = all records)
     "workgroup": "uax-datalake-workgroup-dev",                              # Optional: Athena workgroup (default: uax-datalake-workgroup-dev)
     "database": "uax_datalake_db_dev",                                      # Optional: only needed if not passing <database>.<table_name> in query
     "timeout_seconds": 120                                                  # Optional: query execution timeout (default: 120s)
@@ -255,9 +255,15 @@ def is_athena_query_event(event: Dict[str, Any]) -> bool:
     return layer == 'athena' or action in ('query', 'athena', 'run_query')
 
 
-def format_as_database_table(headers: List[str], rows: List[List[Any]], include_row_num: bool = True) -> str:
+def format_as_database_table(
+    headers: List[str],
+    rows: List[List[Any]],
+    include_row_num: bool = True,
+    max_col_width: Optional[int] = None
+) -> str:
     """
     Renders tabular data as a clean SQL database CLI table (+-----+-----+).
+    Shows all rows and columns in full.
     """
     if not headers and not rows:
         return "(0 rows returned)"
@@ -275,7 +281,10 @@ def format_as_database_table(headers: List[str], rows: List[List[Any]], include_
     for row in display_rows:
         for i, val in enumerate(row):
             clean_val = val.replace('\n', ' ').replace('\r', '')
-            col_widths[i] = max(col_widths[i], min(len(clean_val), 60))
+            val_len = len(clean_val)
+            if max_col_width and max_col_width > 0:
+                val_len = min(val_len, max_col_width)
+            col_widths[i] = max(col_widths[i], val_len)
 
     border_line = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
 
@@ -283,7 +292,7 @@ def format_as_database_table(headers: List[str], rows: List[List[Any]], include_
         formatted_cells = []
         for i, c in enumerate(cells):
             clean = c.replace('\n', ' ').replace('\r', '')
-            if len(clean) > col_widths[i]:
+            if max_col_width and max_col_width > 0 and len(clean) > col_widths[i]:
                 clean = clean[:col_widths[i] - 3] + '...'
             formatted_cells.append(f" {clean.ljust(col_widths[i])} ")
         return "|" + "|".join(formatted_cells) + "|"
@@ -348,7 +357,18 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     athena_region = event.get('region') or event.get('athena_region') or os.environ.get('ATHENA_REGION')
     client = boto3.client('athena', region_name=athena_region.strip()) if athena_region and athena_region.strip() else athena_client
 
-    max_results = int(event.get('max_results') or event.get('MAX_RESULTS') or 50)
+    # Resolve max_results: if not provided or 'all', fetch all records without restriction
+    raw_max = event.get('max_results') if event.get('max_results') is not None else event.get('MAX_RESULTS')
+    if raw_max is None or str(raw_max).strip().lower() in ('none', 'all', '', '0', '-1'):
+        max_results = None
+    else:
+        try:
+            max_results = int(raw_max)
+            if max_results <= 0:
+                max_results = None
+        except (ValueError, TypeError):
+            max_results = None
+
     timeout_seconds = int(event.get('timeout_seconds') or event.get('TIMEOUT_SECONDS') or 120)
     poll_interval = float(event.get('poll_interval_seconds') or event.get('POLL_INTERVAL_SECONDS') or 1.0)
 
@@ -357,7 +377,7 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info(f"Target Database : {database}")
     logger.info(f"Athena Workgroup: {workgroup}")
     logger.info(f"Athena Region   : {athena_region or 'Default'}")
-    logger.info(f"Max Results Log : {max_results}")
+    logger.info(f"Max Results     : {max_results if max_results is not None else 'ALL (No restriction)'}")
     logger.info(f"Query String    :\n{query_str}")
     logger.info("=" * 80)
 
@@ -438,7 +458,11 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     raw_table_rows: List[List[str]] = []
     is_first_page = True
 
-    for page in results_paginator.paginate(QueryExecutionId=query_execution_id, PaginationConfig={'MaxItems': max_results}):
+    paginate_kwargs: Dict[str, Any] = {'QueryExecutionId': query_execution_id}
+    if max_results is not None and max_results > 0:
+        paginate_kwargs['PaginationConfig'] = {'MaxItems': max_results}
+
+    for page in results_paginator.paginate(**paginate_kwargs):
         result_set = page.get('ResultSet', {})
         rows = result_set.get('Rows', [])
 
@@ -472,7 +496,7 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info(f"Execution ID    : {query_execution_id}")
     logger.info(f"Engine Time     : {exec_time_ms} ms ({exec_time_ms / 1000.0:.2f} s)")
     logger.info(f"Data Scanned    : {data_scanned_bytes:,} bytes ({data_scanned_mb:.4f} MB)")
-    logger.info(f"Rows Returned   : {len(records)} (max_results: {max_results})")
+    logger.info(f"Rows Returned   : {len(records)}" + (f" (capped at {max_results})" if max_results else " (ALL records)"))
     logger.info("-" * 80)
 
     if column_names and (records or raw_table_rows):
@@ -484,12 +508,12 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     df.index = range(1, len(df) + 1)
                     df.index.name = '#'
 
-                # Configure pandas display settings for database-style console output
+                # Configure pandas display settings for full database-style console output
                 pd.set_option('display.max_columns', None)
                 pd.set_option('display.max_rows', None)
                 pd.set_option('display.width', 1000)
                 pd.set_option('display.colheader_justify', 'left')
-                pd.set_option('display.max_colwidth', 80)
+                pd.set_option('display.max_colwidth', None)
 
                 logger.info("PANDAS DATAFRAME VIEW:")
                 logger.info("\n" + df.to_string())
@@ -510,8 +534,8 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     else:
         logger.info("Query returned 0 data rows.")
 
-    logger.info("JSON Records Output (First 20):")
-    logger.info(json.dumps(records[:20], indent=2, default=str))
+    logger.info("JSON Records Output:")
+    logger.info(json.dumps(records, indent=2, default=str))
     logger.info("=" * 80)
 
     return {

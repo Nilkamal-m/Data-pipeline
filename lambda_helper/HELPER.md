@@ -26,11 +26,11 @@ If `"query"`, `"athena_query"`, or `"sql"` is provided in the payload, Lambda ru
 
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `query` / `sql` | string | **Required** | - | SQL query string to execute (e.g. `SELECT * FROM raw_tbl_incident LIMIT 10`). |
+| `query` / `sql` | string | **Required** | - | SQL query string to execute (e.g. `SELECT * FROM raw_tbl_incident`). |
 | `database` | string | Optional | `uax_datalake_db_dev` | Target AWS Glue Data Catalog database. |
 | `workgroup` | string | Optional | `uax-datalake-workgroup-dev` | Amazon Athena workgroup name. |
 | `output_location` | string | Optional | Workgroup default | S3 path for Athena query results (e.g. `s3://uax-datalake-dev-bucket/athena-results/`). |
-| `max_results` | integer | Optional | `50` | Maximum number of rows to retrieve and print in the CloudWatch logs. |
+| `max_results` | integer | Optional | `None` (All records) | Maximum number of rows to retrieve and print. Defaults to `null` to return and display **ALL** records without restriction. |
 | `timeout_seconds` | integer | Optional | `120` | Maximum time to wait for query execution before timing out. |
 
 ---
