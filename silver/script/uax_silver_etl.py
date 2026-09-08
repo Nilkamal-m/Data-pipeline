@@ -824,32 +824,20 @@ def main():
                 df_bronze = spark.read.table(f"`{glue_database}`.`{bronze_table_name}`")
                 logger.info(f"Successfully loaded Bronze data from Glue Catalog table `{glue_database}`.`{bronze_table_name}`")
             except Exception as cat_err:
-                logger.info(f"Glue Catalog table `{glue_database}`.`{bronze_table_name}` not directly queryable ({cat_err}). Reading from S3 Parquet: '{bronze_path}'...")
+                logger.info(f"Glue Catalog table `{glue_database}`.`{bronze_table_name}` not directly queryable ({cat_err}). Reading from S3: '{bronze_path}'...")
                 try:
                     df_bronze = spark.read.option("mergeSchema", "true").parquet(bronze_path)
                 except Exception as read_err:
-                    logger.warning(f"Could not read Parquet at '{bronze_path}' ({read_err}). Trying JSON or alternate paths...")
+                    alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{table_clean}/"
                     try:
-                        df_bronze = spark.read.json(bronze_path)
-                    except Exception:
-                        alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{table_clean}/"
-                        try:
-                            df_bronze = spark.read.option("mergeSchema", "true").parquet(alt_bronze_path)
-                        except Exception:
-                            legacy_bronze_path = f"s3://{bucket_name}/bronze/{source_system}/{base_table_name}/"
-                            try:
-                                df_bronze = spark.read.option("mergeSchema", "true").parquet(legacy_bronze_path)
-                            except Exception:
-                                try:
-                                    df_bronze = spark.read.json(legacy_bronze_path)
-                                except Exception as final_read_err:
-                                    raise FileNotFoundError(
-                                        f"Bronze source data for '{bronze_table_name}' was not found in Glue Catalog "
-                                        f"(`{glue_database}`.`{bronze_table_name}`) nor at S3 locations "
-                                        f"('{bronze_path}', '{alt_bronze_path}', '{legacy_bronze_path}'). "
-                                        f"Please ensure the Bronze ingestion job has run for source system '{source_system}' "
-                                        f"and table '{base_table_name}'. (Underlying error: {final_read_err})"
-                                    )
+                        df_bronze = spark.read.option("mergeSchema", "true").parquet(alt_bronze_path)
+                    except Exception as final_read_err:
+                        raise FileNotFoundError(
+                            f"Bronze source data for '{bronze_table_name}' was not found in Glue Catalog "
+                            f"(`{glue_database}`.`{bronze_table_name}`) nor at S3 location '{bronze_path}'. "
+                            f"Please ensure the Bronze ingestion job has run for source system '{source_system}' "
+                            f"and table '{base_table_name}'. (Underlying error: {final_read_err})"
+                        )
 
             # Apply Incremental High-Water Mark Filter if watermark is present
             if last_load_date and watermark_enabled and not full_refresh:
