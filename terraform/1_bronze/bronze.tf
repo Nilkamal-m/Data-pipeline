@@ -70,7 +70,7 @@ locals {
   bucket_name         = "${var.app_name}-${var.environment}-bucket"
   bucket_arn          = "arn:aws:s3:::${local.bucket_name}"
   glue_role_arn       = module.glue_iam_role.iam_role_arn
-  glue_db_name        = "${var.app_name}-db-${var.environment}"
+  glue_db_name        = "${replace(var.app_name, "-", "_")}_db_${var.environment}"
   bronze_crawler_name = "${var.app_name}-bronze-crawler-${var.environment}"
 }
 

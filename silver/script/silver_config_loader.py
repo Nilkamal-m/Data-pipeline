@@ -139,7 +139,7 @@ class SilverConfigLoader:
         if not db or not str(db).strip():
             raise ValueError(
                 "CRITICAL CONFIG ERROR: 'glue_database' is missing or empty in silver_config.json "
-                "(silver_defaults.glue_database). Please configure it (e.g. 'uax-datalake-db-dev')."
+                "(silver_defaults.glue_database). Please configure it (e.g. 'uax_datalake_db_dev')."
             )
         return str(db).strip()
 
@@ -153,7 +153,7 @@ class SilverConfigLoader:
         config_dict: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        Resolves the full Silver Iceberg table identifier (e.g. uax-datalake-db-dev.tbl_incident).
+        Resolves the full Silver Iceberg table identifier (e.g. uax_datalake_db_dev.tbl_incident).
         Allows table-specific override via 'target_table_name' in table_configs.
         Pulls table_prefix and glue_database from centralized config if not provided.
         Strips 'raw_tbl_' prefix from input table_name so output is always tbl_<base_name>.

@@ -148,7 +148,7 @@ aws s3 cp silver/script/config/silver_config.json s3://${DATA_LAKE_BUCKET}/silve
 
 ### Step 4: Deploy Silver Infrastructure (Layer 2)
 
-Deploy the AWS Glue Catalog Database (`uax-datalake-db-dev`), Iceberg Crawler, and PySpark Glue Job:
+Deploy the AWS Glue Catalog Database (`uax_datalake_db_dev`), Iceberg Crawler, and PySpark Glue Job:
 
 ```bash
 cd terraform/2_silver

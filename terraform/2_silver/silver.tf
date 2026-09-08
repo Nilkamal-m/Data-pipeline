@@ -43,7 +43,7 @@ variable "use_existing_glue_database" {
 locals {
   bucket_name   = "${var.app_name}-${var.environment}-bucket"
   glue_role_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-glue-execution-role-${var.environment}"
-  glue_db_name  = "${var.app_name}-db-${var.environment}"
+  glue_db_name  = "${replace(var.app_name, "-", "_")}_db_${var.environment}"
 }
 
 # ------------------------------------------------------------------------------

@@ -65,7 +65,7 @@ This document details the low-level technical architecture, connector design, st
                      v                                                 v
    +------------------------------------+           +------------------------------------+
    |   AWS GLUE DATA CATALOG DATABASE   |           |    AMAZON ATHENA QUERY WORKGROUP   |
-   |      (uax-datalake-db-dev)         |           |       (uax-datalake-workgroup-dev) |
+   |      (uax_datalake_db_dev)         |           |       (uax-datalake-workgroup-dev) |
    +------------------------------------+           +------------------------------------+
 ```
 

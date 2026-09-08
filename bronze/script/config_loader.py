@@ -224,7 +224,7 @@ class ConfigLoader:
         if not db or not str(db).strip():
             raise ValueError(
                 "CRITICAL CONFIG ERROR: 'database_name' is missing or empty in bronze_config.json "
-                "(pipeline_defaults.glue_catalog.database_name). Please configure it (e.g. 'uax-datalake-db-dev')."
+                "(pipeline_defaults.glue_catalog.database_name). Please configure it (e.g. 'uax_datalake_db_dev')."
             )
         return str(db).strip()
 

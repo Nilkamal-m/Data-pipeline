@@ -203,7 +203,7 @@ File-based ingestion connector for external S3 buckets.
 ```json
 {
   "pipeline_defaults": {
-    "target_database": "uax-datalake-db-dev",
+    "target_database": "uax_datalake_db_dev",
     "iceberg_catalog": "glue_catalog",
     "default_merge_strategy": "upsert"
   },

@@ -335,7 +335,7 @@ def parse_arguments() -> dict:
         raise ValueError(
             "CRITICAL CONFIG ERROR: 'database_name' is missing or empty in bronze_config.json "
             "(pipeline_defaults.glue_catalog.database_name) and was not provided via CLI. "
-            "Please configure 'database_name' (e.g. 'uax-datalake-db-dev')."
+            "Please configure 'database_name' (e.g. 'uax_datalake_db_dev')."
         )
     if glue_database_name:
         glue_database_name = str(glue_database_name).strip()
@@ -777,7 +777,7 @@ def sync_bronze_catalog_table(
 ) -> str:
     """
     Creates/updates AWS Glue Data Catalog table for Bronze raw data and registers the execution partition.
-    Naming format: <database_name>.<table_prefix><table_name> (e.g. uax-datalake-db-dev.raw_tbl_incident).
+    Naming format: <database_name>.<table_prefix><table_name> (e.g. uax_datalake_db_dev.raw_tbl_incident).
     Location: s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/
     Partition: _ingested_at=<ISO_TIMESTAMP> (Single partition on _ingested_at)
     """

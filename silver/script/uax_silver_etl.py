@@ -154,7 +154,7 @@ def parse_spark_arguments() -> dict:
         raise ValueError(
             "CRITICAL CONFIG ERROR: 'glue_database' is missing or empty in silver_config.json "
             "(silver_defaults.glue_database) and was not provided via CLI. "
-            "Please configure 'glue_database' (e.g. 'uax-datalake-db-dev')."
+            "Please configure 'glue_database' (e.g. 'uax_datalake_db_dev')."
         )
     glue_database = str(glue_database).strip()
 
@@ -1291,7 +1291,7 @@ def main():
     if should_trigger_crawler:
         crawler_name = (
             cli_crawler_name
-            or f"{glue_database.replace('-db-', '-silver-iceberg-crawler-').replace('-db', '-silver-iceberg-crawler')}"
+            or glue_database.replace('_db_', '-silver-iceberg-crawler-').replace('-db-', '-silver-iceberg-crawler-').replace('_', '-')
         )
         logger.info(
             f"Triggering Silver Iceberg Crawler '{crawler_name}' "

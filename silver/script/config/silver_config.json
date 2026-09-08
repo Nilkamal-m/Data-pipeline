@@ -21,7 +21,7 @@
       "is_current_column": "_is_current",
       "high_date_value": "9999-01-01 00:00:00"
     },
-    "glue_database": "uax-datalake-db-dev",
+    "glue_database": "uax_datalake_db_dev",
     "deduplication": {
       "enabled": true,
       "strategy": "latest_by_order_column",

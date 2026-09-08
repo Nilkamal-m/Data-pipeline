@@ -13,7 +13,7 @@
     "cloudwatch_namespace": "UAX/DataPipeline/Ingestion",
     "glue_catalog": {
       "enabled": true,
-      "database_name": "uax-datalake-db-dev",
+      "database_name": "uax_datalake_db_dev",
       "table_prefix": "raw_tbl_",
       "crawler_name": "uax-datalake-bronze-crawler-dev",
       "trigger_crawler": true,
