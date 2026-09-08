@@ -112,7 +112,7 @@ module "silver_iceberg_job" {
     "--extra-py-files"         = "s3://${local.bucket_name}/silver/script/silver_config_loader.py,s3://${local.bucket_name}/silver/script/transformer.py"
     "--SILVER_CONFIG_S3_PATH" = "s3://${local.bucket_name}/silver/script/config/silver_config.json"
     "--datalake-formats"       = "iceberg"
-    "--conf"                   = "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog spark.sql.catalog.glue_catalog.warehouse=s3://${local.bucket_name}/silver/data/ spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO"
+    "--conf"                   = "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.warehouse=s3://${local.bucket_name}/silver/data/ --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO"
     "--DATA_LAKE_BUCKET"       = local.bucket_name
     "--GLUE_DATABASE"          = local.glue_db_name
     "--TABLE_PREFIX"           = "tbl_"
