@@ -54,6 +54,13 @@ logger.setLevel(logging.INFO)
 glue_client = boto3.client('glue')
 athena_client = boto3.client('athena')
 
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except Exception:
+    pd = None
+    HAS_PANDAS = False
+
 # Terminal status codes for AWS Glue Job Runs
 TERMINAL_STATES = {'SUCCEEDED', 'FAILED', 'STOPPED', 'TIMEOUT'}
 
@@ -248,6 +255,51 @@ def is_athena_query_event(event: Dict[str, Any]) -> bool:
     return layer == 'athena' or action in ('query', 'athena', 'run_query')
 
 
+def format_as_database_table(headers: List[str], rows: List[List[Any]], include_row_num: bool = True) -> str:
+    """
+    Renders tabular data as a clean SQL database CLI table (+-----+-----+).
+    """
+    if not headers and not rows:
+        return "(0 rows returned)"
+
+    display_headers = ["#"] + headers if include_row_num else list(headers)
+    display_rows = []
+    for idx, row in enumerate(rows, 1):
+        if include_row_num:
+            formatted_row = [str(idx)] + [str(v) if v is not None else 'NULL' for v in row]
+        else:
+            formatted_row = [str(v) if v is not None else 'NULL' for v in row]
+        display_rows.append(formatted_row)
+
+    col_widths = [len(h) for h in display_headers]
+    for row in display_rows:
+        for i, val in enumerate(row):
+            clean_val = val.replace('\n', ' ').replace('\r', '')
+            col_widths[i] = max(col_widths[i], min(len(clean_val), 60))
+
+    border_line = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+
+    def _fmt_row(cells: List[str]) -> str:
+        formatted_cells = []
+        for i, c in enumerate(cells):
+            clean = c.replace('\n', ' ').replace('\r', '')
+            if len(clean) > col_widths[i]:
+                clean = clean[:col_widths[i] - 3] + '...'
+            formatted_cells.append(f" {clean.ljust(col_widths[i])} ")
+        return "|" + "|".join(formatted_cells) + "|"
+
+    lines = [
+        border_line,
+        _fmt_row(display_headers),
+        border_line
+    ]
+    for r in display_rows:
+        lines.append(_fmt_row(r))
+    lines.append(border_line)
+    lines.append(f"({len(display_rows)} row{'s' if len(display_rows) != 1 else ''} in set)")
+    return "\n".join(lines)
+
+
 def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Executes an SQL query against Amazon Athena, polls for completion, formats
@@ -317,21 +369,8 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if database:
         start_params['QueryExecutionContext'] = {'Database': database}
     
-    result_config: Dict[str, Any] = {}
     if output_location:
-        result_config['OutputLocation'] = output_location
-
-    # Optional KMS encryption configuration
-    encryption_option = event.get('encryption_option') or event.get('ENCRYPTION_OPTION')
-    kms_key = event.get('kms_key') or event.get('KMS_KEY') or event.get('kms_key_arn')
-    if encryption_option or kms_key:
-        enc_dict: Dict[str, Any] = {'EncryptionOption': encryption_option or 'SSE_KMS'}
-        if kms_key:
-            enc_dict['KmsKey'] = kms_key
-        result_config['EncryptionConfiguration'] = enc_dict
-
-    if result_config:
-        start_params['ResultConfiguration'] = result_config
+        start_params['ResultConfiguration'] = {'OutputLocation': output_location}
 
     try:
         start_response = client.start_query_execution(**start_params)
@@ -436,32 +475,42 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info(f"Rows Returned   : {len(records)} (max_results: {max_results})")
     logger.info("-" * 80)
 
-    if column_names and raw_table_rows:
-        col_widths = [max(len(col), 4) for col in column_names]
-        for row in raw_table_rows:
-            for idx, val in enumerate(row):
-                col_widths[idx] = max(col_widths[idx], min(len(val), 50))
-        col_widths = [min(w, 50) for w in col_widths]
+    if column_names and (records or raw_table_rows):
+        # 1. Format and display using Pandas DataFrame
+        if HAS_PANDAS:
+            try:
+                df = pd.DataFrame(records, columns=column_names)
+                if not df.empty:
+                    df.index = range(1, len(df) + 1)
+                    df.index.name = '#'
 
-        def _fmt_cell(val: str, width: int) -> str:
-            clean = val.replace('\n', ' ').replace('\r', '')
-            if len(clean) > width:
-                return clean[:width - 3] + '...'
-            return clean.ljust(width)
+                # Configure pandas display settings for database-style console output
+                pd.set_option('display.max_columns', None)
+                pd.set_option('display.max_rows', None)
+                pd.set_option('display.width', 1000)
+                pd.set_option('display.colheader_justify', 'left')
+                pd.set_option('display.max_colwidth', 80)
 
-        header_line = " | ".join(_fmt_cell(col, col_widths[i]) for i, col in enumerate(column_names))
-        sep_line = "-+-".join("-" * col_widths[i] for i in range(len(column_names)))
+                logger.info("PANDAS DATAFRAME VIEW:")
+                logger.info("\n" + df.to_string())
+                logger.info(f"DataFrame Shape: {df.shape[0]} rows x {df.shape[1]} columns")
+                logger.info("-" * 80)
+            except Exception as df_err:
+                logger.warning(f"Failed to render pandas DataFrame: {df_err}")
 
-        logger.info(header_line)
-        logger.info(sep_line)
-        for row in raw_table_rows:
-            row_line = " | ".join(_fmt_cell(val, col_widths[i]) for i, val in enumerate(row))
-            logger.info(row_line)
+        # 2. Format and display as SQL Database CLI Table Grid (+-----+-----+)
+        logger.info("DATABASE TABLE VIEW:")
+        db_table_str = format_as_database_table(
+            headers=column_names,
+            rows=raw_table_rows,
+            include_row_num=True
+        )
+        logger.info("\n" + db_table_str)
         logger.info("-" * 80)
     else:
         logger.info("Query returned 0 data rows.")
 
-    logger.info("JSON Records Output:")
+    logger.info("JSON Records Output (First 20):")
     logger.info(json.dumps(records[:20], indent=2, default=str))
     logger.info("=" * 80)
 
