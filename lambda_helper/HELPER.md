@@ -1,21 +1,41 @@
-# AWS Glue Helper Lambda (Bronze & Silver Jobs)
+# AWS Glue & Athena Helper Lambda
 
-This helper Lambda function allows engineers to trigger and synchronously monitor **Bronze (REST API Ingestion)** and **Silver (PySpark Iceberg ETL)** AWS Glue jobs directly via the AWS Lambda Console, AWS CLI, or SDKs without requiring direct access to the AWS Glue Console.
+This helper Lambda function allows engineers to:
+1. **Query Amazon Athena directly**: Run SQL queries against the Glue Data Catalog (`uax_datalake_db_dev`) or Iceberg tables and inspect formatted tabular results directly in the Lambda execution logs.
+2. **Trigger and Monitor AWS Glue Jobs**: Trigger and synchronously monitor **Bronze (REST API Ingestion)** and **Silver (PySpark Iceberg ETL)** AWS Glue jobs directly via the AWS Lambda Console, AWS CLI, or SDKs without requiring direct access to the AWS Glue Console.
 
 ---
 
-## 1. Supported Glue Jobs
+## 1. Supported Operations
 
-| Layer | Job Name | Engine | Purpose |
+| Operation | Trigger Condition | Engine | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Bronze** | `uax-datalake-bronze-ingestion-dev` | Python Shell 3.9 | Ingests raw API / DB data into S3 partitioned by `_ingested_at=<ISO_TIMESTAMP>` and registers Glue Catalog external tables. |
-| **Silver** | `uax-datalake-silver-etl-dev` | Glue PySpark 4.0 | Deduplicates Bronze raw data, applies audit columns (`_is_deleted`, `_is_current`, `_updated_at`, `_inserted_at`), and merges into Iceberg tables (`tbl_<name>`). |
+| **Athena SQL Query** *(New)* | Payload contains `"query"`, `"athena_query"`, or `"sql"` | Amazon Athena Engine v3 | Executes SQL queries against Bronze / Silver tables and logs formatted results directly to CloudWatch. |
+| **Bronze Ingestion Job** | `layer = "bronze"` (or default) | Python Shell 3.9 | Ingests raw API / DB data into S3 partitioned by `_ingested_at=<ISO_TIMESTAMP>` and registers Glue Catalog external tables. |
+| **Silver Iceberg ETL Job** | `layer = "silver"` | Glue PySpark 4.0 | Deduplicates Bronze raw data, applies audit columns (`_is_deleted`, `_is_current`, `_updated_at`, `_inserted_at`), and merges into Iceberg tables (`tbl_<name>`). |
 
 *(Job names automatically resolve via environment variables `DEFAULT_BRONZE_JOB` and `DEFAULT_SILVER_JOB`, or can be explicitly overridden in the event payload via `"job_name"`).*
 
 ---
 
 ## 2. Event Payload Parameters Reference
+
+### 2.1 Athena Query Parameters *(New)*
+
+If `"query"`, `"athena_query"`, or `"sql"` is provided in the payload, Lambda runs the query in Athena and prints the tabular results directly into the Lambda log:
+
+| Parameter | Type | Required | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `query` / `sql` | string | **Required** | - | SQL query string to execute (e.g. `SELECT * FROM raw_tbl_incident LIMIT 10`). |
+| `database` | string | Optional | `uax_datalake_db_dev` | Target AWS Glue Data Catalog database. |
+| `workgroup` | string | Optional | `uax-datalake-workgroup-dev` | Amazon Athena workgroup name. |
+| `output_location` | string | Optional | Workgroup default | S3 path for Athena query results (e.g. `s3://uax-datalake-dev-bucket/athena-results/`). |
+| `max_results` | integer | Optional | `50` | Maximum number of rows to retrieve and print in the CloudWatch logs. |
+| `timeout_seconds` | integer | Optional | `120` | Maximum time to wait for query execution before timing out. |
+
+---
+
+### 2.2 AWS Glue Job Parameters *(Existing)*
 
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -170,6 +190,43 @@ This helper Lambda function allows engineers to trigger and synchronously monito
 
 ---
 
+### D. Athena Query Test Payloads *(New)*
+
+#### 12. Show All Tables in Database
+```json
+{
+  "query": "SHOW TABLES IN uax_datalake_db_dev"
+}
+```
+
+#### 13. Query Bronze Raw Data Table (`raw_tbl_incident`)
+```json
+{
+  "query": "SELECT sys_id, number, state, _ingested_at FROM raw_tbl_incident ORDER BY _ingested_at DESC LIMIT 10",
+  "database": "uax_datalake_db_dev",
+  "max_results": 10
+}
+```
+
+#### 14. Query Silver Iceberg Data Table (`tbl_interactions`)
+```json
+{
+  "query": "SELECT interaction_id, user_email, _is_current, _updated_at FROM tbl_interactions WHERE _is_current = true LIMIT 10",
+  "database": "uax_datalake_db_dev",
+  "workgroup": "uax-datalake-workgroup-dev",
+  "max_results": 10
+}
+```
+
+#### 15. Check High-Watermark State Table (`raw_tbl_watermarks` / `tbl_watermarks`)
+```json
+{
+  "query": "SELECT * FROM tbl_watermarks ORDER BY updated_at DESC"
+}
+```
+
+---
+
 ## 4. Example Responses
 
 ### A. Successful Synchronous Execution (HTTP 200)
@@ -194,6 +251,75 @@ This helper Lambda function allows engineers to trigger and synchronously monito
   "statusCode": 500,
   "body": "{\"job_name\": \"uax-datalake-silver-etl-dev\", \"job_run_id\": \"jr_abcdef1234567890\", \"job_status\": \"FAILED\", \"execution_time_seconds\": 22, \"source_system\": \"moveworks\", \"source_table_name\": \"raw_tbl_interactions\", \"cloudwatch_log_group\": \"/aws-glue/jobs/output\", \"error_message\": \"...\"}"
 }
+```
+
+### D. Successful Athena Query Execution (HTTP 200) *(New)*
+
+**Response JSON:**
+```json
+{
+  "statusCode": 200,
+  "body": {
+    "query_execution_id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+    "status": "SUCCEEDED",
+    "query": "SELECT sys_id, number, state, _ingested_at FROM raw_tbl_incident LIMIT 2",
+    "database": "uax_datalake_db_dev",
+    "workgroup": "uax-datalake-workgroup-dev",
+    "execution_time_ms": 1240,
+    "data_scanned_bytes": 1048576,
+    "columns": ["sys_id", "number", "state", "_ingested_at"],
+    "row_count": 2,
+    "records": [
+      {
+        "sys_id": "9d380721eb311100d4360c5111061735",
+        "number": "INC0000001",
+        "state": "1",
+        "_ingested_at": "2026-09-08T16:00:00Z"
+      },
+      {
+        "sys_id": "e8caed5b1b4001103c8b4088b04bcba7",
+        "number": "INC0000002",
+        "state": "2",
+        "_ingested_at": "2026-09-08T16:00:00Z"
+      }
+    ]
+  }
+}
+```
+
+**Formatted CloudWatch Log Output (Visible in Lambda Logs):**
+```
+================================================================================
+ATHENA QUERY EXECUTION RESULT SUMMARY
+Query           : SELECT sys_id, number, state, _ingested_at FROM raw_tbl_incident LIMIT 2
+Database        : uax_datalake_db_dev
+WorkGroup       : uax-datalake-workgroup-dev
+Execution ID    : a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d
+Engine Time     : 1240 ms (1.24 s)
+Data Scanned    : 1,048,576 bytes (1.0000 MB)
+Rows Returned   : 2 (max_results: 10)
+--------------------------------------------------------------------------------
+sys_id                           | number     | state | _ingested_at        
+---------------------------------+------------+-------+---------------------
+9d380721eb311100d4360c5111061735 | INC0000001 | 1     | 2026-09-08T16:00:00Z
+e8caed5b1b4001103c8b4088b04bcba7 | INC0000002 | 2     | 2026-09-08T16:00:00Z
+--------------------------------------------------------------------------------
+JSON Records Output:
+[
+  {
+    "sys_id": "9d380721eb311100d4360c5111061735",
+    "number": "INC0000001",
+    "state": "1",
+    "_ingested_at": "2026-09-08T16:00:00Z"
+  },
+  {
+    "sys_id": "e8caed5b1b4001103c8b4088b04bcba7",
+    "number": "INC0000002",
+    "state": "2",
+    "_ingested_at": "2026-09-08T16:00:00Z"
+  }
+]
+================================================================================
 ```
 
 ---
@@ -231,7 +357,7 @@ To re-use the existing Glue IAM Execution Role (`uax-datalake-glue-execution-rol
 }
 ```
 
-2. Ensure the policy attached to the role includes permissions to trigger and monitor Glue jobs:
+2. Ensure the policy attached to the role includes permissions for AWS Glue, Amazon Athena, and Amazon S3 query results:
 ```json
 {
   "Version": "2012-10-17",
@@ -242,9 +368,36 @@ To re-use the existing Glue IAM Execution Role (`uax-datalake-glue-execution-rol
         "glue:StartJobRun",
         "glue:GetJobRun",
         "glue:GetJobRuns",
-        "glue:BatchStopJobRun"
+        "glue:BatchStopJobRun",
+        "glue:GetDatabase",
+        "glue:GetTable",
+        "glue:GetPartitions"
       ],
-      "Resource": "arn:aws:glue:*:*:job/uax-datalake-*"
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "athena:StartQueryExecution",
+        "athena:GetQueryExecution",
+        "athena:GetQueryResults",
+        "athena:StopQueryExecution",
+        "athena:GetWorkGroup"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketLocation",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::uax-datalake-*-bucket",
+        "arn:aws:s3:::uax-datalake-*-bucket/*"
+      ]
     },
     {
       "Effect": "Allow",

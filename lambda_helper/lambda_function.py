@@ -1,15 +1,30 @@
 """
-AWS Lambda Helper Function: Trigger & Monitor AWS Glue Ingestion & Silver ETL Jobs
+AWS Lambda Helper Function: Trigger & Monitor AWS Glue Jobs & Execute Athena Queries
 
 Purpose:
-  Enables triggering and optional synchronous monitoring of AWS Glue Bronze & Silver jobs
-  via AWS Lambda console, CLI, or API invocation when direct AWS Glue Console access is restricted.
+  1. Trigger and monitor AWS Glue Bronze Ingestion & Silver Iceberg ETL jobs.
+  2. Execute queries directly on Amazon Athena (Iceberg / Glue Data Catalog tables)
+     and output formatted results into CloudWatch / Lambda execution logs.
 
-Supported Glue Jobs:
-  - Bronze Ingestion Job: uax-datalake-bronze-ingestion-dev (or env DEFAULT_BRONZE_JOB)
-  - Silver Iceberg ETL Job: uax-datalake-silver-etl-dev (or env DEFAULT_SILVER_JOB)
+Supported Operations:
+  A. Athena Query Execution (New):
+     Pass "query", "athena_query", or "sql" in the event payload to execute any SQL query
+     against Athena and inspect the result table in the Lambda logs.
 
-Payload Schema (JSON):
+  B. AWS Glue Job Triggering (Existing):
+     - Bronze Ingestion Job: uax-datalake-bronze-ingestion-dev (or env DEFAULT_BRONZE_JOB)
+     - Silver Iceberg ETL Job: uax-datalake-silver-etl-dev (or env DEFAULT_SILVER_JOB)
+
+Athena Query Payload Schema (JSON):
+{
+    "query": "SELECT * FROM uax_datalake_db_dev.raw_tbl_incident LIMIT 10", # Required SQL query (pass <database>.<table_name> directly in query)
+    "max_results": 50,                                                      # Optional: maximum rows to display in log (default: 50)
+    "workgroup": "uax-datalake-workgroup-dev",                              # Optional: Athena workgroup (default: uax-datalake-workgroup-dev)
+    "database": "uax_datalake_db_dev",                                      # Optional: only needed if not passing <database>.<table_name> in query
+    "timeout_seconds": 120                                                  # Optional: query execution timeout (default: 120s)
+}
+
+Glue Job Payload Schema (JSON):
 {
     "layer": "bronze",                                 # Optional: "bronze" or "silver" (Defaults to "bronze")
     "job_name": "uax-datalake-bronze-ingestion-dev",   # Optional explicit job name override
@@ -30,19 +45,24 @@ import json
 import time
 import logging
 import boto3
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 glue_client = boto3.client('glue')
+athena_client = boto3.client('athena')
 
 # Terminal status codes for AWS Glue Job Runs
 TERMINAL_STATES = {'SUCCEEDED', 'FAILED', 'STOPPED', 'TIMEOUT'}
 
 DEFAULT_BRONZE_JOB = os.environ.get('DEFAULT_BRONZE_JOB', 'uax-datalake-bronze-ingestion-dev')
 DEFAULT_SILVER_JOB = os.environ.get('DEFAULT_SILVER_JOB', 'uax-datalake-silver-etl-dev')
+
+DEFAULT_ATHENA_DATABASE = os.environ.get('DEFAULT_ATHENA_DATABASE', 'uax_datalake_db_dev')
+DEFAULT_ATHENA_WORKGROUP = os.environ.get('DEFAULT_ATHENA_WORKGROUP', 'uax-datalake-workgroup-dev')
+DEFAULT_ATHENA_OUTPUT_LOCATION = os.environ.get('DEFAULT_ATHENA_OUTPUT_LOCATION', '')
 
 
 def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
@@ -212,13 +232,253 @@ def poll_glue_job_run(job_name: str, run_id: str, poll_interval: int, timeout_se
         time.sleep(poll_interval)
 
 
+def is_athena_query_event(event: Dict[str, Any]) -> bool:
+    """
+    Detects if the incoming Lambda payload is intended for Athena query execution.
+    Recognizes:
+      - Explicit query fields: "query", "athena_query", "sql"
+      - Action: "query", "athena", "run_query"
+      - Layer: "athena"
+    """
+    for q_key in ('query', 'athena_query', 'sql', 'QUERY', 'ATHENA_QUERY', 'SQL'):
+        if event.get(q_key) and str(event[q_key]).strip():
+            return True
+    layer = str(event.get('layer', '')).strip().lower()
+    action = str(event.get('action', '')).strip().lower()
+    return layer == 'athena' or action in ('query', 'athena', 'run_query')
+
+
+def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Executes an SQL query against Amazon Athena, polls for completion, formats
+    the tabular results into the Lambda execution logs, and returns the records.
+    """
+    # 1. Resolve SQL Query string
+    query_str = None
+    for q_key in ('query', 'athena_query', 'sql', 'QUERY', 'ATHENA_QUERY', 'SQL'):
+        if event.get(q_key) and str(event[q_key]).strip():
+            query_str = str(event[q_key]).strip()
+            break
+
+    if not query_str:
+        raise ValueError(
+            "Missing SQL query in payload. Please provide 'query' (e.g., {'query': 'SELECT * FROM uax_datalake_db_dev.raw_tbl_incident LIMIT 10'})."
+        )
+
+    # 2. Resolve Database, Workgroup, Output Location
+    # Database is completely optional if your query passes <database>.<table_name> directly (e.g. uax_datalake_db_dev.raw_tbl_incident)
+    database = (
+        event.get('database')
+        or event.get('db')
+        or event.get('glue_database')
+        or event.get('DATABASE')
+        or DEFAULT_ATHENA_DATABASE
+    )
+    database = str(database).strip() if database else 'uax_datalake_db_dev'
+
+    workgroup = (
+        event.get('workgroup')
+        or event.get('athena_workgroup')
+        or event.get('WORKGROUP')
+        or DEFAULT_ATHENA_WORKGROUP
+    )
+    workgroup = str(workgroup).strip() if workgroup else 'uax-datalake-workgroup-dev'
+
+    output_location = (
+        event.get('output_location')
+        or event.get('s3_output')
+        or event.get('OUTPUT_LOCATION')
+        or DEFAULT_ATHENA_OUTPUT_LOCATION
+    )
+    output_location = str(output_location).strip() if output_location else ''
+
+    max_results = int(event.get('max_results') or event.get('MAX_RESULTS') or 50)
+    timeout_seconds = int(event.get('timeout_seconds') or event.get('TIMEOUT_SECONDS') or 120)
+    poll_interval = float(event.get('poll_interval_seconds') or event.get('POLL_INTERVAL_SECONDS') or 1.0)
+
+    logger.info("=" * 80)
+    logger.info("STARTING AMAZON ATHENA QUERY EXECUTION")
+    logger.info(f"Target Database : {database}")
+    logger.info(f"Athena Workgroup: {workgroup}")
+    logger.info(f"Max Results Log : {max_results}")
+    logger.info(f"Query String    :\n{query_str}")
+    logger.info("=" * 80)
+
+    # 3. Start Athena Query Execution
+    start_params: Dict[str, Any] = {
+        'QueryString': query_str,
+        'WorkGroup': workgroup
+    }
+    if database:
+        start_params['QueryExecutionContext'] = {'Database': database}
+    if output_location:
+        start_params['ResultConfiguration'] = {'OutputLocation': output_location}
+
+    try:
+        start_response = athena_client.start_query_execution(**start_params)
+    except ClientError as ce:
+        err_msg = str(ce)
+        # Workgroups with enforced output location may reject explicit ResultConfiguration
+        if 'InvalidRequestException' in err_msg and 'workgroup' in err_msg.lower() and 'outputlocation' in err_msg.lower():
+            logger.info("Workgroup enforces output location. Retrying without explicit ResultConfiguration...")
+            start_params.pop('ResultConfiguration', None)
+            start_response = athena_client.start_query_execution(**start_params)
+        else:
+            raise
+
+    query_execution_id = start_response['QueryExecutionId']
+    logger.info(f"Submitted to Athena. QueryExecutionId: {query_execution_id}")
+
+    # 4. Polling loop
+    start_time = time.time()
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > timeout_seconds:
+            try:
+                athena_client.stop_query_execution(QueryExecutionId=query_execution_id)
+            except Exception:
+                pass
+            raise TimeoutError(
+                f"Athena query '{query_execution_id}' timed out after {timeout_seconds}s."
+            )
+
+        response = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+        query_execution = response.get('QueryExecution', {})
+        status_info = query_execution.get('Status', {})
+        state = status_info.get('State', 'UNKNOWN')
+
+        if state == 'SUCCEEDED':
+            logger.info(f"Athena Query '{query_execution_id}' SUCCEEDED in {elapsed:.2f}s")
+            break
+        elif state in ('FAILED', 'CANCELLED'):
+            reason = status_info.get('StateChangeReason', 'Unknown error')
+            logger.error(f"Athena Query '{query_execution_id}' {state}: {reason}")
+            return {
+                'statusCode': 500 if state == 'FAILED' else 400,
+                'body': json.dumps({
+                    'query_execution_id': query_execution_id,
+                    'status': state,
+                    'query': query_str,
+                    'database': database,
+                    'workgroup': workgroup,
+                    'error_message': reason
+                })
+            }
+
+        time.sleep(poll_interval)
+
+    # 5. Fetch Query Execution Statistics
+    stats = query_execution.get('Statistics', {})
+    exec_time_ms = stats.get('EngineExecutionTimeInMillis', 0)
+    data_scanned_bytes = stats.get('DataScannedInBytes', 0)
+    data_scanned_mb = data_scanned_bytes / (1024.0 * 1024.0)
+
+    # 6. Fetch Query Results
+    results_paginator = athena_client.get_paginator('get_query_results')
+    column_names: List[str] = []
+    records: List[Dict[str, Any]] = []
+    raw_table_rows: List[List[str]] = []
+    is_first_page = True
+
+    for page in results_paginator.paginate(QueryExecutionId=query_execution_id, PaginationConfig={'MaxItems': max_results}):
+        result_set = page.get('ResultSet', {})
+        rows = result_set.get('Rows', [])
+
+        if not rows:
+            continue
+
+        start_row_idx = 0
+        if is_first_page:
+            # Row 0 contains column names
+            column_names = [col.get('VarCharValue', f'col_{idx}') for idx, col in enumerate(rows[0].get('Data', []))]
+            start_row_idx = 1
+            is_first_page = False
+
+        for r in rows[start_row_idx:]:
+            row_data = r.get('Data', [])
+            record_dict = {}
+            record_values = []
+            for idx, col_name in enumerate(column_names):
+                val = row_data[idx].get('VarCharValue') if idx < len(row_data) else None
+                record_dict[col_name] = val
+                record_values.append(str(val) if val is not None else 'NULL')
+            records.append(record_dict)
+            raw_table_rows.append(record_values)
+
+    # 7. Format & Print Pretty Table in Lambda Logs
+    logger.info("=" * 80)
+    logger.info("ATHENA QUERY EXECUTION RESULT SUMMARY")
+    logger.info(f"Query           : {query_str}")
+    logger.info(f"Database        : {database}")
+    logger.info(f"WorkGroup       : {workgroup}")
+    logger.info(f"Execution ID    : {query_execution_id}")
+    logger.info(f"Engine Time     : {exec_time_ms} ms ({exec_time_ms / 1000.0:.2f} s)")
+    logger.info(f"Data Scanned    : {data_scanned_bytes:,} bytes ({data_scanned_mb:.4f} MB)")
+    logger.info(f"Rows Returned   : {len(records)} (max_results: {max_results})")
+    logger.info("-" * 80)
+
+    if column_names and raw_table_rows:
+        col_widths = [max(len(col), 4) for col in column_names]
+        for row in raw_table_rows:
+            for idx, val in enumerate(row):
+                col_widths[idx] = max(col_widths[idx], min(len(val), 50))
+        col_widths = [min(w, 50) for w in col_widths]
+
+        def _fmt_cell(val: str, width: int) -> str:
+            clean = val.replace('\n', ' ').replace('\r', '')
+            if len(clean) > width:
+                return clean[:width - 3] + '...'
+            return clean.ljust(width)
+
+        header_line = " | ".join(_fmt_cell(col, col_widths[i]) for i, col in enumerate(column_names))
+        sep_line = "-+-".join("-" * col_widths[i] for i in range(len(column_names)))
+
+        logger.info(header_line)
+        logger.info(sep_line)
+        for row in raw_table_rows:
+            row_line = " | ".join(_fmt_cell(val, col_widths[i]) for i, val in enumerate(row))
+            logger.info(row_line)
+        logger.info("-" * 80)
+    else:
+        logger.info("Query returned 0 data rows.")
+
+    logger.info("JSON Records Output:")
+    logger.info(json.dumps(records[:20], indent=2, default=str))
+    logger.info("=" * 80)
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'query_execution_id': query_execution_id,
+            'status': 'SUCCEEDED',
+            'query': query_str,
+            'database': database,
+            'workgroup': workgroup,
+            'execution_time_ms': exec_time_ms,
+            'data_scanned_bytes': data_scanned_bytes,
+            'columns': column_names,
+            'row_count': len(records),
+            'records': records
+        })
+    }
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Main Lambda entrypoint.
+    Supports:
+      1. Athena query execution (if 'query', 'athena_query', or 'sql' is in event)
+      2. AWS Glue Job Triggering & Monitoring (existing default)
     """
     logger.info(f"Received invocation event: {json.dumps(event, default=str)}")
 
     try:
+        # Route 1: Athena Query Execution
+        if is_athena_query_event(event):
+            logger.info("Athena query request detected in payload. Routing to execute_athena_query...")
+            return execute_athena_query(event, context)
+
+        # Route 2: AWS Glue Job Triggering & Monitoring (Original Flow)
         # Layer resolution: "bronze" or "silver"
         layer = str(event.get('layer', 'bronze')).strip().lower()
 
