@@ -292,6 +292,10 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     )
     output_location = str(output_location).strip() if output_location else ''
 
+    # Region resolution: payload override > ATHENA_REGION env > default client
+    athena_region = event.get('region') or event.get('athena_region') or os.environ.get('ATHENA_REGION')
+    client = boto3.client('athena', region_name=athena_region.strip()) if athena_region and athena_region.strip() else athena_client
+
     max_results = int(event.get('max_results') or event.get('MAX_RESULTS') or 50)
     timeout_seconds = int(event.get('timeout_seconds') or event.get('TIMEOUT_SECONDS') or 120)
     poll_interval = float(event.get('poll_interval_seconds') or event.get('POLL_INTERVAL_SECONDS') or 1.0)
@@ -300,6 +304,7 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("STARTING AMAZON ATHENA QUERY EXECUTION")
     logger.info(f"Target Database : {database}")
     logger.info(f"Athena Workgroup: {workgroup}")
+    logger.info(f"Athena Region   : {athena_region or 'Default'}")
     logger.info(f"Max Results Log : {max_results}")
     logger.info(f"Query String    :\n{query_str}")
     logger.info("=" * 80)
@@ -311,18 +316,32 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
     if database:
         start_params['QueryExecutionContext'] = {'Database': database}
+    
+    result_config: Dict[str, Any] = {}
     if output_location:
-        start_params['ResultConfiguration'] = {'OutputLocation': output_location}
+        result_config['OutputLocation'] = output_location
+
+    # Optional KMS encryption configuration
+    encryption_option = event.get('encryption_option') or event.get('ENCRYPTION_OPTION')
+    kms_key = event.get('kms_key') or event.get('KMS_KEY') or event.get('kms_key_arn')
+    if encryption_option or kms_key:
+        enc_dict: Dict[str, Any] = {'EncryptionOption': encryption_option or 'SSE_KMS'}
+        if kms_key:
+            enc_dict['KmsKey'] = kms_key
+        result_config['EncryptionConfiguration'] = enc_dict
+
+    if result_config:
+        start_params['ResultConfiguration'] = result_config
 
     try:
-        start_response = athena_client.start_query_execution(**start_params)
+        start_response = client.start_query_execution(**start_params)
     except ClientError as ce:
         err_msg = str(ce)
         # Workgroups with enforced output location may reject explicit ResultConfiguration
-        if 'InvalidRequestException' in err_msg and 'workgroup' in err_msg.lower() and 'outputlocation' in err_msg.lower():
+        if 'InvalidRequestException' in err_msg and 'workgroup' in err_msg.lower() and ('outputlocation' in err_msg.lower() or 'configuration' in err_msg.lower()):
             logger.info("Workgroup enforces output location. Retrying without explicit ResultConfiguration...")
             start_params.pop('ResultConfiguration', None)
-            start_response = athena_client.start_query_execution(**start_params)
+            start_response = client.start_query_execution(**start_params)
         else:
             raise
 
@@ -335,14 +354,14 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         elapsed = time.time() - start_time
         if elapsed > timeout_seconds:
             try:
-                athena_client.stop_query_execution(QueryExecutionId=query_execution_id)
+                client.stop_query_execution(QueryExecutionId=query_execution_id)
             except Exception:
                 pass
             raise TimeoutError(
                 f"Athena query '{query_execution_id}' timed out after {timeout_seconds}s."
             )
 
-        response = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+        response = client.get_query_execution(QueryExecutionId=query_execution_id)
         query_execution = response.get('QueryExecution', {})
         status_info = query_execution.get('Status', {})
         state = status_info.get('State', 'UNKNOWN')
@@ -374,7 +393,7 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     data_scanned_mb = data_scanned_bytes / (1024.0 * 1024.0)
 
     # 6. Fetch Query Results
-    results_paginator = athena_client.get_paginator('get_query_results')
+    results_paginator = client.get_paginator('get_query_results')
     column_names: List[str] = []
     records: List[Dict[str, Any]] = []
     raw_table_rows: List[List[str]] = []
