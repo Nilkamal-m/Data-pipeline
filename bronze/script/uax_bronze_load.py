@@ -476,6 +476,7 @@ def flatten_dict(d: dict, parent_key: str = '', sep: str = '_') -> dict:
 def serialize_chunk_to_bytes(records_chunk: list, output_format: str = "parquet", parquet_compression: str = "snappy") -> tuple:
     """
     Serializes a record chunk into bytes according to configured format (parquet or json).
+    Guarantees that data columns come first, and system metadata columns (_*) are always placed at the end.
     """
     fmt = output_format.strip().lower()
     if fmt == "parquet":
@@ -483,6 +484,13 @@ def serialize_chunk_to_bytes(records_chunk: list, output_format: str = "parquet"
             import pandas as pd
             import io
             df = pd.DataFrame(records_chunk)
+            # Guarantee data columns are first, and system-generated columns (_*) are always at the end
+            data_cols = [c for c in df.columns if not c.startswith('_')]
+            meta_cols = [c for c in df.columns if c.startswith('_')]
+            known_meta_order = ['_source_system', '_table_name', '_execution_id', '_ingested_at']
+            ordered_meta = [c for c in known_meta_order if c in meta_cols] + [c for c in meta_cols if c not in known_meta_order]
+            df = df[data_cols + ordered_meta]
+
             buffer = io.BytesIO()
             df.to_parquet(buffer, compression=parquet_compression, index=False)
             return buffer.getvalue(), "application/x-parquet", ".parquet"
@@ -490,7 +498,17 @@ def serialize_chunk_to_bytes(records_chunk: list, output_format: str = "parquet"
             logger.warning(f"Parquet serialization via pandas failed ({err}). Falling back to JSON format.")
             fmt = "json"
 
-    json_bytes = json.dumps(records_chunk, indent=2).encode('utf-8')
+    # For JSON format, also guarantee data keys are first, system keys last in each dict
+    reordered_records = []
+    for rec in records_chunk:
+        if isinstance(rec, dict):
+            data_dict = {k: v for k, v in rec.items() if not str(k).startswith('_')}
+            meta_dict = {k: v for k, v in rec.items() if str(k).startswith('_')}
+            reordered_records.append({**data_dict, **meta_dict})
+        else:
+            reordered_records.append(rec)
+
+    json_bytes = json.dumps(reordered_records, indent=2).encode('utf-8')
     return json_bytes, "application/json", ".json"
 
 
@@ -793,27 +811,47 @@ def sync_bronze_catalog_table(
     serde_lib = 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe' if is_parquet else 'org.openx.data.jsonserde.JsonSerDe'
 
     # Build schema columns from sample record if available
-    columns = []
+    # Guarantee all data columns are placed first, and system audit columns (_*) are always at the end
+    data_columns = []
+    meta_columns = []
     if sample_record and isinstance(sample_record, dict):
         for k, v in sample_record.items():
             clean_k = str(k).strip().lower().replace(" ", "_").replace("-", "_")
             # Partition keys must NOT be declared in StorageDescriptor.Columns in AWS Glue Data Catalog
-            if clean_k not in ('_ingested_at', 'year', 'month', 'day'):
-                columns.append({'Name': clean_k, 'Type': infer_glue_column_type(v)})
+            if clean_k in ('_ingested_at', 'year', 'month', 'day'):
+                continue
+            col_def = {'Name': clean_k, 'Type': infer_glue_column_type(v)}
+            if clean_k.startswith('_'):
+                meta_columns.append(col_def)
+            else:
+                data_columns.append(col_def)
 
-    # Ensure technical audit columns (_source_system, _table_name, _execution_id) are present
-    existing_col_names = {c['Name'] for c in columns}
+    # Ensure technical audit columns (_source_system, _table_name, _execution_id) are present at the end
+    existing_meta_names = {c['Name'] for c in meta_columns}
     for audit_col in ('_source_system', '_table_name', '_execution_id'):
-        if audit_col not in existing_col_names:
-            columns.append({'Name': audit_col, 'Type': 'string'})
+        if audit_col not in existing_meta_names:
+            meta_columns.append({'Name': audit_col, 'Type': 'string'})
 
-    if not columns:
+    # Keep consistent ordering of known audit metadata columns at the very end
+    known_audit_order = ['_source_system', '_table_name', '_execution_id']
+    ordered_meta = []
+    for ac in known_audit_order:
+        match = next((c for c in meta_columns if c['Name'] == ac), None)
+        if match:
+            ordered_meta.append(match)
+    for mc in meta_columns:
+        if mc['Name'] not in known_audit_order:
+            ordered_meta.append(mc)
+
+    if not data_columns and not ordered_meta:
         columns = [
             {'Name': 'payload', 'Type': 'string'},
             {'Name': '_source_system', 'Type': 'string'},
             {'Name': '_table_name', 'Type': 'string'},
             {'Name': '_execution_id', 'Type': 'string'}
         ]
+    else:
+        columns = data_columns + ordered_meta
 
     # Single partition on _ingested_at
     partition_keys = [

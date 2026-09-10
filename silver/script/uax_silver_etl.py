@@ -529,15 +529,16 @@ def trigger_silver_iceberg_crawler(glue_client, crawler_name: str):
 def get_payload_columns(all_columns: list, nkeys) -> list:
     """
     Returns sorted list of non-key, non-technical business payload columns used for runtime change detection.
-    Technical audit columns and natural keys are excluded so changes to timestamps do not trigger false diffs.
+    Technical audit columns, system columns, and natural keys are excluded so changes to timestamps do not trigger false diffs.
     """
     technical_cols = {
         '_is_deleted', '_inserted_at', '_updated_at',
         '_valid_from', '_valid_to', '_is_current',
-        '_ingested_at', '_transformed_at', 'row_num', '__runtime_hash'
+        '_ingested_at', '_source_system', '_table_name', '_execution_id',
+        '_batch_id', '_raw_payload', '_transformed_at', 'row_num', '__runtime_hash'
     }
     nkey_set = set(nkeys if isinstance(nkeys, list) else [nkeys])
-    return sorted([c for c in all_columns if c not in nkey_set and c not in technical_cols])
+    return sorted([c for c in all_columns if c not in nkey_set and c not in technical_cols and not c.startswith('_')])
 
 
 def build_runtime_hash_expr(payload_cols: list, prefix: str = "") -> str:
@@ -657,10 +658,18 @@ def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_t
         source_hash_expr = build_runtime_hash_expr(payload_cols, prefix="source")
         target_hash_expr = build_runtime_hash_expr(payload_cols, prefix="target")
 
-        # Non-key, non-technical columns to update
-        business_update_cols = [c for c in df.columns if c not in ('_inserted_at', '_updated_at') and c not in nkey_list]
+        # Non-key, non-technical business columns to update
+        silver_tech_cols = {'_valid_from', '_valid_to', '_is_current', '_is_deleted', '_inserted_at', '_updated_at'}
+        nkey_set = set(nkey_list)
+        business_update_cols = [c for c in df.columns if c not in silver_tech_cols and c not in nkey_set]
         update_set_items = [f"target.`{c}` = source.`{c}`" for c in business_update_cols]
+        # In SCD1: update in place without maintaining history; update validity window and ensure _is_current remains 'Y'
+        update_set_items.append("target.`_valid_from` = coalesce(source.`_valid_from`, current_timestamp())")
+        update_set_items.append("target.`_valid_to` = source.`_valid_to`")
+        update_set_items.append("target.`_is_current` = 'Y'")
+        update_set_items.append("target.`_is_deleted` = source.`_is_deleted`")
         update_set_items.append("target.`_updated_at` = current_timestamp()")
+        # target._inserted_at is preserved from initial insert
         update_set_clause = ",\n          ".join(update_set_items)
 
         # Columns to insert for new records
@@ -711,10 +720,15 @@ def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_na
 
     table_exists = check_iceberg_table_exists(spark, glue_client, database_name, target_table_name)
 
-    # Base SCD2 columns for incoming batch
-    incoming_df = df.withColumn(valid_from_col, coalesce(col(order_col_name).cast("timestamp"), current_timestamp())) \
+    # Base SCD2 columns for incoming batch ('Y' for active record)
+    incoming_df = df.withColumn(valid_from_col, coalesce(col(order_col_name).cast("timestamp"), col(valid_from_col), current_timestamp())) \
                     .withColumn(valid_to_col, to_timestamp(lit(high_date_val))) \
                     .withColumn(is_current_col, lit('Y'))
+
+    # Guarantee all business columns come first, and system audit columns are at the very end
+    silver_tech_cols = [valid_from_col, valid_to_col, is_current_col, '_is_deleted', '_inserted_at', '_updated_at']
+    business_cols = [c for c in incoming_df.columns if c not in silver_tech_cols]
+    incoming_df = incoming_df.select(*(business_cols + silver_tech_cols))
 
     if not table_exists:
         logger.info(f"SCD Type 2: Target table '{quoted_table}' does not exist. Creating initial table with high-date '{high_date_val}'...")
@@ -739,7 +753,7 @@ def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_na
     else:
         schema_evolved = sync_iceberg_table_schema(spark, quoted_table, incoming_df)
         logger.info(f"Executing SCD Type 2 Runtime-Hash Change Detection on '{quoted_table}'...")
-        payload_cols = get_payload_columns(df.columns, nkey_list)
+        payload_cols = get_payload_columns(incoming_df.columns, nkey_list)
         logger.info(f"SCD2 Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
 
         temp_view = f"scd2_incoming_{target_table_name.replace('.', '_').replace('-', '_')}"
@@ -752,13 +766,13 @@ def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_na
         target_hash_expr = build_runtime_hash_expr(payload_cols, prefix="target")
 
         # 1. Expire existing active target records ONLY when:
-        #    a) Record exists and target._is_current = 'Y'
+        #    a) Record exists and target._is_current is active ('Y')
         #    b) Payload hash differs OR _is_deleted differs (data actually changed)
         #    c) Incoming record timestamp is >= target._valid_from (not backdated)
         expire_sql = f"""
         MERGE INTO {quoted_table} AS target
         USING {temp_view} AS source
-        ON {join_condition} AND target.`{is_current_col}` = 'Y'
+        ON {join_condition} AND (target.`{is_current_col}` = 'Y' OR cast(target.`{is_current_col}` as string) IN ('true', 'TRUE'))
         WHEN MATCHED AND (
             target.`_is_deleted` != source.`_is_deleted` OR
             {target_hash_expr} != {source_hash_expr}
@@ -776,7 +790,7 @@ def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_na
         #    a) They are completely new (do not exist in active target at all), OR
         #    b) They represent a genuine change over the prior active version (and are newer than prior version)
         active_target_view = f"scd2_active_{target_table_name.replace('.', '_').replace('-', '_')}"
-        spark.sql(f"SELECT * FROM {quoted_table} WHERE `{is_current_col}` = 'Y'").createOrReplaceTempView(active_target_view)
+        spark.sql(f"SELECT * FROM {quoted_table} WHERE `{is_current_col}` = 'Y' OR cast(`{is_current_col}` as string) IN ('true', 'TRUE')").createOrReplaceTempView(active_target_view)
 
         target_active_hash = build_runtime_hash_expr(payload_cols, prefix="act")
         source_inc_hash = build_runtime_hash_expr(payload_cols, prefix="inc")
@@ -1075,12 +1089,22 @@ def main():
             # 1. Perform in-batch deduplication (drops exact duplicates & keeps latest per Nkey)
             df_dedup = perform_deduplication(df_bronze, nkeys, order_cols, dedup_strategy)
 
-            # 2. Apply Declarative transformations & technical audit columns (_is_deleted, _inserted_at, _updated_at)
+            # 2. Strip Bronze layer system metadata columns so they NEVER pass into Silver tables
+            bronze_system_cols = {'_ingested_at', '_source_system', '_table_name', '_execution_id', '_batch_id', '_raw_payload'}
+            bronze_cols_to_drop = [c for c in df_dedup.columns if c in bronze_system_cols]
+            if bronze_cols_to_drop:
+                logger.info(f"Stripping Bronze system columns before Silver processing: {bronze_cols_to_drop}")
+                df_dedup = df_dedup.drop(*bronze_cols_to_drop)
+
+            # 3. Apply Declarative transformations & technical audit columns (_valid_from, _valid_to, _is_current, _is_deleted, _inserted_at, _updated_at)
+            primary_order_col = order_cols[0] if isinstance(order_cols, list) and order_cols else order_cols
             df_transformed = SilverTransformer.apply_transformations(
                 df=df_dedup,
                 source_system=source_system,
                 table_name=table_clean,
                 table_cfg=table_cfg,
+                order_col_name=primary_order_col,
+                nkeys=nkeys,
                 spark=spark
             )
 

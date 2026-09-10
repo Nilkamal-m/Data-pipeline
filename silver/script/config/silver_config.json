@@ -35,7 +35,8 @@
       "sync_watermark_table": true,
       "watermark_table_name": "tbl_watermarks",
       "full_refresh": false
-    }
+    },
+    "exclude_columns": []
   },
   "source_systems": {
     "servicenow": {
@@ -52,7 +53,7 @@
           "column_casts": {
             "sys_mod_count": "integer"
           },
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/servicenow_incident.py"
@@ -66,7 +67,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -80,7 +81,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -94,7 +95,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -113,7 +114,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -127,7 +128,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -141,7 +142,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -160,7 +161,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -174,7 +175,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -188,7 +189,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -207,7 +208,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -221,7 +222,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -235,7 +236,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -254,7 +255,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -268,7 +269,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""
@@ -282,7 +283,7 @@
           "deduplication_strategy": "latest_by_order_column",
           "column_renames": {},
           "column_casts": {},
-          "drop_columns": [],
+          "exclude_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""

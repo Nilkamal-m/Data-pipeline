@@ -103,6 +103,26 @@ class SilverConfigLoader:
         return table_cfg.get('nkey') or table_cfg.get('deduplication_keys') or table_cfg.get('primary_key')
 
     @classmethod
+    def get_exclude_columns(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> list:
+        """
+        Retrieves list of columns to exclude from Silver table.
+        Combines silver_defaults.exclude_columns with table_configs.<table_name>.exclude_columns (or drop_columns).
+        """
+        config = config_dict or cls._config_cache or cls.load_config()
+        defaults = config.get("silver_defaults", {})
+        default_excludes = defaults.get("exclude_columns") or defaults.get("drop_columns") or []
+        if isinstance(default_excludes, str):
+            default_excludes = [c.strip() for c in default_excludes.split(',') if c.strip()]
+
+        table_cfg = cls.get_table_config(source_system, table_name, config)
+        table_excludes = table_cfg.get("exclude_columns") or table_cfg.get("drop_columns") or []
+        if isinstance(table_excludes, str):
+            table_excludes = [c.strip() for c in table_excludes.split(',') if c.strip()]
+
+        combined = list(dict.fromkeys(default_excludes + table_excludes))
+        return combined
+
+    @classmethod
     def get_technical_columns(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Retrieves technical columns configuration from silver_defaults.
