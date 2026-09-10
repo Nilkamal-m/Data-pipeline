@@ -1,0 +1,24 @@
+Executive Summary
+As requested, we evaluated direct integration between Microsoft Power BI and Amazon Athena using both ODBC and JDBC without creating an AWS IAM User.
+
+The evaluation concludes that direct connection to Athena from Power BI is completely blocked by organizational security policy, as outlined below:
+
+1. ODBC Evaluation: Blocked (IAM User is Mandatory)
+Technical Requirement: The Amazon Athena ODBC driver mandatorily requires a dedicated AWS IAM User (Access Key ID and Secret Access Key) to authenticate and enable automated, scheduled refreshes in Power BI Service / On-Premises Data Gateway.
+Organizational Restriction: Corporate Security and Cloud Governance will not approve or provide an IAM User with static credentials due to enterprise security and zero-trust policies.
+Conclusion: Because an IAM User is mandatory for ODBC and the organization strictly refuses to provide one, ODBC cannot be used.
+2. JDBC Evaluation: Blocked by Default
+Platform Architecture: Microsoft Power BI is a Windows-native (.NET) application. It does not natively support JDBC; any attempt to bridge JDBC in Power BI relies directly on the underlying ODBC / ADO.NET layer.
+Inherited Restriction: The Athena JDBC driver requires the exact same AWS IAM authentication and credentials as the ODBC driver.
+Conclusion: Since JDBC in Power BI fundamentally depends on ODBC, and ODBC is not allowed due to the IAM User restriction, by default JDBC is also not allowed and cannot work.
+3. Final Conclusion & Why an Alternative is Mandatory
+We are completely aligned with utilizing Amazon Athena; however, both connection methods (ODBC and JDBC) are completely blocked by the organization's policy prohibiting IAM Users.
+Without an IAM User, Power BI cannot authenticate to Athena for scheduled production dashboard refreshes.
+Therefore, connecting Power BI directly to Athena is impossible under current organizational restrictions.
+4. The Compliant Solution: Relational Serving Layer (RDS / MySQL / PostgreSQL)
+Because Athena direct connection is ruled out by the organization's IAM policy, storing the Gold Layer in a Relational Database (such as RDS MySQL / PostgreSQL) is the only viable, enterprise-compliant solution:
+
+No IAM User Required: Power BI connects natively to RDS using standard database credentials (username/password or Active Directory/SSO). It does not require any AWS IAM User, fully complying with organizational security policies.
+Native Power BI Support: First-class, out-of-the-box connector in Power BI Desktop and Power BI Service with zero driver bridges or complex setup.
+No S3 / KMS Permission Issues: The scheduled Glue ETL job (which already runs under an authorized service role) securely writes the Gold tables to RDS. End users and Power BI never need direct S3 or kms:Decrypt access.
+Reliable Scheduled Refreshes: Power BI Gateway natively supports standard relational databases for automated, scheduled reporting without authentication failures.
