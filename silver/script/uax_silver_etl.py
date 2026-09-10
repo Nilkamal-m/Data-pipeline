@@ -17,6 +17,7 @@ import json
 import logging
 import boto3
 from botocore.exceptions import ClientError
+from urllib.parse import urlparse
 from datetime import datetime, timezone
 from typing import Optional
 from pyspark.context import SparkContext
@@ -474,15 +475,94 @@ def quote_iceberg_table(table_name: str) -> str:
     return '.'.join([f"`{p.strip('`')}`" for p in parts])
 
 
-def check_iceberg_table_exists(spark, glue_client, database_name: str, table_name: str) -> bool:
+def purge_s3_table_location(s3_client, s3_uri: str):
     """
-    Safely checks whether an Iceberg table exists in the AWS Glue Data Catalog.
-    Uses AWS Glue API directly first to avoid Spark SQL catalog parser issues with hyphens.
+    Safely deletes any orphaned or corrupted files at an S3 URI when an Iceberg table is confirmed corrupted.
+    Protects against deleting root or short prefixes by requiring at least 3 path segments.
     """
+    if not s3_client or not s3_uri or not s3_uri.startswith("s3://"):
+        return
+    try:
+        parsed = urlparse(s3_uri)
+        bucket = parsed.netloc
+        prefix = parsed.path.lstrip('/')
+        if not prefix.endswith('/'):
+            prefix += '/'
+        parts = [p for p in prefix.strip('/').split('/') if p]
+        if len(parts) < 3:
+            logger.warning(f"Refusing to purge suspiciously shallow S3 prefix: '{prefix}'")
+            return
+
+        paginator = s3_client.get_paginator('list_objects_v2')
+        total_deleted = 0
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            objects = page.get('Contents', [])
+            if objects:
+                delete_keys = [{'Key': obj['Key']} for obj in objects]
+                s3_client.delete_objects(Bucket=bucket, Delete={'Objects': delete_keys})
+                total_deleted += len(delete_keys)
+        if total_deleted > 0:
+            logger.info(f"Purged {total_deleted} corrupted/orphaned S3 object(s) under '{s3_uri}'.")
+    except Exception as e:
+        logger.warning(f"Failed to clean up S3 table location '{s3_uri}': {e}")
+
+
+def check_iceberg_table_exists(spark, glue_client, database_name: str, table_name: str, s3_client=None, silver_location: str = None) -> bool:
+    """
+    Safely checks whether an Iceberg table exists and is valid/accessible.
+    1. Checks AWS Glue Data Catalog for table registration.
+    2. If found, inspects its metadata_location parameter and verifies the metadata file exists in S3.
+       If the S3 metadata file does not exist (404 NoSuchKey), this identifies a 'ghost' catalog entry
+       (common when S3 test buckets are purged without dropping the Glue Catalog table).
+       In this case, the stale Glue Catalog entry is automatically dropped so the table can be cleanly recreated.
+    3. Probes the table using Spark SQL DESCRIBE TABLE. If S3 NoSuchKeyException occurs, automatically
+       drops the stale catalog entry and returns False to allow clean recreation.
+    """
+    if s3_client is None:
+        try:
+            s3_client = boto3.client('s3')
+        except Exception:
+            pass
+
+    table_found_in_glue = False
+    metadata_location = None
+    table_location = silver_location
+
     if glue_client:
         try:
-            glue_client.get_table(DatabaseName=database_name, Name=table_name)
-            return True
+            resp = glue_client.get_table(DatabaseName=database_name, Name=table_name)
+            table_meta = resp.get('Table', {})
+            table_found_in_glue = True
+            params = table_meta.get('Parameters', {})
+            metadata_location = params.get('metadata_location')
+            table_location = table_meta.get('StorageDescriptor', {}).get('Location') or silver_location
+
+            # Validate whether the metadata_location file actually exists in S3
+            if metadata_location and s3_client and metadata_location.startswith('s3://'):
+                parsed = urlparse(metadata_location)
+                b = parsed.netloc
+                k = parsed.path.lstrip('/')
+                try:
+                    s3_client.head_object(Bucket=b, Key=k)
+                except ClientError as ce:
+                    err_code = ce.response.get('Error', {}).get('Code', '')
+                    http_status = ce.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+                    if err_code in ('404', 'NoSuchKey', 'NotFound') or http_status == 404:
+                        logger.warning(
+                            f"[GHOST TABLE DETECTED] Glue Catalog table `{database_name}`.`{table_name}` points to "
+                            f"non-existent S3 metadata '{metadata_location}' (404 NoSuchKey). "
+                            f"Dropping stale Glue Catalog registration and cleaning up S3 path to allow clean recreation..."
+                        )
+                        try:
+                            glue_client.delete_table(DatabaseName=database_name, Name=table_name)
+                            logger.info(f"Successfully dropped stale Glue Catalog table `{database_name}`.`{table_name}`.")
+                        except Exception as del_err:
+                            logger.warning(f"Failed to delete stale table `{database_name}`.`{table_name}` from Glue Catalog: {del_err}")
+                        if table_location and s3_client:
+                            purge_s3_table_location(s3_client, table_location)
+                        return False
+                    else:
+                        logger.warning(f"Could not verify S3 metadata_location '{metadata_location}': {ce}")
         except ClientError as e:
             if e.response.get('Error', {}).get('Code') in ('EntityNotFoundException', 'NoSuchEntityException'):
                 return False
@@ -490,11 +570,28 @@ def check_iceberg_table_exists(spark, glue_client, database_name: str, table_nam
         except Exception as e:
             logger.warning(f"Unexpected error checking Glue catalog for table {database_name}.{table_name}: {e}")
 
+    # Verify table accessibility via Spark probe
+    quoted = quote_iceberg_table(f"glue_catalog.{database_name}.{table_name}")
     try:
-        quoted = quote_iceberg_table(f"glue_catalog.{database_name}.{table_name}")
         spark.sql(f"DESCRIBE TABLE {quoted}")
         return True
-    except Exception:
+    except Exception as probe_err:
+        err_str = str(probe_err)
+        if any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "NotFoundException", "404", "NoSuchTableException", "Table or view not found", "Path does not exist")):
+            if table_found_in_glue and any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404", "NotFoundException")):
+                logger.warning(
+                    f"[CORRUPTED TABLE DETECTED] Spark probe for Iceberg table '{quoted}' failed with S3 key error: {probe_err}. "
+                    f"Underlying S3 metadata is missing. Automatically dropping stale catalog registration..."
+                )
+                if glue_client:
+                    try:
+                        glue_client.delete_table(DatabaseName=database_name, Name=table_name)
+                        logger.info(f"Successfully dropped stale Glue Catalog table `{database_name}`.`{table_name}`.")
+                    except Exception as del_err:
+                        logger.warning(f"Failed to delete stale table from Glue Catalog: {del_err}")
+                if table_location and s3_client:
+                    purge_s3_table_location(s3_client, table_location)
+            return False
         return False
 
 
@@ -604,11 +701,14 @@ def sync_iceberg_table_schema(spark, quoted_table: str, incoming_df) -> bool:
             return True
         return False
     except Exception as e:
+        err_str = str(e)
+        if any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "NotFoundException", "404")):
+            raise
         logger.warning(f"[SCHEMA EVOLUTION] Schema sync check for '{quoted_table}' encountered: {e}. Proceeding with write...")
         return False
 
 
-def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_table_name: str, df, silver_table_name: str, silver_location: str, nkeys, order_cols):
+def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_table_name: str, df, silver_table_name: str, silver_location: str, nkeys, order_cols, s3_client=None):
     """
     Executes SCD Type 1 (UPSERT via Spark SQL MERGE INTO) on Apache Iceberg table.
     - Compares runtime payload hash to detect genuine business changes.
@@ -621,7 +721,7 @@ def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_t
     nkey_list = nkeys if isinstance(nkeys, list) else [nkeys]
     order_col_name = order_cols[0] if isinstance(order_cols, list) else order_cols
 
-    table_exists = check_iceberg_table_exists(spark, glue_client, database_name, target_table_name)
+    table_exists = check_iceberg_table_exists(spark, glue_client, database_name, target_table_name, s3_client=s3_client, silver_location=silver_location)
 
     if not table_exists:
         logger.info(f"Target Iceberg table '{quoted_table}' does not exist. Creating table with initial data...")
@@ -644,64 +744,100 @@ def execute_iceberg_scd1_upsert(spark, glue_client, database_name: str, target_t
               .saveAsTable(quoted_table)
         return True, False
     else:
-        schema_evolved = sync_iceberg_table_schema(spark, quoted_table, df)
-        logger.info(f"Executing SCD Type 1 Runtime-Hash MERGE INTO (UPSERT) on '{quoted_table}'...")
-        payload_cols = get_payload_columns(df.columns, nkey_list)
-        logger.info(f"Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
+        try:
+            schema_evolved = sync_iceberg_table_schema(spark, quoted_table, df)
+            logger.info(f"Executing SCD Type 1 Runtime-Hash MERGE INTO (UPSERT) on '{quoted_table}'...")
+            payload_cols = get_payload_columns(df.columns, nkey_list)
+            logger.info(f"Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
 
-        temp_view = f"incoming_scd1_{target_table_name.replace('.', '_').replace('-', '_')}"
-        df.createOrReplaceTempView(temp_view)
+            temp_view = f"incoming_scd1_{target_table_name.replace('.', '_').replace('-', '_')}"
+            df.createOrReplaceTempView(temp_view)
 
-        join_conditions = [f"target.`{k}` = source.`{k}`" for k in nkey_list]
-        join_condition = " AND ".join(join_conditions)
+            join_conditions = [f"target.`{k}` = source.`{k}`" for k in nkey_list]
+            join_condition = " AND ".join(join_conditions)
 
-        source_hash_expr = build_runtime_hash_expr(payload_cols, prefix="source")
-        target_hash_expr = build_runtime_hash_expr(payload_cols, prefix="target")
+            source_hash_expr = build_runtime_hash_expr(payload_cols, prefix="source")
+            target_hash_expr = build_runtime_hash_expr(payload_cols, prefix="target")
 
-        # Non-key, non-technical business columns to update
-        silver_tech_cols = {'_valid_from', '_valid_to', '_is_current', '_is_deleted', '_inserted_at', '_updated_at'}
-        nkey_set = set(nkey_list)
-        business_update_cols = [c for c in df.columns if c not in silver_tech_cols and c not in nkey_set]
-        update_set_items = [f"target.`{c}` = source.`{c}`" for c in business_update_cols]
-        # In SCD1: update in place without maintaining history; update validity window and ensure _is_current remains 'Y'
-        update_set_items.append("target.`_valid_from` = coalesce(source.`_valid_from`, current_timestamp())")
-        update_set_items.append("target.`_valid_to` = source.`_valid_to`")
-        update_set_items.append("target.`_is_current` = 'Y'")
-        update_set_items.append("target.`_is_deleted` = source.`_is_deleted`")
-        update_set_items.append("target.`_updated_at` = current_timestamp()")
-        # target._inserted_at is preserved from initial insert
-        update_set_clause = ",\n          ".join(update_set_items)
+            # Non-key, non-technical business columns to update
+            silver_tech_cols = {'_valid_from', '_valid_to', '_is_current', '_is_deleted', '_inserted_at', '_updated_at'}
+            nkey_set = set(nkey_list)
+            business_update_cols = [c for c in df.columns if c not in silver_tech_cols and c not in nkey_set]
+            update_set_items = [f"target.`{c}` = source.`{c}`" for c in business_update_cols]
+            # In SCD1: update in place without maintaining history; update validity window and ensure _is_current remains 'Y'
+            update_set_items.append("target.`_valid_from` = coalesce(source.`_valid_from`, current_timestamp())")
+            update_set_items.append("target.`_valid_to` = source.`_valid_to`")
+            update_set_items.append("target.`_is_current` = 'Y'")
+            update_set_items.append("target.`_is_deleted` = source.`_is_deleted`")
+            update_set_items.append("target.`_updated_at` = current_timestamp()")
+            # target._inserted_at is preserved from initial insert
+            update_set_clause = ",\n              ".join(update_set_items)
 
-        # Columns to insert for new records
-        insert_cols = [c for c in df.columns if c not in ('_inserted_at', '_updated_at')] + ['_inserted_at', '_updated_at']
-        insert_cols_str = ", ".join([f"`{c}`" for c in insert_cols])
-        insert_vals_str = ", ".join([f"source.`{c}`" if c not in ('_inserted_at', '_updated_at') else "current_timestamp()" for c in insert_cols])
+            # Columns to insert for new records
+            insert_cols = [c for c in df.columns if c not in ('_inserted_at', '_updated_at')] + ['_inserted_at', '_updated_at']
+            insert_cols_str = ", ".join([f"`{c}`" for c in insert_cols])
+            insert_vals_str = ", ".join([f"source.`{c}`" if c not in ('_inserted_at', '_updated_at') else "current_timestamp()" for c in insert_cols])
 
-        # Backdate protection: only update if source order_col >= target order_col (or target order_col is null)
-        order_col_check = ""
-        if order_col_name in df.columns:
-            order_col_check = f"AND (source.`{order_col_name}` >= target.`{order_col_name}` OR target.`{order_col_name}` IS NULL)"
+            # Backdate protection: only update if source order_col >= target order_col (or target order_col is null)
+            order_col_check = ""
+            if order_col_name in df.columns:
+                order_col_check = f"AND (source.`{order_col_name}` >= target.`{order_col_name}` OR target.`{order_col_name}` IS NULL)"
 
-        merge_sql = f"""
-        MERGE INTO {quoted_table} AS target
-        USING {temp_view} AS source
-        ON {join_condition}
-        WHEN MATCHED AND (
-            target.`_is_deleted` != source.`_is_deleted` OR
-            {target_hash_expr} != {source_hash_expr}
-        ) {order_col_check} THEN UPDATE SET
-          {update_set_clause}
-        WHEN NOT MATCHED THEN INSERT
-          ({insert_cols_str})
-        VALUES
-          ({insert_vals_str})
-        """
-        logger.info(f"Running Spark SQL SCD1 MERGE INTO Query on {quoted_table}...")
-        spark.sql(merge_sql)
-        return False, schema_evolved
+            merge_sql = f"""
+            MERGE INTO {quoted_table} AS target
+            USING {temp_view} AS source
+            ON {join_condition}
+            WHEN MATCHED AND (
+                target.`_is_deleted` != source.`_is_deleted` OR
+                {target_hash_expr} != {source_hash_expr}
+            ) {order_col_check} THEN UPDATE SET
+              {update_set_clause}
+            WHEN NOT MATCHED THEN INSERT
+              ({insert_cols_str})
+            VALUES
+              ({insert_vals_str})
+            """
+            logger.info(f"Running Spark SQL SCD1 MERGE INTO Query on {quoted_table}...")
+            spark.sql(merge_sql)
+            return False, schema_evolved
+        except Exception as merge_err:
+            err_str = str(merge_err)
+            if any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "NotFoundException", "404")):
+                logger.warning(
+                    f"Iceberg MERGE INTO on '{quoted_table}' failed due to missing S3 metadata/data file: {merge_err}. "
+                    f"Target table is corrupted. Recovering: dropping corrupted catalog registration and recreating table via CTAS fallback..."
+                )
+                if glue_client:
+                    try:
+                        glue_client.delete_table(DatabaseName=database_name, Name=target_table_name)
+                        logger.info(f"Dropped corrupted Glue Catalog table '{database_name}.{target_table_name}'.")
+                    except Exception as del_err:
+                        logger.warning(f"Failed to delete corrupted catalog table: {del_err}")
+                if s3_client and silver_location:
+                    purge_s3_table_location(s3_client, silver_location)
+                temp_view = f"init_{target_table_name.replace('.', '_').replace('-', '_')}"
+                df.createOrReplaceTempView(temp_view)
+                try:
+                    spark.sql(f"""
+                        CREATE TABLE IF NOT EXISTS {quoted_table}
+                        USING iceberg
+                        LOCATION '{silver_location}'
+                        AS SELECT * FROM {temp_view}
+                    """)
+                    logger.info(f"Successfully recovered and recreated Iceberg table '{quoted_table}' via Spark SQL CTAS.")
+                except Exception as ctas_err:
+                    logger.warning(f"Recovery CTAS failed ({ctas_err}), falling back to DataFrameWriter...")
+                    df.write \
+                      .format("iceberg") \
+                      .mode("append") \
+                      .option("path", silver_location) \
+                      .saveAsTable(quoted_table)
+                return True, False
+            else:
+                raise
 
 
-def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_name: str, df, silver_table_name: str, silver_location: str, nkeys, order_cols, scd2_cfg):
+def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_name: str, df, silver_table_name: str, silver_location: str, nkeys, order_cols, scd2_cfg, s3_client=None):
     """
     Executes SCD Type 2 (Slowly Changing Dimension Type 2) on Apache Iceberg table.
     Tracks historical change history with _valid_from, _valid_to, _is_current ('Y'/'N'), and _is_deleted ('Y'/'N').
@@ -718,7 +854,7 @@ def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_na
     is_current_col = scd2_cfg.get('is_current_column', '_is_current')
     high_date_val = scd2_cfg.get('high_date_value', '9999-01-01 00:00:00')
 
-    table_exists = check_iceberg_table_exists(spark, glue_client, database_name, target_table_name)
+    table_exists = check_iceberg_table_exists(spark, glue_client, database_name, target_table_name, s3_client=s3_client, silver_location=silver_location)
 
     # Base SCD2 columns for incoming batch ('Y' for active record)
     incoming_df = df.withColumn(valid_from_col, coalesce(col(order_col_name).cast("timestamp"), col(valid_from_col), current_timestamp())) \
@@ -751,82 +887,118 @@ def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_na
                        .saveAsTable(quoted_table)
         return True, False
     else:
-        schema_evolved = sync_iceberg_table_schema(spark, quoted_table, incoming_df)
-        logger.info(f"Executing SCD Type 2 Runtime-Hash Change Detection on '{quoted_table}'...")
-        payload_cols = get_payload_columns(incoming_df.columns, nkey_list)
-        logger.info(f"SCD2 Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
+        try:
+            schema_evolved = sync_iceberg_table_schema(spark, quoted_table, incoming_df)
+            logger.info(f"Executing SCD Type 2 Runtime-Hash Change Detection on '{quoted_table}'...")
+            payload_cols = get_payload_columns(incoming_df.columns, nkey_list)
+            logger.info(f"SCD2 Payload columns for runtime change detection ({len(payload_cols)}): {payload_cols}")
 
-        temp_view = f"scd2_incoming_{target_table_name.replace('.', '_').replace('-', '_')}"
-        incoming_df.createOrReplaceTempView(temp_view)
+            temp_view = f"scd2_incoming_{target_table_name.replace('.', '_').replace('-', '_')}"
+            incoming_df.createOrReplaceTempView(temp_view)
 
-        join_conditions = [f"target.`{k}` = source.`{k}`" for k in nkey_list]
-        join_condition = " AND ".join(join_conditions)
+            join_conditions = [f"target.`{k}` = source.`{k}`" for k in nkey_list]
+            join_condition = " AND ".join(join_conditions)
 
-        source_hash_expr = build_runtime_hash_expr(payload_cols, prefix="source")
-        target_hash_expr = build_runtime_hash_expr(payload_cols, prefix="target")
+            source_hash_expr = build_runtime_hash_expr(payload_cols, prefix="source")
+            target_hash_expr = build_runtime_hash_expr(payload_cols, prefix="target")
 
-        # 1. Expire existing active target records ONLY when:
-        #    a) Record exists and target._is_current is active ('Y')
-        #    b) Payload hash differs OR _is_deleted differs (data actually changed)
-        #    c) Incoming record timestamp is >= target._valid_from (not backdated)
-        expire_sql = f"""
-        MERGE INTO {quoted_table} AS target
-        USING {temp_view} AS source
-        ON {join_condition} AND (target.`{is_current_col}` = 'Y' OR cast(target.`{is_current_col}` as string) IN ('true', 'TRUE'))
-        WHEN MATCHED AND (
-            target.`_is_deleted` != source.`_is_deleted` OR
-            {target_hash_expr} != {source_hash_expr}
-        ) AND (
-            source.`{valid_from_col}` >= target.`{valid_from_col}` OR target.`{valid_from_col}` IS NULL
-        ) THEN UPDATE SET
-          target.`{is_current_col}` = 'N',
-          target.`{valid_to_col}` = source.`{valid_from_col}`,
-          target.`_updated_at` = current_timestamp()
-        """
-        logger.info(f"Executing SCD Type 2 Target Expiration MERGE INTO on {quoted_table}...")
-        spark.sql(expire_sql)
+            # 1. Expire existing active target records ONLY when:
+            #    a) Record exists and target._is_current is active ('Y')
+            #    b) Payload hash differs OR _is_deleted differs (data actually changed)
+            #    c) Incoming record timestamp is >= target._valid_from (not backdated)
+            expire_sql = f"""
+            MERGE INTO {quoted_table} AS target
+            USING {temp_view} AS source
+            ON {join_condition} AND (target.`{is_current_col}` = 'Y' OR cast(target.`{is_current_col}` as string) IN ('true', 'TRUE'))
+            WHEN MATCHED AND (
+                target.`_is_deleted` != source.`_is_deleted` OR
+                {target_hash_expr} != {source_hash_expr}
+            ) AND (
+                source.`{valid_from_col}` >= target.`{valid_from_col}` OR target.`{valid_from_col}` IS NULL
+            ) THEN UPDATE SET
+              target.`{is_current_col}` = 'N',
+              target.`{valid_to_col}` = source.`{valid_from_col}`,
+              target.`_updated_at` = current_timestamp()
+            """
+            logger.info(f"Executing SCD Type 2 Target Expiration MERGE INTO on {quoted_table}...")
+            spark.sql(expire_sql)
 
-        # 2. Append new incoming records ONLY if:
-        #    a) They are completely new (do not exist in active target at all), OR
-        #    b) They represent a genuine change over the prior active version (and are newer than prior version)
-        active_target_view = f"scd2_active_{target_table_name.replace('.', '_').replace('-', '_')}"
-        spark.sql(f"SELECT * FROM {quoted_table} WHERE `{is_current_col}` = 'Y' OR cast(`{is_current_col}` as string) IN ('true', 'TRUE')").createOrReplaceTempView(active_target_view)
+            # 2. Append new incoming records ONLY if:
+            #    a) They are completely new (do not exist in active target at all), OR
+            #    b) They represent a genuine change over the prior active version (and are newer than prior version)
+            active_target_view = f"scd2_active_{target_table_name.replace('.', '_').replace('-', '_')}"
+            spark.sql(f"SELECT * FROM {quoted_table} WHERE `{is_current_col}` = 'Y' OR cast(`{is_current_col}` as string) IN ('true', 'TRUE')").createOrReplaceTempView(active_target_view)
 
-        target_active_hash = build_runtime_hash_expr(payload_cols, prefix="act")
-        source_inc_hash = build_runtime_hash_expr(payload_cols, prefix="inc")
-        active_join_conditions = [f"act.`{k}` = inc.`{k}`" for k in nkey_list]
-        active_join_cond = " AND ".join(active_join_conditions)
+            target_active_hash = build_runtime_hash_expr(payload_cols, prefix="act")
+            source_inc_hash = build_runtime_hash_expr(payload_cols, prefix="inc")
+            active_join_conditions = [f"act.`{k}` = inc.`{k}`" for k in nkey_list]
+            active_join_cond = " AND ".join(active_join_conditions)
 
-        changed_and_new_sql = f"""
-        SELECT inc.*
-        FROM {temp_view} AS inc
-        LEFT JOIN {active_target_view} AS act
-          ON {active_join_cond}
-        WHERE act.`{nkey_list[0]}` IS NULL
-           OR (
-               (act.`_is_deleted` != inc.`_is_deleted` OR {target_active_hash} != {source_inc_hash})
-               AND (inc.`{valid_from_col}` >= act.`{valid_from_col}` OR act.`{valid_from_col}` IS NULL)
-           )
-        """
-        changed_or_new_df = spark.sql(changed_and_new_sql)
-        num_new_versions = changed_or_new_df.count()
-        logger.info(f"SCD Type 2: Appending {num_new_versions} genuine new/updated version(s) to '{quoted_table}'...")
+            changed_and_new_sql = f"""
+            SELECT inc.*
+            FROM {temp_view} AS inc
+            LEFT JOIN {active_target_view} AS act
+              ON {active_join_cond}
+            WHERE act.`{nkey_list[0]}` IS NULL
+               OR (
+                   (act.`_is_deleted` != inc.`_is_deleted` OR {target_active_hash} != {source_inc_hash})
+                   AND (inc.`{valid_from_col}` >= act.`{valid_from_col}` OR act.`{valid_from_col}` IS NULL)
+               )
+            """
+            changed_or_new_df = spark.sql(changed_and_new_sql)
+            num_new_versions = changed_or_new_df.count()
+            logger.info(f"SCD Type 2: Appending {num_new_versions} genuine new/updated version(s) to '{quoted_table}'...")
 
-        if num_new_versions > 0:
-            temp_append_view = f"scd2_append_{target_table_name.replace('.', '_').replace('-', '_')}"
-            changed_or_new_df.createOrReplaceTempView(temp_append_view)
-            try:
-                spark.sql(f"INSERT INTO {quoted_table} SELECT * FROM {temp_append_view}")
-            except Exception as ins_err:
-                logger.warning(f"Spark SQL INSERT INTO failed ({ins_err}), falling back to DataFrameWriter...")
-                changed_or_new_df.write \
-                                 .format("iceberg") \
-                                 .mode("append") \
-                                 .option("path", silver_location) \
-                                 .saveAsTable(quoted_table)
-        else:
-            logger.info(f"SCD Type 2: 0 changed records found in incoming batch. No duplicate versions appended.")
-        return False, schema_evolved
+            if num_new_versions > 0:
+                temp_append_view = f"scd2_append_{target_table_name.replace('.', '_').replace('-', '_')}"
+                changed_or_new_df.createOrReplaceTempView(temp_append_view)
+                try:
+                    spark.sql(f"INSERT INTO {quoted_table} SELECT * FROM {temp_append_view}")
+                except Exception as ins_err:
+                    logger.warning(f"Spark SQL INSERT INTO failed ({ins_err}), falling back to DataFrameWriter...")
+                    changed_or_new_df.write \
+                                     .format("iceberg") \
+                                     .mode("append") \
+                                     .option("path", silver_location) \
+                                     .saveAsTable(quoted_table)
+            else:
+                logger.info(f"SCD Type 2: 0 changed records found in incoming batch. No duplicate versions appended.")
+            return False, schema_evolved
+        except Exception as scd2_err:
+            err_str = str(scd2_err)
+            if any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "NotFoundException", "404")):
+                logger.warning(
+                    f"Iceberg SCD2 on '{quoted_table}' failed due to missing S3 metadata/data file: {scd2_err}. "
+                    f"Target table is corrupted. Recovering: dropping corrupted catalog registration and recreating table via CTAS fallback..."
+                )
+                if glue_client:
+                    try:
+                        glue_client.delete_table(DatabaseName=database_name, Name=target_table_name)
+                        logger.info(f"Dropped corrupted Glue Catalog table '{database_name}.{target_table_name}'.")
+                    except Exception as del_err:
+                        logger.warning(f"Failed to delete corrupted catalog table: {del_err}")
+                if s3_client and silver_location:
+                    purge_s3_table_location(s3_client, silver_location)
+                temp_view = f"scd2_init_{target_table_name.replace('.', '_').replace('-', '_')}"
+                incoming_df.createOrReplaceTempView(temp_view)
+                try:
+                    spark.sql(f"""
+                        CREATE TABLE IF NOT EXISTS {quoted_table}
+                        USING iceberg
+                        LOCATION '{silver_location}'
+                        AS SELECT * FROM {temp_view}
+                    """)
+                    logger.info(f"Successfully recovered and recreated SCD2 Iceberg table '{quoted_table}' via Spark SQL CTAS.")
+                except Exception as ctas_err:
+                    logger.warning(f"Recovery CTAS failed ({ctas_err}), falling back to DataFrameWriter...")
+                    incoming_df.write \
+                               .format("iceberg") \
+                               .mode("append") \
+                               .option("path", silver_location) \
+                               .saveAsTable(quoted_table)
+                return True, False
+            else:
+                raise
 
 
 def main():
@@ -924,6 +1096,14 @@ def main():
         silver_table_name = f"glue_catalog.{glue_database}.{target_table_name}"
         bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
         silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{base_table_name}/"
+        if glue_client:
+            try:
+                tbl_desc = glue_client.get_table(DatabaseName=glue_database, Name=target_table_name).get('Table', {})
+                existing_loc = tbl_desc.get('StorageDescriptor', {}).get('Location')
+                if existing_loc and existing_loc.startswith('s3://'):
+                    silver_location = existing_loc if existing_loc.endswith('/') else f"{existing_loc}/"
+            except Exception:
+                pass
 
         # Resolve High-Water Mark state key & last load date
         state_key = get_silver_watermark_key(source_system, base_table_name, metadata_prefix)
@@ -1125,7 +1305,8 @@ def main():
                     silver_location=silver_location,
                     nkeys=nkeys,
                     order_cols=order_cols,
-                    scd2_cfg=scd2_cfg
+                    scd2_cfg=scd2_cfg,
+                    s3_client=s3_client
                 )
             elif merge_strategy in ('upsert', 'merge_into'):
                 table_is_new, schema_evolved = execute_iceberg_scd1_upsert(
@@ -1137,10 +1318,11 @@ def main():
                     silver_table_name=silver_table_name,
                     silver_location=silver_location,
                     nkeys=nkeys,
-                    order_cols=order_cols
+                    order_cols=order_cols,
+                    s3_client=s3_client
                 )
             elif merge_strategy == 'overwrite':
-                table_exists = check_iceberg_table_exists(spark, glue_client, glue_database, target_table_name)
+                table_exists = check_iceberg_table_exists(spark, glue_client, glue_database, target_table_name, s3_client=s3_client, silver_location=silver_location)
                 if not table_exists:
                     logger.info(f"Target Iceberg table '{quoted_iceberg_table}' does not exist. Initializing table via Spark SQL CTAS...")
                     temp_view = f"init_{target_table_name.replace('.', '_').replace('-', '_')}"
@@ -1162,13 +1344,36 @@ def main():
                     table_is_new = True
                 else:
                     schema_evolved = sync_iceberg_table_schema(spark, quoted_iceberg_table, df_transformed)
-                    df_transformed.write \
-                        .format("iceberg") \
-                        .mode("overwrite") \
-                        .option("path", silver_location) \
-                        .saveAsTable(quoted_iceberg_table)
+                    try:
+                        df_transformed.write \
+                            .format("iceberg") \
+                            .mode("overwrite") \
+                            .option("path", silver_location) \
+                            .saveAsTable(quoted_iceberg_table)
+                    except Exception as ow_err:
+                        err_str = str(ow_err)
+                        if any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "NotFoundException", "404")):
+                            logger.warning(f"Iceberg overwrite on '{quoted_iceberg_table}' failed due to missing S3 file ({ow_err}). Recreating...")
+                            if glue_client:
+                                try:
+                                    glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                                except Exception:
+                                    pass
+                            if s3_client and silver_location:
+                                purge_s3_table_location(s3_client, silver_location)
+                            temp_view = f"init_{target_table_name.replace('.', '_').replace('-', '_')}"
+                            df_transformed.createOrReplaceTempView(temp_view)
+                            spark.sql(f"""
+                                CREATE TABLE IF NOT EXISTS {quoted_iceberg_table}
+                                USING iceberg
+                                LOCATION '{silver_location}'
+                                AS SELECT * FROM {temp_view}
+                            """)
+                            table_is_new = True
+                        else:
+                            raise
             else:
-                table_exists = check_iceberg_table_exists(spark, glue_client, glue_database, target_table_name)
+                table_exists = check_iceberg_table_exists(spark, glue_client, glue_database, target_table_name, s3_client=s3_client, silver_location=silver_location)
                 if not table_exists:
                     logger.info(f"Target Iceberg table '{quoted_iceberg_table}' does not exist. Initializing table via Spark SQL CTAS...")
                     temp_view = f"init_{target_table_name.replace('.', '_').replace('-', '_')}"
@@ -1190,11 +1395,34 @@ def main():
                     table_is_new = True
                 else:
                     schema_evolved = sync_iceberg_table_schema(spark, quoted_iceberg_table, df_transformed)
-                    df_transformed.write \
-                        .format("iceberg") \
-                        .mode("append") \
-                        .option("path", silver_location) \
-                        .saveAsTable(quoted_iceberg_table)
+                    try:
+                        df_transformed.write \
+                            .format("iceberg") \
+                            .mode("append") \
+                            .option("path", silver_location) \
+                            .saveAsTable(quoted_iceberg_table)
+                    except Exception as app_err:
+                        err_str = str(app_err)
+                        if any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "NotFoundException", "404")):
+                            logger.warning(f"Iceberg append on '{quoted_iceberg_table}' failed due to missing S3 file ({app_err}). Recreating...")
+                            if glue_client:
+                                try:
+                                    glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                                except Exception:
+                                    pass
+                            if s3_client and silver_location:
+                                purge_s3_table_location(s3_client, silver_location)
+                            temp_view = f"init_{target_table_name.replace('.', '_').replace('-', '_')}"
+                            df_transformed.createOrReplaceTempView(temp_view)
+                            spark.sql(f"""
+                                CREATE TABLE IF NOT EXISTS {quoted_iceberg_table}
+                                USING iceberg
+                                LOCATION '{silver_location}'
+                                AS SELECT * FROM {temp_view}
+                            """)
+                            table_is_new = True
+                        else:
+                            raise
 
             if table_is_new:
                 tables_created += 1
