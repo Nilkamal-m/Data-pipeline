@@ -42,7 +42,8 @@ sys.modules['awsglue.job'].Job = MagicMock
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 silver_dir = os.path.join(repo_root, "silver", "script")
 gold_dir = os.path.join(repo_root, "gold", "script")
-for p in [repo_root, silver_dir, gold_dir]:
+lambda_dir = os.path.join(repo_root, "lambda_helper")
+for p in [repo_root, silver_dir, gold_dir, lambda_dir]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -429,6 +430,136 @@ class TestCustomTransformsAndApiEnrichment(unittest.TestCase):
             params = parse_spark_arguments()
             self.assertEqual(params['GOLD_QUERY_S3_PATH'], "s3://my-test-bucket/gold/query/servicenow")
             self.assertEqual(params['GOLD_DATA_S3_PATH'], "s3://my-test-bucket/gold/data/servicenow")
+
+
+class TestLambdaHelper(unittest.TestCase):
+    """Verifies that the helper Lambda function can trigger and monitor Bronze, Silver, Gold, and Multi-Stage pipelines."""
+
+    def test_athena_query_detection(self):
+        from lambda_function import is_athena_query_event
+        self.assertTrue(is_athena_query_event({"query": "SELECT 1"}))
+        self.assertTrue(is_athena_query_event({"sql": "SELECT 1"}))
+        self.assertTrue(is_athena_query_event({"layer": "athena"}))
+        self.assertFalse(is_athena_query_event({"layer": "gold", "source_system": "servicenow"}))
+
+    def test_build_glue_arguments_gold(self):
+        from lambda_function import build_glue_arguments
+        event = {
+            "layer": "gold",
+            "source_system": "servicenow",
+            "gold_schema": "enterprise_reporting",
+            "rds_secret_name": "prod/rds/credentials",
+            "rds_password": "manual_password",
+            "rds_host": "db.internal",
+            "gold_target": "aurora"
+        }
+        args = build_glue_arguments(event)
+        self.assertEqual(args["--SOURCE_SYSTEM"], "servicenow")
+        self.assertEqual(args["--PROCESS_LAYER"], "gold")
+        self.assertEqual(args["--GOLD_SCHEMA"], "enterprise_reporting")
+        self.assertEqual(args["--RDS_SECRET_NAME"], "prod/rds/credentials")
+        self.assertEqual(args["--RDS_PASSWORD"], "manual_password")
+        self.assertEqual(args["--RDS_HOST"], "db.internal")
+        self.assertEqual(args["--GOLD_TARGET"], "aurora")
+
+    def test_build_glue_arguments_gold_missing_schema_raises_error(self):
+        from lambda_function import build_glue_arguments
+        event = {
+            "layer": "gold",
+            "source_system": "servicenow"
+        }
+        with self.assertRaises(ValueError) as ctx:
+            build_glue_arguments(event)
+        self.assertIn("Missing required parameter 'gold_schema'", str(ctx.exception))
+        self.assertIn("no fallback schema is permitted", str(ctx.exception))
+
+    def test_build_glue_arguments_silver(self):
+        from lambda_function import build_glue_arguments
+        event = {
+            "layer": "silver",
+            "source_system": "servicenow",
+            "source_table_name": "incident",
+            "full_refresh": True
+        }
+        args = build_glue_arguments(event)
+        self.assertEqual(args["--SOURCE_SYSTEM"], "servicenow")
+        self.assertEqual(args["--PROCESS_LAYER"], "silver")
+        self.assertEqual(args["--FULL_REFRESH"], "True")
+
+    @patch('lambda_function.glue_client')
+    @patch('lambda_function.poll_glue_job_run')
+    def test_single_gold_job_execution(self, mock_poll, mock_glue):
+        from lambda_function import lambda_handler
+        mock_glue.start_job_run.return_value = {"JobRunId": "jr_gold_123"}
+        mock_poll.return_value = {
+            "JobState": "SUCCEEDED",
+            "ExecutionTimeSeconds": 42,
+            "LogGroupName": "/aws-glue/jobs/output"
+        }
+        event = {
+            "layer": "gold",
+            "source_system": "servicenow",
+            "gold_schema": "enterprise_reporting"
+        }
+        resp = lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 200)
+        body = json.loads(resp["body"])
+        self.assertEqual(body["job_status"], "SUCCEEDED")
+        self.assertEqual(body["layer"], "gold")
+        self.assertEqual(body["gold_schema"], "enterprise_reporting")
+        self.assertEqual(body["process_layer"], "gold")
+
+    @patch('lambda_function.glue_client')
+    @patch('lambda_function.poll_glue_job_run')
+    def test_multi_stage_pipeline_execution_success(self, mock_poll, mock_glue):
+        from lambda_function import lambda_handler
+        mock_glue.start_job_run.side_effect = [
+            {"JobRunId": "jr_bronze_1"},
+            {"JobRunId": "jr_silver_2"},
+            {"JobRunId": "jr_gold_3"}
+        ]
+        mock_poll.side_effect = [
+            {"JobState": "SUCCEEDED", "ExecutionTimeSeconds": 30, "LogGroupName": "log1"},
+            {"JobState": "SUCCEEDED", "ExecutionTimeSeconds": 45, "LogGroupName": "log2"},
+            {"JobState": "SUCCEEDED", "ExecutionTimeSeconds": 25, "LogGroupName": "log3"}
+        ]
+        event = {
+            "layer": "all",
+            "source_system": "servicenow",
+            "gold_schema": "enterprise_reporting"
+        }
+        resp = lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 200)
+        body = json.loads(resp["body"])
+        self.assertEqual(body["status"], "SUCCEEDED")
+        self.assertIn("bronze", body["stage_results"])
+        self.assertIn("silver", body["stage_results"])
+        self.assertIn("gold", body["stage_results"])
+
+    @patch('lambda_function.glue_client')
+    @patch('lambda_function.poll_glue_job_run')
+    def test_multi_stage_pipeline_failure_halts_pipeline(self, mock_poll, mock_glue):
+        from lambda_function import lambda_handler
+        mock_glue.start_job_run.side_effect = [
+            {"JobRunId": "jr_bronze_1"},
+            {"JobRunId": "jr_silver_2"}
+        ]
+        mock_poll.side_effect = [
+            {"JobState": "SUCCEEDED", "ExecutionTimeSeconds": 30, "LogGroupName": "log1"},
+            {"JobState": "FAILED", "ExecutionTimeSeconds": 15, "ErrorMessage": "Iceberg merge conflict", "LogGroupName": "log2"}
+        ]
+        event = {
+            "layers": ["bronze", "silver", "gold"],
+            "source_system": "servicenow",
+            "gold_schema": "enterprise_reporting"
+        }
+        resp = lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 500)
+        body = json.loads(resp["body"])
+        self.assertEqual(body["status"], "FAILED")
+        self.assertEqual(body["failed_stage"], "silver")
+        self.assertIn("Iceberg merge conflict", body["error_message"])
+        self.assertEqual(mock_glue.start_job_run.call_count, 2)
 
 
 if __name__ == "__main__":

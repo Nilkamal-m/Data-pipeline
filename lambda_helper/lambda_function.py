@@ -2,42 +2,44 @@
 AWS Lambda Helper Function: Trigger & Monitor AWS Glue Jobs & Execute Athena Queries
 
 Purpose:
-  1. Trigger and monitor AWS Glue Bronze Ingestion & Silver Iceberg ETL jobs.
-  2. Execute queries directly on Amazon Athena (Iceberg / Glue Data Catalog tables)
+  1. Trigger and monitor AWS Glue Bronze Ingestion, Silver Iceberg ETL, and Gold Serving Mart jobs.
+  2. Orchestrate end-to-end multi-layer pipeline runs (Bronze -> Silver -> Gold).
+  3. Execute queries directly on Amazon Athena (Iceberg / Glue Data Catalog tables)
      and output formatted results into CloudWatch / Lambda execution logs.
 
 Supported Operations:
-  A. Athena Query Execution (New):
+  A. Athena Query Execution:
      Pass "query", "athena_query", or "sql" in the event payload to execute any SQL query
-     against Athena and inspect the result table in the Lambda logs.
+     against Athena and inspect the formatted result table in the Lambda logs.
+     Payload: {"query": "SELECT * FROM uax_datalake_db_dev.raw_tbl_incident LIMIT 10"}
 
-  B. AWS Glue Job Triggering (Existing):
-     - Bronze Ingestion Job: uax-datalake-bronze-ingestion-dev (or env DEFAULT_BRONZE_JOB)
-     - Silver Iceberg ETL Job: uax-datalake-silver-etl-dev (or env DEFAULT_SILVER_JOB)
+  B. Bronze Ingestion Glue Job:
+     Payload: {"layer": "bronze", "source_system": "servicenow", "source_table_name": "incident"}
 
-Athena Query Payload Schema (JSON):
-{
-    "query": "SELECT * FROM uax_datalake_db_dev.raw_tbl_incident",          # Required SQL query (all records shown by default)
-    "max_results": null,                                                    # Optional: max rows to retrieve (default: null = all records)
-    "workgroup": "uax-datalake-workgroup-dev",                              # Optional: Athena workgroup (default: uax-datalake-workgroup-dev)
-    "database": "uax_datalake_db_dev",                                      # Optional: only needed if not passing <database>.<table_name> in query
-    "timeout_seconds": 120                                                  # Optional: query execution timeout (default: 120s)
-}
+  C. Silver Iceberg ETL Glue Job:
+     Payload: {"layer": "silver", "source_system": "servicenow", "source_table_name": "incident"}
 
-Glue Job Payload Schema (JSON):
-{
-    "layer": "bronze",                                 # Optional: "bronze" or "silver" (Defaults to "bronze")
-    "job_name": "uax-datalake-bronze-ingestion-dev",   # Optional explicit job name override
-    "source_system": "servicenow",                     # Required: servicenow, moveworks, genesys, postgresql, mysql
-    "source_table_name": "incident",                   # Optional: single string ("incident"), list (["incident", "sys_user"]), or comma-separated ("incident,sys_user")
-    "secret_name": "uax-datalake/servicenow-credentials-dev", # Optional secret name override
-    "custom_query": "",                                # Optional custom query override
-    "full_refresh": false,                             # Optional for Silver: true to ignore watermarks
-    "watermark_enabled": true,                         # Optional for Silver: default true
-    "wait_until_completion": true,                    # Optional: true (default) or false (async)
-    "poll_interval_seconds": 10,                       # Optional polling interval in seconds
-    "timeout_seconds": 600                             # Optional maximum polling timeout
-}
+  D. Gold Serving Layer Glue Job:
+     Payload: {
+         "layer": "gold",
+         "source_system": "servicenow",
+         "gold_schema": "enterprise_reporting",
+         "rds_secret_name": "prod/rds/mysql_credentials"   # or "rds_password": "manual_password"
+     }
+
+  E. End-to-End Multi-Stage Pipeline Execution (Run All):
+     Payload: {
+         "layer": "all",                                    # Runs Bronze -> Silver -> Gold sequentially
+         "source_system": "servicenow",
+         "gold_schema": "enterprise_reporting",
+         "rds_secret_name": "prod/rds/mysql_credentials"
+     }
+     Or custom stage selection:
+     Payload: {
+         "layers": ["silver", "gold"],                     # Runs Silver -> Gold
+         "source_system": "servicenow",
+         "gold_schema": "enterprise_reporting"
+     }
 """
 
 import os
@@ -66,6 +68,7 @@ TERMINAL_STATES = {'SUCCEEDED', 'FAILED', 'STOPPED', 'TIMEOUT'}
 
 DEFAULT_BRONZE_JOB = os.environ.get('DEFAULT_BRONZE_JOB', 'uax-datalake-bronze-ingestion-dev')
 DEFAULT_SILVER_JOB = os.environ.get('DEFAULT_SILVER_JOB', 'uax-datalake-silver-etl-dev')
+DEFAULT_GOLD_JOB = os.environ.get('DEFAULT_GOLD_JOB', DEFAULT_SILVER_JOB)
 
 DEFAULT_ATHENA_DATABASE = os.environ.get('DEFAULT_ATHENA_DATABASE', 'uax_datalake_db_dev')
 DEFAULT_ATHENA_WORKGROUP = os.environ.get('DEFAULT_ATHENA_WORKGROUP', 'uax-datalake-workgroup-dev')
@@ -187,13 +190,77 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         'scd_type': '--SCD_TYPE',
         'SCD_TYPE': '--SCD_TYPE',
         'deduplication_strategy': '--DEDUPLICATION_STRATEGY',
-        'DEDUPLICATION_STRATEGY': '--DEDUPLICATION_STRATEGY'
+        'DEDUPLICATION_STRATEGY': '--DEDUPLICATION_STRATEGY',
+        # Gold Serving Layer parameters
+        'gold_schema': '--GOLD_SCHEMA',
+        'GOLD_SCHEMA': '--GOLD_SCHEMA',
+        'schema_name': '--GOLD_SCHEMA',
+        'SCHEMA_NAME': '--GOLD_SCHEMA',
+        'schema': '--GOLD_SCHEMA',
+        'SCHEMA': '--GOLD_SCHEMA',
+        'gold_target': '--GOLD_TARGET',
+        'GOLD_TARGET': '--GOLD_TARGET',
+        'gold_query_s3_path': '--GOLD_QUERY_S3_PATH',
+        'GOLD_QUERY_S3_PATH': '--GOLD_QUERY_S3_PATH',
+        'gold_data_s3_path': '--GOLD_DATA_S3_PATH',
+        'GOLD_DATA_S3_PATH': '--GOLD_DATA_S3_PATH',
+        'rds_secret_name': '--RDS_SECRET_NAME',
+        'RDS_SECRET_NAME': '--RDS_SECRET_NAME',
+        'db_secret_name': '--RDS_SECRET_NAME',
+        'DB_SECRET_NAME': '--RDS_SECRET_NAME',
+        'rds_password': '--RDS_PASSWORD',
+        'RDS_PASSWORD': '--RDS_PASSWORD',
+        'rds_host': '--RDS_HOST',
+        'RDS_HOST': '--RDS_HOST',
+        'rds_port': '--RDS_PORT',
+        'RDS_PORT': '--RDS_PORT',
+        'rds_user': '--RDS_USER',
+        'RDS_USER': '--RDS_USER',
+        'connection_name': '--CONNECTION_NAME',
+        'CONNECTION_NAME': '--CONNECTION_NAME',
+        'glue_connection_name': '--CONNECTION_NAME',
+        'GLUE_CONNECTION_NAME': '--CONNECTION_NAME',
+        'external_columns': '--EXTERNAL_COLUMNS',
+        'EXTERNAL_COLUMNS': '--EXTERNAL_COLUMNS',
+        'process_layer': '--PROCESS_LAYER',
+        'PROCESS_LAYER': '--PROCESS_LAYER'
     }
 
     for event_key, glue_arg_key in param_mappings.items():
         val = event.get(event_key)
         if val is not None and str(val).strip() != '':
             glue_args[glue_arg_key] = str(val).strip()
+
+    # Determine process layer (--PROCESS_LAYER strictly silver or gold for uax_silver_etl.py)
+    layer = str(event.get('layer', '')).strip().lower()
+    if layer == 'bronze':
+        # Bronze ingestion job does not use --PROCESS_LAYER or gold/rds parameters
+        glue_args.pop('--PROCESS_LAYER', None)
+        for k in list(glue_args.keys()):
+            if k.startswith('--GOLD_') or k.startswith('--RDS_'):
+                glue_args.pop(k, None)
+    elif layer == 'silver':
+        glue_args['--PROCESS_LAYER'] = 'silver'
+        for k in list(glue_args.keys()):
+            if k.startswith('--GOLD_') or k.startswith('--RDS_'):
+                glue_args.pop(k, None)
+    elif layer == 'gold':
+        glue_args['--PROCESS_LAYER'] = 'gold'
+    elif not glue_args.get('--PROCESS_LAYER'):
+        if 'gold_schema' in event or 'GOLD_SCHEMA' in event or event.get('action') == 'gold':
+            glue_args['--PROCESS_LAYER'] = 'gold'
+        else:
+            glue_args['--PROCESS_LAYER'] = 'silver'
+
+    # Strict Gold Schema Validation (Enterprise Shared DB Policy - Zero Fallback)
+    if glue_args.get('--PROCESS_LAYER') == 'gold':
+        gold_schema = glue_args.get('--GOLD_SCHEMA')
+        if not gold_schema or not str(gold_schema).strip():
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: Missing required parameter 'gold_schema' (or 'GOLD_SCHEMA') in event payload for Gold layer.\n"
+                "In accordance with enterprise shared database policy, no fallback schema is permitted.\n"
+                "Example: {'layer': 'gold', 'source_system': 'servicenow', 'gold_schema': 'enterprise_reporting'}"
+            )
 
     # Allow custom arbitrary arguments passed via 'arguments' dictionary
     if 'arguments' in event and isinstance(event['arguments'], dict):
@@ -555,12 +622,127 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
 
 
+def execute_pipeline_stages(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Executes a sequential multi-stage data pipeline (e.g. Bronze -> Silver -> Gold).
+    Monitors each stage to completion, logs structured progress, and halts immediately if any stage fails.
+    """
+    pipeline_start_time = time.time()
+    layers_requested = event.get('layers')
+    if not layers_requested:
+        # Default pipeline: bronze -> silver -> gold (or silver -> gold if skip_bronze is True)
+        skip_bronze = event.get('skip_bronze', False)
+        if isinstance(skip_bronze, str):
+            skip_bronze = skip_bronze.strip().lower() in ('true', '1', 'yes')
+        layers_requested = ['silver', 'gold'] if skip_bronze else ['bronze', 'silver', 'gold']
+
+    cleaned_layers = [str(l).strip().lower() for l in layers_requested if str(l).strip()]
+    logger.info(
+        f"\n+================================================================================+\n"
+        f"|  STARTING MULTI-STAGE DATA PIPELINE: {' -> '.join([l.upper() for l in cleaned_layers])}\n"
+        f"+================================================================================+"
+    )
+
+    poll_interval = int(event.get('poll_interval_seconds', 10))
+    timeout_seconds = int(event.get('timeout_seconds', 540))
+    source_system = str(event.get('source_system') or event.get('SOURCE_SYSTEM') or '').strip().lower()
+
+    stage_results = {}
+
+    for idx, stage in enumerate(cleaned_layers, 1):
+        logger.info(
+            f"\n================================================================================\n"
+            f"[PIPELINE STAGE {idx}/{len(cleaned_layers)}] Starting Layer: {stage.upper()}\n"
+            f"================================================================================"
+        )
+
+        stage_event = dict(event)
+        stage_event['layer'] = stage
+
+        # Resolve job name for stage
+        if stage == 'bronze':
+            stage_job = stage_event.get('bronze_job_name') or DEFAULT_BRONZE_JOB
+        elif stage == 'silver':
+            stage_job = stage_event.get('silver_job_name') or DEFAULT_SILVER_JOB
+        elif stage == 'gold':
+            stage_job = stage_event.get('gold_job_name') or DEFAULT_GOLD_JOB
+        else:
+            raise ValueError(f"Unknown pipeline stage layer: '{stage}'. Expected 'bronze', 'silver', or 'gold'.")
+
+        stage_args = build_glue_arguments(stage_event)
+        logger.info(f"Triggering Glue Job for stage '{stage}': '{stage_job}' with args: {json.dumps(stage_args)}")
+
+        run_resp = glue_client.start_job_run(JobName=stage_job, Arguments=stage_args)
+        run_id = run_resp['JobRunId']
+        logger.info(f"Stage '{stage.upper()}' started with RunId: {run_id}")
+
+        # Poll stage to completion
+        poll_res = poll_glue_job_run(
+            job_name=stage_job,
+            run_id=run_id,
+            poll_interval=poll_interval,
+            timeout_seconds=timeout_seconds
+        )
+
+        job_state = poll_res['JobState']
+        exec_duration = poll_res.get('ExecutionTimeSeconds', 0)
+
+        stage_results[stage] = {
+            'job_name': stage_job,
+            'job_run_id': run_id,
+            'status': job_state,
+            'execution_time_seconds': exec_duration,
+            'log_group': poll_res.get('LogGroupName'),
+            'error_message': poll_res.get('ErrorMessage')
+        }
+
+        if job_state != 'SUCCEEDED':
+            total_time = int(time.time() - pipeline_start_time)
+            err_msg = poll_res.get('ErrorMessage') or f"Stage '{stage}' failed with state '{job_state}'."
+            logger.error(
+                f"\n+================================================================================+\n"
+                f"|  PIPELINE FAILED AT STAGE '{stage.upper()}' (RunId: {run_id})\n"
+                f"|  Error: {err_msg}\n"
+                f"+================================================================================+"
+            )
+            return {
+                'statusCode': 500,
+                'body': json.dumps({
+                    'status': 'FAILED',
+                    'failed_stage': stage,
+                    'error_message': err_msg,
+                    'total_duration_seconds': total_time,
+                    'stage_results': stage_results
+                })
+            }
+
+        logger.info(f"[PIPELINE STAGE {idx}/{len(cleaned_layers)}] Stage '{stage.upper()}' SUCCEEDED in {exec_duration}s.")
+
+    total_pipeline_time = int(time.time() - pipeline_start_time)
+    logger.info(
+        f"\n+================================================================================+\n"
+        f"|  PIPELINE EXECUTION COMPLETED SUCCESSFULLY IN {total_pipeline_time}s!\n"
+        f"+================================================================================+"
+    )
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'status': 'SUCCEEDED',
+            'pipeline': ' -> '.join(cleaned_layers),
+            'source_system': source_system,
+            'total_duration_seconds': total_pipeline_time,
+            'stage_results': stage_results
+        })
+    }
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Main Lambda entrypoint.
     Supports:
       1. Athena query execution (if 'query', 'athena_query', or 'sql' is in event)
-      2. AWS Glue Job Triggering & Monitoring (existing default)
+      2. Multi-Stage Pipeline Execution (if layer="all" / "pipeline" / "e2e" or "layers" list)
+      3. Single AWS Glue Job Triggering & Monitoring (Bronze, Silver, or Gold)
     """
     logger.info(f"Received invocation event: {json.dumps(event, default=str)}")
 
@@ -570,21 +752,30 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.info("Athena query request detected in payload. Routing to execute_athena_query...")
             return execute_athena_query(event, context)
 
-        # Route 2: AWS Glue Job Triggering & Monitoring (Original Flow)
-        # Layer resolution: "bronze" or "silver"
+        # Route 2: Multi-Stage Pipeline Execution ("all", "pipeline", "e2e", or layers list)
         layer = str(event.get('layer', 'bronze')).strip().lower()
+        if event.get('action') in ('run_all', 'pipeline', 'e2e', 'all'):
+            layer = 'all'
 
-        # Job Name resolution: explicit override > environment defaults
+        if layer in ('all', 'pipeline', 'e2e', 'full') or isinstance(event.get('layers'), list):
+            logger.info("Multi-stage pipeline request detected. Routing to execute_pipeline_stages...")
+            return execute_pipeline_stages(event, context)
+
+        # Route 3: Single AWS Glue Job Triggering & Monitoring (Bronze, Silver, Gold)
         job_name = event.get('job_name')
         if not job_name:
-            if layer == 'silver':
+            if layer == 'gold':
+                job_name = DEFAULT_GOLD_JOB
+            elif layer == 'silver':
                 job_name = DEFAULT_SILVER_JOB
             elif layer == 'bronze':
                 job_name = DEFAULT_BRONZE_JOB
             else:
-                raise ValueError(f"Invalid layer '{layer}'. Expected 'bronze' or 'silver'.")
+                raise ValueError(
+                    f"Invalid layer '{layer}'. Expected 'bronze', 'silver', 'gold', or 'all'."
+                )
 
-        # Build Glue command-line arguments (--SOURCE_SYSTEM, --SOURCE_TABLE_NAME, etc.)
+        # Build Glue command-line arguments (--SOURCE_SYSTEM, --SOURCE_TABLE_NAME, --PROCESS_LAYER, etc.)
         glue_args = build_glue_arguments(event)
         logger.info(f"Triggering Glue Job: '{job_name}' with arguments: {json.dumps(glue_args)}")
 
@@ -594,7 +785,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             Arguments=glue_args
         )
         run_id = run_response['JobRunId']
-        logger.info(f"Successfully started Glue Job '{job_name}' with RunId: {run_id}")
+        logger.info(f"Successfully started Glue Job '{job_name}' (Layer: {layer.upper()}) with RunId: {run_id}")
 
         # Execution mode: Synchronous (wait_until_completion=True) or Asynchronous (wait_until_completion=False)
         wait_until_completion = event.get('wait_until_completion', True)
@@ -610,7 +801,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             return {
                 'statusCode': 202,
                 'body': json.dumps({
-                    'message': 'Glue job started asynchronously.',
+                    'message': f'Glue job ({layer.upper()}) started asynchronously.',
+                    'layer': layer,
                     'job_name': job_name,
                     'job_run_id': run_id,
                     'status': 'STARTING',
@@ -631,12 +823,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         status_code = 200 if is_success else 500
 
         response_body = {
+            'layer': layer,
             'job_name': job_name,
             'job_run_id': run_id,
             'job_status': job_state,
             'execution_time_seconds': final_result.get('ExecutionTimeSeconds', 0),
             'source_system': glue_args.get('--SOURCE_SYSTEM'),
             'source_table_name': glue_args.get('--SOURCE_TABLE_NAME', 'ALL_CONFIGURED'),
+            'process_layer': glue_args.get('--PROCESS_LAYER'),
+            'gold_schema': glue_args.get('--GOLD_SCHEMA'),
             'cloudwatch_log_group': final_result.get('LogGroupName', '/aws-glue/jobs/output'),
             'error_message': final_result.get('ErrorMessage', '') if not is_success else None
         }
@@ -653,6 +848,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'statusCode': 400,
             'body': json.dumps({
                 'error': str(err),
-                'message': 'Failed to trigger or monitor AWS Glue Job'
+                'message': 'Failed to execute operation in Helper Lambda'
             })
         }
