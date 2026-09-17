@@ -223,3 +223,15 @@ module "silver_iceberg_job" {
   connections = [module.glue_connection.name]
 }
 ```
+
+---
+
+## 7. Helper Lambda Orchestration (`lambda_helper/lambda_function.py`)
+
+The Helper Lambda provides a single interface to trigger and monitor:
+1. **Athena SQL Queries**: Ad-hoc SQL with tabular database and pandas console formatting.
+2. **Bronze Ingestion**: Single Glue job run (`layer: "bronze"`).
+3. **Silver Iceberg ETL**: Single Glue job run (`layer: "silver"`).
+4. **Gold Serving Marts**: Single Glue job run (`layer: "gold"`, `--GOLD_SCHEMA`, `--RDS_SECRET_NAME`).
+5. **Multi-Stage Pipeline ("Run All")**: Sequential `Bronze -> Silver -> Gold` (or custom stages), polling to completion with immediate halt on failure (`layer: "all"`).
+
