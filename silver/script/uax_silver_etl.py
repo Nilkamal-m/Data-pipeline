@@ -18,6 +18,7 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 from urllib.parse import urlparse
+import traceback
 from datetime import datetime, timezone
 from typing import Optional
 from pyspark.context import SparkContext
@@ -31,14 +32,16 @@ from pyspark.sql.functions import (
     to_timestamp, sha2, concat_ws, when, upper, max as spark_max
 )
 
-# Ensure script directory is on sys.path for SilverConfigLoader & SilverTransformer imports
+# Ensure script directories are on sys.path for Silver & Gold imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
-for path in [script_dir, os.getcwd(), "/tmp/extraPython"]:
+gold_dir = os.path.join(os.path.dirname(script_dir), "gold", "script")
+for path in [script_dir, gold_dir, os.getcwd(), "/tmp/extraPython"]:
     if os.path.exists(path) and path not in sys.path:
         sys.path.insert(0, path)
 
 from silver_config_loader import SilverConfigLoader
 from transformer import SilverTransformer
+from gold_layer_manager import GoldLayerManager
 
 
 # ------------------------------------------------------------------------------
@@ -132,10 +135,22 @@ def parse_spark_arguments() -> dict:
     silver_full_config = SilverConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client)
     defaults_cfg = silver_full_config.get('silver_defaults', {})
 
+    # Process Layer Routing: Strictly 2 Options ('silver' or 'gold')
+    process_layer = (get_cli_arg('PROCESS_LAYER', 'process_layer', default='silver')).lower().strip()
+    if process_layer not in ('silver', 'gold'):
+        raise ValueError(
+            f"Invalid --PROCESS_LAYER value '{process_layer}'. "
+            f"Strictly 2 options are supported: '--PROCESS_LAYER=silver' or '--PROCESS_LAYER=gold'."
+        )
+
     source_system = get_cli_arg('SOURCE_SYSTEM', 'source_system')
-    if not source_system:
+    if not source_system or not str(source_system).strip():
         logger.error("Missing required parameter '--SOURCE_SYSTEM'. Example: --SOURCE_SYSTEM servicenow")
-        raise ValueError("Missing required parameter '--SOURCE_SYSTEM'.")
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: Missing required parameter '--SOURCE_SYSTEM'.\n"
+            "The ultimate Gold query path is 's3://<bucket>/gold/query/<source>/<table_name>.sql'.\n"
+            "Please explicitly specify the source system (e.g. --SOURCE_SYSTEM servicenow)."
+        )
 
     source_system_clean = source_system.strip().lower()
 
@@ -196,6 +211,9 @@ def parse_spark_arguments() -> dict:
     if raw_tables:
         table_list = [t.strip() for t in raw_tables.split(',') if t.strip()]
         logger.info(f"Using CLI parameter table override: {table_list}")
+    elif process_layer == 'gold':
+        table_list = []
+        logger.info("Process layer is 'gold'. Bypassing Silver table_list resolution.")
     else:
         table_list = SilverConfigLoader.get_default_tables(source_system_clean, silver_full_config)
         if not table_list:
@@ -269,7 +287,31 @@ def parse_spark_arguments() -> dict:
     else:
         trigger_crawler = None
 
+    # Gold Serving Layer Parameters
+    gold_schema = get_cli_arg('GOLD_SCHEMA', 'gold_schema')
+    if process_layer == 'gold' and (not gold_schema or not str(gold_schema).strip()):
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_SCHEMA'.\n"
+            "In accordance with enterprise shared database policy, no fallback schema is permitted.\n"
+            "Please explicitly specify the target MySQL schema name (e.g. --GOLD_SCHEMA enterprise_reporting)."
+        )
+    if gold_schema:
+        gold_schema = str(gold_schema).strip()
+
+    gold_target = (get_cli_arg('GOLD_TARGET', 'gold_target', default='aurora')).lower().strip()
+    default_gold_query = f"s3://{data_lake_bucket}/gold/query/{source_system_clean}"
+    default_gold_data = f"s3://{data_lake_bucket}/gold/data/{source_system_clean}"
+    gold_query_s3_path = get_cli_arg('GOLD_QUERY_S3_PATH', 'gold_query_s3_path', default=default_gold_query)
+    gold_data_s3_path = get_cli_arg('GOLD_DATA_S3_PATH', 'gold_data_s3_path', default=default_gold_data)
+    connection_name = get_cli_arg('CONNECTION_NAME', 'connection_name', 'GLUE_CONNECTION_NAME', 'glue_connection_name')
+    rds_secret_name = get_cli_arg('RDS_SECRET_NAME', 'rds_secret_name', 'SECRET_NAME', 'secret_name', 'DB_SECRET_NAME', 'db_secret_name')
+    rds_host = get_cli_arg('RDS_HOST', 'rds_host')
+    rds_port = get_cli_arg('RDS_PORT', 'rds_port', default='3306')
+    rds_user = get_cli_arg('RDS_USER', 'rds_user')
+    rds_password = get_cli_arg('RDS_PASSWORD', 'rds_password')
+
     return {
+        'PROCESS_LAYER': process_layer,
         'JOB_NAME': job_name,
         'SOURCE_SYSTEM': source_system_clean,
         'TABLE_LIST': table_list,
@@ -287,6 +329,16 @@ def parse_spark_arguments() -> dict:
         'CRAWLER_NAME': crawler_name,
         'TRIGGER_CRAWLER': trigger_crawler,
         'SILVER_FULL_CONFIG': silver_full_config,
+        'GOLD_SCHEMA': gold_schema,
+        'GOLD_TARGET': gold_target,
+        'GOLD_QUERY_S3_PATH': gold_query_s3_path,
+        'GOLD_DATA_S3_PATH': gold_data_s3_path,
+        'CONNECTION_NAME': connection_name,
+        'RDS_SECRET_NAME': rds_secret_name,
+        'RDS_HOST': rds_host,
+        'RDS_PORT': rds_port,
+        'RDS_USER': rds_user,
+        'RDS_PASSWORD': rds_password,
         'ARG_DICT': arg_dict
     }
 
@@ -683,19 +735,34 @@ def sync_iceberg_table_schema(spark, quoted_table: str, incoming_df) -> bool:
     Compares incoming DataFrame schema with existing target Iceberg table schema.
     If incoming batch has new columns, dynamically executes 'ALTER TABLE <tbl> ADD COLUMNS (...)'
     to capture schema changes and automatically update the Iceberg table definition.
+    Emits [SCHEMA EVOLUTION DETECTED] card and [DDL AUDIT - ALTER TABLE] logs.
     Returns True if schema was evolved, False otherwise.
     """
     try:
         target_df = spark.table(quoted_table)
         target_field_names = {f.name.lower() for f in target_df.schema.fields}
         new_columns = []
+        new_column_details = []
         for field in incoming_df.schema.fields:
             if field.name.lower() not in target_field_names:
                 new_columns.append(f"`{field.name}` {field.dataType.simpleString()}")
+                new_column_details.append((field.name, field.dataType.simpleString()))
 
         if new_columns:
             alter_sql = f"ALTER TABLE {quoted_table} ADD COLUMNS ({', '.join(new_columns)})"
-            logger.info(f"[SCHEMA EVOLUTION] Detected {len(new_columns)} new column(s) for '{quoted_table}'. Executing: {alter_sql}")
+            diff_lines = [
+                "+--------------------------------------------------------------------------------+",
+                f"| [SCHEMA EVOLUTION DETECTED] Target Silver Iceberg Table: {quoted_table}",
+                "+--------------------------------------------------------------------------------+",
+                f"| Detected {len(new_columns)} new column(s) to add to Iceberg schema:"
+            ]
+            for col_name, col_type in new_column_details:
+                diff_lines.append(f"|   ├── Added: '{col_name}' ({col_type})")
+            diff_lines.append(f"| Executing DDL: {alter_sql}")
+            diff_lines.append("+--------------------------------------------------------------------------------+")
+            logger.info("\n".join(diff_lines))
+
+            logger.info(f"[DDL AUDIT - ALTER TABLE] Altering Iceberg table '{quoted_table}' to add columns: {[c[0] for c in new_column_details]}")
             spark.sql(alter_sql)
             logger.info(f"[SCHEMA EVOLUTION] Successfully updated table schema for '{quoted_table}'.")
             return True
@@ -1055,6 +1122,23 @@ def main():
     execution_start_utc = datetime.now(timezone.utc)
     current_run_time = execution_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
+    process_layer = params.get('PROCESS_LAYER', 'silver')
+    if process_layer == 'gold':
+        logger.info(
+            f"\n+================================================================================+\n"
+            f"|  ROUTING TO GOLD SERVING ENGINE: --PROCESS_LAYER=gold                           |\n"
+            f"+================================================================================+"
+        )
+        GoldLayerManager.run_gold_pipeline(
+            spark=spark,
+            params=params,
+            glue_client=glue_client,
+            s3_client=s3_client
+        )
+        job.commit()
+        logger.info("All Gold serving layer operations completed successfully.")
+        return
+
     start_banner = (
         f"[JOB START] SILVER ICEBERG ETL | Source: {source_system.upper()} | Tables: {', '.join(table_list)}\n"
         "+================================================================================+\n"
@@ -1137,6 +1221,11 @@ def main():
         dedup_strategy = table_cfg.get('deduplication_strategy') or defaults_cfg.get('deduplication', {}).get('strategy', 'latest_by_order_column')
 
         try:
+            logger.info(
+                f"\n================================================================================\n"
+                f"[SILVER STEP 1/6] Ingesting Bronze Data & Evaluating Watermark for '{bronze_table_name}'\n"
+                f"--------------------------------------------------------------------------------"
+            )
             logger.info(f"Reading raw Bronze data for '{bronze_table_name}' from Glue Catalog (`{glue_database}`.`{bronze_table_name}`) or S3 ('{bronze_path}')...")
 
             try:
@@ -1266,6 +1355,11 @@ def main():
 
             logger.info(f"Deduplicating table '{table_clean}': Nkey={nkeys}, OrderBy={order_cols}, Strategy='{dedup_strategy}'")
 
+            logger.info(
+                f"\n================================================================================\n"
+                f"[SILVER STEP 2/6] Deduplicating Records for '{table_clean}' (Nkey: {nkeys}, Strategy: '{dedup_strategy}')\n"
+                f"--------------------------------------------------------------------------------"
+            )
             # 1. Perform in-batch deduplication (drops exact duplicates & keeps latest per Nkey)
             df_dedup = perform_deduplication(df_bronze, nkeys, order_cols, dedup_strategy)
 
@@ -1276,8 +1370,21 @@ def main():
                 logger.info(f"Stripping Bronze system columns before Silver processing: {bronze_cols_to_drop}")
                 df_dedup = df_dedup.drop(*bronze_cols_to_drop)
 
-            # 3. Apply Declarative transformations & technical audit columns (_valid_from, _valid_to, _is_current, _is_deleted, _inserted_at, _updated_at)
+            logger.info(
+                f"\n================================================================================\n"
+                f"[SILVER STEP 3/6] Applying Transformations & API Enrichment Hook for '{table_clean}'\n"
+                f"--------------------------------------------------------------------------------"
+            )
             primary_order_col = order_cols[0] if isinstance(order_cols, list) and order_cols else order_cols
+            context = {
+                "glue_database": glue_database,
+                "source_system": source_system,
+                "table_name": table_clean,
+                "base_table_name": base_table_name,
+                "data_lake_bucket": bucket_name,
+                "silver_data_prefix": silver_data_prefix,
+                "table_cfg": table_cfg
+            }
             df_transformed = SilverTransformer.apply_transformations(
                 df=df_dedup,
                 source_system=source_system,
@@ -1285,10 +1392,16 @@ def main():
                 table_cfg=table_cfg,
                 order_col_name=primary_order_col,
                 nkeys=nkeys,
-                spark=spark
+                spark=spark,
+                context=context
             )
 
-            logger.info(f"Target Iceberg Table: '{silver_table_name}', SCD Type: '{scd_type.upper()}', Merge Strategy: '{merge_strategy.upper()}'")
+            logger.info(
+                f"\n================================================================================\n"
+                f"[SILVER STEP 4/6 & 5/6] Checking Schema Evolution & Executing Iceberg Write for '{target_table_name}'\n"
+                f"--------------------------------------------------------------------------------\n"
+                f"Target Iceberg Table: '{silver_table_name}', SCD Type: '{scd_type.upper()}', Merge Strategy: '{merge_strategy.upper()}'"
+            )
 
             # 3. Execute SCD Type 2 or SCD Type 1 / Append / Overwrite
             quoted_iceberg_table = quote_iceberg_table(silver_table_name)
@@ -1438,6 +1551,11 @@ def main():
 
             # Update High-Water Mark state in S3 (table_name='tbl_<base_table_name>')
             if watermark_enabled:
+                logger.info(
+                    f"\n================================================================================\n"
+                    f"[SILVER STEP 6/6] Updating Watermark State & Catalog for '{target_table_name}'\n"
+                    f"--------------------------------------------------------------------------------"
+                )
                 update_silver_watermark(
                     s3_client=s3_client,
                     bucket=bucket_name,
@@ -1490,13 +1608,14 @@ def main():
                 f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
                 f"|  * End Time (UTC)   : {table_end_time_str}\n"
                 f"|  * Silver Location  : {silver_location}\n"
-                "+================================================================================+"
+                f"+================================================================================+"
             )
             logger.info(summary_card)
 
         except Exception as err:
             table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
             failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            tb = traceback.format_exc()
             table_stats.append({
                 "table_name": target_table_name,
                 "status": "FAILED",
@@ -1507,19 +1626,24 @@ def main():
                 "error_message": str(err)
             })
             failed_card = (
-                f"[TABLE FAILED] {bronze_table_name} -> {target_table_name} | FAILED | Duration: {table_duration:.2f}s | Error: {str(err)[:60]}\n"
-                "+================================================================================+\n"
-                f"|  SILVER TABLE FAILED: {target_table_name} [FAILED]\n"
-                "+--------------------------------------------------------------------------------+\n"
-                f"|  * Source System    : {source_system}\n"
-                f"|  * Bronze Table     : {glue_database}.{bronze_table_name}\n"
-                f"|  * Target Table     : {silver_table_name}\n"
-                f"|  * Status           : FAILED\n"
-                f"|  * Error Details    : {err}\n"
-                f"|  * Table Duration   : {table_duration:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
-                f"|  * Failed At (UTC)  : {failed_time_str}\n"
-                "+================================================================================+"
+                f"\n+================================================================================+\n"
+                f"|  ERROR DIAGNOSTIC CARD: SILVER TABLE FAILURE [FAILED]\n"
+                f"+================================================================================+\n"
+                f"|  * Execution Layer    : SILVER\n"
+                f"|  * Failed Entity      : {target_table_name}\n"
+                f"|  * Source System      : {source_system}\n"
+                f"|  * Bronze Table       : {glue_database}.{bronze_table_name}\n"
+                f"|  * Target Silver      : {silver_table_name}\n"
+                f"|  * SCD / Merge Mode   : SCD: {scd_type.upper()} | Merge: {merge_strategy.upper()}\n"
+                f"|  * S3 Silver Location : {silver_location}\n"
+                f"|  * Table Duration     : {table_duration:.2f}s\n"
+                f"|  * Failed At (UTC)    : {failed_time_str}\n"
+                f"|  * Exception Type     : {err.__class__.__name__}\n"
+                f"|  * Exception Message  : {str(err)}\n"
+                f"+--------------------------------------------------------------------------------+\n"
+                f"|  * Full Python / Spark Stack Trace:\n"
+                f"{tb.strip()}\n"
+                f"+================================================================================+"
             )
             logger.error(failed_card)
             failed_tables.append((target_table_name, str(err)))

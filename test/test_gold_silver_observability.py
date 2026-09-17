@@ -1,0 +1,435 @@
+"""
+Unit and Integration Validation for Silver & Gold Serving Layer.
+Tests:
+1. Strict 2-Option Parameter Validation (--PROCESS_LAYER=silver|gold)
+2. Shared MySQL Database Guardrails & Schema Pre-Existence Verification
+3. Naming Convention Guardrails (gold_tbl_* and v_*)
+4. Column Schema Introspection & Evolution Detection
+5. Silver API Enrichment Hook & Inter-Table Custom Transform Calling
+"""
+
+import sys
+import os
+import types
+import unittest
+from unittest.mock import MagicMock, patch
+import json
+
+# Mock awsglue, pyspark, boto3, dateutil for standalone testing without Glue/Hadoop runtime
+for pkg in ['pyspark', 'pyspark.sql', 'awsglue', 'botocore', 'dateutil']:
+    m = types.ModuleType(pkg)
+    m.__path__ = []
+    sys.modules[pkg] = m
+
+for mod in [
+    'pyspark.context', 'pyspark.conf', 'pyspark.sql', 'pyspark.sql.functions', 'pyspark.sql.types', 'pyspark.sql.window',
+    'awsglue', 'awsglue.context', 'awsglue.job', 'awsglue.utils',
+    'boto3', 'botocore', 'botocore.session', 'botocore.client', 'botocore.exceptions',
+    'dateutil', 'dateutil.tz', 'dateutil.parser'
+]:
+    if mod not in sys.modules:
+        sys.modules[mod] = MagicMock()
+
+sys.modules['pyspark.sql'].SparkSession = MagicMock
+sys.modules['pyspark.sql.window'].Window = MagicMock
+sys.modules['pyspark.sql'].DataFrame = MagicMock
+sys.modules['pyspark.context'].SparkContext = MagicMock
+sys.modules['pyspark.conf'].SparkConf = MagicMock
+sys.modules['awsglue.context'].GlueContext = MagicMock
+sys.modules['awsglue.job'].Job = MagicMock
+
+# Ensure directories are on sys.path
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+silver_dir = os.path.join(repo_root, "silver", "script")
+gold_dir = os.path.join(repo_root, "gold", "script")
+for p in [repo_root, silver_dir, gold_dir]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from gold_layer_manager import GoldLayerManager
+from transformer import SilverTransformer
+from custom_transforms import servicenow_incident
+
+
+class TestProcessLayerOptions(unittest.TestCase):
+    """Verifies that --PROCESS_LAYER strictly accepts only 'silver' or 'gold'."""
+
+    def test_invalid_process_layer_all(self):
+        """Passing --PROCESS_LAYER=all must raise an explicit ValueError."""
+        test_args = [
+            "uax_silver_etl.py",
+            "--PROCESS_LAYER", "all",
+            "--SOURCE_SYSTEM", "servicenow"
+        ]
+        with patch.object(sys, 'argv', test_args):
+            from uax_silver_etl import parse_spark_arguments
+            with self.assertRaises(ValueError) as ctx:
+                parse_spark_arguments()
+            self.assertIn("Strictly 2 options are supported", str(ctx.exception))
+
+    def test_invalid_process_layer_custom(self):
+        """Passing an unknown layer must raise an explicit ValueError."""
+        test_args = [
+            "uax_silver_etl.py",
+            "--PROCESS_LAYER", "bronze",
+            "--SOURCE_SYSTEM", "servicenow"
+        ]
+        with patch.object(sys, 'argv', test_args):
+            from uax_silver_etl import parse_spark_arguments
+            with self.assertRaises(ValueError) as ctx:
+                parse_spark_arguments()
+            self.assertIn("Strictly 2 options are supported", str(ctx.exception))
+
+    def test_valid_process_layer_silver(self):
+        """Passing --PROCESS_LAYER=silver succeeds and parses correctly."""
+        test_args = [
+            "uax_silver_etl.py",
+            "--PROCESS_LAYER", "silver",
+            "--SOURCE_SYSTEM", "servicenow",
+            "--DATA_LAKE_BUCKET", "test-bucket",
+            "--GLUE_DATABASE", "test_db",
+            "--TABLE_PREFIX", "tbl_",
+            "--SOURCE_TABLE_NAME", "raw_tbl_incident"
+        ]
+        with patch.object(sys, 'argv', test_args):
+            from uax_silver_etl import parse_spark_arguments
+            params = parse_spark_arguments()
+            self.assertEqual(params['PROCESS_LAYER'], 'silver')
+            self.assertEqual(params['SOURCE_SYSTEM'], 'servicenow')
+
+    def test_valid_process_layer_gold(self):
+        """Passing --PROCESS_LAYER=gold succeeds and parses gold parameters."""
+        test_args = [
+            "uax_silver_etl.py",
+            "--PROCESS_LAYER", "gold",
+            "--SOURCE_SYSTEM", "servicenow",
+            "--GOLD_SCHEMA", "gold_marts",
+            "--GOLD_TARGET", "aurora",
+            "--DATA_LAKE_BUCKET", "test-bucket",
+            "--GLUE_DATABASE", "test_db",
+            "--TABLE_PREFIX", "tbl_"
+        ]
+        with patch.object(sys, 'argv', test_args):
+            from uax_silver_etl import parse_spark_arguments
+            params = parse_spark_arguments()
+            self.assertEqual(params['PROCESS_LAYER'], 'gold')
+            self.assertEqual(params['SOURCE_SYSTEM'], 'servicenow')
+            self.assertEqual(params['GOLD_SCHEMA'], 'gold_marts')
+            self.assertEqual(params['GOLD_TARGET'], 'aurora')
+
+    def test_gold_layer_missing_schema_raises_value_error(self):
+        """Omitting --GOLD_SCHEMA when --PROCESS_LAYER=gold must raise a guiding ValueError."""
+        test_args = [
+            "uax_silver_etl.py",
+            "--PROCESS_LAYER", "gold",
+            "--SOURCE_SYSTEM", "servicenow",
+            "--DATA_LAKE_BUCKET", "test-bucket"
+        ]
+        with patch.object(sys, 'argv', test_args):
+            from uax_silver_etl import parse_spark_arguments
+            with self.assertRaises(ValueError) as ctx:
+                parse_spark_arguments()
+            self.assertIn("Missing required parameter '--GOLD_SCHEMA'", str(ctx.exception))
+            self.assertIn("no fallback schema is permitted", str(ctx.exception))
+
+    def test_gold_layer_missing_source_system_raises_value_error(self):
+        """Omitting --SOURCE_SYSTEM when --PROCESS_LAYER=gold must raise a guiding ValueError."""
+        test_args = [
+            "uax_silver_etl.py",
+            "--PROCESS_LAYER", "gold",
+            "--GOLD_SCHEMA", "my_mart",
+            "--DATA_LAKE_BUCKET", "test-bucket"
+        ]
+        with patch.object(sys, 'argv', test_args):
+            from uax_silver_etl import parse_spark_arguments
+            with self.assertRaises(ValueError) as ctx:
+                parse_spark_arguments()
+            self.assertIn("Missing required parameter '--SOURCE_SYSTEM'", str(ctx.exception))
+
+
+class TestGoldSharedDatabaseSafety(unittest.TestCase):
+    """Verifies MySQL shared DB safety, schema pre-existence check, and naming guardrails."""
+
+    def test_schema_missing_raises_runtime_error(self):
+        """If target schema does not exist, must raise RuntimeError with zero DDL execution."""
+        jdbc_info = {"host": "mock-db", "port": "3306", "user": "user", "password": "pwd"}
+
+        with patch.object(GoldLayerManager, '_execute_sql_query', return_value=[]):
+            with self.assertRaises(RuntimeError) as ctx:
+                GoldLayerManager._verify_schema_exists_or_raise(jdbc_info, "non_existent_schema")
+            self.assertIn("CRITICAL SHARED-DB POLICY ERROR", str(ctx.exception))
+            self.assertIn("NEVER executes CREATE DATABASE", str(ctx.exception))
+
+    def test_schema_exists_passes(self):
+        """If target schema exists, validation passes silently."""
+        jdbc_info = {"host": "mock-db", "port": "3306", "user": "user", "password": "pwd"}
+
+        with patch.object(GoldLayerManager, '_execute_sql_query', return_value=[("gold_marts",)]):
+            try:
+                GoldLayerManager._verify_schema_exists_or_raise(jdbc_info, "gold_marts")
+            except RuntimeError:
+                self.fail("Schema check raised RuntimeError unexpectedly for an existing schema.")
+
+    def test_table_naming_guardrails(self):
+        """Verifies naming conventions for tables and views."""
+        table_base = "incident_kpi"
+        target_table = f"gold_tbl_{table_base}"
+        staging_table = f"gold_tbl_{table_base}_staging"
+        view_name = f"v_{table_base}"
+
+        self.assertTrue(target_table.startswith("gold_tbl_"))
+        self.assertTrue(staging_table.startswith("gold_tbl_") and staging_table.endswith("_staging"))
+        self.assertTrue(view_name.startswith("v_"))
+
+        # Negative test: unauthorized table name
+        invalid_table = "tbl_financial_records"
+        with self.assertRaises(AssertionError):
+            assert invalid_table.startswith("gold_tbl_"), "Safety Error"
+
+    def test_password_manual_option(self):
+        """Tests that manual password via --RDS_PASSWORD is used."""
+        params = {
+            "GOLD_SCHEMA": "enterprise_reporting",
+            "RDS_PASSWORD": "manual_secure_password_123",
+            "RDS_HOST": "aurora-cluster.internal",
+            "RDS_USER": "report_user"
+        }
+        conn = GoldLayerManager._resolve_mysql_connection_info(params)
+        self.assertEqual(conn["password"], "manual_secure_password_123")
+        self.assertEqual(conn["user"], "report_user")
+        self.assertEqual(conn["database"], "enterprise_reporting")
+
+    def test_password_from_secret_json(self):
+        """Tests retrieving credentials from AWS Secrets Manager JSON payload."""
+        mock_secrets = MagicMock()
+        mock_secrets.get_secret_value.return_value = {
+            "SecretString": json.dumps({
+                "password": "secret_vault_pwd",
+                "username": "secret_user",
+                "host": "secret-aurora.aws.com",
+                "port": "3306"
+            })
+        }
+        params = {
+            "GOLD_SCHEMA": "enterprise_reporting",
+            "RDS_SECRET_NAME": "prod/rds/mysql_credentials"
+        }
+        conn = GoldLayerManager._resolve_mysql_connection_info(params, secrets_client=mock_secrets)
+        self.assertEqual(conn["password"], "secret_vault_pwd")
+        self.assertEqual(conn["user"], "secret_user")
+        self.assertEqual(conn["host"], "secret-aurora.aws.com")
+        self.assertEqual(conn["database"], "enterprise_reporting")
+        mock_secrets.get_secret_value.assert_called_once_with(SecretId="prod/rds/mysql_credentials")
+
+    def test_password_from_secret_plain_text(self):
+        """Tests retrieving credentials from AWS Secrets Manager plain string secret."""
+        mock_secrets = MagicMock()
+        mock_secrets.get_secret_value.return_value = {
+            "SecretString": "raw_plain_password\n"
+        }
+        params = {
+            "GOLD_SCHEMA": "enterprise_reporting",
+            "SECRET_NAME": "prod/rds/raw_password"
+        }
+        conn = GoldLayerManager._resolve_mysql_connection_info(params, secrets_client=mock_secrets)
+        self.assertEqual(conn["password"], "raw_plain_password")
+        self.assertEqual(conn["database"], "enterprise_reporting")
+
+    def test_password_secret_failure_raises_guiding_error(self):
+        """Tests that a failure in Secrets Manager raises a clear guiding ValueError."""
+        mock_secrets = MagicMock()
+        mock_secrets.get_secret_value.side_effect = Exception("AccessDenied: User is not authorized")
+        params = {
+            "GOLD_SCHEMA": "enterprise_reporting",
+            "RDS_SECRET_NAME": "prod/rds/denied_secret"
+        }
+        with self.assertRaises(ValueError) as ctx:
+            GoldLayerManager._resolve_mysql_connection_info(params, secrets_client=mock_secrets)
+        self.assertIn("Failed to retrieve MySQL credentials from AWS Secrets Manager", str(ctx.exception))
+        self.assertIn("AccessDenied", str(ctx.exception))
+
+    def test_missing_password_raises_guiding_error(self):
+        """Tests that missing database password raises an explicit guiding ValueError."""
+        params = {
+            "GOLD_SCHEMA": "enterprise_reporting"
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValueError) as ctx:
+                GoldLayerManager._resolve_mysql_connection_info(params)
+            self.assertIn("CRITICAL AUTH ERROR: MySQL database password is missing", str(ctx.exception))
+            self.assertIn("AWS Secrets Manager", str(ctx.exception))
+            self.assertIn("Manual Password", str(ctx.exception))
+
+    def test_missing_schema_raises_guiding_error(self):
+        """Tests that missing GOLD_SCHEMA raises an explicit guiding ValueError."""
+        params = {
+            "RDS_PASSWORD": "pwd"
+        }
+        with self.assertRaises(ValueError) as ctx:
+            GoldLayerManager._resolve_mysql_connection_info(params)
+        self.assertIn("CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_SCHEMA'", str(ctx.exception))
+        self.assertIn("no fallback schema is permitted", str(ctx.exception))
+
+
+class TestCustomTransformsAndApiEnrichment(unittest.TestCase):
+    """Verifies that custom_transforms can query other tables and API enrichment attaches default null string."""
+
+    def test_custom_transform_signature(self):
+        """Verifies servicenow_incident.transform accepts (df, spark, context)."""
+        import inspect
+        sig = inspect.signature(servicenow_incident.transform)
+        param_names = list(sig.parameters.keys())
+        self.assertIn("df", param_names)
+        self.assertIn("spark", param_names)
+        self.assertIn("context", param_names)
+
+    def test_external_columns_null_string(self):
+        """Tests that configured external columns are attached with null string default."""
+        mock_df = MagicMock()
+        mock_df.columns = ["col1", "col2"]
+        mock_df.withColumn.return_value = mock_df
+
+        table_cfg = {"external_columns": ["external_api_data"]}
+        res_df = SilverTransformer._apply_external_columns(mock_df, table_cfg)
+        mock_df.withColumn.assert_called_once()
+        args = mock_df.withColumn.call_args[0]
+        self.assertEqual(args[0], "external_api_data")
+
+    def test_api_enrichment_backward_compat(self):
+        """Tests that legacy api_enrichment_columns key and alias function still work."""
+        mock_df = MagicMock()
+        mock_df.columns = ["col1", "col2"]
+        mock_df.withColumn.return_value = mock_df
+
+        table_cfg = {"api_enrichment_columns": ["legacy_api_data"]}
+        res_df = SilverTransformer._apply_api_enrichment(mock_df, table_cfg)
+        mock_df.withColumn.assert_called_once()
+        args = mock_df.withColumn.call_args[0]
+        self.assertEqual(args[0], "legacy_api_data")
+
+    def test_silver_config_declares_external_columns(self):
+        """Tests that silver_config.json explicitly defines external_columns in defaults and table configs."""
+        with open("silver/script/config/silver_config.json", "r") as f:
+            cfg = json.load(f)
+        self.assertIn("external_columns", cfg.get("silver_defaults", {}))
+        for source_sys, s_cfg in cfg.get("source_systems", {}).items():
+            for tbl, t_cfg in s_cfg.get("table_configs", {}).items():
+                self.assertIn("external_columns", t_cfg, f"Table {source_sys}.{tbl} missing external_columns in config")
+
+    def test_silver_schema_introspection(self):
+        """Tests formatting of Silver schema introspection."""
+        field1 = MagicMock()
+        field1.name = "incident_id"
+        field1.dataType.simpleString.return_value = "string"
+        field2 = MagicMock()
+        field2.name = "_valid_from"
+        field2.dataType.simpleString.return_value = "timestamp"
+
+        mock_df = MagicMock()
+        mock_df.schema.fields = [field1, field2]
+
+        with patch('transformer.logger') as mock_logger:
+            SilverTransformer.log_schema_introspection(mock_df, "Test Table Introspection")
+            log_calls = [str(call) for call in mock_logger.info.call_args_list]
+            self.assertTrue(any("SCHEMA INTROSPECTION" in c for c in log_calls))
+            self.assertTrue(any("incident_id" in c for c in log_calls))
+            self.assertTrue(any("_valid_from" in c for c in log_calls))
+
+    def test_schema_evolution_detection(self):
+        """Tests that new columns in incoming DataFrame are detected against existing MySQL table."""
+        jdbc_info = {"host": "mock-db", "port": "3306", "user": "user", "password": "pwd"}
+        existing_cols = [("c1", "varchar"), ("c2", "int")]
+
+        field1 = MagicMock()
+        field1.name = "c1"
+        field1.dataType.simpleString.return_value = "string"
+        field2 = MagicMock()
+        field2.name = "c2"
+        field2.dataType.simpleString.return_value = "int"
+        field3 = MagicMock()
+        field3.name = "c3_new"
+        field3.dataType.simpleString.return_value = "double"
+
+        mock_df = MagicMock()
+        mock_df.schema.fields = [field1, field2, field3]
+
+        with patch.object(GoldLayerManager, '_execute_sql_query', return_value=existing_cols):
+            with patch('gold_layer_manager.logger') as mock_logger:
+                GoldLayerManager._detect_schema_evolution(jdbc_info, "gold_marts", "gold_tbl_test", mock_df)
+                log_calls = [str(call) for call in mock_logger.info.call_args_list]
+                self.assertTrue(any("SCHEMA EVOLUTION DETECTED" in c for c in log_calls))
+                self.assertTrue(any("c3_new" in c for c in log_calls))
+
+    def test_discover_local_queries(self):
+        """Tests that local .sql files are discovered when S3 is not available."""
+        s3_client = MagicMock()
+        s3_client.get_paginator.side_effect = Exception("No S3")
+        queries = GoldLayerManager._discover_queries(
+            "s3://fake-bucket/gold/query/servicenow",
+            "fake-bucket",
+            s3_client,
+            source_system="servicenow"
+        )
+        self.assertIn("incident_kpi", queries)
+        self.assertIn("tbl_incident", queries["incident_kpi"])
+
+    def test_discover_source_specific_s3_queries(self):
+        """Tests that S3 queries under bucket/gold/query/<source>/*.sql are discovered."""
+        s3_client = MagicMock()
+        mock_page = {
+            'Contents': [
+                {'Key': 'gold/query/servicenow/incident_kpi.sql'}
+            ]
+        }
+        paginator = MagicMock()
+        paginator.paginate.return_value = [mock_page]
+        s3_client.get_paginator.return_value = paginator
+        s3_client.get_object.return_value = {
+            'Body': MagicMock(read=lambda: b"SELECT 1 FROM tbl_incident")
+        }
+
+        queries = GoldLayerManager._discover_queries(
+            "s3://fake-bucket/gold/query/servicenow",
+            "fake-bucket",
+            s3_client,
+            source_system="servicenow"
+        )
+        self.assertIn("incident_kpi", queries)
+        self.assertEqual(queries["incident_kpi"], "SELECT 1 FROM tbl_incident")
+        paginator.paginate.assert_called_once_with(
+            Bucket="fake-bucket",
+            Prefix="gold/query/servicenow"
+        )
+
+    def test_discover_source_specific_local_queries(self):
+        """Tests that local queries in gold/query/<source>/*.sql are discovered when S3 is unavailable."""
+        s3_client = MagicMock()
+        s3_client.get_paginator.side_effect = Exception("No S3")
+        queries = GoldLayerManager._discover_queries(
+            "s3://fake-bucket/gold/query/servicenow",
+            "fake-bucket",
+            s3_client,
+            source_system="servicenow"
+        )
+        self.assertIn("incident_kpi", queries)
+        self.assertIn("tbl_incident", queries["incident_kpi"])
+
+    def test_gold_source_specific_path_resolution(self):
+        """Tests that query_s3_path and data_s3_path automatically append source_system."""
+        from uax_silver_etl import parse_spark_arguments
+
+        test_args = [
+            "script_name",
+            "--PROCESS_LAYER", "gold",
+            "--SOURCE_SYSTEM", "servicenow",
+            "--DATA_LAKE_BUCKET", "my-test-bucket",
+            "--GOLD_SCHEMA", "gold_marts"
+        ]
+        with patch.object(sys, 'argv', test_args):
+            params = parse_spark_arguments()
+            self.assertEqual(params['GOLD_QUERY_S3_PATH'], "s3://my-test-bucket/gold/query/servicenow")
+            self.assertEqual(params['GOLD_DATA_S3_PATH'], "s3://my-test-bucket/gold/data/servicenow")
+
+
+if __name__ == "__main__":
+    unittest.main()

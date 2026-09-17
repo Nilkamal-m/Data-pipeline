@@ -123,6 +123,26 @@ class SilverConfigLoader:
         return combined
 
     @classmethod
+    def get_external_columns(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> list:
+        """
+        Retrieves list of external columns configured for Silver table.
+        Combines silver_defaults.external_columns with table_configs.<table_name>.external_columns.
+        """
+        config = config_dict or cls._config_cache or cls.load_config()
+        defaults = config.get("silver_defaults", {})
+        default_ext = defaults.get("external_columns") or defaults.get("api_enrichment_columns") or defaults.get("api_columns") or []
+        if isinstance(default_ext, str):
+            default_ext = [c.strip() for c in default_ext.split(',') if c.strip()]
+
+        table_cfg = cls.get_table_config(source_system, table_name, config)
+        table_ext = table_cfg.get("external_columns") or table_cfg.get("api_enrichment_columns") or table_cfg.get("api_columns") or []
+        if isinstance(table_ext, str):
+            table_ext = [c.strip() for c in table_ext.split(',') if c.strip()]
+
+        combined = list(dict.fromkeys(default_ext + table_ext))
+        return combined
+
+    @classmethod
     def get_technical_columns(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Retrieves technical columns configuration from silver_defaults.

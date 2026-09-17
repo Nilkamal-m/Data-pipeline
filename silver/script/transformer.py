@@ -13,6 +13,7 @@ Applies declarative transformations configured in silver_config.json:
 import os
 import sys
 import logging
+import inspect
 import importlib.util
 from typing import Dict, Any, Optional
 from pyspark.sql import DataFrame
@@ -24,11 +25,48 @@ logger = logging.getLogger(__name__)
 class SilverTransformer:
     """
     Applies declarative transformations, technical audit columns (_valid_from, _valid_to, _is_current,
-    _is_deleted, _inserted_at, _updated_at), and custom Python transformation files to Silver DataFrames.
+    _is_deleted, _inserted_at, _updated_at), API enrichment hooks, and custom Python transformation
+    files to Silver DataFrames.
     Guarantees:
     1. Bronze layer system metadata columns are stripped and never passed into Silver tables.
-    2. All Silver system-generated audit columns are appended at the very end of the tables.
+    2. Comprehensive column schema introspection is logged before and after transformations.
+    3. Custom transformation scripts receive the active SparkSession and runtime execution context to query other tables.
+    4. Extensible API enrichment hook attaches configured columns with a NULL string default value.
+    5. All Silver system-generated audit columns are appended at the very end of the tables.
     """
+
+    @classmethod
+    def log_schema_introspection(cls, df: DataFrame, title: str) -> None:
+        """
+        Logs a clean, structured schema breakdown of all columns and data types in the DataFrame.
+        Enables developers to quickly audit column presence, data types, and debug schema issues.
+        """
+        fields = df.schema.fields
+        tech_cols = {'_valid_from', '_valid_to', '_is_current', '_is_deleted', '_inserted_at', '_updated_at'}
+        payload_fields = [f for f in fields if f.name not in tech_cols]
+        audit_fields = [f for f in fields if f.name in tech_cols]
+
+        lines = [
+            "+--------------------------------------------------------------------------------+",
+            f"| [SCHEMA INTROSPECTION] {title[:66]}",
+            "+--------------------------------------------------------------------------------+",
+            f"| Total Column Count: {len(fields)} (Payload: {len(payload_fields)}, System Audit: {len(audit_fields)})",
+            "|"
+        ]
+
+        if payload_fields:
+            lines.append(f"| Business / Payload Columns ({len(payload_fields)}):")
+            for f in payload_fields:
+                lines.append(f"|   |-- {f.name:<32} : {f.dataType.simpleString()}")
+
+        if audit_fields:
+            lines.append("|")
+            lines.append(f"| Silver Technical Audit Columns ({len(audit_fields)} - Placed Last):")
+            for f in audit_fields:
+                lines.append(f"|   |-- {f.name:<32} : {f.dataType.simpleString()}")
+
+        lines.append("+--------------------------------------------------------------------------------+")
+        logger.info("\n".join(lines))
 
     @classmethod
     def apply_transformations(
@@ -39,54 +77,58 @@ class SilverTransformer:
         table_cfg: Dict[str, Any],
         order_col_name: Optional[str] = None,
         nkeys: Optional[Any] = None,
-        spark=None
+        spark=None,
+        context: Optional[Dict[str, Any]] = None
     ) -> DataFrame:
         """
-        Executes all configured declarative and custom file transformations for a table.
+        Executes all configured declarative, API enrichment, and custom file transformations for a table.
         Strips Bronze system columns and enriches DataFrame with Silver technical audit columns.
         """
         logger.info(f"Applying transformations for '{source_system}.{table_name}'...")
 
-        # 1. Resolve primary ordering column if not explicitly supplied
+        # 1. Log incoming schema introspection
+        cls.log_schema_introspection(df, f"Incoming Schema: '{source_system}.{table_name}'")
+
+        # 2. Resolve primary ordering column if not explicitly supplied
         if not order_col_name:
             cfg_order = table_cfg.get('deduplication_order_by') or table_cfg.get('order_by')
             if cfg_order:
                 order_col_name = cfg_order[0] if isinstance(cfg_order, list) else cfg_order
 
-        # 2. Strip Bronze system-generated columns so they NEVER pass into Silver
+        # 3. Strip Bronze system-generated columns so they NEVER pass into Silver
         bronze_system_cols = {'_ingested_at', '_source_system', '_table_name', '_execution_id', '_batch_id', '_raw_payload'}
         bronze_drops = [c for c in df.columns if c in bronze_system_cols]
         if bronze_drops:
             logger.info(f"Removing Bronze system metadata columns from Silver processing: {bronze_drops}")
             df = df.drop(*bronze_drops)
 
-        # 3. Apply Filter Expression if specified
+        # 4. Apply Filter Expression if specified
         filter_expr = table_cfg.get('filter_expression')
         if filter_expr and isinstance(filter_expr, str) and filter_expr.strip():
             logger.info(f"Applying filter expression: '{filter_expr}'")
             df = df.filter(expr(filter_expr))
 
-        # 4. Apply Column Casts
+        # 5. Apply Column Casts
         column_casts = table_cfg.get('column_casts', {})
         for column_name, target_type in column_casts.items():
             if column_name in df.columns:
                 logger.info(f"Casting column '{column_name}' -> '{target_type}'")
                 df = df.withColumn(column_name, col(column_name).cast(target_type))
 
-        # 5. Apply Custom SQL Expressions
+        # 6. Apply Custom SQL Expressions
         custom_expressions = table_cfg.get('custom_expressions', {})
         for new_col, sql_expr in custom_expressions.items():
             logger.info(f"Adding derived column '{new_col}' = expr('{sql_expr}')")
             df = df.withColumn(new_col, expr(sql_expr))
 
-        # 6. Apply Column Renames
+        # 7. Apply Column Renames
         column_renames = table_cfg.get('column_renames', {})
         for old_name, new_name in column_renames.items():
             if old_name in df.columns:
                 logger.info(f"Renaming column '{old_name}' -> '{new_name}'")
                 df = df.withColumnRenamed(old_name, new_name)
 
-        # 7. Exclude Columns if configured in silver_config.json (protecting key columns and technical audit columns)
+        # 8. Exclude Columns if configured in silver_config.json (protecting key columns and technical audit columns)
         exclude_cfg = table_cfg.get('exclude_columns') or table_cfg.get('drop_columns') or []
         if isinstance(exclude_cfg, str):
             exclude_cfg = [c.strip() for c in exclude_cfg.split(',') if c.strip()]
@@ -115,16 +157,51 @@ class SilverTransformer:
                 f"These columns are required for natural key identification and deduplication."
             )
 
-        # 8. Apply Custom External Transformation File if configured
+        # 9. Apply Custom External Transformation File if configured (can query other tables via spark & context)
         custom_script_path = table_cfg.get('custom_transform_script') or table_cfg.get('custom_transform_file')
         if custom_script_path:
-            df = cls._apply_custom_script(df, custom_script_path, spark)
+            df = cls._apply_custom_script(df, custom_script_path, spark=spark, context=context)
 
-        # 9. Enrich Technical Audit Columns & Place them at the very end
+        # 10. Apply Extensible External Columns Hook (initializes configured external_columns to NULL string default)
+        df = cls._apply_external_columns(df, table_cfg)
+
+        # 11. Enrich Technical Audit Columns & Place them at the very end
         high_date_val = table_cfg.get('high_date_value', '9999-01-01 00:00:00')
         df = cls._enrich_technical_columns(df, order_col_name=order_col_name, high_date_val=high_date_val)
 
+        # 12. Log final transformed schema introspection
+        cls.log_schema_introspection(df, f"Final Transformed Silver Schema: '{source_system}.{table_name}'")
+
         return df
+
+    @classmethod
+    def _apply_external_columns(cls, df: DataFrame, table_cfg: Dict[str, Any]) -> DataFrame:
+        """
+        Extensible hook for external columns / external API enrichment.
+        Attaches configured external columns initialized with a NULL string default value (lit(None).cast("string")).
+        Future development teams can leverage this hook or a custom transform script to call an external API
+        passing designated source columns and populating the returned values into these external columns.
+        """
+        external_cols = (
+            table_cfg.get('external_columns')
+            or table_cfg.get('api_enrichment_columns')
+            or table_cfg.get('api_columns')
+            or []
+        )
+        if isinstance(external_cols, str):
+            external_cols = [c.strip() for c in external_cols.split(',') if c.strip()]
+
+        if external_cols:
+            for col_name in external_cols:
+                if col_name not in df.columns:
+                    logger.info(f"[EXTERNAL COLUMNS] Attaching external column '{col_name}' initialized to NULL string default.")
+                    df = df.withColumn(col_name, lit(None).cast("string"))
+                else:
+                    logger.info(f"[EXTERNAL COLUMNS] External column '{col_name}' already present in DataFrame.")
+        return df
+
+    # Backward compatibility alias
+    _apply_api_enrichment = _apply_external_columns
 
     @classmethod
     def _enrich_technical_columns(
@@ -208,12 +285,22 @@ class SilverTransformer:
         return df
 
     @classmethod
-    def _apply_custom_script(cls, df: DataFrame, script_path: str, spark=None) -> DataFrame:
+    def _apply_custom_script(
+        cls,
+        df: DataFrame,
+        script_path: str,
+        spark=None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> DataFrame:
         """
-        Dynamically loads and calls the transform(df, spark) function from a custom Python file.
+        Dynamically loads and calls the transform function from a custom Python file.
+        Supports flexible function signatures:
+        - transform(df, spark, context): full access to active SparkSession and metadata (e.g. glue_database) to query other tables
+        - transform(df, spark): standard transformation with SparkSession
+        - transform(df): simple DataFrame transform
         """
         logger.info(f"Loading custom transform script: '{script_path}'...")
-        
+
         # Resolve absolute path
         abs_script_path = script_path
         if not os.path.isabs(script_path):
@@ -231,13 +318,31 @@ class SilverTransformer:
             spec.loader.exec_module(custom_module)
 
             if hasattr(custom_module, 'transform'):
-                logger.info(f"Invoking custom transform() function in '{script_path}'...")
-                df = custom_module.transform(df, spark)
+                transform_func = getattr(custom_module, 'transform')
+                sig = inspect.signature(transform_func)
+                param_names = list(sig.parameters.keys())
+                num_params = len(param_names)
+
+                logger.info(
+                    f"[CUSTOM TRANSFORM] Invoking transform() in '{script_path}' "
+                    f"with signature ({', '.join(param_names)})..."
+                )
+
+                if "context" in param_names:
+                    df = transform_func(df, spark=spark, context=context)
+                elif num_params >= 3:
+                    df = transform_func(df, spark, context)
+                elif num_params == 2:
+                    df = transform_func(df, spark)
+                else:
+                    df = transform_func(df)
+
+                logger.info(f"[CUSTOM TRANSFORM] Completed transform() execution from '{script_path}'.")
             else:
-                logger.warning(f"Custom script '{script_path}' does not define a 'transform(df, spark)' function.")
+                logger.warning(f"Custom script '{script_path}' does not define a 'transform()' function.")
 
         except Exception as err:
-            logger.error(f"Error executing custom transform script '{script_path}': {err}")
+            logger.error(f"Error executing custom transform script '{script_path}': {err}", exc_info=True)
             raise
 
         return df
