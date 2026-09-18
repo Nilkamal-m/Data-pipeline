@@ -621,13 +621,16 @@ def update_last_load_date(
     state_key: str,
     source_system: str,
     table_name: str,
-    current_run_time: str,
+    execution_start_time: str,
     total_records: int,
     table_prefix: str
 ) -> None:
     """
     Writes/Updates the High-Water Mark JSON metadata file for a specific table in S3.
     Formats table_name with the centralized table_prefix (e.g. raw_tbl_incident).
+    Crucial: 'last_load_date' is recorded as the execution START timestamp (not completion time)
+    to guarantee zero data gaps between the extraction window and subsequent runs.
+    'updated_at' records the completion timestamp when this state file was updated in S3.
     """
     if not table_prefix or not str(table_prefix).strip():
         raise ValueError(
@@ -638,13 +641,14 @@ def update_last_load_date(
     prefix = str(table_prefix).strip()
     clean_table = table_name.strip().replace('-', '_')
     formatted_table_name = clean_table if clean_table.startswith(prefix) else f"{prefix}{clean_table}"
+    updated_at_now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     state_payload = {
         "source_system": source_system,
         "table_name": formatted_table_name,
-        "last_load_date": current_run_time,
+        "last_load_date": execution_start_time,
         "last_status": "SUCCESS",
         "records_ingested": total_records,
-        "updated_at": current_run_time
+        "updated_at": updated_at_now
     }
     
     try:
@@ -655,7 +659,7 @@ def update_last_load_date(
             Body=json.dumps(state_payload, indent=2).encode('utf-8'),
             ContentType="application/json"
         )
-        logger.info(f"Successfully updated S3 state file at '{s3_path}'")
+        logger.info(f"Successfully updated S3 state file at '{s3_path}' (last_load_date={execution_start_time}, updated_at={updated_at_now})")
     except ClientError as err:
         logger.error(f"Failed to update S3 state file at '{s3_path}': {err}")
         raise
@@ -1156,12 +1160,13 @@ def main():
         clean_table_name = api_table_name.replace('-', '_')
 
         table_start_time = datetime.now(timezone.utc)
+        table_start_time_str = table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
         table_header = (
-            f"[TABLE START] {api_table_name} -> {glue_table_prefix}{clean_table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {current_run_time}\n"
+            f"[TABLE START] {api_table_name} -> {glue_table_prefix}{clean_table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {table_start_time_str}\n"
             "+--------------------------------------------------------------------------------+\n"
             f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {api_table_name.upper()} (Lake Table: {glue_table_prefix}{clean_table_name})\n"
             f"|     Execution ID       : {execution_id}\n"
-            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"|     Table Start (UTC)  : {table_start_time_str}\n"
             "+--------------------------------------------------------------------------------+"
         )
         logger.info(table_header)
@@ -1186,7 +1191,7 @@ def main():
                 "status": "FAILED",
                 "date_range": {
                     "start_date": None,
-                    "end_date": current_run_time
+                    "end_date": table_start_time_str
                 },
                 "records_fetched": 0,
                 "chunks_written": 0,
@@ -1292,9 +1297,17 @@ def main():
                 logger.info(f"Table '{clean_table_name}' extraction completed cleanly with 0 new records since {last_load_date}.")
                 cleanup_failed_staging(bronze_bucket, staging_prefix)
 
-            # Create or update High-Water Mark watermark state file in S3 with current execution timestamp
-            update_last_load_date(state_bucket, state_key, source_system, clean_table_name, current_run_time, total_table_records, table_prefix=glue_table_prefix)
-            logger.info(f"Table '{clean_table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with timestamp {current_run_time}.")
+            # Create or update High-Water Mark watermark state file in S3 with execution start timestamp (guarantees zero data gaps)
+            update_last_load_date(
+                state_bucket=state_bucket,
+                state_key=state_key,
+                source_system=source_system,
+                table_name=clean_table_name,
+                execution_start_time=table_start_time_str,
+                total_records=total_table_records,
+                table_prefix=glue_table_prefix
+            )
+            logger.info(f"Table '{clean_table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with execution start timestamp {table_start_time_str}.")
 
             # Ensure Athena-queryable Watermark Catalog Table is synced
             if glue_catalog_enabled and sync_watermark_table:
@@ -1311,7 +1324,7 @@ def main():
                 "status": "SUCCESS",
                 "date_range": {
                     "start_date": last_load_date,
-                    "end_date": current_run_time
+                    "end_date": table_start_time_str
                 },
                 "records_fetched": total_table_records,
                 "chunks_written": parts_written,
@@ -1324,7 +1337,7 @@ def main():
             table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             catalog_table_display = f"{glue_database_name}.{glue_table_prefix}{clean_table_name}" if glue_catalog_enabled else "N/A"
             summary_card = (
-                f"[TABLE SUMMARY] {clean_table_name} | SUCCESS | Records: {total_table_records:,} | Chunks: {parts_written} | Duration: {duration_sec:.2f}s | Range: {last_load_date} -> {current_run_time}\n"
+                f"[TABLE SUMMARY] {clean_table_name} | SUCCESS | Records: {total_table_records:,} | Chunks: {parts_written} | Duration: {duration_sec:.2f}s | Range: {last_load_date} -> {table_start_time_str}\n"
                 "+================================================================================+\n"
                 f"|  TABLE EXTRACTION COMPLETED: {clean_table_name} [SUCCESS]\n"
                 "+--------------------------------------------------------------------------------+\n"
@@ -1332,11 +1345,11 @@ def main():
                 f"|  * Lake Table Name  : {clean_table_name}\n"
                 f"|  * API Entity Name  : {api_table_name}\n"
                 f"|  * Status           : SUCCESS\n"
-                f"|  * Extraction Range : {last_load_date}  -->  {current_run_time}\n"
+                f"|  * Extraction Range : {last_load_date}  -->  {table_start_time_str}\n"
                 f"|  * Records Ingested : {total_table_records:,}\n"
                 f"|  * Chunks Written   : {parts_written}\n"
                 f"|  * Table Duration   : {duration_sec:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"|  * Start Time (UTC) : {table_start_time_str}\n"
                 f"|  * End Time (UTC)   : {table_end_time_str}\n"
                 f"|  * Catalog Table    : {catalog_table_display}\n"
                 f"|  * Watermark S3 Key : {state_key}\n"
@@ -1368,7 +1381,7 @@ def main():
                 "status": "FAILED",
                 "date_range": {
                     "start_date": last_load_date if 'last_load_date' in locals() else None,
-                    "end_date": current_run_time
+                    "end_date": table_start_time_str
                 },
                 "records_fetched": 0,
                 "chunks_written": parts_written,
@@ -1387,10 +1400,10 @@ def main():
                 f"|  * Lake Table Name  : {clean_table_name}\n"
                 f"|  * API Entity Name  : {api_table_name}\n"
                 f"|  * Status           : FAILED\n"
-                f"|  * Extraction Range : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {current_run_time}\n"
+                f"|  * Extraction Range : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {table_start_time_str}\n"
                 f"|  * Error Details    : {table_err}\n"
                 f"|  * Table Duration   : {duration_sec:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"|  * Start Time (UTC) : {table_start_time_str}\n"
                 f"|  * Failed At (UTC)  : {failed_time_str}\n"
                 "+================================================================================+"
             )

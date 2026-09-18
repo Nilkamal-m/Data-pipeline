@@ -53,7 +53,7 @@ from transformer import SilverTransformer
 from silver_config_loader import SilverConfigLoader
 from custom_transforms import servicenow_incident
 from config_loader import ConfigLoader
-from uax_bronze_load import get_table_state_key
+from uax_bronze_load import get_table_state_key, update_last_load_date
 
 
 class TestProcessLayerOptions(unittest.TestCase):
@@ -669,6 +669,40 @@ class TestHyphenToUnderscoreHandling(unittest.TestCase):
         self.assertEqual(f"v_{clean_base_name}", "v_chat_sessions")
 
 
+class TestWatermarkExecutionStartTime(unittest.TestCase):
+    """
+    Validates that Bronze watermark state records 'last_load_date' as the execution START timestamp
+    rather than completion/end timestamp, preventing data gaps during long-running extractions.
+    """
+
+    @patch('uax_bronze_load.s3_client')
+    def test_update_last_load_date_records_execution_start_time(self, mock_s3):
+        execution_start = "2026-09-18T10:00:00Z"
+        update_last_load_date(
+            state_bucket="test-bucket",
+            state_key="metadata/bronze/servicenow/incident/watermark.json",
+            source_system="servicenow",
+            table_name="incident",
+            execution_start_time=execution_start,
+            total_records=150,
+            table_prefix="raw_tbl_"
+        )
+        mock_s3.put_object.assert_called_once()
+        call_kwargs = mock_s3.put_object.call_args[1]
+        payload = json.loads(call_kwargs["Body"].decode('utf-8'))
+
+        # Verify last_load_date matches execution start time exactly (prevents data gaps)
+        self.assertEqual(payload["last_load_date"], execution_start)
+        self.assertEqual(payload["table_name"], "raw_tbl_incident")
+        self.assertEqual(payload["source_system"], "servicenow")
+        self.assertEqual(payload["records_ingested"], 150)
+        self.assertEqual(payload["last_status"], "SUCCESS")
+        # updated_at records the current write timestamp
+        self.assertIn("updated_at", payload)
+        self.assertTrue(payload["updated_at"].endswith("Z"))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
