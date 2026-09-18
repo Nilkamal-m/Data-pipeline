@@ -181,6 +181,15 @@ class GoldLayerManager:
 
         logger.info(f"[GOLD STEP 2/6] Discovered {len(queries)} mart query file(s) to process: {list(queries.keys())}")
 
+        # Set Spark active database to GLUE_DATABASE so queries can use direct table names without schema prefix
+        glue_database = params.get('GLUE_DATABASE')
+        if glue_database and spark:
+            try:
+                spark.sql(f"USE `{glue_database}`")
+                logger.info(f"[GOLD PREP] Set Spark active database to '{glue_database}'. Direct table names (e.g. 'tbl_incident') are fully supported.")
+            except Exception as use_err:
+                logger.warning(f"[GOLD PREP] Could not set Spark active database to '{glue_database}': {use_err}")
+
         # Process each discovered mart query
         for table_base_name, sql_text in queries.items():
             clean_base_name = table_base_name.strip().replace('-', '_')
