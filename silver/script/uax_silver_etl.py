@@ -1168,15 +1168,16 @@ def main():
 
     for table_idx, table_name in enumerate(table_list, start=1):
         table_clean = table_name.strip().lower()
-        base_table_name = table_clean[len("raw_tbl_"):] if table_clean.startswith("raw_tbl_") else table_clean
-        bronze_table_name = table_clean if table_clean.startswith("raw_tbl_") else f"raw_tbl_{table_clean}"
+        raw_base_name = table_clean[len("raw_tbl_"):] if table_clean.startswith("raw_tbl_") else table_clean
+        base_table_name = raw_base_name.replace("-", "_")
+        bronze_table_name = f"raw_tbl_{base_table_name}"
         table_start_time = datetime.now(timezone.utc)
 
         table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
         defaults_cfg = silver_full_config.get('silver_defaults', {})
         scd2_cfg = defaults_cfg.get('scd_type2_config', {})
 
-        target_table_name = table_cfg.get('target_table_name') or f"{table_prefix}{base_table_name}"
+        target_table_name = (table_cfg.get('target_table_name') or f"{table_prefix}{base_table_name}").replace("-", "_")
         silver_table_name = f"glue_catalog.{glue_database}.{target_table_name}"
         bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
         silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{base_table_name}/"
@@ -1237,7 +1238,7 @@ def main():
                 try:
                     df_bronze = spark.read.option("mergeSchema", "true").parquet(bronze_path)
                 except Exception as read_err:
-                    alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{table_clean}/"
+                    alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
                     try:
                         df_bronze = spark.read.option("mergeSchema", "true").parquet(alt_bronze_path)
                     except Exception as final_read_err:
@@ -1263,7 +1264,7 @@ def main():
                 table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
                 table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                 table_stats.append({
-                    "table_name": table_clean,
+                    "table_name": target_table_name,
                     "status": "SKIPPED_UP_TO_DATE",
                     "scd_type": scd_type.upper(),
                     "merge_strategy": merge_strategy.upper(),

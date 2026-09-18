@@ -95,11 +95,16 @@ class ConfigLoader:
 
         # 2. Check table_initial_load_dates in bronze_config.json
         config = source_config or cls.get_source_config(source_system)
+        table_clean = table_name.strip()
         table_dates = config.get("table_initial_load_dates", {})
-        if table_clean in table_dates and table_dates[table_clean] and str(table_dates[table_clean]).strip():
-            date_val = str(table_dates[table_clean]).strip()
-            logger.info(f"Using configured initial_load_date from bronze_config.json for table '{table_clean}': {date_val}")
-            return date_val
+        matched_date = None
+        for key in [table_clean, table_clean.replace('_', '-'), table_clean.replace('-', '_')]:
+            if key in table_dates and table_dates[key] and str(table_dates[key]).strip():
+                matched_date = str(table_dates[key]).strip()
+                break
+        if matched_date:
+            logger.info(f"Using configured initial_load_date from bronze_config.json for table '{table_clean}': {matched_date}")
+            return matched_date
 
         # 3. Check global default_initial_load_date in bronze_config.json defaults
         global_default = cls.get_default_setting("default_initial_load_date", None)
@@ -149,10 +154,11 @@ class ConfigLoader:
             return final_filter
 
         table_overrides = config.get("table_query_overrides", {})
-        if table_clean in table_overrides and table_overrides[table_clean]:
-            configured_query = table_overrides[table_clean].replace("{last_load_date}", last_load_date)
-            logger.info(f"Using Configured Table Query override for table '{table_clean}': {configured_query}")
-            return configured_query
+        for key in [table_clean, table_clean.replace('_', '-'), table_clean.replace('-', '_')]:
+            if key in table_overrides and table_overrides[key]:
+                configured_query = table_overrides[key].replace("{last_load_date}", last_load_date)
+                logger.info(f"Using Configured Table Query override for table '{table_clean}': {configured_query}")
+                return configured_query
 
         default_filter = config.get("default_delta_filter", "sys_updated_on>={last_load_date}")
         final_filter = default_filter.replace("{last_load_date}", last_load_date)
@@ -173,9 +179,10 @@ class ConfigLoader:
         table_clean = table_name.strip()
 
         custom_endpoints = config.get("custom_table_endpoints", {})
-        if table_clean in custom_endpoints and custom_endpoints[table_clean]:
-            logger.info(f"Using Custom Table Endpoint for '{table_clean}': {custom_endpoints[table_clean]}")
-            return custom_endpoints[table_clean]
+        for key in [table_clean, table_clean.replace('_', '-'), table_clean.replace('-', '_')]:
+            if key in custom_endpoints and custom_endpoints[key]:
+                logger.info(f"Using Custom Table Endpoint for '{table_clean}': {custom_endpoints[key]}")
+                return custom_endpoints[key]
 
         template = config.get("api_endpoint_template", "/api/now/table/{table_name}")
         return template.format(table_name=table_clean)

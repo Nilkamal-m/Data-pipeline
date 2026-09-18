@@ -557,7 +557,8 @@ def emit_cloudwatch_metrics(
 
 def get_table_state_key(source_system: str, table_name: str) -> str:
     """Returns the S3 metadata key for a given source system and table name: metadata/bronze/<source>/<table>/watermark.json."""
-    return f"metadata/bronze/{source_system}/{table_name}/watermark.json"
+    clean_table = table_name.strip().replace('-', '_')
+    return f"metadata/bronze/{source_system}/{clean_table}/watermark.json"
 
 
 def get_last_load_date(
@@ -588,6 +589,18 @@ def get_last_load_date(
     except ClientError as err:
         error_code = err.response.get('Error', {}).get('Code')
         if error_code in ('NoSuchKey', '404'):
+            alt_name = table_name.replace('-', '_') if '-' in table_name else table_name.replace('_', '-')
+            if alt_name != table_name:
+                alt_key = f"metadata/bronze/{source_system}/{alt_name}/watermark.json"
+                try:
+                    alt_resp = s3_client.get_object(Bucket=state_bucket, Key=alt_key)
+                    alt_data = json.loads(alt_resp['Body'].read().decode('utf-8'))
+                    alt_date = alt_data.get('last_load_date')
+                    if alt_date and str(alt_date).strip():
+                        logger.info(f"HIGH-WATER MARK FOUND in alternate S3 metadata (s3://{state_bucket}/{alt_key}): '{alt_date}'.")
+                        return str(alt_date).strip()
+                except Exception:
+                    pass
             logger.info(f"Watermark state file NOT present in S3 at '{s3_path}'. Falling back to bronze_config.json 'table_initial_load_dates' for initial run...")
         else:
             logger.error(f"Error reading state file from '{s3_path}': {err}")
@@ -623,7 +636,8 @@ def update_last_load_date(
         )
     s3_path = f"s3://{state_bucket}/{state_key}"
     prefix = str(table_prefix).strip()
-    formatted_table_name = table_name if table_name.startswith(prefix) else f"{prefix}{table_name}"
+    clean_table = table_name.strip().replace('-', '_')
+    formatted_table_name = clean_table if clean_table.startswith(prefix) else f"{prefix}{clean_table}"
     state_payload = {
         "source_system": source_system,
         "table_name": formatted_table_name,
@@ -799,8 +813,9 @@ def sync_bronze_catalog_table(
     Location: s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/
     Partition: _ingested_at=<ISO_TIMESTAMP> (Single partition on _ingested_at)
     """
-    catalog_table_name = f"{table_prefix}{table_name}"
-    table_location = f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/"
+    clean_name = table_name.strip().replace('-', '_')
+    catalog_table_name = f"{table_prefix}{clean_name}"
+    table_location = f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{clean_name}/"
     
     ingested_at_str = ingested_at or partition_date.strftime('%Y-%m-%dT%H:%M:%SZ')
     partition_location = f"{table_location}_ingested_at={ingested_at_str}/"
@@ -1121,19 +1136,37 @@ def main():
     table_stats = []
 
     # Loop through each requested table dynamically
-    for table_idx, table_name in enumerate(table_list, start=1):
+    for table_idx, raw_table_name in enumerate(table_list, start=1):
+        raw_clean = raw_table_name.strip()
+        if raw_clean.startswith(glue_table_prefix):
+            raw_clean = raw_clean[len(glue_table_prefix):]
+
+        configured_tables = list(source_config.get("default_tables", []))
+        for extra_k in ("table_initial_load_dates", "custom_table_endpoints", "table_query_overrides"):
+            extra_m = source_config.get(extra_k, {})
+            if isinstance(extra_m, dict):
+                configured_tables.extend(extra_m.keys())
+
+        # Determine API Table Name (exact entity name with hyphens for API endpoint calls)
+        api_table_name = raw_clean
+        if raw_clean not in configured_tables and raw_clean.replace('_', '-') in configured_tables:
+            api_table_name = raw_clean.replace('_', '-')
+
+        # Determine Clean Lake Table Name (sanitizes hyphens to underscores for S3, Glue Catalog, Iceberg, and MySQL)
+        clean_table_name = api_table_name.replace('-', '_')
+
         table_start_time = datetime.now(timezone.utc)
         table_header = (
-            f"[TABLE START] {table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {current_run_time}\n"
+            f"[TABLE START] {api_table_name} -> {glue_table_prefix}{clean_table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {current_run_time}\n"
             "+--------------------------------------------------------------------------------+\n"
-            f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {table_name.upper()} (Source: {source_system})\n"
+            f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {api_table_name.upper()} (Lake Table: {glue_table_prefix}{clean_table_name})\n"
             f"|     Execution ID       : {execution_id}\n"
             f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
             "+--------------------------------------------------------------------------------+"
         )
         logger.info(table_header)
 
-        state_key = get_table_state_key(source_system, table_name)
+        state_key = get_table_state_key(source_system, clean_table_name)
         
         try:
             # Resolves last load date or table-specific initial_load_date (Throws ValueError if load date is missing/null)
@@ -1141,15 +1174,15 @@ def main():
                 state_bucket=state_bucket,
                 state_key=state_key,
                 source_system=source_system,
-                table_name=table_name,
+                table_name=api_table_name,
                 cli_initial_date=initial_load_date_cli,
                 source_config=source_config
             )
         except Exception as load_date_err:
-            logger.error(f"Cannot process table '{table_name}': {load_date_err}")
-            failed_tables.append((table_name, str(load_date_err)))
+            logger.error(f"Cannot process table '{api_table_name}': {load_date_err}")
+            failed_tables.append((clean_table_name, str(load_date_err)))
             table_stats.append({
-                "table_name": table_name,
+                "table_name": clean_table_name,
                 "status": "FAILED",
                 "date_range": {
                     "start_date": None,
@@ -1158,7 +1191,7 @@ def main():
                 "records_fetched": 0,
                 "chunks_written": 0,
                 "duration_seconds": 0.0,
-                "s3_destination": f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{table_name}/{partition_prefix}/",
+                "s3_destination": f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{clean_table_name}/{partition_prefix}/",
                 "error_message": str(load_date_err)
             })
             if error_handling_mode == 'HALT_ON_ERROR':
@@ -1166,8 +1199,8 @@ def main():
             else:
                 continue
 
-        staging_prefix = f"_staging/exec_{execution_id}/{source_system}/{table_name}/"
-        final_partition_prefix = f"{bronze_data_prefix}/{source_system}/{table_name}/{partition_prefix}/"
+        staging_prefix = f"_staging/exec_{execution_id}/{source_system}/{clean_table_name}/"
+        final_partition_prefix = f"{bronze_data_prefix}/{source_system}/{clean_table_name}/{partition_prefix}/"
 
         total_table_records = 0
         parts_written = 0
@@ -1190,7 +1223,7 @@ def main():
                     for rec in expanded_recs:
                         rec['_ingested_at'] = current_run_time
                         rec['_source_system'] = source_system
-                        rec['_table_name'] = table_name
+                        rec['_table_name'] = clean_table_name
                         rec['_execution_id'] = execution_id
                         processed_chunk.append(rec)
                 else:
@@ -1220,11 +1253,11 @@ def main():
             )
 
         try:
-            # Extract delta records writing to STAGING area
+            # Extract delta records writing to STAGING area (API call uses exact api_table_name with hyphens)
             connector_cls.fetch_delta(
                 last_load_date=last_load_date,
                 secret_dict=secret_dict,
-                table_name=table_name,
+                table_name=api_table_name,
                 source_config=source_config,
                 custom_query=custom_query,
                 on_chunk_callback=chunk_writer_callback,
@@ -1235,16 +1268,16 @@ def main():
 
             # If extraction completed successfully, promote staging if records exist and update High-Water Mark in S3
             if total_table_records > 0:
-                logger.info(f"Table '{table_name}' extraction succeeded ({total_table_records} records in {duration_sec:.2f}s). Promoting staging to Bronze...")
+                logger.info(f"Table '{clean_table_name}' extraction succeeded ({total_table_records} records in {duration_sec:.2f}s). Promoting staging to Bronze...")
                 promote_staging_to_bronze(bronze_bucket, staging_prefix, final_partition_prefix)
 
-                # Sync table schema and execution partition to Glue Data Catalog directly
+                # Sync table schema and execution partition to Glue Data Catalog directly (using clean_table_name with underscores)
                 if glue_catalog_enabled:
                     sync_bronze_catalog_table(
                         database_name=glue_database_name,
                         table_prefix=glue_table_prefix,
                         source_system=source_system,
-                        table_name=table_name,
+                        table_name=clean_table_name,
                         bronze_bucket=bronze_bucket,
                         bronze_data_prefix=bronze_data_prefix,
                         partition_date=execution_start_utc,
@@ -1256,12 +1289,12 @@ def main():
                     if trigger_crawler and bronze_crawler_name:
                         trigger_glue_crawler(bronze_crawler_name)
             else:
-                logger.info(f"Table '{table_name}' extraction completed cleanly with 0 new records since {last_load_date}.")
+                logger.info(f"Table '{clean_table_name}' extraction completed cleanly with 0 new records since {last_load_date}.")
                 cleanup_failed_staging(bronze_bucket, staging_prefix)
 
             # Create or update High-Water Mark watermark state file in S3 with current execution timestamp
-            update_last_load_date(state_bucket, state_key, source_system, table_name, current_run_time, total_table_records, table_prefix=glue_table_prefix)
-            logger.info(f"Table '{table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with timestamp {current_run_time}.")
+            update_last_load_date(state_bucket, state_key, source_system, clean_table_name, current_run_time, total_table_records, table_prefix=glue_table_prefix)
+            logger.info(f"Table '{clean_table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with timestamp {current_run_time}.")
 
             # Ensure Athena-queryable Watermark Catalog Table is synced
             if glue_catalog_enabled and sync_watermark_table:
@@ -1274,7 +1307,7 @@ def main():
 
             # Record table execution details
             table_stats.append({
-                "table_name": table_name,
+                "table_name": clean_table_name,
                 "status": "SUCCESS",
                 "date_range": {
                     "start_date": last_load_date,
@@ -1289,14 +1322,15 @@ def main():
 
             # High-visibility table extraction summary block in CloudWatch logs
             table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-            catalog_table_display = f"{glue_database_name}.{glue_table_prefix}{table_name}" if glue_catalog_enabled else "N/A"
+            catalog_table_display = f"{glue_database_name}.{glue_table_prefix}{clean_table_name}" if glue_catalog_enabled else "N/A"
             summary_card = (
-                f"[TABLE SUMMARY] {table_name} | SUCCESS | Records: {total_table_records:,} | Chunks: {parts_written} | Duration: {duration_sec:.2f}s | Range: {last_load_date} -> {current_run_time}\n"
+                f"[TABLE SUMMARY] {clean_table_name} | SUCCESS | Records: {total_table_records:,} | Chunks: {parts_written} | Duration: {duration_sec:.2f}s | Range: {last_load_date} -> {current_run_time}\n"
                 "+================================================================================+\n"
-                f"|  TABLE EXTRACTION COMPLETED: {table_name} [SUCCESS]\n"
+                f"|  TABLE EXTRACTION COMPLETED: {clean_table_name} [SUCCESS]\n"
                 "+--------------------------------------------------------------------------------+\n"
                 f"|  * Source System    : {source_system}\n"
-                f"|  * Table Name       : {table_name}\n"
+                f"|  * Lake Table Name  : {clean_table_name}\n"
+                f"|  * API Entity Name  : {api_table_name}\n"
                 f"|  * Status           : SUCCESS\n"
                 f"|  * Extraction Range : {last_load_date}  -->  {current_run_time}\n"
                 f"|  * Records Ingested : {total_table_records:,}\n"
@@ -1315,7 +1349,7 @@ def main():
             emit_cloudwatch_metrics(
                 namespace=cloudwatch_namespace,
                 source_system=source_system,
-                table_name=table_name,
+                table_name=clean_table_name,
                 records_count=total_table_records,
                 duration_seconds=duration_sec,
                 success=True
@@ -1323,20 +1357,21 @@ def main():
 
         except Exception as table_err:
             duration_sec = (datetime.now(timezone.utc) - table_start_time).total_seconds()
-            logger.error(f"FAILURE during extraction for table '{table_name}': {table_err}")
+            logger.error(f"FAILURE during extraction for table '{api_table_name}': {table_err}")
             
             # Clean up uncommitted staging artifacts
             cleanup_failed_staging(bronze_bucket, staging_prefix)
 
+            failed_tables.append((clean_table_name, str(table_err)))
             table_stats.append({
-                "table_name": table_name,
+                "table_name": clean_table_name,
                 "status": "FAILED",
                 "date_range": {
                     "start_date": last_load_date if 'last_load_date' in locals() else None,
                     "end_date": current_run_time
                 },
                 "records_fetched": 0,
-                "chunks_written": 0,
+                "chunks_written": parts_written,
                 "duration_seconds": round(duration_sec, 2),
                 "s3_destination": f"s3://{bronze_bucket}/{final_partition_prefix}",
                 "error_message": str(table_err)
@@ -1344,12 +1379,13 @@ def main():
 
             failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             failed_card = (
-                f"[TABLE FAILED] {table_name} | FAILED | Duration: {duration_sec:.2f}s | Error: {str(table_err)[:60]}\n"
+                f"[TABLE FAILED] {clean_table_name} | FAILED | Duration: {duration_sec:.2f}s | Error: {str(table_err)[:60]}\n"
                 "+================================================================================+\n"
-                f"|  TABLE EXTRACTION FAILED: {table_name} [FAILED]\n"
+                f"|  TABLE EXTRACTION FAILED: {clean_table_name} [FAILED]\n"
                 "+--------------------------------------------------------------------------------+\n"
                 f"|  * Source System    : {source_system}\n"
-                f"|  * Table Name       : {table_name}\n"
+                f"|  * Lake Table Name  : {clean_table_name}\n"
+                f"|  * API Entity Name  : {api_table_name}\n"
                 f"|  * Status           : FAILED\n"
                 f"|  * Extraction Range : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {current_run_time}\n"
                 f"|  * Error Details    : {table_err}\n"
@@ -1364,13 +1400,11 @@ def main():
             emit_cloudwatch_metrics(
                 namespace=cloudwatch_namespace,
                 source_system=source_system,
-                table_name=table_name,
+                table_name=clean_table_name,
                 records_count=0,
                 duration_seconds=duration_sec,
                 success=False
             )
-
-            failed_tables.append((table_name, str(table_err)))
 
             if error_handling_mode == 'HALT_ON_ERROR':
                 logger.error(f"Error handling mode is HALT_ON_ERROR. Halting execution immediately.")

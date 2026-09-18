@@ -76,21 +76,28 @@ class SilverConfigLoader:
     def get_table_config(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Retrieves table-specific configuration (nkey, order_by, scd_type, etc.).
-        Supports lookup by raw_tbl_<table_name> or base <table_name>.
+        Supports lookup by raw_tbl_<table_name> or base <table_name> with hyphens or underscores.
         """
         source_cfg = cls.get_source_config(source_system, config_dict)
         table_configs = source_cfg.get("table_configs", {})
         clean = table_name.strip().lower()
-        if clean in table_configs:
-            return table_configs[clean]
+
+        candidates = [clean]
         if clean.startswith("raw_tbl_"):
-            base = clean[len("raw_tbl_"):]
-            if base in table_configs:
-                return table_configs[base]
+            candidates.append(clean[len("raw_tbl_"):])
         else:
-            prefixed = f"raw_tbl_{clean}"
-            if prefixed in table_configs:
-                return table_configs[prefixed]
+            candidates.append(f"raw_tbl_{clean}")
+
+        expanded_candidates = list(candidates)
+        for cand in candidates:
+            if '-' in cand:
+                expanded_candidates.append(cand.replace('-', '_'))
+            if '_' in cand:
+                expanded_candidates.append(cand.replace('_', '-'))
+
+        for cand in expanded_candidates:
+            if cand in table_configs:
+                return table_configs[cand]
         return {}
 
     @classmethod
@@ -203,7 +210,8 @@ class SilverConfigLoader:
         table_cfg = cls.get_table_config(source_system, table_name, config_dict)
         table_clean = table_name.strip().lower()
         base_name = table_clean[len("raw_tbl_"):] if table_clean.startswith("raw_tbl_") else table_clean
-        target_name = table_cfg.get("target_table_name") or f"{prefix}{base_name}"
+        base_name = base_name.replace("-", "_")
+        target_name = (table_cfg.get("target_table_name") or f"{prefix}{base_name}").replace("-", "_")
         return f"{db}.{target_name}"
 
     @classmethod

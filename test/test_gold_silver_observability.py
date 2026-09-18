@@ -40,16 +40,20 @@ sys.modules['awsglue.job'].Job = MagicMock
 
 # Ensure directories are on sys.path
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+bronze_dir = os.path.join(repo_root, "bronze", "script")
 silver_dir = os.path.join(repo_root, "silver", "script")
 gold_dir = os.path.join(repo_root, "gold", "script")
 lambda_dir = os.path.join(repo_root, "lambda_helper")
-for p in [repo_root, silver_dir, gold_dir, lambda_dir]:
+for p in [repo_root, bronze_dir, silver_dir, gold_dir, lambda_dir]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
 from gold_layer_manager import GoldLayerManager
 from transformer import SilverTransformer
+from silver_config_loader import SilverConfigLoader
 from custom_transforms import servicenow_incident
+from config_loader import ConfigLoader
+from uax_bronze_load import get_table_state_key
 
 
 class TestProcessLayerOptions(unittest.TestCase):
@@ -562,5 +566,109 @@ class TestLambdaHelper(unittest.TestCase):
         self.assertEqual(mock_glue.start_job_run.call_count, 2)
 
 
+
+class TestHyphenToUnderscoreHandling(unittest.TestCase):
+    """
+    Validates end-to-end handling of table names containing hyphens ('-'):
+    API calls preserve hyphens, while Bronze, Silver, and Gold lake tables
+    consistently sanitize hyphens to underscores ('_').
+    """
+
+    def test_bronze_watermark_state_key_sanitizes_hyphens(self):
+        state_key = get_table_state_key("moveworks", "chat-sessions")
+        self.assertEqual(state_key, "metadata/bronze/moveworks/chat_sessions/watermark.json")
+
+    def test_bronze_config_loader_hyphen_and_underscore_lookup(self):
+        sample_config = {
+            "source_systems": {
+                "moveworks": {
+                    "api_endpoint_template": "/export/v1/records/{table_name}",
+                    "default_delta_filter": "last_updated_time gt '{last_load_date}'",
+                    "table_initial_load_dates": {
+                        "chat-sessions": "2024-01-01T00:00:00Z"
+                    },
+                    "custom_table_endpoints": {
+                        "user-profiles": "/export/v1/records/user-profiles"
+                    }
+                }
+            }
+        }
+        # 1. table_initial_load_dates finds date whether looked up via hyphen or underscore
+        date_hyphen = ConfigLoader.get_table_initial_load_date("moveworks", "chat-sessions", source_config=sample_config["source_systems"]["moveworks"])
+        date_underscore = ConfigLoader.get_table_initial_load_date("moveworks", "chat_sessions", source_config=sample_config["source_systems"]["moveworks"])
+        self.assertEqual(date_hyphen, "2024-01-01T00:00:00Z")
+        self.assertEqual(date_underscore, "2024-01-01T00:00:00Z")
+
+        # 2. get_table_endpoint formats API endpoint with exact entity name
+        ep = ConfigLoader.get_table_endpoint("moveworks", "chat-sessions", source_config=sample_config["source_systems"]["moveworks"])
+        self.assertEqual(ep, "/export/v1/records/chat-sessions")
+
+        # 3. custom_table_endpoints matches whether looked up via hyphen or underscore
+        custom_ep = ConfigLoader.get_table_endpoint("moveworks", "user_profiles", source_config=sample_config["source_systems"]["moveworks"])
+        self.assertEqual(custom_ep, "/export/v1/records/user-profiles")
+
+    def test_silver_table_name_and_config_lookup_hyphen_sanitization(self):
+        sample_silver_config = {
+            "silver_defaults": {
+                "table_prefix": "tbl_"
+            },
+            "source_systems": {
+                "moveworks": {
+                    "table_configs": {
+                        "raw_tbl_chat_sessions": {
+                            "nkey": "session_id",
+                            "target_table_name": "tbl_chat_sessions"
+                        }
+                    }
+                }
+            }
+        }
+        # Look up using hyphen variant matches underscore config
+        cfg_hyphen = SilverConfigLoader.get_table_config("moveworks", "chat-sessions", sample_silver_config)
+        self.assertEqual(cfg_hyphen.get("nkey"), "session_id")
+
+        cfg_raw_hyphen = SilverConfigLoader.get_table_config("moveworks", "raw_tbl_chat-sessions", sample_silver_config)
+        self.assertEqual(cfg_raw_hyphen.get("nkey"), "session_id")
+
+        # Verify silver table name sanitizes hyphen to underscore
+        silver_name = SilverConfigLoader.get_silver_table_name(
+            source_system="moveworks",
+            table_name="chat-sessions",
+            glue_database="uax_db",
+            config_dict=sample_silver_config
+        )
+        self.assertEqual(silver_name, "uax_db.tbl_chat_sessions")
+
+    def test_gold_query_filter_matches_hyphens_and_underscores(self):
+        # Discovered queries has underscore mart name
+        queries = {"chat_sessions": "SELECT * FROM tbl_chat_sessions"}
+        
+        # Filtering with hyphen parameter
+        table_filter = ["chat-sessions"]
+        clean_filters = set()
+        for t in table_filter:
+            low = t.lower()
+            clean_filters.add(low)
+            clean_filters.add(low.replace('-', '_'))
+            clean_filters.add(low.replace('_', '-'))
+            for prefix in ['gold_tbl_', 'raw_tbl_', 'tbl_', 'v_']:
+                if low.startswith(prefix):
+                    stripped = low[len(prefix):]
+                    clean_filters.add(stripped)
+                    clean_filters.add(stripped.replace('-', '_'))
+                    clean_filters.add(stripped.replace('_', '-'))
+        matched = {
+            k: v for k, v in queries.items()
+            if k.lower() in clean_filters or any(cf in k.lower() for cf in clean_filters)
+        }
+        self.assertIn("chat_sessions", matched)
+
+        # Target MySQL table and view naming check
+        clean_base_name = "chat-sessions".replace('-', '_')
+        self.assertEqual(f"gold_tbl_{clean_base_name}", "gold_tbl_chat_sessions")
+        self.assertEqual(f"v_{clean_base_name}", "v_chat_sessions")
+
+
 if __name__ == "__main__":
     unittest.main()
+

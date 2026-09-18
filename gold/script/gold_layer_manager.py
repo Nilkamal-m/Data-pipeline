@@ -158,9 +158,14 @@ class GoldLayerManager:
             for t in table_filter:
                 low = t.lower()
                 clean_filters.add(low)
+                clean_filters.add(low.replace('-', '_'))
+                clean_filters.add(low.replace('_', '-'))
                 for prefix in ['gold_tbl_', 'raw_tbl_', 'tbl_', 'v_']:
                     if low.startswith(prefix):
-                        clean_filters.add(low[len(prefix):])
+                        stripped = low[len(prefix):]
+                        clean_filters.add(stripped)
+                        clean_filters.add(stripped.replace('-', '_'))
+                        clean_filters.add(stripped.replace('_', '-'))
             matched = {
                 k: v for k, v in queries.items()
                 if k.lower() in clean_filters or any(cf in k.lower() for cf in clean_filters)
@@ -178,11 +183,12 @@ class GoldLayerManager:
 
         # Process each discovered mart query
         for table_base_name, sql_text in queries.items():
+            clean_base_name = table_base_name.strip().replace('-', '_')
             mart_start = datetime.now(timezone.utc)
-            target_table = f"gold_tbl_{table_base_name}"
-            staging_table = f"gold_tbl_{table_base_name}_staging"
-            old_backup_table = f"gold_tbl_{table_base_name}_old"
-            view_name = f"v_{table_base_name}"
+            target_table = f"gold_tbl_{clean_base_name}"
+            staging_table = f"gold_tbl_{clean_base_name}_staging"
+            old_backup_table = f"gold_tbl_{clean_base_name}_old"
+            view_name = f"v_{clean_base_name}"
 
             # Shared Database Safety Assertion
             assert target_table.startswith("gold_tbl_"), f"Safety Error: Invalid table name {target_table}"
@@ -191,7 +197,7 @@ class GoldLayerManager:
 
             logger.info(
                 f"\n+--------------------------------------------------------------------------------+\n"
-                f"|  PROCESSING GOLD MART: '{table_base_name}'\n"
+                f"|  PROCESSING GOLD MART: '{clean_base_name}'\n"
                 f"|  * Target Table  : {gold_schema}.{target_table}\n"
                 f"|  * Staging Table : {gold_schema}.{staging_table}\n"
                 f"|  * Serving View  : {gold_schema}.{view_name}\n"
@@ -201,7 +207,7 @@ class GoldLayerManager:
             try:
                 # [GOLD STEP 3/6] Spark SQL Execution & Result Introspection
                 logger.info(
-                    f"\n[GOLD STEP 3/6] Executing Spark SQL query for '{table_base_name}'..."
+                    f"\n[GOLD STEP 3/6] Executing Spark SQL query for '{clean_base_name}'..."
                 )
                 df_mart = spark.sql(sql_text)
 
@@ -212,10 +218,10 @@ class GoldLayerManager:
                 logger.info(f"[GOLD STEP 3/6] Query executed successfully. Computed {row_count:,} records.")
 
                 # Log full column schema introspection
-                cls._log_schema_introspection(df_mart, f"Gold Query Output Schema: '{table_base_name}'")
+                cls._log_schema_introspection(df_mart, f"Gold Query Output Schema: '{clean_base_name}'")
 
                 # [GOLD STEP 4/6] S3 Materialization
-                mart_s3_dest = f"{data_s3_path.rstrip('/')}/{table_base_name}"
+                mart_s3_dest = f"{data_s3_path.rstrip('/')}/{clean_base_name}"
                 logger.info(
                     f"\n[GOLD STEP 4/6] Materializing {row_count:,} records to S3 Parquet:\n"
                     f"                -> Location: {mart_s3_dest}"
@@ -583,7 +589,7 @@ class GoldLayerManager:
             s3_prefix = parsed.path.lstrip('/')
             try:
                 if s3_prefix.endswith('.sql'):
-                    base_name = os.path.splitext(os.path.basename(s3_prefix))[0]
+                    base_name = os.path.splitext(os.path.basename(s3_prefix))[0].replace('-', '_')
                     resp = s3_client.get_object(Bucket=s3_bucket, Key=s3_prefix)
                     queries[base_name] = resp['Body'].read().decode('utf-8')
                     logger.info(f"[QUERY DISCOVERY] Loaded single S3 query for '{base_name}' from '{query_path}'")
@@ -593,7 +599,7 @@ class GoldLayerManager:
                         for obj in page.get('Contents', []):
                             key = obj['Key']
                             if key.endswith('.sql'):
-                                base_name = os.path.splitext(os.path.basename(key))[0]
+                                base_name = os.path.splitext(os.path.basename(key))[0].replace('-', '_')
                                 resp = s3_client.get_object(Bucket=s3_bucket, Key=key)
                                 queries[base_name] = resp['Body'].read().decode('utf-8')
                                 logger.info(f"[QUERY DISCOVERY] Loaded S3 query for '{base_name}' from 's3://{s3_bucket}/{key}'")
@@ -604,7 +610,7 @@ class GoldLayerManager:
         if not queries:
             local_dir = f"gold/query/{source_system}" if source_system else "gold/query"
             for file_path in glob.glob(f"{local_dir}/*.sql"):
-                base_name = os.path.splitext(os.path.basename(file_path))[0]
+                base_name = os.path.splitext(os.path.basename(file_path))[0].replace('-', '_')
                 if base_name not in queries:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         queries[base_name] = f.read()
