@@ -1031,6 +1031,35 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         with self.assertRaises(ValueError):
             HTTPClient._build_auth_header({'auth_type': 'invalid_scheme'})
 
+    @patch('connectors.http_client.HTTPClient.get')
+    def test_moveworks_empty_odata_response_omitted_value_key(self, mock_http_get):
+        """Validates that MoveworksConnector treats OData response with only '@odata.context' as 0 records."""
+        from connectors.moveworks import MoveworksConnector
+
+        # Moveworks returns only @odata.context when 0 records match the shard window
+        mock_http_get.return_value = {
+            '@odata.context': 'https://api.moveworks.ai/export/v1beta2/$metadata#records/plugin-calls'
+        }
+
+        cfg = ConfigLoader.load_config(env='dev')
+        mw_cfg = cfg['source_systems']['moveworks']
+        records = MoveworksConnector._fetch_single_window(
+            lower_bound='2024-12-26T00:00:00Z',
+            upper_bound='2025-01-10T00:00:00Z',
+            base_url='https://api.moveworks.ai',
+            endpoint='/export/v1beta2/records/plugin-calls',
+            response_key='value',
+            limit=500,
+            secret_dict={'auth_type': 'oauth2', 'token_url': 'https://token'},
+            custom_headers={},
+            table_name='plugin_calls',
+            source_config=mw_cfg,
+            custom_query=None,
+            on_chunk_callback=None,
+            s3_chunk_size=10000,
+        )
+        self.assertEqual(records, [])
+
 
 if __name__ == "__main__":
     unittest.main()

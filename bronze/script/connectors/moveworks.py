@@ -333,7 +333,18 @@ class MoveworksConnector:
                 batch = response
             elif isinstance(response, dict):
                 batch = response.get(response_key)
-                if not isinstance(batch, list):
+                if batch is None:
+                    # In OData v4 / Moveworks API, if no records match the query window,
+                    # the 'value' key is omitted by the API (e.g. only {'@odata.context': '...'} is returned).
+                    if '@odata.context' in response or not response:
+                        batch = []
+                    else:
+                        raise KeyError(
+                            f"[{table_name}] Response key '{response_key}' not found or not a list. "
+                            f"Available keys: {list(response.keys())}. "
+                            f"Update 'response_records_key' in bronze_config.json."
+                        )
+                elif not isinstance(batch, list):
                     raise KeyError(
                         f"[{table_name}] Response key '{response_key}' not found or not a list. "
                         f"Available keys: {list(response.keys())}. "
