@@ -101,7 +101,7 @@
       "default_delta_filter": "last_updated_time ge '{last_load_date}' and last_updated_time le '{upper_bound}'",
       "response_records_key": "value",
       "batch_size": 500,
-      "orderby": "id desc",
+      "orderby": "last_updated_time desc",
       "parallel_processing": {
         "enabled": true,
         "max_workers": 5,

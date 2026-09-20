@@ -328,7 +328,7 @@ class MoveworksConnector:
             upper_bound=upper_bound,
         )
 
-        orderby_col = (source_config or {}).get('orderby', 'id desc')
+        orderby_col = (source_config or {}).get('orderby', 'last_updated_time desc')
         first_params = {'$orderby': orderby_col, '$top': str(limit)}
         if query_filter and query_filter.strip():
             first_params['$filter'] = query_filter.strip()
