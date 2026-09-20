@@ -990,6 +990,47 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         )
         self.assertEqual(res_manual, "2024-03-01 00:00:00")
 
+    @patch('connectors.oauth.OAuth2Client.get_access_token', return_value='mock_token_123')
+    def test_http_client_auth_type_oauth2_and_aliases(self, mock_oauth):
+        """Validates that HTTPClient accepts 'oauth2', 'oauth', 'basic', and 'api_key'."""
+        from connectors.http_client import HTTPClient
+
+        # 1. auth_type = 'oauth2'
+        h1 = HTTPClient._build_auth_header({
+            'auth_type': 'oauth2',
+            'token_url': 'https://api.moveworks.ai/rest/v1/oauth/token',
+            'client_id': 'cid',
+            'client_secret': 'sec'
+        })
+        self.assertEqual(h1, {'Authorization': 'Bearer mock_token_123'})
+
+        # 2. auth_type = 'oauth'
+        h2 = HTTPClient._build_auth_header({
+            'auth_type': 'oauth',
+            'token_url': 'https://api.moveworks.ai/rest/v1/oauth/token'
+        })
+        self.assertEqual(h2, {'Authorization': 'Bearer mock_token_123'})
+
+        # 3. auth_type = 'basic'
+        h3 = HTTPClient._build_auth_header({
+            'auth_type': 'basic',
+            'username': 'admin',
+            'password': 'secret_password'
+        })
+        self.assertTrue(h3['Authorization'].startswith('Basic '))
+
+        # 4. auth_type = 'api_key'
+        h4 = HTTPClient._build_auth_header({
+            'auth_type': 'api_key',
+            'api_key': 'key_abc',
+            'api_key_header': 'X-Custom-Key'
+        })
+        self.assertEqual(h4, {'X-Custom-Key': 'key_abc'})
+
+        # 5. Invalid auth_type raises ValueError
+        with self.assertRaises(ValueError):
+            HTTPClient._build_auth_header({'auth_type': 'invalid_scheme'})
+
 
 if __name__ == "__main__":
     unittest.main()

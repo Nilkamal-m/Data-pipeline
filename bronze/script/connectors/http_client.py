@@ -4,6 +4,7 @@ HTTP Client — AWS Glue Data Pipeline Connectors.
 Authentication: set 'auth_type' in Secrets Manager.
   auth_type = 'basic'   → requires 'username', 'password'
   auth_type = 'oauth'   → requires 'token_url' (+ 'client_id', 'client_secret', 'grant_type')
+  auth_type = 'oauth2'  → alias for 'oauth'
   auth_type = 'api_key' → requires 'api_key'; optional 'api_key_header' (default: 'x-api-key')
 
 Retry policy (built-in, no configuration required):
@@ -26,7 +27,7 @@ from .oauth import OAuth2Client
 
 logger = logging.getLogger(__name__)
 
-_VALID_AUTH_TYPES = ('basic', 'oauth', 'api_key')
+_VALID_AUTH_TYPES = ('basic', 'oauth', 'oauth2', 'api_key')
 
 
 class HTTPClient:
@@ -42,29 +43,37 @@ class HTTPClient:
 
         Canonical key: 'auth_type' in Secrets Manager.
         If 'auth_type' is absent, auto-detects from credential keys and logs a warning.
+        Supports 'basic', 'oauth', 'oauth2', 'api_key'.
         """
-        auth_type = str(secret_dict.get('auth_type', '')).lower().strip()
+        raw_auth_type = str(secret_dict.get('auth_type', '')).lower().strip()
 
-        if not auth_type:
+        if not raw_auth_type:
             if secret_dict.get('token_url') or secret_dict.get('grant_type'):
-                auth_type = 'oauth'
+                raw_auth_type = 'oauth2'
             elif secret_dict.get('username') and secret_dict.get('password'):
-                auth_type = 'basic'
+                raw_auth_type = 'basic'
             elif secret_dict.get('api_key'):
-                auth_type = 'api_key'
+                raw_auth_type = 'api_key'
             else:
                 raise ValueError(
                     "Secrets Manager is missing required key 'auth_type'. "
                     f"Add 'auth_type' with one of: {_VALID_AUTH_TYPES}."
                 )
             logger.warning(
-                f"'auth_type' not set in Secrets Manager — auto-detected as '{auth_type}'. "
-                f"Set 'auth_type': '{auth_type}' explicitly to remove this warning."
+                f"'auth_type' not set in Secrets Manager — auto-detected as '{raw_auth_type}'. "
+                f"Set 'auth_type': '{raw_auth_type}' explicitly to remove this warning."
             )
 
-        if auth_type not in _VALID_AUTH_TYPES:
+        # Normalize aliases: oauth2/oauth_2/oauth-2 -> oauth, apikey/api-key -> api_key
+        if raw_auth_type in ('oauth', 'oauth2', 'oauth_2', 'oauth-2'):
+            auth_type = 'oauth'
+        elif raw_auth_type in ('api_key', 'apikey', 'api-key'):
+            auth_type = 'api_key'
+        elif raw_auth_type == 'basic':
+            auth_type = 'basic'
+        else:
             raise ValueError(
-                f"Invalid 'auth_type': '{auth_type}' in Secrets Manager. "
+                f"Invalid 'auth_type': '{raw_auth_type}' in Secrets Manager. "
                 f"Allowed values: {_VALID_AUTH_TYPES}."
             )
 

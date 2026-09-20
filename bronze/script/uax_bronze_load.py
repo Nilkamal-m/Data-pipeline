@@ -83,12 +83,14 @@ for path in [script_dir, os.getcwd(), "/tmp/extraPython", "/tmp"]:
         sys.path.insert(0, path)
 
 # Auto-discover and extract connectors.zip across Glue script directories (e.g. /tmp/glue-python-scripts-*)
+# Only extract if connectors package is not already present on disk
 candidate_zips = set()
-for search_dir in [script_dir, "/tmp", "/tmp/extraPython", os.getcwd()]:
-    if os.path.exists(search_dir):
-        for root, _, files in os.walk(search_dir):
-            if "connectors.zip" in files:
-                candidate_zips.add(os.path.join(root, "connectors.zip"))
+if not os.path.exists(os.path.join(script_dir, "connectors", "__init__.py")):
+    for search_dir in [script_dir, "/tmp", "/tmp/extraPython", os.getcwd()]:
+        if os.path.exists(search_dir):
+            for root, _, files in os.walk(search_dir):
+                if "connectors.zip" in files:
+                    candidate_zips.add(os.path.join(root, "connectors.zip"))
 
 for candidate in candidate_zips:
     try:
