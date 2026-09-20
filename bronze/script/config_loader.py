@@ -512,7 +512,8 @@ class ConfigLoader:
                 return custom_endpoints[key]
 
         template = config.get("api_endpoint_template", "/api/now/table/{table_name}")
-        return template.format(table_name=table_clean)
+        endpoint_name = table_clean.replace('_', '-') if source_system.strip().lower() == 'moveworks' else table_clean
+        return template.format(table_name=endpoint_name)
 
     @classmethod
     def get_table_file_path(

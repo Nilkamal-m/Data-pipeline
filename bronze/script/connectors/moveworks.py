@@ -329,7 +329,12 @@ class MoveworksConnector:
         )
 
         orderby_col = (source_config or {}).get('orderby', 'last_updated_time desc')
-        first_params = {'$orderby': orderby_col, '$top': str(limit)}
+        first_params: Dict[str, str] = {'$orderby': orderby_col}
+        # In OData v4, $top specifies the total record limit for the entire query, NOT the page size.
+        # Omitting $top allows Moveworks to stream all pages (500 records/page) via @odata.nextLink.
+        # Only include $top if explicitly configured in source_config.
+        if 'top' in (source_config or {}):
+            first_params['$top'] = str(source_config['top'])
         if query_filter and query_filter.strip():
             first_params['$filter'] = query_filter.strip()
 

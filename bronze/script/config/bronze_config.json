@@ -118,15 +118,18 @@
         },
         "plugin_calls": {
           "initial_load_date": "1900-01-01 00:00:00",
-          "upper_bound": ""
+          "upper_bound": "",
+          "custom_endpoint": "/export/v1beta2/records/plugin-calls"
         },
         "plugin_cells": {
           "initial_load_date": "1900-01-01 00:00:00",
-          "upper_bound": ""
+          "upper_bound": "",
+          "custom_endpoint": "/export/v1beta2/records/plugin-cells"
         },
         "plugin_resources": {
           "initial_load_date": "1900-01-01 00:00:00",
-          "upper_bound": ""
+          "upper_bound": "",
+          "custom_endpoint": "/export/v1beta2/records/plugin-resources"
         },
         "users": {
           "initial_load_date": "1900-01-01 00:00:00",

@@ -1144,6 +1144,76 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         call_kwargs = mock_single.call_args[1]
         self.assertIsNone(call_kwargs['upper_bound'])
 
+    @patch('connectors.http_client.HTTPClient.get')
+    def test_moveworks_multi_page_pagination_without_top(self, mock_http_get):
+        """Validates that _fetch_single_window does NOT send $top and traverses all @odata.nextLink pages."""
+        from connectors.moveworks import MoveworksConnector
+
+        page1_records = [{"id": f"p1_{i}"} for i in range(500)]
+        page2_records = [{"id": f"p2_{i}"} for i in range(500)]
+        page3_records = [{"id": f"p3_{i}"} for i in range(481)]
+
+        mock_http_get.side_effect = [
+            {
+                "@odata.context": "https://api.moveworks.ai/export/v1beta2/$metadata#records/interactions",
+                "value": page1_records,
+                "@odata.nextLink": "https://api.moveworks.ai/export/v1beta2/records/interactions?skiptoken=page2_cursor"
+            },
+            {
+                "@odata.context": "https://api.moveworks.ai/export/v1beta2/$metadata#records/interactions",
+                "value": page2_records,
+                "@odata.nextLink": "https://api.moveworks.ai/export/v1beta2/records/interactions?skiptoken=page3_cursor"
+            },
+            {
+                "@odata.context": "https://api.moveworks.ai/export/v1beta2/$metadata#records/interactions",
+                "value": page3_records
+            }
+        ]
+
+        cfg = ConfigLoader.load_config(env='dev')
+        mw_cfg = cfg['source_systems']['moveworks']
+
+        all_records = MoveworksConnector._fetch_single_window(
+            lower_bound='2024-01-01T00:00:00Z',
+            upper_bound=None,
+            base_url='https://api.moveworks.ai',
+            endpoint='/export/v1beta2/records/interactions',
+            response_key='value',
+            limit=500,
+            secret_dict={'auth_type': 'oauth2', 'token_url': 'https://token'},
+            custom_headers={},
+            table_name='interactions',
+            source_config=mw_cfg,
+            custom_query=None,
+            on_chunk_callback=None,
+            s3_chunk_size=10000,
+        )
+
+        # 1. Must fetch all 3 pages: 500 + 500 + 481 = 1,481 records (no truncation at 500)
+        self.assertEqual(len(all_records), 1481)
+        self.assertEqual(mock_http_get.call_count, 3)
+
+        # 2. Page 1 URL must NOT contain '$top' or '%24top'
+        first_call_url = mock_http_get.call_args_list[0][1]['url']
+        self.assertNotIn('%24top', first_call_url)
+        self.assertNotIn('$top', first_call_url)
+        self.assertIn('%24orderby', first_call_url)
+
+        # 3. Page 2 and Page 3 must use nextLink URLs verbatim
+        second_call_url = mock_http_get.call_args_list[1][1]['url']
+        self.assertEqual(second_call_url, "https://api.moveworks.ai/export/v1beta2/records/interactions?skiptoken=page2_cursor")
+
+        third_call_url = mock_http_get.call_args_list[2][1]['url']
+        self.assertEqual(third_call_url, "https://api.moveworks.ai/export/v1beta2/records/interactions?skiptoken=page3_cursor")
+
+    def test_moveworks_endpoint_hyphenation(self):
+        """Validates that Moveworks endpoint resolution converts underscores to hyphens."""
+        ep_calls = ConfigLoader.get_table_endpoint('moveworks', 'plugin_calls')
+        self.assertEqual(ep_calls, '/export/v1beta2/records/plugin-calls')
+
+        ep_resources = ConfigLoader.get_table_endpoint('moveworks', 'plugin_resources')
+        self.assertEqual(ep_resources, '/export/v1beta2/records/plugin-resources')
+
 
 if __name__ == "__main__":
     unittest.main()
