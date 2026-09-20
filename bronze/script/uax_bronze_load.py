@@ -517,9 +517,10 @@ def serialize_chunk_to_bytes(records_chunk: list, output_format: str = "parquet"
             df = pd.DataFrame(records_chunk)
             # Guarantee data columns are first, and system-generated columns (_*) are always at the end
             data_cols = [c for c in df.columns if not c.startswith('_')]
-            meta_cols = [c for c in df.columns if c.startswith('_')]
-            known_meta_order = ['_source_system', '_table_name', '_execution_id', '_ingested_at']
+            meta_cols = [c for c in df.columns if c.startswith('_') and c != '_ingested_at']
+            known_meta_order = ['_source_system', '_table_name', '_execution_id']
             ordered_meta = [c for c in known_meta_order if c in meta_cols] + [c for c in meta_cols if c not in known_meta_order]
+            # Exclude _ingested_at from file payload since it is the S3 directory partition key (_ingested_at=<ts>/)
             df = df[data_cols + ordered_meta]
 
             buffer = io.BytesIO()
@@ -529,12 +530,12 @@ def serialize_chunk_to_bytes(records_chunk: list, output_format: str = "parquet"
             logger.warning(f"Parquet serialization via pandas failed ({err}). Falling back to JSON format.")
             fmt = "json"
 
-    # For JSON format, also guarantee data keys are first, system keys last in each dict
+    # For JSON format, also guarantee data keys are first, system keys last in each dict (excluding partition key _ingested_at)
     reordered_records = []
     for rec in records_chunk:
         if isinstance(rec, dict):
             data_dict = {k: v for k, v in rec.items() if not str(k).startswith('_')}
-            meta_dict = {k: v for k, v in rec.items() if str(k).startswith('_')}
+            meta_dict = {k: v for k, v in rec.items() if str(k).startswith('_') and str(k) != '_ingested_at'}
             reordered_records.append({**data_dict, **meta_dict})
         else:
             reordered_records.append(rec)
@@ -953,11 +954,15 @@ def sync_bronze_catalog_table(
                         f"[GLUE SCHEMA EVOLUTION] Adding {len(new_cols_to_add)} newly observed column(s) to table "
                         f"'{database_name}.{catalog_table_name}': {[c['Name'] for c in new_cols_to_add]}"
                     )
-                    audit_names = {'_source_system', '_table_name', '_execution_id', '_ingested_at'}
-                    cur_business = [c for c in existing_cols if c['Name'].lower() not in audit_names]
+                    audit_names = {'_source_system', '_table_name', '_execution_id'}
+                    # Ensure partition keys like _ingested_at are never included in StorageDescriptor.Columns
+                    cur_business = [c for c in existing_cols if c['Name'].lower() not in audit_names and c['Name'].lower() != '_ingested_at']
                     cur_audit = [c for c in existing_cols if c['Name'].lower() in audit_names]
                     for nc in new_cols_to_add:
-                        if nc['Name'].lower() not in audit_names:
+                        nc_name = nc['Name'].lower()
+                        if nc_name == '_ingested_at':
+                            continue
+                        if nc_name not in audit_names:
                             cur_business.append(nc)
                         else:
                             cur_audit.append(nc)
@@ -1316,7 +1321,6 @@ def main():
                 if isinstance(record, dict):
                     expanded_recs = flatten_and_expand_record(record, sep=flatten_sep) if flatten_enabled else [record]
                     for rec in expanded_recs:
-                        rec['_ingested_at'] = current_run_time
                         rec['_source_system'] = source_system
                         rec['_table_name'] = clean_table_name
                         rec['_execution_id'] = execution_id

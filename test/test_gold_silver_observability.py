@@ -1622,8 +1622,35 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
             self.assertIn('detail_entity', evolved_columns)
             self.assertIn('detail_content', evolved_columns)
             self.assertIn('detail_platform_name', evolved_columns)
+            # Ensure partition key _ingested_at is NOT in StorageDescriptor.Columns
+            self.assertNotIn('_ingested_at', evolved_columns)
         finally:
             uax_bronze_load.glue_client = orig_glue
+
+    def test_json_serialization_excludes_partition_col(self):
+        """Validates that serialize_chunk_to_bytes strips _ingested_at from JSON payload."""
+        from uax_bronze_load import serialize_chunk_to_bytes
+        import json
+
+        records = [
+            {
+                "id": "1",
+                "name": "test",
+                "_source_system": "moveworks",
+                "_table_name": "interactions",
+                "_execution_id": "exec_1",
+                "_ingested_at": "2026-09-21T00:00:00Z"
+            }
+        ]
+        file_bytes, content_type, file_ext = serialize_chunk_to_bytes(
+            records_chunk=records,
+            output_format="json"
+        )
+        self.assertEqual(file_ext, ".json")
+        deserialized = json.loads(file_bytes.decode('utf-8'))
+        self.assertIn("id", deserialized[0])
+        self.assertIn("_source_system", deserialized[0])
+        self.assertNotIn("_ingested_at", deserialized[0])
 
 
 if __name__ == "__main__":
