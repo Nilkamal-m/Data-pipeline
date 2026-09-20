@@ -392,31 +392,34 @@ Executes the full multiline Gold aggregation query from the repository:
 
 ---
 
-### G. S3 Parquet File Column Deletion & AWS Glue Data Catalog Synchronization
+### G. S3 Parquet File Column Deletion (Simple S3 Rewrite + Manual Crawler Workflow)
 
-#### 27. Delete Column Entirely from S3 Parquet Files & Glue Data Catalog (Recommended)
-> **Use Case**: Eliminates the extra `_ingested_at` column entirely from the physical `.parquet` files in S3 across all partitions, and removes it from `StorageDescriptor.Columns` in the Glue Data Catalog. Even if an AWS Glue Crawler runs again, it discovers NO `_ingested_at` inside the Parquet files!
+#### 27. Simple In-Place Parquet Rewrite (Recommended)
+> **Use Case**: Reads every Parquet file under the specified S3 path, deletes `_ingested_at` (or any specified column) directly from the Parquet schema, and rewrites the file in-place with snappy compression.
+> **Note**: Completely decoupled from Glue Catalog! Even if the table was dropped or does not exist, this executes cleanly without throwing 400 errors. You can then trigger your Glue Crawler manually to create the table cleanly.
+
 ```json
 {
-  "action": "delete_from_parquet",
-  "database": "uax_datalake_db_dev",
-  "table": "raw_tbl_interactions",
-  "column_name": "_ingested_at"
-}
-```
-*Also accepted as `action: "delete_column"` (by default deletes from both S3 Parquet files and Glue Catalog unless `"catalog_only": true` is passed).*
-
-#### 28. Delete Column by Explicit S3 Path & Table
-> **Use Case**: When you want to explicitly target an S3 prefix or execute a dry-run check:
-```json
-{
-  "action": "delete_from_parquet",
-  "database": "uax_datalake_db_dev",
-  "table": "raw_tbl_interactions",
   "s3_path": "s3://uax-datalake-bronze-bucket-dev/bronze/data/moveworks/interactions/",
   "column_name": "_ingested_at"
 }
 ```
+
+*Or pass table name to auto-resolve standard Bronze path:*
+```json
+{
+  "action": "delete_from_parquet",
+  "table": "raw_tbl_interactions",
+  "column_name": "_ingested_at"
+}
+```
+
+#### 28. Standalone Python Runner (AWS CloudShell / Terminal)
+> If you prefer not using Lambda layers or want to run directly in AWS CloudShell or your local terminal:
+```bash
+python3 lambda_helper/lambda_function.py s3://uax-datalake-bronze-bucket-dev/bronze/data/moveworks/interactions/ _ingested_at
+```
+
 
 #### 29. Fast Catalog-Only Fix (Zero S3 I/O)
 > **Use Case**: Only removes the column from the AWS Glue Data Catalog table schema without touching S3 files:

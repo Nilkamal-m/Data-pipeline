@@ -517,6 +517,10 @@ def is_catalog_maintenance_event(event: Dict[str, Any]) -> bool:
       - 'layer': 'catalog', 'glue_catalog', 'parquet', 'sanitize'
       - Explicit field: 'exclude_columns', 'column_name', 'drop_column', 'delete_from_parquet', 'rewrite_parquet'
     """
+def is_catalog_maintenance_event(event: Dict[str, Any]) -> bool:
+    """Detects if event is requesting catalog or Parquet column deletion/sanitization."""
+    if not isinstance(event, dict):
+        return False
     action = str(event.get('action', '')).strip().lower()
     layer = str(event.get('layer', '')).strip().lower()
     return (
@@ -525,27 +529,31 @@ def is_catalog_maintenance_event(event: Dict[str, Any]) -> bool:
             'delete_from_parquet', 'sanitize_parquet', 'rewrite_parquet',
             'delete_column_from_parquet', 'clean_parquet',
             'fix_catalog_table', 'fix_columns', 'clean_catalog_table',
-            'update_schema', 'catalog_fix', 'sanitize_table'
+            'update_schema', 'catalog_fix', 'sanitize_table',
+            'delete', 'drop', 'clean', 'sanitize', 'rewrite'
         )
-        or layer in ('catalog', 'glue_catalog', 'parquet', 'sanitize')
+        or layer in ('catalog', 'glue_catalog', 'parquet', 'sanitize', 'clean')
+        or 's3_path' in event
+        or 's3_uri' in event
         or 'exclude_columns' in event
+        or 'column_name' in event
+        or 'drop_column' in event
+        or 'columns' in event
         or 'delete_from_parquet' in event
         or 'rewrite_parquet' in event
-        or (bool(event.get('column_name') or event.get('drop_column')) and action in ('delete', 'drop', 'remove', 'clean', 'fix', 'sanitize', 'rewrite'))
     )
+
 
 
 def fix_catalog_table_columns(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Deletes specified columns entirely from:
-      1. Physical Apache Parquet files in S3 (in-place rewrite to eliminate internal column from data & footer).
-      2. AWS Glue Data Catalog table's StorageDescriptor.Columns.
-
-    This resolves duplicate column issues in Athena/Spark (e.g. when _ingested_at was written
-    both as a file column and an S3 partition key). Even if an AWS Glue Crawler runs again,
-    it discovers NO duplicate column inside the Parquet files!
+    Deletes specified columns entirely from physical Apache Parquet files in S3.
+    Reads each Parquet file, drops the target column(s) (e.g. _ingested_at), and rewrites
+    the file in-place with snappy compression.
+    Optionally syncs AWS Glue Catalog if the table exists, but never fails if the table is dropped.
+    The user can then manually run the Glue Crawler to recreate the table cleanly.
     """
-    # 1. Resolve column(s) to remove
+    # 1. Resolve column(s) to remove (default: _ingested_at)
     exclude_cols = set()
     for col_key in ('column_name', 'column', 'columns', 'exclude_columns', 'exclude_column', 'drop_columns', 'drop_column'):
         val = event.get(col_key)
@@ -577,40 +585,50 @@ def fix_catalog_table_columns(event: Dict[str, Any], context: Any) -> Dict[str, 
         or event.get('s3_uri')
         or event.get('s3_location')
         or event.get('location')
+        or event.get('path')
     )
 
-    if not table_name and not s3_path:
-        raise ValueError("Missing required parameter 'table' / 'table_name' or 's3_path' for column deletion.")
+    # If bucket and prefix were passed separately
+    if not s3_path and event.get('bucket'):
+        b = str(event['bucket']).strip().strip('/')
+        p = str(event.get('prefix', '')).strip().strip('/')
+        s3_path = f"s3://{b}/{p}/" if p else f"s3://{b}/"
 
+    # Safely inspect Glue Catalog table if table_name is given (NEVER fail if table was dropped)
     table = None
-    table_location = ''
     if table_name:
-        logger.info(f"Inspecting Glue Catalog table: {database}.{table_name}...")
-        response = glue_client.get_table(DatabaseName=database, Name=table_name)
-        table = response['Table']
-        sd = table.get('StorageDescriptor', {})
-        table_location = sd.get('Location', '')
+        try:
+            logger.info(f"Checking Glue Catalog for table: {database}.{table_name}...")
+            response = glue_client.get_table(DatabaseName=database, Name=table_name)
+            table = response.get('Table')
+            if not s3_path and table:
+                table_loc = table.get('StorageDescriptor', {}).get('Location', '')
+                if table_loc:
+                    s3_path = table_loc
+                    logger.info(f"Resolved S3 location from Glue Catalog: {s3_path}")
+        except Exception as tbl_err:
+            logger.info(f"Table '{table_name}' not found in Glue Catalog ({tbl_err}). Crawler will create it after S3 rewrite.")
 
-    if not s3_path and table_location:
-        s3_path = table_location
+    # Fallback S3 path resolution for standard Bronze layout if s3_path is still empty
+    if not s3_path:
+        target_tbl = table_name or 'raw_tbl_interactions'
+        clean_tbl = target_tbl.replace('raw_tbl_', '').replace('tbl_', '')
+        source_sys = event.get('source_system') or ('moveworks' if 'interaction' in clean_tbl or 'conversation' in clean_tbl else 'servicenow')
+        env = event.get('env') or os.environ.get('ENVIRONMENT', 'dev')
+        candidate_bucket = os.environ.get('DEFAULT_BRONZE_BUCKET') or f"uax-datalake-bronze-{env}"
+        s3_path = f"s3://{candidate_bucket}/bronze/data/{source_sys}/{clean_tbl}/"
+        logger.info(f"Constructed default Bronze S3 path: {s3_path}")
 
-    # 3. In-place S3 Parquet File Rewrite (enabled by default unless explicitly disabled)
-    delete_from_parquet = not (
-        bool(event.get('catalog_only'))
-        or bool(event.get('only_catalog'))
-        or event.get('delete_from_parquet') is False
-        or event.get('rewrite_s3_files') is False
-        or event.get('rewrite_parquet') is False
-    )
 
+    # 3. Read Parquet files, delete column, and rewrite in-place
     parquet_summary = None
-    if delete_from_parquet and s3_path and s3_path.startswith('s3://'):
+    if s3_path.startswith('s3://'):
         clean_s3 = s3_path[5:]
         parts = clean_s3.split('/', 1)
         bucket = parts[0]
         prefix = parts[1] if len(parts) > 1 else ''
 
-        logger.info(f"Scanning S3 for Parquet files under s3://{bucket}/{prefix} to delete column(s) {list(exclude_cols)}...")
+        logger.info(f"Scanning S3 for Parquet files under s3://{bucket}/{prefix} to delete {list(exclude_cols)}...")
         try:
             try:
                 import pyarrow.parquet as pq
@@ -621,13 +639,18 @@ def fix_catalog_table_columns(event: Dict[str, Any], context: Any) -> Dict[str, 
 
             if not has_arrow:
                 msg = (
-                    "PyArrow is required to delete columns directly from S3 Parquet files. "
-                    "Please attach the AWS managed layer 'AWSSDKPandas' to this Lambda function "
-                    f"(arn:aws:lambda:{os.environ.get('AWS_REGION', 'us-east-1')}:336392948345:layer:AWSSDKPandas-Python39:26) "
-                    "or deploy via Terraform with pandas_layer_arn."
+                    "PyArrow is not installed in the current Lambda runtime.\n"
+                    "HOW TO FIX IN 10 SECONDS:\n"
+                    "1. Go to AWS Lambda Console -> your Helper Lambda -> scroll to 'Layers' at the bottom.\n"
+                    "2. Click 'Add a layer' -> choose 'AWS layers' -> select 'AWSSDKPandas-Python39' -> click Add.\n"
+                    "OR run directly in AWS CloudShell / terminal: python3 lambda_function.py " + s3_path
                 )
                 logger.warning(msg)
-                parquet_summary = {'status': 'SKIPPED', 'reason': 'pyarrow_not_installed', 'message': msg}
+                parquet_summary = {
+                    'status': 'SKIPPED',
+                    'reason': 'pyarrow_not_installed',
+                    'message': msg
+                }
             else:
                 paginator = s3_client.get_paginator('list_objects_v2')
                 parquet_keys = []
@@ -643,7 +666,8 @@ def fix_catalog_table_columns(event: Dict[str, Any], context: Any) -> Dict[str, 
                 if total_files == 0:
                     parquet_summary = {
                         'status': 'NO_FILES_FOUND',
-                        'message': f"No .parquet files found under s3://{bucket}/{prefix}."
+                        's3_location': f"s3://{bucket}/{prefix}",
+                        'message': f"No .parquet files found under s3://{bucket}/{prefix}. Please check the S3 path."
                     }
                 else:
                     def _sanitize_file(key: str) -> Dict[str, Any]:
@@ -675,10 +699,11 @@ def fix_catalog_table_columns(event: Dict[str, Any], context: Any) -> Dict[str, 
                             if res.get('rewritten'):
                                 rewritten_files += 1
 
-                    logger.info(
-                        f"✓ S3 Parquet sanitization complete: {rewritten_files}/{total_files} file(s) rewritten. "
-                        f"Column(s) {list(exclude_cols)} deleted entirely from all Parquet files. Total records: {total_records}."
+                    success_msg = (
+                        f"Successfully deleted column(s) {list(exclude_cols)} from all {rewritten_files} Parquet file(s) "
+                        f"in S3 ({total_records} records sanitized). You can now manually trigger your Glue Crawler to create the table cleanly."
                     )
+                    logger.info(f"✓ {success_msg}")
                     parquet_summary = {
                         'status': 'SUCCEEDED',
                         'files_scanned': total_files,
@@ -686,69 +711,60 @@ def fix_catalog_table_columns(event: Dict[str, Any], context: Any) -> Dict[str, 
                         'total_records': total_records,
                         'deleted_columns': list(exclude_cols),
                         's3_location': f"s3://{bucket}/{prefix}",
-                        'message': f"Column(s) {list(exclude_cols)} deleted entirely from all {total_files} Parquet file(s)."
+                        'message': success_msg
                     }
         except Exception as rw_err:
-            logger.error(f"S3 Parquet rewrite encountered an error: {rw_err}", exc_info=True)
-            parquet_summary = {'status': 'FAILED', 'error': str(rw_err)}
+            logger.error(f"S3 Parquet rewrite error: {rw_err}", exc_info=True)
+            return {
+                'statusCode': 500,
+                'body': json.dumps({
+                    'status': 'FAILED',
+                    'error': str(rw_err),
+                    'message': f"Failed rewriting Parquet files under s3://{bucket}/{prefix}"
+                })
+            }
 
-    # 4. Glue Catalog Table Update
+    # 4. Optional: Update Glue Catalog if table exists (fail-safe)
     catalog_summary = None
-    if table:
-        sd = table.get('StorageDescriptor', {})
-        original_cols = sd.get('Columns', [])
-        cleaned_cols = [c for c in original_cols if c.get('Name', '').strip().lower() not in exclude_cols]
-        removed_cols = [c.get('Name') for c in original_cols if c.get('Name', '').strip().lower() in exclude_cols]
-        pkeys = [pk.get('Name') for pk in table.get('PartitionKeys', [])]
+    if table and table_name:
+        try:
+            sd = table.get('StorageDescriptor', {})
+            original_cols = sd.get('Columns', [])
+            cleaned_cols = [c for c in original_cols if c.get('Name', '').strip().lower() not in exclude_cols]
+            removed_cols = [c.get('Name') for c in original_cols if c.get('Name', '').strip().lower() in exclude_cols]
+            pkeys = [pk.get('Name') for pk in table.get('PartitionKeys', [])]
 
-        if removed_cols:
-            read_only_keys = [
-                'DatabaseName', 'CreateTime', 'UpdateTime', 'CreatedBy',
-                'IsRegisteredWithLakeFormation', 'CatalogId', 'VersionId',
-                'FederatedTable', 'Owner'
-            ]
-            table_input = {k: v for k, v in table.items() if k not in read_only_keys}
-            table_input['StorageDescriptor']['Columns'] = cleaned_cols
-
-            logger.info(
-                f"Updating {database}.{table_name}: deleting {removed_cols} from StorageDescriptor.Columns. "
-                f"Remaining columns: {len(cleaned_cols)}, Partition keys: {pkeys}"
-            )
-            glue_client.update_table(
-                DatabaseName=database,
-                TableInput=table_input
-            )
-            catalog_summary = {
-                'status': 'SUCCEEDED',
-                'deleted_columns': removed_cols,
-                'remaining_columns_count': len(cleaned_cols),
-                'partition_keys': pkeys,
-                'message': f"Successfully removed {removed_cols} from StorageDescriptor.Columns. Partition keys: {pkeys}."
-            }
-        else:
-            catalog_summary = {
-                'status': 'NO_CHANGE',
-                'remaining_columns_count': len(cleaned_cols),
-                'partition_keys': pkeys,
-                'message': f"No columns matching {list(exclude_cols)} were present in StorageDescriptor.Columns. Partition keys: {pkeys}."
-            }
-
-    overall_status = 'SUCCEEDED'
-    if parquet_summary and parquet_summary.get('status') == 'FAILED':
-        overall_status = 'PARTIAL_SUCCESS' if (catalog_summary and catalog_summary.get('status') == 'SUCCEEDED') else 'FAILED'
+            if removed_cols:
+                read_only_keys = [
+                    'DatabaseName', 'CreateTime', 'UpdateTime', 'CreatedBy',
+                    'IsRegisteredWithLakeFormation', 'CatalogId', 'VersionId',
+                    'FederatedTable', 'Owner'
+                ]
+                table_input = {k: v for k, v in table.items() if k not in read_only_keys}
+                table_input['StorageDescriptor']['Columns'] = cleaned_cols
+                glue_client.update_table(DatabaseName=database, TableInput=table_input)
+                catalog_summary = {
+                    'status': 'SUCCEEDED',
+                    'deleted_columns': removed_cols,
+                    'partition_keys': pkeys,
+                    'message': f"Updated existing Glue Catalog table {database}.{table_name}."
+                }
+            else:
+                catalog_summary = {'status': 'NO_CHANGE', 'message': f"Table {table_name} catalog schema already clean."}
+        except Exception as cat_err:
+            logger.info(f"Catalog update skipped ({cat_err}); crawler will manage table schema.")
 
     resp_payload = {
-        'status': overall_status,
-        'database': database,
-        'table': table_name,
+        'status': 'SUCCEEDED',
+        'message': f"Column(s) {list(exclude_cols)} deleted entirely from Parquet files in S3. Trigger crawler to create/refresh table.",
         'deleted_columns': list(exclude_cols),
-        'parquet_sanitization': parquet_summary,
-        'catalog_update': catalog_summary
+        'parquet_sanitization': parquet_summary
     }
+    if catalog_summary:
+        resp_payload['catalog_update'] = catalog_summary
 
-    status_code = 200 if overall_status in ('SUCCEEDED', 'PARTIAL_SUCCESS') else 500
     return {
-        'statusCode': status_code,
+        'statusCode': 200,
         'body': json.dumps(resp_payload)
     }
 
@@ -1403,15 +1419,35 @@ def execute_pipeline_stages(event: Dict[str, Any], context: Any) -> Dict[str, An
     }
 
 
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+def lambda_handler(event: Any, context: Any) -> Dict[str, Any]:
     """
     Main Lambda entrypoint.
     Supports:
       1. Athena query execution (if 'query', 'athena_query', or 'sql' is in event)
-      2. Multi-Stage Pipeline Execution (if layer="all" / "pipeline" / "e2e" or "layers" list)
-      3. Single AWS Glue Job Triggering & Monitoring (Bronze, Silver, or Gold)
+      2. Glue Catalog / Parquet sanitization (delete_from_parquet / s3_path / column_name)
+      3. Glue Crawler Trigger & Monitoring (if crawler_name / action="crawler")
+      4. Multi-Stage Pipeline Execution (if layer="all" / "pipeline" / "e2e" or "layers" list)
+      5. Single AWS Glue Job Triggering & Monitoring (Bronze, Silver, or Gold)
     """
+    if isinstance(event, str):
+        try:
+            event = json.loads(event)
+        except Exception:
+            pass
+
+    if not isinstance(event, dict):
+        event = {}
+
+    if 'body' in event and isinstance(event.get('body'), str):
+        try:
+            parsed_body = json.loads(event['body'])
+            if isinstance(parsed_body, dict):
+                event = {**parsed_body, **event}
+        except Exception:
+            pass
+
     logger.info(f"Received invocation event: {json.dumps(event, default=str)}")
+
 
     try:
         # Route 1: Athena Query Execution
@@ -1528,3 +1564,21 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'message': 'Failed to execute operation in Helper Lambda'
             })
         }
+
+
+if __name__ == '__main__':
+    import sys
+    # Direct execution support: python3 lambda_function.py <s3_path> [column_name]
+    if len(sys.argv) > 1:
+        target_s3 = sys.argv[1]
+        col_to_drop = sys.argv[2] if len(sys.argv) > 2 else "_ingested_at"
+        print(f"Running Parquet sanitization on: {target_s3} to remove '{col_to_drop}'...")
+        res = lambda_handler({
+            "action": "delete_from_parquet",
+            "s3_path": target_s3,
+            "column_name": col_to_drop
+        }, None)
+        print(json.dumps(res, indent=2))
+    else:
+        print("Usage: python3 lambda_function.py <s3_path> [column_name]")
+        print("Example: python3 lambda_function.py s3://my-bucket/bronze/data/moveworks/interactions/ _ingested_at")

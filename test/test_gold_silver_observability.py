@@ -1788,6 +1788,128 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
             self.assertEqual(catalog_res['status'], 'SUCCEEDED')
             mock_glue.update_table.assert_called_once()
 
+    def test_lambda_delete_from_parquet_when_table_dropped(self):
+        """Validates that Lambda handles dropped/missing Glue tables gracefully and still sanitizes S3 Parquet."""
+        from lambda_function import lambda_handler
+        import sys
+
+        event = {
+            "action": "delete_from_parquet",
+            "s3_path": "s3://test-bucket/bronze/data/moveworks/interactions/",
+            "table": "raw_tbl_interactions",
+            "column_name": "_ingested_at"
+        }
+
+        mock_arrow_table = MagicMock()
+        mock_arrow_table.column_names = ['id', '_ingested_at']
+        mock_arrow_table.drop.return_value = MagicMock()
+        mock_arrow_table.__len__.return_value = 100
+
+        mock_pq = MagicMock()
+        mock_pq.read_table.return_value = mock_arrow_table
+
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {'Contents': [{'Key': 'bronze/data/moveworks/interactions/part-0.parquet'}]}
+        ]
+
+        mock_pyarrow = MagicMock()
+        mock_pyarrow.parquet = mock_pq
+
+        with patch('lambda_function.glue_client') as mock_glue, \
+             patch('lambda_function.s3_client') as mock_s3, \
+             patch.dict(sys.modules, {'pyarrow': mock_pyarrow, 'pyarrow.parquet': mock_pq}):
+
+            # Simulate table dropped in Glue Catalog (EntityNotFoundException)
+            mock_glue.get_table.side_effect = Exception("EntityNotFoundException: Table raw_tbl_interactions not found")
+            mock_s3.get_paginator.return_value = mock_paginator
+            mock_s3.get_object.return_value = {'Body': MagicMock(read=lambda: b'BYTES')}
+
+            resp = lambda_handler(event, None)
+            # Must be 200 OK, NEVER 400!
+            self.assertEqual(resp['statusCode'], 200)
+            body = json.loads(resp['body'])
+            self.assertEqual(body['status'], 'SUCCEEDED')
+            self.assertEqual(body['parquet_sanitization']['files_rewritten'], 1)
+            mock_s3.put_object.assert_called_once()
+
+    def test_lambda_delete_from_parquet_minimal_s3_path_payload(self):
+        """Validates that Lambda handles a dead-simple payload containing only s3_path without crashing."""
+        from lambda_function import lambda_handler
+        import sys
+
+        # Simplest possible payload: just s3_path!
+        event = {
+            "s3_path": "s3://test-bucket/bronze/data/moveworks/interactions/"
+        }
+
+        mock_arrow_table = MagicMock()
+        mock_arrow_table.column_names = ['id', '_ingested_at']
+        mock_arrow_table.drop.return_value = MagicMock()
+        mock_arrow_table.__len__.return_value = 50
+
+        mock_pq = MagicMock()
+        mock_pq.read_table.return_value = mock_arrow_table
+
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {'Contents': [{'Key': 'bronze/data/moveworks/interactions/part-0.parquet'}]}
+        ]
+
+        mock_pyarrow = MagicMock()
+        mock_pyarrow.parquet = mock_pq
+
+        with patch('lambda_function.glue_client') as mock_glue, \
+             patch('lambda_function.s3_client') as mock_s3, \
+             patch.dict(sys.modules, {'pyarrow': mock_pyarrow, 'pyarrow.parquet': mock_pq}):
+
+            mock_s3.get_paginator.return_value = mock_paginator
+            mock_s3.get_object.return_value = {'Body': MagicMock(read=lambda: b'BYTES')}
+
+            resp = lambda_handler(event, None)
+            self.assertEqual(resp['statusCode'], 200)
+            body = json.loads(resp['body'])
+            self.assertEqual(body['status'], 'SUCCEEDED')
+            self.assertEqual(body['parquet_sanitization']['files_rewritten'], 1)
+            self.assertEqual(body['parquet_sanitization']['deleted_columns'], ['_ingested_at'])
+            mock_s3.put_object.assert_called_once()
+
+    def test_lambda_handles_string_or_body_event(self):
+        """Validates that Lambda handles string events or API Gateway body strings safely without 400 error."""
+        from lambda_function import lambda_handler
+        import sys
+
+        string_event = json.dumps({
+            "s3_path": "s3://test-bucket/bronze/data/moveworks/interactions/"
+        })
+
+        mock_arrow_table = MagicMock()
+        mock_arrow_table.column_names = ['id', '_ingested_at']
+        mock_arrow_table.drop.return_value = MagicMock()
+        mock_arrow_table.__len__.return_value = 50
+
+        mock_pq = MagicMock()
+        mock_pq.read_table.return_value = mock_arrow_table
+
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {'Contents': [{'Key': 'bronze/data/moveworks/interactions/part-0.parquet'}]}
+        ]
+
+        mock_pyarrow = MagicMock()
+        mock_pyarrow.parquet = mock_pq
+
+        with patch('lambda_function.glue_client') as mock_glue, \
+             patch('lambda_function.s3_client') as mock_s3, \
+             patch.dict(sys.modules, {'pyarrow': mock_pyarrow, 'pyarrow.parquet': mock_pq}):
+
+            mock_s3.get_paginator.return_value = mock_paginator
+            mock_s3.get_object.return_value = {'Body': MagicMock(read=lambda: b'BYTES')}
+
+            resp = lambda_handler(string_event, None)
+            self.assertEqual(resp['statusCode'], 200)
+
+
 
 if __name__ == "__main__":
     unittest.main()
