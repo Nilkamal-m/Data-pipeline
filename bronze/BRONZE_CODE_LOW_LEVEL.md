@@ -43,18 +43,18 @@ graph TD
 
 Parses `sys.argv` with a custom key=value and positional parser designed specifically for AWS Glue Python Shell jobs (which pass parameters in `--KEY value` format).
 
-**3-tier parameter precedence (CLI > Config > Default):**
+**5-tier parameter precedence (CLI > Table Config > Source Config > Default > Runtime):**
 ```python
-# Example: upper_bound resolution
+# In parse_arguments():
 upper_bound_cli = get_cli_arg('UPPER_BOUND')
-upper_bound = (
-    upper_bound_cli or 
-    source_config.get('upper_bound') or 
-    pipeline_defaults.get('upper_bound') or 
-    ''
+
+# In main() table processing loop (table-wise resolution):
+table_upper_bound = ConfigLoader.get_table_upper_bound(
+    source_system=source_system,
+    table_name=api_table_name,
+    cli_upper_bound=upper_bound_cli,
+    source_config=source_config
 )
-if upper_bound and str(upper_bound).strip():
-    source_config['upper_bound'] = str(upper_bound).strip()
 ```
 
 **Strict validation — raises `ValueError` if:**
@@ -65,7 +65,7 @@ if upper_bound and str(upper_bound).strip():
 
 **Returns dict keys:**
 ```
-JOB_NAME, SOURCE_SYSTEM, TABLE_LIST, CUSTOM_QUERY, SECRET_NAME,
+JOB_NAME, SOURCE_SYSTEM, TABLE_LIST, CUSTOM_QUERY, SECRET_NAME, ENV,
 BRONZE_BUCKET, STATE_BUCKET, BRONZE_DATA_PREFIX, INITIAL_LOAD_DATE_CLI,
 UPPER_BOUND, S3_CHUNK_SIZE, OUTPUT_FORMAT, PARQUET_COMPRESSION,
 ERROR_HANDLING_MODE, CLOUDWATCH_NAMESPACE, GLUE_CATALOG_ENABLED,
@@ -126,11 +126,12 @@ Persists updated `watermark.json` to S3 **after** `promote_staging_to_bronze` su
 
 **Effective Watermark Logic:**
 ```python
-effective_watermark = upper_bound if upper_bound else current_run_time
+is_high_date = bool(table_upper_bound and (str(table_upper_bound).strip().startswith('9999') or str(table_upper_bound).strip().startswith('9998')))
+effective_watermark = current_run_time if (not table_upper_bound or is_high_date) else str(table_upper_bound).strip()
 update_last_load_date(state_bucket, state_key, source_system, clean_table_name, effective_watermark, total_table_records, table_prefix=glue_table_prefix)
 ```
-- During regular runs (`upper_bound` is empty), watermark advances to `current_run_time`.
-- During backfill runs (`upper_bound` is specified), watermark advances to `upper_bound`. This guarantees that subsequent runs resume from `upper_bound` without skipping data between `upper_bound` and current time!
+- During open-ended runs (`table_upper_bound` is empty or sentinel `"9999-01-01 00:00:00"`), watermark advances to `current_run_time`. This protects the state from year 9999 corruption.
+- During backfill runs (`table_upper_bound` is a historical timestamp e.g. `"2024-04-01 00:00:00"`), watermark advances to `table_upper_bound`. This guarantees that subsequent runs resume from `table_upper_bound` without skipping data!
 
 ---
 
@@ -147,9 +148,28 @@ Passed as `on_chunk_callback` to connectors. Executes whenever buffered records 
 
 ## 3. `config_loader.py` — Dynamic Configuration Engine
 
-### `ConfigLoader.get_table_query_filter(..., upper_bound=None) → str`
-**Lines 124–195**
+### `ConfigLoader.get_table_config(source_system, table_name) → dict`
 
+Retrieves the self-contained table configuration dictionary from `source_systems.<source>.tables.<table_name>`. Handles hyphen-to-underscore normalization automatically.
+
+### `ConfigLoader.get_source_tables(source_system) → list[str]`
+
+Discovers tables to process for a source system:
+1. `source_systems.<source>.tables.keys()` (Canonical registry).
+2. `source_systems.<source>.default_tables` (Legacy fallback).
+3. `source_systems.<source>.table_initial_load_dates.keys()` (Legacy fallback).
+
+### `ConfigLoader.get_table_upper_bound(...) → Optional[str]`
+
+Resolves the upper bound timestamp for a specific table:
+1. CLI `--UPPER_BOUND` argument.
+2. Table-wise `tables.<table_name>.upper_bound` in `bronze_config.json` (format: `"YYYY-MM-DD HH:MM:SS"`).
+3. Legacy `table_upper_bounds.<table_name>` fallback.
+4. Source-level `upper_bound` in `bronze_config.json`.
+5. Global `pipeline_defaults.upper_bound` in `bronze_config.json`.
+6. Returns `None` (open-ended extraction up to current execution time).
+
+### `ConfigLoader.get_table_query_filter(..., upper_bound=None) → str`
 Constructs the API or SQL filter expression. Safely resolves `{upper_bound}` and `{last_load_date}`:
 ```python
 effective_ub = (

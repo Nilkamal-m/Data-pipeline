@@ -53,7 +53,7 @@ from transformer import SilverTransformer
 from silver_config_loader import SilverConfigLoader
 from custom_transforms import servicenow_incident
 from config_loader import ConfigLoader
-from uax_bronze_load import get_table_state_key, update_last_load_date
+from uax_bronze_load import get_table_state_key, update_last_load_date, parse_arguments, get_last_load_date
 
 
 class TestProcessLayerOptions(unittest.TestCase):
@@ -700,6 +700,298 @@ class TestWatermarkExecutionStartTime(unittest.TestCase):
         self.assertTrue(payload["updated_at"].endswith("Z"))
 
 
+class TestDynamicEnvironmentInterpolation(unittest.TestCase):
+    """
+    Validates dynamic environment ({env}) interpolation across ConfigLoader and parse_arguments.
+    """
+
+    def setUp(self):
+        ConfigLoader.clear_cache()
+
+    def tearDown(self):
+        ConfigLoader.clear_cache()
+
+    def test_interpolate_env_nested_structures(self):
+        sample = {
+            "db": "uax_datalake_db_{env}",
+            "crawler": "uax-datalake-bronze-crawler-{env}",
+            "upper_placeholder": "BUCKET_{ENV}",
+            "nested": {
+                "prefix": "data/{env}/raw",
+                "items": ["db_{env}_tbl", 123, True]
+            }
+        }
+        interpolated = ConfigLoader.interpolate_env(sample, "prod")
+        self.assertEqual(interpolated["db"], "uax_datalake_db_prod")
+        self.assertEqual(interpolated["crawler"], "uax-datalake-bronze-crawler-prod")
+        self.assertEqual(interpolated["upper_placeholder"], "BUCKET_PROD")
+        self.assertEqual(interpolated["nested"]["prefix"], "data/prod/raw")
+        self.assertEqual(interpolated["nested"]["items"][0], "db_prod_tbl")
+
+    def test_load_config_with_custom_env(self):
+        prod_cfg = ConfigLoader.load_config(env="prod")
+        catalog_cfg = prod_cfg["pipeline_defaults"]["glue_catalog"]
+        self.assertEqual(catalog_cfg["database_name"], "uax_datalake_db_prod")
+        self.assertEqual(catalog_cfg["crawler_name"], "uax-datalake-bronze-crawler-prod")
+
+        dev_cfg = ConfigLoader.load_config(env="dev")
+        dev_catalog = dev_cfg["pipeline_defaults"]["glue_catalog"]
+        self.assertEqual(dev_catalog["database_name"], "uax_datalake_db_dev")
+        self.assertEqual(dev_catalog["crawler_name"], "uax-datalake-bronze-crawler-dev")
+
+    def test_get_glue_database_and_crawler_name_env_resolution(self):
+        db_qa = ConfigLoader.get_glue_database(env="qa")
+        self.assertEqual(db_qa, "uax_datalake_db_qa")
+
+        crawler_qa = ConfigLoader.get_crawler_name(env="qa")
+        self.assertEqual(crawler_qa, "uax-datalake-bronze-crawler-qa")
+
+    @patch('sys.argv', ['uax_bronze_load.py', '--SOURCE_SYSTEM', 'servicenow', '--SOURCE_TABLE_NAME', 'incident', '--ENV', 'staging', '--BRONZE_BUCKET', 'my-bucket-{env}'])
+    def test_parse_arguments_resolves_env_parameter(self):
+        params = parse_arguments()
+        self.assertEqual(params["ENV"], "staging")
+        self.assertEqual(params["GLUE_DATABASE_NAME"], "uax_datalake_db_staging")
+        self.assertEqual(params["BRONZE_CRAWLER_NAME"], "uax-datalake-bronze-crawler-staging")
+        self.assertEqual(params["BRONZE_BUCKET"], "my-bucket-staging")
+
+
+class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
+    """
+    Validates table-wise upper_bound ('table_upper_bounds'), format validation
+    ('YYYY-MM-DD HH:MM:SS'), Moveworks shard building with high-date capping,
+    query filter normalization, and watermark sentinel protection.
+    """
+
+    def setUp(self):
+        ConfigLoader.clear_cache()
+
+    def tearDown(self):
+        ConfigLoader.clear_cache()
+
+    def test_moveworks_parse_ts_formats(self):
+        from datetime import timezone
+        from connectors.moveworks import MoveworksConnector
+
+        ts1 = MoveworksConnector._parse_ts("9999-01-01 00:00:00")
+        self.assertEqual(ts1.year, 9999)
+        self.assertEqual(ts1.tzinfo, timezone.utc)
+
+        ts2 = MoveworksConnector._parse_ts("2024-03-01 15:30:00")
+        self.assertEqual(ts2.year, 2024)
+        self.assertEqual(ts2.month, 3)
+        self.assertEqual(ts2.day, 1)
+        self.assertEqual(ts2.tzinfo, timezone.utc)
+
+        ts3 = MoveworksConnector._parse_ts("2024-03-01T15:30:00Z")
+        self.assertEqual(ts3.year, 2024)
+        self.assertEqual(ts3.tzinfo, timezone.utc)
+
+    def test_moveworks_build_shards_caps_high_date(self):
+        from datetime import datetime, timezone
+        from connectors.moveworks import MoveworksConnector
+
+        # Without capping, 2024 to 9999 would generate >190,000 shards and crash memory
+        shards = MoveworksConnector._build_shards("2024-01-01 00:00:00", "9999-01-01 00:00:00", window_days=30)
+        self.assertGreater(len(shards), 0)
+        self.assertLess(len(shards), 100)  # Capped at current UTC time
+        self.assertTrue(shards[0][0].startswith("2024-01-01T00:00:00Z"))
+        self.assertTrue(shards[-1][1].endswith("Z"))
+
+    def test_config_loader_moveworks_query_filter_normalization(self):
+        filter_str = ConfigLoader.get_table_query_filter(
+            source_system="moveworks",
+            table_name="conversations",
+            last_load_date="2024-01-01 00:00:00",
+            upper_bound="9999-01-01 00:00:00"
+        )
+        # Verify timestamps are normalized to ISO-8601 without spaces for Moveworks OData
+        self.assertIn("last_updated_time ge '2024-01-01T00:00:00Z'", filter_str)
+        self.assertIn("last_updated_time le '9999-01-01T00:00:00Z'", filter_str)
+        self.assertNotIn("00:00:00'", filter_str)  # No raw space-separated timestamp in quotes
+
+    def test_watermark_sentinel_protection(self):
+        current_run_time = "2026-09-20T12:00:00Z"
+
+        # Case 1: Open-ended sentinel '9999-01-01 00:00:00'
+        ub_high = "9999-01-01 00:00:00"
+        is_high_date = bool(ub_high and (str(ub_high).strip().startswith('9999') or str(ub_high).strip().startswith('9998')))
+        effective_watermark = current_run_time if (not ub_high or is_high_date) else str(ub_high).strip()
+        self.assertTrue(is_high_date)
+        self.assertEqual(effective_watermark, current_run_time)
+
+        # Case 2: Historical backfill date
+        ub_backfill = "2024-03-01 00:00:00"
+        is_high_date_bf = bool(ub_backfill and (str(ub_backfill).strip().startswith('9999') or str(ub_backfill).strip().startswith('9998')))
+        effective_watermark_bf = current_run_time if (not ub_backfill or is_high_date_bf) else str(ub_backfill).strip()
+        self.assertFalse(is_high_date_bf)
+        self.assertEqual(effective_watermark_bf, "2024-03-01 00:00:00")
+
+    @patch('sys.argv', ['uax_bronze_load.py', '--SOURCE_SYSTEM', 'servicenow', '--SOURCE_TABLE_NAME', 'incident', '--UPPER_BOUND', '9999-01-01 00:00:00', '--BRONZE_BUCKET', 'test-bucket'])
+    def test_parse_arguments_upper_bound_propagation(self):
+        params = parse_arguments()
+        self.assertEqual(params["UPPER_BOUND"], "9999-01-01 00:00:00")
+
+    def test_table_wise_upper_bound_resolution(self):
+        mock_source_config = {
+            "tables": {
+                "incident": {
+                    "initial_load_date": "2024-01-01 00:00:00",
+                    "upper_bound": "2024-06-01 00:00:00"
+                },
+                "change_request": {
+                    "initial_load_date": "2024-03-01 00:00:00",
+                    "upper_bound": ""
+                }
+            }
+        }
+        # 1. Configured table has specific upper bound
+        ub_inc = ConfigLoader.get_table_upper_bound("servicenow", "incident", source_config=mock_source_config)
+        self.assertEqual(ub_inc, "2024-06-01 00:00:00")
+
+        # 2. Configured table with empty string returns None (open-ended)
+        ub_cr = ConfigLoader.get_table_upper_bound("servicenow", "change_request", source_config=mock_source_config)
+        self.assertIsNone(ub_cr)
+
+        # 3. CLI override takes priority over tables.<tbl>.upper_bound
+        ub_cli = ConfigLoader.get_table_upper_bound(
+            "servicenow", "incident", cli_upper_bound="2024-12-31 23:59:59", source_config=mock_source_config
+        )
+        self.assertEqual(ub_cli, "2024-12-31 23:59:59")
+
+    def test_all_initial_load_dates_format_in_config(self):
+        """Validates that all tables.initial_load_date follow 'YYYY-MM-DD HH:MM:SS' across all sources."""
+        from datetime import datetime
+        config = ConfigLoader.load_config()
+        sources = config.get("source_systems", {})
+        
+        checked_count = 0
+        for source_name, source_cfg in sources.items():
+            tables = source_cfg.get("tables", {})
+            for tbl, tbl_cfg in tables.items():
+                dt_str = tbl_cfg.get("initial_load_date", "")
+                checked_count += 1
+                # Must parse strictly with '%Y-%m-%d %H:%M:%S'
+                try:
+                    parsed = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+                    self.assertIsNotNone(parsed)
+                except ValueError:
+                    self.fail(f"Source '{source_name}', table '{tbl}' initial load date '{dt_str}' does not match 'YYYY-MM-DD HH:MM:SS'")
+                
+                # Must not contain 'T' or 'Z'
+                self.assertNotIn('T', dt_str)
+                self.assertNotIn('Z', dt_str)
+
+        self.assertGreater(checked_count, 15)
+
+    def test_unified_source_tables_resolution(self):
+        """Validates that ConfigLoader resolves all table properties from the unified 'tables' structure."""
+        config = ConfigLoader.load_config()
+        sn_cfg = config["source_systems"]["servicenow"]
+
+        # 1. Initial load date from tables
+        init_date = ConfigLoader.get_table_initial_load_date("servicenow", "incident", source_config=sn_cfg)
+        self.assertEqual(init_date, "2024-01-01 00:00:00")
+
+        # 2. Query override from tables
+        query = ConfigLoader.get_table_query_filter("servicenow", "incident", "2024-01-01 00:00:00", source_config=sn_cfg)
+        self.assertIn("active=true", query)
+
+        # 3. Custom endpoint from tables
+        endpoint = ConfigLoader.get_table_endpoint("servicenow", "u_special_report", source_config=sn_cfg)
+        self.assertEqual(endpoint, "/api/now/v1/custom_reports")
+
+        # 4. S3 File feed file_path and fetch_mode
+        va_cfg = config["source_systems"]["vendor_a_s3"]
+        file_path = ConfigLoader.get_table_file_path("vendor_a_s3", "employee_feed", source_config=va_cfg)
+        self.assertEqual(file_path, "raw_feed/employee_feed/")
+        fetch_mode = ConfigLoader.get_table_fetch_mode("vendor_a_s3", "employee_feed", source_config=va_cfg)
+        self.assertEqual(fetch_mode, "latest")
+
+        # 5. Table list discovery
+        tables = ConfigLoader.get_source_tables("servicenow", source_config=sn_cfg)
+        self.assertIn("incident", tables)
+        self.assertIn("change_request", tables)
+        self.assertIn("sys_user", tables)
+
+    def test_backward_compatibility_with_legacy_maps(self):
+        """Validates dual-read strategy with legacy parallel dictionaries."""
+        legacy_source_cfg = {
+            "table_initial_load_dates": {
+                "legacy_tbl": "2023-05-01 00:00:00"
+            },
+            "table_upper_bounds": {
+                "legacy_tbl": "2023-12-31 23:59:59"
+            },
+            "table_query_overrides": {
+                "legacy_tbl": "status='ARCHIVED'^sys_updated_on>={last_load_date}"
+            },
+            "custom_table_endpoints": {
+                "legacy_tbl": "/api/custom/legacy"
+            },
+            "default_tables": ["legacy_tbl"]
+        }
+
+        # 1. Initial load date fallback
+        d = ConfigLoader.get_table_initial_load_date("legacy_source", "legacy_tbl", source_config=legacy_source_cfg)
+        self.assertEqual(d, "2023-05-01 00:00:00")
+
+        # 2. Upper bound fallback
+        ub = ConfigLoader.get_table_upper_bound("legacy_source", "legacy_tbl", source_config=legacy_source_cfg)
+        self.assertEqual(ub, "2023-12-31 23:59:59")
+
+        # 3. Query override fallback
+        q = ConfigLoader.get_table_query_filter("legacy_source", "legacy_tbl", "2023-05-01 00:00:00", source_config=legacy_source_cfg)
+        self.assertIn("status='ARCHIVED'", q)
+
+        # 4. Custom endpoint fallback
+        ep = ConfigLoader.get_table_endpoint("legacy_source", "legacy_tbl", source_config=legacy_source_cfg)
+        self.assertEqual(ep, "/api/custom/legacy")
+
+        # 5. Table list fallback
+        tbls = ConfigLoader.get_source_tables("legacy_source", source_config=legacy_source_cfg)
+        self.assertEqual(tbls, ["legacy_tbl"])
+
+    def test_defaults_upper_bound_is_empty(self):
+        """Validates that pipeline_defaults.upper_bound is empty string and not hardcoded to 9999."""
+        config = ConfigLoader.load_config()
+        pipeline_defaults = config.get("pipeline_defaults", {})
+        self.assertEqual(pipeline_defaults.get("upper_bound"), "")
+
+    @patch('uax_bronze_load.s3_client')
+    def test_manual_date_range_cli_initial_load_date_override(self, mock_s3):
+        """Validates that CLI --INITIAL_LOAD_DATE overrides existing S3 watermark for manual date range ingestion."""
+        # Setup S3 mock with existing watermark of 2026-09-18
+        mock_body = MagicMock()
+        mock_body.read.return_value = json.dumps({
+            "source_system": "servicenow",
+            "table_name": "raw_tbl_incident",
+            "last_load_date": "2026-09-18T10:00:00Z",
+            "last_status": "SUCCESS"
+        }).encode('utf-8')
+        mock_s3.get_object.return_value = {"Body": mock_body}
+
+        # 1. Without CLI override, returns S3 watermark
+        res_standard = get_last_load_date(
+            state_bucket="test-bucket",
+            state_key="metadata/bronze/servicenow/incident/watermark.json",
+            source_system="servicenow",
+            table_name="incident",
+            cli_initial_date=None
+        )
+        self.assertEqual(res_standard, "2026-09-18T10:00:00Z")
+
+        # 2. With CLI override (manual backfill for date range), overrides S3 watermark
+        res_manual = get_last_load_date(
+            state_bucket="test-bucket",
+            state_key="metadata/bronze/servicenow/incident/watermark.json",
+            source_system="servicenow",
+            table_name="incident",
+            cli_initial_date="2024-03-01 00:00:00"
+        )
+        self.assertEqual(res_manual, "2024-03-01 00:00:00")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

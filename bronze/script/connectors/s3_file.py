@@ -71,13 +71,16 @@ class S3FileConnector:
                 f"(source_systems.<name>.source_bucket)."
             )
 
-        # Per-table path override, fallback to global file_prefix
+        # Per-table path override: tables.<table_name>.file_path > table_paths > global file_prefix
+        tables_dict = config.get('tables', {})
+        table_cfg = tables_dict.get(table_name, {}) if isinstance(tables_dict, dict) else {}
         table_paths = config.get('table_paths', {})
-        file_prefix = table_paths.get(table_name) or config.get('file_prefix', f'raw/{table_name}/')
+        file_prefix = table_cfg.get('file_path') or table_paths.get(table_name) or config.get('file_prefix', f'raw/{table_name}/')
 
-        # Per-table fetch_mode override, fallback to global fetch_mode
-        table_modes  = config.get('table_fetch_modes', {})
-        fetch_mode   = (table_modes.get(table_name) or config.get('fetch_mode', 'all')).lower()
+        # Per-table fetch_mode override: tables.<table_name>.fetch_mode > table_fetch_modes > global fetch_mode
+        table_modes = config.get('table_fetch_modes', {})
+        raw_mode = table_cfg.get('fetch_mode') or table_modes.get(table_name) or config.get('fetch_mode', 'all')
+        fetch_mode = str(raw_mode).strip().lower()
         if fetch_mode not in _VALID_FETCH_MODES:
             raise ValueError(
                 f"S3FileConnector for '{table_name}': invalid 'fetch_mode' = '{fetch_mode}'. "
@@ -106,9 +109,18 @@ class S3FileConnector:
         else:
             s3 = boto3.client('s3')
 
-        # Parse watermark and optional upper_bound
+        # Parse watermark and optional upper_bound (support 'YYYY-MM-DD HH:MM:SS' and ISO-8601)
         try:
-            hwm = datetime.fromisoformat(last_load_date.replace('Z', '+00:00'))
+            hwm_str = str(last_load_date).strip()
+            if hwm_str.endswith('Z') or hwm_str.endswith('z'):
+                hwm_str = hwm_str[:-1] + '+00:00'
+            elif ' ' in hwm_str and '+' not in hwm_str and '-' not in hwm_str[10:]:
+                hwm_str = hwm_str.replace(' ', 'T') + '+00:00'
+            elif 'T' in hwm_str and '+' not in hwm_str and '-' not in hwm_str[10:]:
+                hwm_str = hwm_str + '+00:00'
+            hwm = datetime.fromisoformat(hwm_str)
+            if hwm.tzinfo is None:
+                hwm = hwm.replace(tzinfo=timezone.utc)
         except Exception:
             hwm = datetime.min.replace(tzinfo=timezone.utc)
 
@@ -116,7 +128,16 @@ class S3FileConnector:
         ub_dt = None
         if upper_bound_str and str(upper_bound_str).strip():
             try:
-                ub_dt = datetime.fromisoformat(str(upper_bound_str).strip().replace('Z', '+00:00'))
+                ub_clean = str(upper_bound_str).strip()
+                if ub_clean.endswith('Z') or ub_clean.endswith('z'):
+                    ub_clean = ub_clean[:-1] + '+00:00'
+                elif ' ' in ub_clean and '+' not in ub_clean and '-' not in ub_clean[10:]:
+                    ub_clean = ub_clean.replace(' ', 'T') + '+00:00'
+                elif 'T' in ub_clean and '+' not in ub_clean and '-' not in ub_clean[10:]:
+                    ub_clean = ub_clean + '+00:00'
+                ub_dt = datetime.fromisoformat(ub_clean)
+                if ub_dt.tzinfo is None:
+                    ub_dt = ub_dt.replace(tzinfo=timezone.utc)
             except Exception:
                 logger.warning(f"[S3File/{table_name}] Could not parse upper_bound '{upper_bound_str}', ignoring.")
 

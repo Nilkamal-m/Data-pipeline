@@ -367,7 +367,25 @@ class MoveworksConnector:
         )
         return all_records if not on_chunk_callback else []
 
-    # ── Private: Shard builder ─────────────────────────────────────────────────
+    # ── Private: Timestamp parsing and shard builder ──────────────────────────
+
+    @staticmethod
+    def _parse_ts(ts: str) -> datetime:
+        """
+        Parses ISO-8601 or 'YYYY-MM-DD HH:MM:SS' string into a timezone-aware UTC datetime.
+        Handles both '9999-01-01 00:00:00' and '9999-01-01T00:00:00Z'.
+        """
+        s = str(ts).strip()
+        if s.endswith('Z') or s.endswith('z'):
+            s = s[:-1] + '+00:00'
+        elif ' ' in s and '+' not in s and '-' not in s[10:]:
+            s = s.replace(' ', 'T') + '+00:00'
+        elif 'T' in s and '+' not in s and '-' not in s[10:]:
+            s = s + '+00:00'
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
     @staticmethod
     def _build_shards(lower_bound: str, upper_bound: str, window_days: int) -> List[Tuple[str, str]]:
@@ -376,13 +394,25 @@ class MoveworksConnector:
 
         Each window: (shard_lower, shard_upper).
         Adjacent shards share a boundary — the ge/le filter ensures no overlap or gap.
+        Caps open-ended or sentinel upper_bound (e.g. 9999-01-01 00:00:00) at current UTC time
+        to prevent memory exhaustion from millions of shards.
         """
-        fmt    = '%Y-%m-%dT%H:%M:%SZ'
-        start  = datetime.strptime(lower_bound, fmt).replace(tzinfo=timezone.utc)
-        end    = datetime.strptime(upper_bound, fmt).replace(tzinfo=timezone.utc)
-        step   = timedelta(days=window_days)
+        fmt     = '%Y-%m-%dT%H:%M:%SZ'
+        start   = MoveworksConnector._parse_ts(lower_bound)
+        end     = MoveworksConnector._parse_ts(upper_bound)
+        now_utc = datetime.now(timezone.utc)
+
+        # Sentinel protection: cap open-ended upper bound (e.g. 9999-01-01) or future timestamps to current UTC time
+        if end.year >= 9000 or end > now_utc:
+            logger.info(
+                f"Capping open-ended / future upper_bound ({upper_bound}) to current UTC time: "
+                f"{now_utc.strftime(fmt)}"
+            )
+            end = now_utc
+
+        step    = timedelta(days=window_days)
         shards: List[Tuple[str, str]] = []
-        cursor = start
+        cursor  = start
         while cursor < end:
             shard_upper = min(cursor + step, end)
             shards.append((cursor.strftime(fmt), shard_upper.strftime(fmt)))

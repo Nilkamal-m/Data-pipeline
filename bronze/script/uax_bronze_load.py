@@ -191,11 +191,14 @@ def parse_arguments() -> dict:
         else:
             i += 1
 
-    def get_cli_arg(name: str, default=None):
-        """Case-insensitive single-key CLI argument lookup."""
-        for k, v in arg_dict.items():
-            if k.lower() == name.lower() and v is not None and str(v).strip():
-                return str(v).strip()
+    def get_cli_arg(*names: str, default=None):
+        """Case-insensitive CLI argument lookup across one or multiple alias names."""
+        for name in names:
+            if not isinstance(name, str):
+                continue
+            for k, v in arg_dict.items():
+                if k.lower() == name.lower() and v is not None and str(v).strip():
+                    return str(v).strip()
         return default
 
     # Required: source system
@@ -204,26 +207,40 @@ def parse_arguments() -> dict:
         raise ValueError("Missing required argument '--SOURCE_SYSTEM'. Example: --SOURCE_SYSTEM moveworks")
 
     source_system_clean = source_system.strip().lower()
-    config_s3_path = get_cli_arg('CONFIG_S3_PATH', 'config_s3_path')
 
-    # Load centralized Bronze configuration
-    full_config = ConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client)
-    pipeline_defaults = ConfigLoader.get_pipeline_defaults(full_config)
-    source_config = ConfigLoader.get_source_config(source_system_clean, full_config)
+    # Target Deployment Environment: CLI (--ENV or --ENVIRONMENT) > Code Default ('dev')
+    env = (
+        get_cli_arg('ENV', 'ENVIRONMENT')
+        or os.environ.get('ENV')
+        or os.environ.get('ENVIRONMENT')
+        or 'dev'
+    ).strip().lower()
+    logger.info(f"Target deployment environment resolved: '{env}'")
+
+    config_s3_path = get_cli_arg('CONFIG_S3_PATH')
+
+    # Load centralized Bronze configuration with dynamic {env} interpolation
+    full_config = ConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client, env=env)
+    pipeline_defaults = ConfigLoader.get_pipeline_defaults(full_config, env=env)
+    source_config = ConfigLoader.get_source_config(source_system_clean, full_config, env=env)
 
     # -------------------------------------------------------------
     # STRICT 3-TIER PARAMETER PRECEDENCE (CLI > Config > Code Default)
     # -------------------------------------------------------------
 
-    # Table list: CLI > Config > error
+    # Table list: CLI > Config tables > Config default_tables > Config legacy table_initial_load_dates > error
     cli_tables = get_cli_arg('SOURCE_TABLE_NAME')
     if cli_tables:
         table_list = [t.strip() for t in cli_tables.split(',') if t.strip()]
+    elif source_config.get('tables'):
+        table_list = list(source_config['tables'].keys())
     elif source_config.get('default_tables'):
         table_list = list(source_config['default_tables'])
+    elif source_config.get('table_initial_load_dates'):
+        table_list = list(source_config['table_initial_load_dates'].keys())
     else:
         raise ValueError(
-            f"'default_tables' is missing for source '{source_system_clean}' in bronze_config.json "
+            f"No tables configured for source '{source_system_clean}' in bronze_config.json "
             f"and was not provided via --SOURCE_TABLE_NAME."
         )
 
@@ -257,10 +274,13 @@ def parse_arguments() -> dict:
     else:
         upper_bound = ''
 
-    bronze_bucket = get_cli_arg('BRONZE_BUCKET', default=pipeline_defaults.get('bronze_bucket') or os.environ.get('BRONZE_BUCKET', ''))
-    if not bronze_bucket:
+    raw_bronze_bucket = get_cli_arg('BRONZE_BUCKET', default=pipeline_defaults.get('bronze_bucket') or os.environ.get('BRONZE_BUCKET', ''))
+    if not raw_bronze_bucket:
         raise ValueError("'BRONZE_BUCKET' is required. Set it via --BRONZE_BUCKET or pipeline_defaults.bronze_bucket in bronze_config.json.")
-    state_bucket  = get_cli_arg('STATE_BUCKET', default=pipeline_defaults.get('state_bucket') or bronze_bucket)
+    bronze_bucket = raw_bronze_bucket.replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+    raw_state_bucket = get_cli_arg('STATE_BUCKET', default=pipeline_defaults.get('state_bucket') or bronze_bucket)
+    state_bucket = raw_state_bucket.replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
     s3_chunk_size = int(get_cli_arg('S3_CHUNK_SIZE') or pipeline_defaults.get('s3_chunk_size', 10000))
     output_format = (get_cli_arg('OUTPUT_FORMAT') or pipeline_defaults.get('output_format', 'parquet')).lower()
@@ -285,35 +305,33 @@ def parse_arguments() -> dict:
     if cli_assistant:
         source_config['assistant_name'] = cli_assistant
 
-    job_name = get_cli_arg('JOB_NAME', default=f"glue-bronze-{source_system_clean}")
+    job_name = get_cli_arg('JOB_NAME', default=f"glue-bronze-{source_system_clean}-{env}").replace('{env}', env).replace('{ENV}', env.upper())
 
     bronze_data_prefix = (
         get_cli_arg('BRONZE_DATA_PREFIX') or pipeline_defaults.get('bronze_data_prefix', 'bronze/data')
     ).strip('/')
 
 
-    # Glue Catalog & Crawler Configuration (Option B: Unified Lake Database with raw_tbl_ Table Prefix)
+    # Glue Catalog & Crawler Configuration (Unified Lake Database with raw_tbl_ Table Prefix)
     catalog_config = pipeline_defaults.get('glue_catalog', {})
     glue_catalog_enabled = (
-        get_cli_arg('SYNC_GLUE_CATALOG', 'sync_glue_catalog', 'GLUE_CATALOG_ENABLED', 'glue_catalog_enabled')
-        or str(catalog_config.get('enabled', True))
+        get_cli_arg('SYNC_GLUE_CATALOG', 'GLUE_CATALOG_ENABLED', default=str(catalog_config.get('enabled', True)))
     ).lower() == 'true'
 
-    glue_database_name = (
-        get_cli_arg('GLUE_DATABASE', 'glue_database', 'GLUE_DB_NAME', 'glue_db_name')
+    raw_database_name = (
+        get_cli_arg('GLUE_DATABASE', 'GLUE_DB_NAME')
         or catalog_config.get('database_name')
     )
-    if glue_catalog_enabled and (not glue_database_name or not str(glue_database_name).strip()):
+    if glue_catalog_enabled and (not raw_database_name or not str(raw_database_name).strip()):
         raise ValueError(
             "CRITICAL CONFIG ERROR: 'database_name' is missing or empty in bronze_config.json "
             "(pipeline_defaults.glue_catalog.database_name) and was not provided via CLI. "
-            "Please configure 'database_name' (e.g. 'uax_datalake_db_dev')."
+            "Please configure 'database_name' (e.g. 'uax_datalake_db_{env}')."
         )
-    if glue_database_name:
-        glue_database_name = str(glue_database_name).strip()
+    glue_database_name = str(raw_database_name).replace('{env}', env).replace('{ENV}', env.upper()).strip() if raw_database_name else ''
 
     glue_table_prefix = (
-        get_cli_arg('GLUE_TABLE_PREFIX', 'glue_table_prefix', 'TABLE_PREFIX', 'table_prefix')
+        get_cli_arg('GLUE_TABLE_PREFIX', 'TABLE_PREFIX')
         or catalog_config.get('table_prefix')
     )
     if not glue_table_prefix or not str(glue_table_prefix).strip():
@@ -324,31 +342,30 @@ def parse_arguments() -> dict:
         )
     glue_table_prefix = str(glue_table_prefix).strip()
 
-    bronze_crawler_name = (
-        get_cli_arg('BRONZE_CRAWLER_NAME', 'bronze_crawler_name', 'CRAWLER_NAME', 'crawler_name')
+    raw_crawler_name = (
+        get_cli_arg('BRONZE_CRAWLER_NAME', 'CRAWLER_NAME')
         or catalog_config.get('crawler_name')
     )
+    bronze_crawler_name = str(raw_crawler_name).replace('{env}', env).replace('{ENV}', env.upper()).strip() if raw_crawler_name else ''
 
     trigger_crawler = (
-        get_cli_arg('TRIGGER_CRAWLER', 'trigger_crawler')
-        or str(catalog_config.get('trigger_crawler', True))
+        get_cli_arg('TRIGGER_CRAWLER', default=str(catalog_config.get('trigger_crawler', True)))
     ).lower() == 'true'
 
     sync_watermark_table = (
-        get_cli_arg('SYNC_WATERMARK_TABLE', 'sync_watermark_table')
-        or str(catalog_config.get('sync_watermark_table', True))
+        get_cli_arg('SYNC_WATERMARK_TABLE', default=str(catalog_config.get('sync_watermark_table', True)))
     ).lower() == 'true'
 
-    watermark_table_name = (
-        get_cli_arg('WATERMARK_TABLE_NAME', 'watermark_table_name')
-        or catalog_config.get('watermark_table_name')
+    raw_watermark_table = (
+        get_cli_arg('WATERMARK_TABLE_NAME', default=catalog_config.get('watermark_table_name'))
     )
-    if sync_watermark_table and (not watermark_table_name or not str(watermark_table_name).strip()):
+    if sync_watermark_table and (not raw_watermark_table or not str(raw_watermark_table).strip()):
         raise ValueError(
             "CRITICAL CONFIG ERROR: 'watermark_table_name' is missing or empty in bronze_config.json "
             "(pipeline_defaults.glue_catalog.watermark_table_name) and was not provided via CLI. "
             "Please configure 'watermark_table_name' (e.g. 'raw_tbl_watermarks')."
         )
+    watermark_table_name = str(raw_watermark_table).replace('{env}', env).replace('{ENV}', env.upper()).strip() if raw_watermark_table else ''
     if watermark_table_name:
         watermark_table_name = str(watermark_table_name).strip()
 
@@ -362,12 +379,14 @@ def parse_arguments() -> dict:
         'STATE_BUCKET': state_bucket,
         'BRONZE_DATA_PREFIX': bronze_data_prefix,
         'INITIAL_LOAD_DATE_CLI': initial_load_date_cli,
-        'UPPER_BOUND': upper_bound_cli,          # None = use datetime.now() inside the connector
+        'UPPER_BOUND_CLI': upper_bound_cli,          # CLI override (applies to all tables if passed)
+        'UPPER_BOUND': upper_bound,                  # Fallback source/global upper_bound
         'S3_CHUNK_SIZE': s3_chunk_size,
         'OUTPUT_FORMAT': output_format,
         'PARQUET_COMPRESSION': parquet_compression,
         'ERROR_HANDLING_MODE': error_handling_mode,
         'CLOUDWATCH_NAMESPACE': cloudwatch_namespace,
+        'ENV': env,
         'GLUE_CATALOG_ENABLED': glue_catalog_enabled,
         'GLUE_DATABASE_NAME': glue_database_name,
         'GLUE_TABLE_PREFIX': glue_table_prefix,
@@ -536,9 +555,14 @@ def get_last_load_date(
 ) -> str:
     """
     Fetches the last successful load timestamp for a table from S3 metadata JSON (watermark.json).
-    ONLY if the watermark state file is NOT present in S3 does it fall back to bronze_config.json table_initial_load_dates.
+    If an explicit CLI override is passed (--INITIAL_LOAD_DATE), it takes highest precedence (bypassing S3 watermark).
+    ONLY if the watermark state file is NOT present in S3 does it fall back to bronze_config.json initial_load_dates.
     Strictly throws ValueError if load date is NULL/missing.
     """
+    if cli_initial_date and str(cli_initial_date).strip():
+        logger.info(f"Using CLI passed initial_load_date override for table '{table_name}': '{cli_initial_date.strip()}' (Bypassing S3 watermark)")
+        return str(cli_initial_date).strip()
+
     s3_path = f"s3://{state_bucket}/{state_key}"
     try:
         logger.info(f"Checking for High-Water Mark state file at '{s3_path}'...")
@@ -1054,6 +1078,7 @@ def main():
     source_config = params['SOURCE_CONFIG']
     pipeline_defaults = params.get('PIPELINE_DEFAULTS', {})
     upper_bound = params.get('UPPER_BOUND')
+    upper_bound_cli = params.get('UPPER_BOUND_CLI')
     
     execution_start_utc = datetime.now(timezone.utc)
     current_run_time = execution_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -1069,12 +1094,16 @@ def main():
     sync_watermark_table = params.get('SYNC_WATERMARK_TABLE', True)
     watermark_table_name = params.get('WATERMARK_TABLE_NAME')
 
+    is_ub_open = bool(not upper_bound or str(upper_bound).strip().startswith('9999') or str(upper_bound).strip().startswith('9998'))
+    ub_display = f"{upper_bound} (Open-ended)" if (upper_bound and is_ub_open) else (upper_bound if upper_bound else 'Per-table / Open-ended')
+
     start_banner = (
         f"[JOB START] UAX BRONZE INGESTION | Source: {source_system.upper()} | Tables: {', '.join(table_list)} | Mode: {error_handling_mode}\n"
         "+================================================================================+\n"
         "|                  UAX DATA LAKE - BRONZE INGESTION ENGINE                       |\n"
         "+================================================================================+\n"
         f"|  Execution ID       : {execution_id:<57}|\n"
+        f"|  Environment        : {params.get('ENV', 'dev').upper():<57}|\n"
         f"|  Source System      : {source_system.upper():<57}|\n"
         f"|  Target Tables      : {', '.join(table_list):<57}|\n"
         f"|  Output Format      : {f'{output_format.upper()} (Compression: {parquet_compression})':<57}|\n"
@@ -1082,7 +1111,7 @@ def main():
         f"|  Bronze Bucket      : {f's3://{bronze_bucket}/':<57}|\n"
         f"|  Bronze Data Path   : {f's3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/':<57}|\n"
         f"|  State S3 Bucket    : {f's3://{state_bucket}/':<57}|\n"
-        f"|  Upper Bound        : {upper_bound if upper_bound else 'Current Run Time (Open-ended)':<57}|\n"
+        f"|  Upper Bound        : {ub_display:<57}|\n"
         f"|  Glue Database      : {glue_database_name:<57}|\n"
         f"|  Catalog Prefix     : {glue_table_prefix:<57}|\n"
         f"|  Bronze Crawler     : {bronze_crawler_name if bronze_crawler_name else 'N/A':<57}|\n"
@@ -1123,16 +1152,6 @@ def main():
         clean_table_name = api_table_name.replace('-', '_')
 
         table_start_time = datetime.now(timezone.utc)
-        table_header = (
-            f"[TABLE START] {api_table_name} -> {glue_table_prefix}{clean_table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {current_run_time}\n"
-            "+--------------------------------------------------------------------------------+\n"
-            f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {api_table_name.upper()} (Lake Table: {glue_table_prefix}{clean_table_name})\n"
-            f"|     Execution ID       : {execution_id}\n"
-            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
-            "+--------------------------------------------------------------------------------+"
-        )
-        logger.info(table_header)
-
         state_key = get_table_state_key(source_system, clean_table_name)
         
         try:
@@ -1143,6 +1162,13 @@ def main():
                 source_system=source_system,
                 table_name=api_table_name,
                 cli_initial_date=initial_load_date_cli,
+                source_config=source_config
+            )
+            # Resolves table-specific upper bound (CLI --UPPER_BOUND > table_upper_bounds > source upper_bound > pipeline_defaults upper_bound)
+            table_upper_bound = ConfigLoader.get_table_upper_bound(
+                source_system=source_system,
+                table_name=api_table_name,
+                cli_upper_bound=upper_bound_cli,
                 source_config=source_config
             )
         except Exception as load_date_err:
@@ -1165,6 +1191,18 @@ def main():
                 raise
             else:
                 continue
+
+        ub_table_display = table_upper_bound if table_upper_bound else 'Current Run Time (Open-ended)'
+        table_header = (
+            f"[TABLE START] {api_table_name} -> {glue_table_prefix}{clean_table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {current_run_time}\n"
+            "+--------------------------------------------------------------------------------+\n"
+            f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {api_table_name.upper()} (Lake Table: {glue_table_prefix}{clean_table_name})\n"
+            f"|     Execution ID       : {execution_id}\n"
+            f"|     Upper Bound        : {ub_table_display}\n"
+            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            "+--------------------------------------------------------------------------------+"
+        )
+        logger.info(table_header)
 
         staging_prefix = f"_staging/exec_{execution_id}/{source_system}/{clean_table_name}/"
         final_partition_prefix = f"{bronze_data_prefix}/{source_system}/{clean_table_name}/{partition_prefix}/"
@@ -1220,12 +1258,19 @@ def main():
             )
 
         try:
+            # Prepare table-specific source config with resolved table_upper_bound
+            table_source_config = dict(source_config)
+            if table_upper_bound and str(table_upper_bound).strip():
+                table_source_config['upper_bound'] = str(table_upper_bound).strip()
+            else:
+                table_source_config.pop('upper_bound', None)
+
             # Extract delta records writing to STAGING area (API call uses exact api_table_name with hyphens)
             connector_cls.fetch_delta(
                 last_load_date=last_load_date,
                 secret_dict=secret_dict,
                 table_name=api_table_name,
-                source_config=source_config,
+                source_config=table_source_config,
                 custom_query=custom_query,
                 on_chunk_callback=chunk_writer_callback,
                 s3_chunk_size=s3_chunk_size
@@ -1260,7 +1305,16 @@ def main():
                 cleanup_failed_staging(bronze_bucket, staging_prefix)
 
             # Create or update High-Water Mark watermark state file in S3 with effective watermark
-            effective_watermark = upper_bound if upper_bound else current_run_time
+            # High-date sentinel protection: if table_upper_bound is open-ended (e.g. '9999-01-01 00:00:00' or starts with 9999/9998),
+            # writing year 9999 into watermark.json would permanently freeze future incremental loads at 0 records.
+            # Record current_run_time for open-ended runs, and the actual table_upper_bound for historical backfills.
+            is_high_date = bool(table_upper_bound and (str(table_upper_bound).strip().startswith('9999') or str(table_upper_bound).strip().startswith('9998')))
+            effective_watermark = current_run_time if (not table_upper_bound or is_high_date) else str(table_upper_bound).strip()
+            if is_high_date:
+                logger.info(
+                    f"Table '{clean_table_name}': High-date sentinel upper_bound '{table_upper_bound}' detected. "
+                    f"Safeguarding watermark state: recording current execution time '{effective_watermark}' instead of year 9999."
+                )
             update_last_load_date(state_bucket, state_key, source_system, clean_table_name, effective_watermark, total_table_records, table_prefix=glue_table_prefix)
             logger.info(f"Table '{clean_table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with timestamp {effective_watermark}.")
 
@@ -1473,6 +1527,7 @@ def main():
         f"|  * Latest Log Pointer  : s3://{state_bucket}/metadata/logs/bronze/{source_system}/latest_execution.json\n"
         "+--------------------------------------------------------------------------------+\n"
         "|  GLUE CATALOG & ATHENA INTEGRATION:\n"
+        f"|  * Environment        : {params.get('ENV', 'dev')}\n"
         f"|  * Glue Database       : {glue_database_name}\n"
         f"|  * Catalog Tables      : {glue_database_name}.{glue_table_prefix}<tablename>\n"
         f"|  * Watermark Athena Tbl: {glue_database_name}.{watermark_table_name}\n"

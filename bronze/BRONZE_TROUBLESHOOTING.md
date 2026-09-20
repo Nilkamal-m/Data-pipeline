@@ -60,11 +60,11 @@
 ```json
 "pipeline_defaults": {
   "glue_catalog": {
-    "database_name": "uax_datalake_db_dev"
+    "database_name": "uax_datalake_db_{env}"
   }
 }
 ```
-Or pass `--GLUE_DATABASE uax_datalake_db_dev` via CLI.
+Or pass `--GLUE_DATABASE uax_datalake_db_{env}` (or `--ENV dev`) via CLI.
 
 ---
 
@@ -99,28 +99,34 @@ Or pass `--GLUE_DATABASE uax_datalake_db_dev` via CLI.
 **When**: Table has no S3 watermark (first run) and no initial load date is configured.
 
 **Fix** (choose one, in priority order):
-1. CLI: `--INITIAL_LOAD_DATE 2024-01-01T00:00:00Z` (applies to all tables in this run).
-2. Config per-table:
+1. CLI: `--INITIAL_LOAD_DATE "2024-01-01 00:00:00"` (applies to all tables in this run).
+2. Config per-table under `tables.<table_name>`:
    ```json
-   "table_initial_load_dates": {
-     "incident": "2024-01-01T00:00:00Z"
+   "tables": {
+     "incident": {
+       "initial_load_date": "2024-01-01 00:00:00"
+     }
    }
    ```
 3. Config global fallback (use with caution):
    ```json
-   "pipeline_defaults": { "default_initial_load_date": "2024-01-01T00:00:00Z" }
+   "pipeline_defaults": { "default_initial_load_date": "2024-01-01 00:00:00" }
    ```
 
 ---
 
-#### E11 — `'default_tables' is missing for source '<source>'`
+#### E11 — `No tables configured for source '<source>'`
 
-**When**: `--SOURCE_TABLE_NAME` not passed via CLI and `default_tables` is absent/empty in the source config block.
+**When**: `--SOURCE_TABLE_NAME` was not passed via CLI and the source has no tables configured under `tables` (or legacy `default_tables`).
 
-**Fix**: Add `default_tables` to the source block:
+**Fix**: Add table definitions to `tables` in the source block:
 ```json
 "moveworks": {
-  "default_tables": ["conversations", "interactions", "users"]
+  "tables": {
+    "conversations": { "initial_load_date": "2024-01-01 00:00:00" },
+    "interactions": { "initial_load_date": "2024-01-01 00:00:00" },
+    "users": { "initial_load_date": "2024-01-01 00:00:00" }
+  }
 }
 ```
 
@@ -335,13 +341,13 @@ Or create an S3 lifecycle rule to auto-expire `_staging/` objects after 1 day.
 
 #### E43 — Extraction Returns 0 Records Due to Inverted Window (`upper_bound < lower_bound`)
 
-**When**: An explicit `--UPPER_BOUND` is passed that is earlier than the table's current watermark (`last_load_date`). Example: `lower_bound = '2024-05-01T00:00:00Z'` and `--UPPER_BOUND '2024-03-01T00:00:00Z'`.
+**When**: An explicit `--UPPER_BOUND` or table-wise `table_upper_bounds` is earlier than the table's current watermark (`last_load_date`). Example: `lower_bound = '2024-05-01 00:00:00'` and `--UPPER_BOUND '2024-03-01 00:00:00'`.
 
-**Cause**: The filter expression `WHERE updated_at >= '2024-05-01' and updated_at <= '2024-03-01'` evaluates to an empty set.
+**Cause**: The filter expression `WHERE updated_at >= '2024-05-01 00:00:00' and updated_at <= '2024-03-01 00:00:00'` evaluates to an empty set.
 
-**Fix**: Ensure `--UPPER_BOUND` is strictly greater than `last_load_date`. If backfilling an earlier historical period, also supply `--INITIAL_LOAD_DATE` to reset `lower_bound` for the backfill run:
+**Fix**: Ensure `--UPPER_BOUND` or `table_upper_bounds` is strictly greater than `last_load_date`. If backfilling an earlier historical period, also supply `--INITIAL_LOAD_DATE` to reset `lower_bound` for the backfill run:
 ```bash
---INITIAL_LOAD_DATE 2024-01-01T00:00:00Z --UPPER_BOUND 2024-03-01T00:00:00Z
+--INITIAL_LOAD_DATE "2024-01-01 00:00:00" --UPPER_BOUND "2024-03-01 00:00:00"
 ```
 
 ---
@@ -378,9 +384,10 @@ aws secretsmanager get-secret-value --secret-id prod/new_source/api_credentials 
 
 **When**: S3FileConnector or Moveworks sharding raises `ValueError: Invalid isoformat string` or `strptime` error.
 
-**Cause**: The timestamp passed via `--UPPER_BOUND` or `--INITIAL_LOAD_DATE` is not in standard ISO 8601 UTC format.
+**Cause**: The timestamp passed via `--UPPER_BOUND` or `--INITIAL_LOAD_DATE` is in an unrecognized date format.
 
-**Fix**: Use exact ISO 8601 UTC format: `YYYY-MM-DDTHH:MM:SSZ` (e.g. `2024-03-01T00:00:00Z`). Avoid spaces or omitted `T`/`Z`.
+**Fix**: Use standard database timestamp format `"YYYY-MM-DD HH:MM:SS"` (e.g. `"9999-01-01 00:00:00"`) or standard ISO 8601 UTC format `"YYYY-MM-DDTHH:MM:SSZ"` (e.g. `"2024-03-01T00:00:00Z"`). Both formats are automatically supported and parsed by all Bronze connectors. When `"9999-01-01 00:00:00"` is used, the pipeline automatically records the current run time into the watermark state to prevent state corruption.
+
 
 ---
 

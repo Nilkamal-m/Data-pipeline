@@ -20,6 +20,7 @@
 11. [Error Handling & Resilience](#11-error-handling--resilience)
 12. [Observability & Monitoring](#12-observability--monitoring)
 13. [Step-by-Step Guide: Onboarding a New Source System](#13-step-by-step-guide-onboarding-a-new-source-system)
+14. [Manual Date Range Ingestion & Backfill Runbook](#14-manual-date-range-ingestion--backfill-runbook)
 
 ---
 
@@ -179,26 +180,35 @@ In many data engineering scenarios (such as historical backfilling, reprocessing
 [lower_bound = 2024-01-01T00:00:00Z]  →  [upper_bound = 2024-03-01T00:00:00Z]
 ```
 
-### Resolution Precedence
-The pipeline resolves `upper_bound` via the standard 3-tier hierarchy:
-1. **Tier 1 (CLI)**: `--UPPER_BOUND 2024-03-01T00:00:00Z`
-2. **Tier 2 (Config)**: `source_systems.<source>.upper_bound` or `pipeline_defaults.upper_bound` in `bronze_config.json`
-3. **Tier 3 (Runtime Fallback)**: `datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')`
+### Resolution Precedence & Supported Formats
+The pipeline accepts upper bound timestamps in standard database format (`"YYYY-MM-DD HH:MM:SS"`, e.g. `"2024-03-01 00:00:00"`) as well as ISO 8601 UTC (`"YYYY-MM-DDTHH:MM:SSZ"`). Both `table_initial_load_dates` and `table_upper_bounds` use the uniform format `"YYYY-MM-DD HH:MM:SS"`.
 
-### Backfill & Watermark Mechanics
-When an `upper_bound` is explicitly provided:
-- Connectors extract only records within `[lower_bound, upper_bound]`.
-- Upon successful staging promotion, **the watermark is advanced to `upper_bound`** (NOT `current_run_time`).
-- **Guarantee**: Subsequent pipeline executions automatically resume from `upper_bound` without skipping historical records!
+Upper bounds are resolved **table-wise** via a 5-tier resolution hierarchy:
+1. **Tier 1 (CLI Override)**: `--UPPER_BOUND "2024-03-01 00:00:00"` (overrides all tables processed in this job)
+2. **Tier 2 (Table-wise Config)**: `source_systems.<source>.table_upper_bounds.<table_name>` in `bronze_config.json` (per-table override, e.g. `"incident": "2024-06-01 00:00:00"`)
+3. **Tier 3 (Source-level Config)**: `source_systems.<source>.upper_bound` in `bronze_config.json` (defaults to `""`)
+4. **Tier 4 (Global Pipeline Defaults)**: `pipeline_defaults.upper_bound` in `bronze_config.json` (defaults to `""`)
+5. **Tier 5 (Runtime Fallback)**: Open-ended extraction up to current execution time (`datetime.now(timezone.utc)`).
+
+### Backfill & Watermark Sentinel Protection
+- **Default Open-Ended Runs (empty string `""`)**: When `upper_bound` is empty (`""`), extraction runs open-ended up to the job's execution time, and `current_run_time` is recorded into `watermark.json`.
+- **High-Date Sentinel Protection (`9999-01-01 00:00:00`)**: `"9999-01-01 00:00:00"` is a format reference for high-date sentinels. If passed, the pipeline automatically **safeguards the watermark state by recording `current_run_time`** instead of year 9999. This guarantees future incremental runs never get frozen with zero extracted records. Furthermore, Moveworks date-sharding automatically caps open-ended upper bounds at current UTC time to prevent generating excessive shards.
+- **Historical Backfill Runs (e.g. `2024-04-01 00:00:00`)**: When a historical date is configured either table-wise or via CLI, connectors extract only records within `[lower_bound, table_upper_bound]`. Upon successful staging promotion, **the watermark is advanced to `table_upper_bound`** (NOT `current_run_time`). Subsequent executions resume automatically from `table_upper_bound` without skipping historical records.
 
 ```bash
-# Example: Backfill Q1 2024 data without skipping into current time
+# Example 1: Standard open-ended run (uses table_upper_bounds or current_run_time)
+python3 bronze/script/uax_bronze_load.py \
+  --SOURCE_SYSTEM moveworks \
+  --SOURCE_TABLE_NAME interactions
+# Watermark saved to S3: current_run_time (e.g. 2026-09-20T12:00:00Z)
+
+# Example 2: Backfill specific table with table-wise upper bound or CLI override
 python3 bronze/script/uax_bronze_load.py \
   --SOURCE_SYSTEM moveworks \
   --SOURCE_TABLE_NAME interactions \
-  --INITIAL_LOAD_DATE 2024-01-01T00:00:00Z \
-  --UPPER_BOUND 2024-04-01T00:00:00Z
-# Watermark saved to S3: 2024-04-01T00:00:00Z
+  --INITIAL_LOAD_DATE "2024-01-01 00:00:00" \
+  --UPPER_BOUND "2024-04-01 00:00:00"
+# Watermark saved to S3: 2024-04-01 00:00:00
 ```
 
 ---
@@ -213,7 +223,7 @@ Central file: `bronze/script/config/bronze_config.json`
 |---|---|---|
 | `bronze_bucket` | `""` | Target S3 bucket for Bronze Parquet data partitions. Set here or pass via CLI. |
 | `state_bucket` | `""` | S3 bucket for watermarks and audit logs (defaults to `bronze_bucket` if empty). |
-| `upper_bound` | `""` | Optional ISO 8601 UTC timestamp to bound extraction for backfill. Defaults to current time. |
+| `upper_bound` | `""` | Optional global upper bound timestamp (`YYYY-MM-DD HH:MM:SS`). Default is `""` (open-ended up to current execution time). |
 | `batch_size` | `1000` | Default API page size or record batch size. |
 | `s3_chunk_size` | `10000` | Number of records buffered before flushing a Parquet file chunk to S3. |
 | `bronze_data_prefix` | `bronze/data` | S3 prefix for raw data (e.g. `s3://<bucket>/bronze/data/<source>/<table>/`). |
@@ -223,9 +233,10 @@ Central file: `bronze/script/config/bronze_config.json`
 | `flatten_separator` | `_` | Column name separator for flattened keys (e.g. `user_email`). |
 | `error_handling_mode` | `CONTINUE_ON_ERROR` | `CONTINUE_ON_ERROR` (skip bad tables) or `HALT_ON_ERROR` (abort on first error). |
 | `cloudwatch_namespace` | `UAX/DataPipeline/Ingestion` | Namespace for custom CloudWatch metrics. |
-| `default_initial_load_date` | `""` | Optional global fallback. Prefer setting explicit per-table dates. |
+| `default_initial_load_date` | `""` | Optional global fallback (`YYYY-MM-DD HH:MM:SS`). Prefer setting explicit per-table dates. |
 | `glue_catalog.enabled` | `true` | Automatically synchronizes Glue Data Catalog tables and partitions. |
-| `glue_catalog.database_name` | `uax_datalake_db_dev` | Target unified Glue Data Catalog database name. |
+| `glue_catalog.database_name` | `uax_datalake_db_{env}` | Target unified Glue Data Catalog database. `{env}` is replaced by `--ENV` (e.g. `dev`, `prod`). |
+| `glue_catalog.crawler_name` | `uax-datalake-bronze-crawler-{env}` | Target Glue Crawler name. `{env}` is dynamically replaced by `--ENV`. |
 | `glue_catalog.table_prefix` | `raw_tbl_` | Catalog table name prefix (e.g. `raw_tbl_interactions`). |
 | `glue_catalog.sync_watermark_table` | `true` | Maintains Athena-queryable `raw_tbl_watermarks` table. |
 
@@ -235,20 +246,22 @@ Central file: `bronze/script/config/bronze_config.json`
 |---|---|---|
 | `base_url` | REST APIs | API base URL. Can be overridden by `api_base_url` in Secrets Manager. |
 | `api_endpoint_template`| REST APIs | URI template with `{table_name}` placeholder. |
-| `default_tables` | All | List of tables processed when `--SOURCE_TABLE_NAME` is not supplied. |
 | `response_records_key` | REST APIs | JSON key containing record array (e.g. `value`, `result`, `entities`). |
 | `batch_size` | REST APIs | Page size requested from the API (Moveworks max: 500). |
-| `upper_bound` | All | Source-specific upper-bound override for backfill. |
-| `table_initial_load_dates`| All | **Mandatory** ISO 8601 UTC date per table for first run. |
-| `table_query_overrides` | REST/DB | Table-specific query/filter string overriding `default_delta_filter`. |
-| `custom_table_endpoints`| REST APIs | Custom URL endpoints for non-standard tables. |
+| `tables` | All | **Canonical Table Registry**: Dictionary of table objects containing all table-specific properties. |
+| `tables.<table>.initial_load_date` | All | **Mandatory** start date for first run (`YYYY-MM-DD HH:MM:SS` format, e.g. `"2024-01-01 00:00:00"`). |
+| `tables.<table>.upper_bound` | All | **Table-wise** upper bound (`YYYY-MM-DD HH:MM:SS` or `""`). Controls extraction ceiling per table. |
+| `tables.<table>.query_override` | REST/DB | Table-specific query/filter string overriding `default_delta_filter`. |
+| `tables.<table>.custom_endpoint`| REST APIs | Custom URL endpoint for non-standard tables (e.g. `/api/now/v1/custom_reports`). |
+| `tables.<table>.file_path` | S3File | Table-specific S3 folder/prefix override (e.g. `raw_feed/employee_feed/`). |
+| `tables.<table>.fetch_mode` | S3File | Table-specific fetch strategy (`all` for incremental or `latest` for snapshot). |
 | `default_delta_filter` | REST/DB | Template filter (e.g. `last_updated_time ge '{last_load_date}' and last_updated_time le '{upper_bound}'`). |
 | `query_template` | Database | SQL query template with `{table_name}` and `{query_filter}` placeholders. |
 | `fetch_size` | Database | Cursor batch size per database `fetchmany` call. |
 | `source_bucket` | S3File | S3 bucket containing source files to ingest. |
-| `file_prefix` | S3File | Key prefix for file search. |
-| `fetch_mode` | S3File | `all` (files modified after watermark) or `latest` (most recent file only). |
-| `parallel_processing` | Moveworks | Multi-threaded date-sharding configuration block. |
+| `file_prefix` | S3File | Global key prefix for file search. |
+| `fetch_mode` | S3File | Global default fetch mode (`all` or `latest`). |
+| `parallel_processing` | Moveworks | Multi-threaded date-sharding configuration block (`enabled`, `max_workers`, `shard_window_days`). |
 
 ---
 
@@ -281,7 +294,8 @@ s3://<state_bucket>/metadata/bronze/<source_system>/<table_name>/watermark.json
 
 ## 9. Glue Data Catalog Integration
 
-- **Database**: Single unified database (e.g. `uax_datalake_db_dev`).
+- **Database**: Unified lake database per environment (`uax_datalake_db_{env}` -> `uax_datalake_db_dev`, `uax_datalake_db_prod`).
+- **Crawler**: Targeted crawler per environment (`uax-datalake-bronze-crawler-{env}` -> `uax-datalake-bronze-crawler-dev`, `uax-datalake-bronze-crawler-prod`).
 - **Table Name**: `<table_prefix><clean_table_name>` (e.g. `raw_tbl_conversations`).
 - **Partition Key**: `_ingested_at` (`string`, formatted as ISO 8601 UTC).
 - **Audit Table**: `raw_tbl_watermarks` tracks ingestion state across all tables and sources for easy Athena querying:
@@ -299,6 +313,7 @@ ORDER BY updated_at DESC;
 ```bash
 python3 bronze/script/uax_bronze_load.py \
   --SOURCE_SYSTEM moveworks \
+  --ENV dev \
   --SOURCE_TABLE_NAME interactions,conversations \
   --BRONZE_BUCKET my-bronze-bucket \
   --STATE_BUCKET my-state-bucket \
@@ -309,6 +324,14 @@ python3 bronze/script/uax_bronze_load.py \
   --S3_CHUNK_SIZE 10000 \
   --ERROR_HANDLING_MODE CONTINUE_ON_ERROR
 ```
+
+> [!TIP]
+> **Dynamic Environment Templating (`--ENV`)**:
+> Passing `--ENV dev` (or `prod`, `qa`, `staging`) automatically resolves any `{env}` or `{ENV}` placeholders across:
+> - Catalog Database: `uax_datalake_db_{env}` -> `uax_datalake_db_dev`
+> - Glue Crawler: `uax-datalake-bronze-crawler-{env}` -> `uax-datalake-bronze-crawler-dev`
+> - S3 Buckets / Job Name: `my-bucket-{env}` -> `my-bucket-dev`
+> If omitted, `--ENV` defaults gracefully to `dev`.
 
 ---
 
@@ -479,13 +502,17 @@ Open `bronze/script/config/bronze_config.json` and add a new configuration block
   "default_delta_filter": "updated_at>='{last_load_date}' and updated_at<='{upper_bound}'",
   "response_records_key": "data",
   "batch_size": 500,
-  "default_tables": ["users", "transactions"],
-  "table_initial_load_dates": {
-    "users": "2024-01-01T00:00:00Z",
-    "transactions": "2024-01-01T00:00:00Z"
-  },
-  "table_query_overrides": {},
-  "custom_table_endpoints": {}
+  "tables": {
+    "users": {
+      "initial_load_date": "2024-01-01 00:00:00",
+      "upper_bound": ""
+    },
+    "transactions": {
+      "initial_load_date": "2024-01-01 00:00:00",
+      "upper_bound": "",
+      "query_override": "status='SUCCESS' and updated_at>='{last_load_date}' and updated_at<='{upper_bound}'"
+    }
+  }
 }
 ```
 
@@ -530,3 +557,234 @@ python3 bronze/script/uax_bronze_load.py \
    ```sql
    SELECT * FROM uax_datalake_db_dev.raw_tbl_users LIMIT 10;
    ```
+
+---
+
+## 14. Manual Date Range Ingestion & Backfill Runbook
+
+When an operational requirement arises to manually extract data for a **specific, past, or custom date range** (e.g. from `2024-03-01 00:00:00` to `2024-03-15 23:59:59` to reprocess missing records, backfill historical data, or repair corrupted upstream periods), multiple standard processes are supported depending on your operational role and automation preference.
+
+### Summary of Manual Ingestion Processes
+
+| Process | Mechanism | Best Suited For | S3 Watermark Impact |
+|---|---|---|---|
+| **Process 1 (Recommended)** | **CLI / Glue Job Arguments Override** | Ad-hoc manual re-runs via AWS CLI, Glue Console, or script. No code or config changes needed. | Overrides existing watermark for this run; advances watermark to `UPPER_BOUND` on completion. |
+| **Process 2** | **Declarative `bronze_config.json` Edit** | Scheduled or GitOps-controlled backfills where parameters are committed to version control. | Governed by `tables.<table>.initial_load_date` and `upper_bound` (requires resetting watermark if table ran before). |
+| **Process 3** | **S3 Watermark State Reset / Edit** | Reprocessing past intervals using unmodified automated schedules without touching job definitions. | Directly controls the next incremental extraction start point. |
+| **Process 4** | **Event-Driven Orchestration (Step Functions / Lambda)** | Programmatic backfill triggers from CI/CD pipelines, Airflow, or data ops scripts. | Passes CLI overrides via Lambda/Step Function event payload. |
+
+---
+
+### Process 1: Ad-Hoc / On-Demand Execution via Job Arguments (Recommended)
+
+This is the fastest, safest, and most common production workflow. You do **not** need to touch `bronze_config.json` or modify code. Explicit CLI arguments take highest priority (Tier 1) in the pipeline hierarchy, overriding any pre-existing S3 watermark and configuration settings.
+
+#### Execution Parameters
+- `--SOURCE_SYSTEM`: Target source system (e.g. `servicenow`, `moveworks`, `postgresql`, `mysql`, `genesys`, `vendor_a_s3`).
+- `--SOURCE_TABLE_NAME`: Target table(s) comma-separated (e.g. `incident` or `interactions,conversations`).
+- `--INITIAL_LOAD_DATE`: Lower bound start timestamp (`"YYYY-MM-DD HH:MM:SS"`, e.g. `"2024-03-01 00:00:00"`).
+- `--UPPER_BOUND`: Upper bound end timestamp (`"YYYY-MM-DD HH:MM:SS"`, e.g. `"2024-03-15 23:59:59"`).
+- `--ENV`: Target environment (`dev`, `qa`, `staging`, `prod`).
+
+#### Method 1A: AWS CLI (`aws glue start-job-run`)
+Run the following from your terminal or deployment bastion:
+
+```bash
+aws glue start-job-run \
+  --job-name uax-datalake-bronze-ingestion-dev \
+  --arguments '{
+    "--SOURCE_SYSTEM": "servicenow",
+    "--SOURCE_TABLE_NAME": "incident",
+    "--INITIAL_LOAD_DATE": "2024-03-01 00:00:00",
+    "--UPPER_BOUND": "2024-03-15 23:59:59",
+    "--ENV": "dev"
+  }'
+```
+
+#### Method 1B: AWS Glue Console (Web UI)
+1. Open the **AWS Glue Console** -> Navigate to **ETL jobs**.
+2. Select the Bronze Glue job (e.g., `uax-datalake-bronze-ingestion-dev`).
+3. In the top-right menu, select **Action** -> **Run with parameters**.
+4. Under the **Job parameters** section, enter or override:
+   - `--SOURCE_SYSTEM` = `servicenow`
+   - `--SOURCE_TABLE_NAME` = `incident`
+   - `--INITIAL_LOAD_DATE` = `2024-03-01 00:00:00`
+   - `--UPPER_BOUND` = `2024-03-15 23:59:59`
+   - `--ENV` = `dev`
+5. Click **Run job**.
+
+#### Method 1C: Direct Script Execution (Local / Bastion / Test Run)
+```bash
+python3 bronze/script/uax_bronze_load.py \
+  --SOURCE_SYSTEM servicenow \
+  --SOURCE_TABLE_NAME incident \
+  --INITIAL_LOAD_DATE "2024-03-01 00:00:00" \
+  --UPPER_BOUND "2024-03-15 23:59:59" \
+  --ENV dev \
+  --BRONZE_BUCKET my-datalake-dev-bucket \
+  --SECRET_NAME dev/servicenow/api_credentials
+```
+
+> [!IMPORTANT]
+> **What Happens to the Watermark?**
+> When a historical `UPPER_BOUND` is provided (e.g. `2024-03-15 23:59:59`), the pipeline advances the S3 watermark to `2024-03-15 23:59:59` upon successful completion. The next incremental scheduled run will pick up smoothly from that exact timestamp.
+
+---
+
+### Process 2: Declarative Configuration via `bronze_config.json` (GitOps / CI/CD)
+
+If your organization mandates that all pipeline runs are tracked via git commits rather than manual CLI parameters:
+
+1. Open `bronze/script/config/bronze_config.json`.
+2. Locate the source and target table under `source_systems.<source>.tables.<table_name>`.
+3. Set `initial_load_date` and `upper_bound` to your desired window:
+
+```json
+{
+  "source_systems": {
+    "servicenow": {
+      "tables": {
+        "incident": {
+          "initial_load_date": "2024-03-01 00:00:00",
+          "upper_bound": "2024-03-15 23:59:59"
+        }
+      }
+    }
+  }
+}
+```
+
+4. **S3 Watermark Precedence Note**:
+   - If the table has **already been ingested before**, an S3 watermark file exists at `s3://<state_bucket>/metadata/bronze/<source>/<table>/watermark.json`.
+   - By default, the automated job respects the existing S3 watermark `last_load_date` to prevent re-extracting already ingested records.
+   - Therefore, to force the job to read the new `initial_load_date` from `bronze_config.json`, you must either:
+     - Run via **Process 1** (passing `--INITIAL_LOAD_DATE`), OR
+     - Reset the S3 watermark as shown in **Process 3**.
+5. Once the backfill job runs, reset `upper_bound` back to `""` (empty string) in `bronze_config.json` so regular runs continue extracting up to the current run time.
+
+---
+
+### Process 3: S3 Watermark State Reset / Edit (State-Driven Backfill)
+
+If you want the scheduled automated pipeline to reprocess an earlier time window without modifying job definitions or passing CLI arguments, you can directly manage the S3 state file:
+
+**State File Location**:
+`s3://<state_bucket>/metadata/bronze/<source_system>/<table_name>/watermark.json`
+
+#### Option 3A: Modify `last_load_date` In-Place
+1. Download the current watermark file from S3:
+   ```bash
+   aws s3 cp s3://my-state-bucket/metadata/bronze/servicenow/incident/watermark.json ./watermark.json
+   ```
+2. Open `watermark.json` and change `last_load_date` to your desired start date:
+   ```json
+   {
+     "source_system": "servicenow",
+     "table_name": "raw_tbl_incident",
+     "last_load_date": "2024-03-01 00:00:00",
+     "last_status": "SUCCESS",
+     "records_ingested": 1250,
+     "updated_at": "2026-09-20T12:00:00Z"
+   }
+   ```
+3. Upload the modified watermark file back to S3:
+   ```bash
+   aws s3 cp ./watermark.json s3://my-state-bucket/metadata/bronze/servicenow/incident/watermark.json
+   ```
+4. If you want extraction to stop at an upper bound, pass `--UPPER_BOUND "2024-03-15 23:59:59"` or configure `tables.incident.upper_bound` in `bronze_config.json`. Otherwise, it will extract continuously from `2024-03-01 00:00:00` up to the current time.
+
+#### Option 3B: Delete Watermark File for a Fresh Initial Load
+Deleting the watermark file triggers the initial load fallback logic:
+```bash
+aws s3 rm s3://my-state-bucket/metadata/bronze/servicenow/incident/watermark.json
+```
+On the next job execution:
+- The orchestrator detects `NoSuchKey` for the state file.
+- It falls back to `tables.incident.initial_load_date` configured in `bronze_config.json`.
+- It creates a fresh watermark file upon successful completion.
+
+---
+
+### Process 4: Event-Driven Orchestration (AWS Step Functions / Lambda)
+
+If you have automated workflow orchestrators (such as AWS Step Functions, Airflow, or a management Lambda), trigger the Bronze ingestion by passing the date range in the execution event payload:
+
+#### Step Functions / Lambda JSON Event Payload
+```json
+{
+  "layer": "bronze",
+  "source_system": "servicenow",
+  "source_table_name": "incident",
+  "initial_load_date": "2024-03-01 00:00:00",
+  "upper_bound": "2024-03-15 23:59:59",
+  "env": "dev"
+}
+```
+
+The trigger Lambda maps these event attributes into `--INITIAL_LOAD_DATE` and `--UPPER_BOUND` arguments when invoking `glue.start_job_run()`.
+
+---
+
+### Process 5: Connector Behaviors During Date Range Ingestion
+
+Each connector automatically translates `[INITIAL_LOAD_DATE, UPPER_BOUND]` into source-native extraction filters:
+
+```mermaid
+flowchart TD
+    Args["Range Input: [2024-03-01 00:00:00, 2024-03-15 23:59:59]"] --> ConnRouter{"Connector"}
+    
+    ConnRouter -- "Moveworks" --> MW["Convert to ISO UTC<br/>2024-03-01T00:00:00Z to 2024-03-15T23:59:59Z<br/>Split into 15-day parallel shards"]
+    ConnRouter -- "ServiceNow" --> SN["Table API sysparm_query<br/>sys_updated_on>=2024-03-01 00:00:00^sys_updated_on<=2024-03-15 23:59:59"]
+    ConnRouter -- "Genesys" --> GN["Analytics Query Interval<br/>2024-03-01T00:00:00Z/2024-03-15T23:59:59Z"]
+    ConnRouter -- "Database" --> DB["SQL Filter<br/>updated_at >= '2024-03-01 00:00:00' AND updated_at <= '2024-03-15 23:59:59'"]
+    ConnRouter -- "S3 File" --> SF["Object Metadata Filter<br/>LastModified >= 2024-03-01 and LastModified <= 2024-03-15"]
+```
+
+- **Moveworks (Parallel Date Sharding)**:
+  If a large date range is requested (e.g. 60 days), Moveworks calculates `[lower_bound, upper_bound]` and segments it into multiple 15-day non-overlapping date windows (`shard_window_days: 15`). Up to 5 worker threads (`max_workers: 5`) fetch records concurrently, streaming chunks to S3 staging.
+- **ServiceNow**:
+  Constructs: `sys_updated_on>=2024-03-01 00:00:00^sys_updated_on<=2024-03-15 23:59:59`.
+- **Genesys Cloud**:
+  Translates into ISO-8601 interval: `2024-03-01T00:00:00Z/2024-03-15T23:59:59Z`.
+- **Relational Databases (PostgreSQL / MySQL)**:
+  Constructs: `WHERE updated_at >= '2024-03-01 00:00:00' AND updated_at <= '2024-03-15 23:59:59' ORDER BY updated_at ASC`.
+- **S3 Flat Files (`s3_file`)**:
+  Filters S3 objects within the bucket where `LastModified` falls inside the date range.
+
+---
+
+### Process 6: Downstream Verification & Silver/Gold Processing
+
+After completing a manual date range ingestion:
+
+1. **Verify S3 Partition Directory**:
+   Confirm that newly extracted records are committed to S3 under the execution timestamp partition:
+   ```bash
+   aws s3 ls s3://my-bronze-bucket/bronze/data/servicenow/incident/
+   # Should list: _ingested_at=<YYYY-MM-DDTHH:MM:SSZ>/
+   ```
+2. **Verify Watermark File**:
+   Verify that `watermark.json` records `last_load_date` set to the `UPPER_BOUND`:
+   ```bash
+   aws s3 cp s3://my-state-bucket/metadata/bronze/servicenow/incident/watermark.json -
+   ```
+3. **Query via Athena**:
+   ```sql
+   SELECT COUNT(*), MIN(sys_updated_on), MAX(sys_updated_on)
+   FROM uax_datalake_db_dev.raw_tbl_incident
+   WHERE _ingested_at = '2026-09-20T14:30:00Z';
+   ```
+4. **Propagate to Silver Layer**:
+   - The Silver Layer runs an Iceberg `MERGE INTO` (upsert) keyed on primary keys (`sys_id`, `interaction_id`, etc.).
+   - Re-ingesting past records in Bronze will **NOT** create duplicates in Silver; the Silver transformer automatically updates existing records or inserts new ones.
+   - Run the Silver job after backfilling:
+     ```bash
+     aws glue start-job-run \
+       --job-name uax-datalake-silver-etl-dev \
+       --arguments '{
+         "--SOURCE_SYSTEM": "servicenow",
+         "--PROCESS_LAYER": "silver",
+         "--ENV": "dev"
+       }'
+     ```
+

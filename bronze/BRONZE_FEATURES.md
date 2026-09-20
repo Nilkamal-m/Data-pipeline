@@ -51,6 +51,7 @@
 | F40 | JSON fallback if Parquet fails | Auto | All |
 | F41 | Configurable upper bound & backfill mode | `upper_bound` / `--UPPER_BOUND` | All |
 | F42 | Pluggable zero-touch source onboarding | Pluggable connectors | All |
+| F43 | Dynamic environment templating ({env}) | `--ENV` / `{env}` placeholder | All |
 
 ---
 
@@ -167,19 +168,38 @@
 
 ### F41 — Configurable Upper Bound & Backfill Mode
 
-**Problem solved**: Historical backfilling or replaying a specific historical window without advancing watermark to the current date.  
+**Problem solved**: Historical backfilling or replaying a specific historical window without advancing watermark to the current date, as well as safe open-ended runs using high-date sentinels.  
 **Implementation**:
-- CLI parameter: `--UPPER_BOUND 2024-03-01T00:00:00Z`
-- Config setting: `"upper_bound": "2024-03-01T00:00:00Z"`
-- Dynamic substitution: `ConfigLoader` replaces `{upper_bound}` with the resolved timestamp.
-- Watermark update: Advances S3 watermark to `upper_bound` rather than `current_run_time`. Future runs automatically resume from `upper_bound`.
+- **Table-wise Control**: Configured per table under `source_systems.<source>.tables.<table_name>.upper_bound` (e.g. `"incident": {"upper_bound": "2024-06-01 00:00:00"}`).
+- **Uniform Format Standard**: Both `initial_load_date` and `upper_bound` use `"YYYY-MM-DD HH:MM:SS"`. Default is `""` (open-ended).
+- **Resolution Precedence**: CLI `--UPPER_BOUND` > per-table `tables.<tbl>.upper_bound` > legacy `table_upper_bounds` > source `upper_bound` > `pipeline_defaults.upper_bound` > current execution time (`open-ended`).
+- **Dynamic substitution**: `ConfigLoader` replaces `{upper_bound}` with the resolved timestamp (and automatically normalizes Moveworks OData timestamps to ISO 8601 UTC).
+- **High-Water Mark protection**:
+  - **Open-ended runs (empty or sentinel `9999-01-01 00:00:00`)**: Sentinel protection writes `current_run_time` to `watermark.json` (preventing watermark state corruption with year 9999).
+  - **Historical backfill runs (`2024-03-01 00:00:00`)**: Advances watermark to `table_upper_bound` so future incremental runs resume from the backfilled boundary.
+
 
 ---
 
-### F42 — Pluggable Zero-Touch Source Onboarding
+### F42 — Pluggable Zero-Touch Source & Table Onboarding
 
-**Problem solved**: Risk of breaking existing pipelines when adding new source integrations.  
+**Problem solved**: Risk of breaking existing pipelines when adding new source integrations or onboarding new tables.  
 **Implementation**:
-- Orchestrator `script/uax_bronze_load.py` is 100% connector-agnostic.
+- **Unified Canonical Table Registry**: Each source manages its entities in a self-contained `source_systems.<source>.tables` dictionary. To onboard a new table, simply declare it under `tables` with its `initial_load_date`, `upper_bound`, and optional overrides.
+- Orchestrator `script/uax_bronze_load.py` is 100% connector-agnostic. When `--SOURCE_TABLE_NAME` is omitted, the job automatically extracts all tables defined under `tables`.
 - New sources are added by creating a class in `script/connectors/<source>.py` adhering to `fetch_delta()` and registering it in `script/connectors/__init__.py`.
-- Zero lines in `uax_bronze_load.py` are modified when onboarding new sources.
+- Zero lines in `uax_bronze_load.py` are modified when onboarding new sources or tables.
+
+---
+
+### F43 — Dynamic Environment Templating ({env})
+
+**Problem solved**: Eliminates hardcoded environment references (such as `_dev` or `uax_datalake_db_dev`) across configurations and scripts, enabling seamless deployment across `dev`, `qa`, `stage`, and `prod`.  
+**Implementation**:
+- Pass `--ENV <environment>` (e.g. `--ENV prod`) via Glue job CLI parameters (defaults to `dev`).
+- `ConfigLoader` recursively parses configuration JSON and dynamic parameters, substituting `{env}` with the lowercase environment and `{ENV}` with the uppercase environment.
+- Dynamically resolves:
+  - Glue Catalog Database: `uax_datalake_db_{env}` -> `uax_datalake_db_prod`
+  - Glue Crawler: `uax-datalake-bronze-crawler-{env}` -> `uax-datalake-bronze-crawler-prod`
+  - S3 Buckets / Prefixes: `uax-datalake-{env}-bronze` -> `uax-datalake-prod-bronze`
+  - Job Names: `glue-bronze-<source>-{env}` -> `glue-bronze-<source>-prod`

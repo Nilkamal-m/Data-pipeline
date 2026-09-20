@@ -15,20 +15,20 @@
     "flatten_separator": "_",
     "error_handling_mode": "CONTINUE_ON_ERROR",
     "_note_error_modes": "Allowed values: CONTINUE_ON_ERROR (skip failed tables) | HALT_ON_ERROR (stop immediately on first failure)",
-    "cloudwatch_namespace": "UAX/DataPipeline/Ingestion",
     "upper_bound": "",
-    "_note_upper_bound": "Optional: ISO 8601 UTC timestamp (e.g. '2024-03-01T00:00:00Z'). Caps extraction at this upper boundary for backfills/historical loads. If empty or null, defaults to current run time.",
+    "_note_upper_bound": "Optional global upper bound timestamp (format: 'YYYY-MM-DD HH:MM:SS', e.g. '2024-03-01 00:00:00' for backfills). Can also be configured per-table under source_systems.<source>.tables.<table>.upper_bound or passed via CLI --UPPER_BOUND. When empty, extraction runs open-ended up to current run time.",
     "default_initial_load_date": "",
-    "_note_default_initial_load_date": "Optional global fallback. If empty, each table MUST have an entry in table_initial_load_dates or pass --INITIAL_LOAD_DATE via CLI.",
+    "_note_default_initial_load_date": "Optional global fallback (format: 'YYYY-MM-DD HH:MM:SS'). If empty, each table MUST have an entry under tables.<table>.initial_load_date or pass --INITIAL_LOAD_DATE via CLI.",
     "glue_catalog": {
       "enabled": true,
-      "database_name": "uax_datalake_db_dev",
+      "database_name": "uax_datalake_db_{env}",
       "table_prefix": "raw_tbl_",
-      "crawler_name": "uax-datalake-bronze-crawler-dev",
+      "crawler_name": "uax-datalake-bronze-crawler-{env}",
       "trigger_crawler": true,
       "sync_watermark_table": true,
       "watermark_table_name": "raw_tbl_watermarks"
-    }
+    },
+    "_note_env": "Dynamic environment templating: Any string containing '{env}' or '{ENV}' (e.g. database_name, crawler_name, bronze_bucket) is dynamically resolved at runtime from the --ENV / --ENVIRONMENT Glue parameter (defaults to 'dev')."
   },
   "source_systems": {
     "servicenow": {
@@ -39,19 +39,34 @@
       "default_delta_filter": "sys_updated_on>={last_load_date}",
       "response_records_key": "result",
       "batch_size": 1000,
-      "default_tables": ["incident", "change_request", "problem", "sys_user"],
-      "table_initial_load_dates": {
-        "incident": "2024-01-01T00:00:00Z",
-        "change_request": "2024-03-01T00:00:00Z",
-        "problem": "2024-06-01T00:00:00Z",
-        "sys_user": "2024-01-01T00:00:00Z"
-      },
-      "table_query_overrides": {
-        "incident": "active=true^sys_updated_on>={last_load_date}",
-        "u_custom_incident": "u_active=true^u_category=hardware^sys_updated_on>={last_load_date}"
-      },
-      "custom_table_endpoints": {
-        "u_special_report": "/api/now/v1/custom_reports"
+      "tables": {
+        "incident": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": "",
+          "query_override": "active=true^sys_updated_on>={last_load_date}"
+        },
+        "change_request": {
+          "initial_load_date": "2024-03-01 00:00:00",
+          "upper_bound": ""
+        },
+        "problem": {
+          "initial_load_date": "2024-06-01 00:00:00",
+          "upper_bound": ""
+        },
+        "sys_user": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "u_custom_incident": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": "",
+          "query_override": "u_active=true^u_category=hardware^sys_updated_on>={last_load_date}"
+        },
+        "u_special_report": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": "",
+          "custom_endpoint": "/api/now/v1/custom_reports"
+        }
       }
     },
     "genesys": {
@@ -62,14 +77,20 @@
       "default_delta_filter": "{last_load_date}",
       "response_records_key": "entities",
       "batch_size": 100,
-      "default_tables": ["conversations", "users", "queues"],
-      "table_initial_load_dates": {
-        "conversations": "2024-01-01T00:00:00Z",
-        "users": "2024-01-01T00:00:00Z",
-        "queues": "2024-01-01T00:00:00Z"
-      },
-      "table_query_overrides": {},
-      "custom_table_endpoints": {}
+      "tables": {
+        "conversations": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "users": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "queues": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        }
+      }
     },
     "moveworks": {
       "_secrets_required": ["auth_type", "token_url", "client_id", "client_secret", "grant_type", "api_base_url", "batch_size"],
@@ -81,22 +102,29 @@
       "response_records_key": "value",
       "batch_size": 500,
       "orderby": "last_updated_time desc",
-      "default_tables": ["conversations", "interactions", "users"],
-      "table_initial_load_dates": {
-        "conversations": "2024-01-01T00:00:00Z",
-        "interactions": "2024-01-01T00:00:00Z",
-        "users": "2024-01-01T00:00:00Z",
-        "tickets": "2024-01-01T00:00:00Z"
-      },
-      "table_query_overrides": {},
-      "custom_table_endpoints": {
-        "tickets": "/export/v1beta2/records/conversations"
-      },
-      "upper_bound": "",
       "parallel_processing": {
         "enabled": true,
         "max_workers": 5,
         "shard_window_days": 15
+      },
+      "tables": {
+        "conversations": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "interactions": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "users": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "tickets": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": "",
+          "custom_endpoint": "/export/v1beta2/records/conversations"
+        }
       }
     },
     "postgresql": {
@@ -108,14 +136,20 @@
       "default_delta_filter": "updated_at >= '{last_load_date}'",
       "query_template": "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC",
       "fetch_size": 10000,
-      "default_tables": ["orders", "order_items", "customers"],
-      "table_initial_load_dates": {
-        "orders": "2024-01-01T00:00:00Z",
-        "order_items": "2024-01-01T00:00:00Z",
-        "customers": "2024-01-01T00:00:00Z"
-      },
-      "table_query_overrides": {
-        "orders": "status = 'COMPLETED' AND updated_at >= '{last_load_date}'"
+      "tables": {
+        "orders": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": "",
+          "query_override": "status = 'COMPLETED' AND updated_at >= '{last_load_date}'"
+        },
+        "order_items": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "customers": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        }
       }
     },
     "mysql": {
@@ -127,38 +161,45 @@
       "default_delta_filter": "updated_at >= '{last_load_date}'",
       "query_template": "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC",
       "fetch_size": 10000,
-      "default_tables": ["transactions", "users", "accounts"],
-      "table_initial_load_dates": {
-        "transactions": "2024-01-01T00:00:00Z",
-        "users": "2024-01-01T00:00:00Z",
-        "accounts": "2024-01-01T00:00:00Z"
-      },
-      "table_query_overrides": {}
+      "tables": {
+        "transactions": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "users": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "accounts": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        }
+      }
     },
     "vendor_a_s3": {
       "_note": "Vendor A CSV file feed. 'type' must match a key in connectors CONNECTOR_MAP (use 's3_file').",
       "type": "s3_file",
       "source_bucket": "vendor-a-incoming-bucket",
       "file_prefix": "raw_feed/",
-      "_note_file_prefix": "Global prefix. Per-table paths are set in table_paths override below.",
       "file_format": "csv",
       "delimiter": ",",
       "has_header": true,
       "encoding": "utf-8",
       "fetch_mode": "all",
       "_note_fetch_mode": "'all' = all files modified after watermark (incremental). 'latest' = only the most recently modified file (snapshot/full-refresh).",
-      "default_tables": ["employee_feed", "orders"],
-      "table_paths": {
-        "employee_feed": "raw_feed/employee_feed/",
-        "orders": "raw_feed/orders/"
-      },
-      "table_fetch_modes": {
-        "employee_feed": "latest",
-        "orders": "all"
-      },
-      "table_initial_load_dates": {
-        "employee_feed": "2024-01-01T00:00:00Z",
-        "orders": "2024-01-01T00:00:00Z"
+      "tables": {
+        "employee_feed": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": "",
+          "file_path": "raw_feed/employee_feed/",
+          "fetch_mode": "latest"
+        },
+        "orders": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": "",
+          "file_path": "raw_feed/orders/",
+          "fetch_mode": "all"
+        }
       }
     },
     "vendor_b_s3": {
@@ -169,18 +210,19 @@
       "file_format": "json",
       "fetch_mode": "all",
       "encoding": "utf-8",
-      "default_tables": ["user_activity", "audit_logs"],
-      "table_paths": {
-        "user_activity": "json_feeds/user_activity/",
-        "audit_logs": "json_feeds/audit_logs/"
-      },
-      "table_fetch_modes": {
-        "user_activity": "all",
-        "audit_logs": "latest"
-      },
-      "table_initial_load_dates": {
-        "user_activity": "2024-01-01T00:00:00Z",
-        "audit_logs": "2024-01-01T00:00:00Z"
+      "tables": {
+        "user_activity": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": "",
+          "file_path": "json_feeds/user_activity/",
+          "fetch_mode": "all"
+        },
+        "audit_logs": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": "",
+          "file_path": "json_feeds/audit_logs/",
+          "fetch_mode": "latest"
+        }
       }
     }
   }
