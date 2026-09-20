@@ -1,176 +1,247 @@
-# 🔍 Bronze Layer: Low-Level Technical & Code Execution Guide
+# Bronze Layer — Low-Level Code Mechanics
 
-This document provides an exhaustive, low-level technical explanation of how the Bronze Ingestion Layer operates within the UAX Data Lake Pipeline. It details the execution lifecycle, internal function call stacks, data flow, memory management, catalog synchronizations, and failure containment strategies implemented in [uax_bronze_load.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py) and supporting modules.
+> Audience: Engineers modifying, extending, or debugging Bronze pipeline code.  
+> Assumes familiarity with `BRONZE_LAYER_GUIDE.md`.
 
 ---
 
-## 🏗️ 1. High-Level Architecture & Execution Flow
-
-The Bronze layer implements a **Modular Connector Factory Pattern** with **Chunked Streaming Ingestion**, **Atomic Two-Phase Staging**, and **Instant Glue Data Catalog Synchronization**.
+## 1. Module Dependency Map
 
 ```mermaid
-flowchart TD
-    A([Glue Job Trigger / CLI / Lambda]) --> B[parse_arguments: CLI > Config JSON > Defaults]
-    B --> C[get_secret: AWS Secrets Manager / Env]
-    C --> D[Connector Factory: ServiceNow / Moveworks / Genesys / DB / S3]
-    D --> E{Iterate Over Tables}
-    
-    E --> F[get_last_load_date: Check S3 Watermark State]
-    F --> G[Extract Records via Connector in Chunks]
-    G --> H[Technical Column Injection: _ingested_at, _source_system, _execution_id]
-    H --> I[serialize_chunk_to_bytes: Parquet Snappy / NDJSON / CSV]
-    I --> J[Write Chunk to S3 Staging: staging/bronze/...]
-    
-    J --> K{Extraction Complete?}
-    K -- More Chunks --> G
-    K -- All Records Done --> L[promote_staging_to_bronze: Atomic Move to final S3 partition]
-    
-    L --> M[update_last_load_date: Persist new high-watermark JSON to S3]
-    M --> N[sync_bronze_catalog_table: Infer Schema & Add Partition to Glue Catalog]
-    N --> O[sync_watermark_catalog_table: Update tbl_watermarks catalog table]
-    O --> P[emit_cloudwatch_metrics: Push RecordCount, Duration, Errors]
-    P --> Q[save_execution_log: Write Execution Audit JSON to S3]
-    
-    Q --> R{More Tables in List?}
-    R -- Yes --> E
-    R -- No --> S[trigger_glue_crawler: Optional Trigger]
-    S --> T([Job Complete])
-    
-    G -- Error Encountered --> U{error_handling_mode}
-    U -- FAIL_FAST --> V[cleanup_failed_staging & Raise Exception]
-    U -- CONTINUE_ON_ERROR --> W[Log Error, cleanup_failed_staging & Skip to Next Table]
-    U -- QUARANTINE --> X[Dump Corrupted Raw Data to S3 DLQ / Quarantine]
+graph TD
+    Orch["uax_bronze_load.py<br/>(Glue Shell Orchestrator)"]
+    CfgLoader["config_loader.py<br/>(3-Tier Config & Filter Engine)"]
+    Factory["connectors/__init__.py<br/>(get_connector Factory)"]
+
+    Orch --> CfgLoader
+    Orch --> Factory
+
+    Factory --> MW["connectors/moveworks.py"]
+    Factory --> SN["connectors/servicenow.py"]
+    Factory --> GN["connectors/genesys.py"]
+    Factory --> DB["connectors/database.py"]
+    Factory --> S3["connectors/s3_file.py"]
+
+    MW --> HTTP["connectors/http_client.py"]
+    SN --> HTTP
+    GN --> HTTP
+
+    MW --> CfgLoader
+    SN --> CfgLoader
+    GN --> CfgLoader
+    DB --> CfgLoader
+
+    HTTP --> OAuth["connectors/oauth.py<br/>(Cached Token Client)"]
 ```
 
 ---
 
-## ⚙️ 2. Core Execution Lifecycle (Step-by-Step)
+## 2. `uax_bronze_load.py` — Function Reference
 
-### Step 1: Argument Resolution & Configuration Loading
-- **Function**: `parse_arguments()` ([uax_bronze_load.py:L163](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py#L163))
-- **Configuration Loader**: [config_loader.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/config_loader.py)
-- **Hierarchy of Precedence**:
-  1. **CLI / Glue Job Arguments**: (e.g. `--SOURCE_SYSTEM`, `--TABLE_NAME`, `--FULL_REFRESH`, `--GLUE_DATABASE`)
-  2. **Central S3 Config File**: `bronze_config.json` (loaded from `--CONFIG_S3_PATH` or default S3 path)
-  3. **Hardcoded Fallbacks**: Safe operational defaults.
+### `parse_arguments() → dict`
+**Lines 164–375**
+
+Parses `sys.argv` with a custom key=value and positional parser designed specifically for AWS Glue Python Shell jobs (which pass parameters in `--KEY value` format).
+
+**3-tier parameter precedence (CLI > Config > Default):**
+```python
+# Example: upper_bound resolution
+upper_bound_cli = get_cli_arg('UPPER_BOUND')
+upper_bound = (
+    upper_bound_cli or 
+    source_config.get('upper_bound') or 
+    pipeline_defaults.get('upper_bound') or 
+    ''
+)
+if upper_bound and str(upper_bound).strip():
+    source_config['upper_bound'] = str(upper_bound).strip()
+```
+
+**Strict validation — raises `ValueError` if:**
+- `--SOURCE_SYSTEM` is missing.
+- `BRONZE_BUCKET` is not resolvable from CLI, config, or environment.
+- `database_name` or `table_prefix` is empty when `GLUE_CATALOG_ENABLED=true`.
+- `watermark_table_name` is empty when `SYNC_WATERMARK_TABLE=true`.
+
+**Returns dict keys:**
+```
+JOB_NAME, SOURCE_SYSTEM, TABLE_LIST, CUSTOM_QUERY, SECRET_NAME,
+BRONZE_BUCKET, STATE_BUCKET, BRONZE_DATA_PREFIX, INITIAL_LOAD_DATE_CLI,
+UPPER_BOUND, S3_CHUNK_SIZE, OUTPUT_FORMAT, PARQUET_COMPRESSION,
+ERROR_HANDLING_MODE, CLOUDWATCH_NAMESPACE, GLUE_CATALOG_ENABLED,
+GLUE_DATABASE_NAME, GLUE_TABLE_PREFIX, BRONZE_CRAWLER_NAME,
+TRIGGER_CRAWLER, SYNC_WATERMARK_TABLE, WATERMARK_TABLE_NAME,
+SOURCE_CONFIG, PIPELINE_DEFAULTS
+```
+
+---
+
+### `get_secret(secret_name) → dict`
+**Lines 127–161**
+
+Retrieves credentials from AWS Secrets Manager.
+
+**`_val` sanitizer:**
+```python
+def _val(key: str, default: str) -> str:
+    v = sec_payload.get(key)
+    if v and str(v).strip() and not str(v).startswith("CHANGE_ME") and not str(v).startswith("YOUR_"):
+        return str(v).strip()
+    return default
+```
+Any placeholder starting with `"CHANGE_ME"` or `"YOUR_"` is treated as unconfigured and falls back to `default`, preventing accidental authorization failures caused by documentation template values.
+
+---
+
+### `get_last_load_date(...) → str`
+**Lines 521–573**
+
+Resolves the extraction start watermark (`lower_bound`):
+```mermaid
+flowchart TD
+    Start([Start Watermark Resolution]) --> CheckS3{"1. Check S3 State File<br/>s3://bucket/metadata/bronze/..."}
+    
+    CheckS3 -- "Found & Valid" --> ReturnS3["Return S3 last_load_date<br/>(Incremental Delta Load)"]
+    CheckS3 -- "NoSuchKey / 404" --> TryAlt{"Try Alternate S3 Key<br/>(hyphens vs underscores)"}
+    
+    TryAlt -- "Found & Valid" --> ReturnS3
+    TryAlt -- "Missing" --> CheckCLI{"2. CLI --INITIAL_LOAD_DATE?"}
+    
+    CheckCLI -- "Provided" --> ReturnCLI["Return CLI Date"]
+    CheckCLI -- "Not Provided" --> CheckConfig{"3. table_initial_load_dates in config?"}
+    
+    CheckConfig -- "Configured" --> ReturnConfig["Return Table Initial Date"]
+    CheckConfig -- "Missing" --> CheckGlobal{"4. default_initial_load_date in config?"}
+    
+    CheckGlobal -- "Configured" --> ReturnGlobal["Return Global Default Date"]
+    CheckGlobal -- "Empty / Missing" --> RaiseError["Raise ValueError<br/>(Strict: Zero Unbounded Runs)"]
+```
+
+---
+
+### `update_last_load_date(...) → None`
+**Lines 576–618**
+
+Persists updated `watermark.json` to S3 **after** `promote_staging_to_bronze` succeeds.
+
+**Effective Watermark Logic:**
+```python
+effective_watermark = upper_bound if upper_bound else current_run_time
+update_last_load_date(state_bucket, state_key, source_system, clean_table_name, effective_watermark, total_table_records, table_prefix=glue_table_prefix)
+```
+- During regular runs (`upper_bound` is empty), watermark advances to `current_run_time`.
+- During backfill runs (`upper_bound` is specified), watermark advances to `upper_bound`. This guarantees that subsequent runs resume from `upper_bound` without skipping data between `upper_bound` and current time!
+
+---
+
+### `chunk_writer_callback(records_chunk, part_num)`
+**Lines 1167–1210** (closure inside `main()` table loop)
+
+Passed as `on_chunk_callback` to connectors. Executes whenever buffered records reach `s3_chunk_size`:
+1. Flattens nested structures if `flatten_nested_json: true` via `flatten_and_expand_record()`.
+2. Injects standard audit columns: `_ingested_at`, `_source_system`, `_table_name`, `_execution_id`.
+3. Serializes chunk to Parquet (Snappy) using PyArrow.
+4. Streams bytes directly to ephemeral staging S3 prefix: `_staging/exec_<id>/<source>/<table>/delta_<id>_part_<part_num>.parquet`.
+
+---
+
+## 3. `config_loader.py` — Dynamic Configuration Engine
+
+### `ConfigLoader.get_table_query_filter(..., upper_bound=None) → str`
+**Lines 124–195**
+
+Constructs the API or SQL filter expression. Safely resolves `{upper_bound}` and `{last_load_date}`:
+```python
+effective_ub = (
+    str(upper_bound).strip()
+    if upper_bound and str(upper_bound).strip()
+    else datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+)
+```
+- Template: `last_updated_time ge '{last_load_date}' and last_updated_time le '{upper_bound}'`
+- Output: `last_updated_time ge '2024-01-01T00:00:00Z' and last_updated_time le '2024-03-01T00:00:00Z'`
+- **Guarantee**: `{upper_bound}` is never leaked to the target system as an unrendered string. If `upper_bound` is omitted, `effective_ub` defaults to the current UTC timestamp.
+
+---
+
+## 4. `connectors/__init__.py` — Factory
+
+### `get_connector(source_system, source_config=None) → class`
+
+**Resolution Order:**
+1. Exact source name match in `CONNECTOR_MAP`.
+2. Type-based routing: if `source_config` contains `"type": "s3_file"` or `"type": "database"`, resolves to the corresponding generic connector.
+3. If neither matches, raises descriptive `ValueError` listing available sources.
 
 ```python
-# Low-level resolution example:
-source_system = get_cli_arg('SOURCE_SYSTEM', 'source_system')
-glue_database_name = (
-    get_cli_arg('GLUE_DATABASE', 'glue_database', 'GLUE_DB_NAME', 'glue_db_name')
-    or catalog_config.get('database_name')
+CONNECTOR_MAP = {
+    'moveworks': MoveworksConnector,
+    'servicenow': ServiceNowConnector,
+    'genesys': GenesysConnector,
+    'database': DatabaseConnector,
+    'postgresql': DatabaseConnector,
+    'mysql': DatabaseConnector,
+    'mariadb': DatabaseConnector,
+    'sqlite': DatabaseConnector,
+    's3_file': S3FileConnector,
+}
+```
+
+---
+
+## 5. `connectors/moveworks.py` — Sharding & Extraction
+
+### Parallel vs. Sequential Routing
+```python
+configured_ub = config.get('upper_bound')
+upper_bound = (
+    str(configured_ub).strip()
+    if configured_ub and str(configured_ub).strip()
+    else datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+)
+
+if parallel_enabled and on_chunk_callback:
+    MoveworksConnector._fetch_parallel(
+        lower_bound=last_load_date,
+        upper_bound=upper_bound,
+        ...
+    )
+    return []
+
+return MoveworksConnector._fetch_single_window(
+    lower_bound=last_load_date,
+    upper_bound=upper_bound,
+    ...
 )
 ```
 
-### Step 2: Secrets & Credential Resolution
-- **Function**: `get_secret(secret_name)` ([uax_bronze_load.py:L127](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py#L127))
-- Retrieves API credentials, OAuth client secrets, or database passwords from **AWS Secrets Manager**.
-- Automatically extracts connection parameters (`base_url`, `client_id`, `client_secret`, `username`, `password`).
-- Provides fallback to local environment variables if running in local unit test mode.
-
-### Step 3: Connector Instantiation via Factory Pattern
-- Dynamically resolves and instantiates the target connector based on `SOURCE_SYSTEM`:
-  - `servicenow` -> `ServiceNowConnector` ([servicenow.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/connectors/servicenow.py))
-  - `moveworks` -> `MoveworksConnector` ([moveworks.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/connectors/moveworks.py))
-  - `genesys` -> `GenesysConnector` ([genesys.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/connectors/genesys.py))
-  - `database` -> `DatabaseConnector` ([database.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/connectors/database.py))
-  - `s3_file` -> `S3FileConnector` ([s3_file.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/connectors/s3_file.py))
-
-### Step 4: Watermark Retrieval (State Management)
-- **Function**: `get_last_load_date()` ([uax_bronze_load.py:L545](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py#L545))
-- State File S3 Location: `s3://<bronze_bucket>/metadata/bronze/<source_system>/<table_name>_watermark.json`
-- **Logic**:
-  - If `--FULL_REFRESH true` is passed: Ignores the stored watermark and begins extraction from epoch (`1970-01-01T00:00:00Z`) or initial configured start time.
-  - If incremental load: Reads the JSON state file and extracts `last_load_date` or `last_watermark_value`.
-  - If state file does not exist (initial table run): Defaults to `table_configs.<table_name>.initial_load_date` or `1970-01-01T00:00:00Z`.
-
-### Step 5: Streaming Chunk Extraction & In-Memory Processing
-- **Callback**: `chunk_writer_callback(records_chunk, part_num)` ([uax_bronze_load.py:L1139](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py#L1139))
-- Connectors emit batches of records (e.g. 5,000 to 10,000 records per chunk) rather than loading entire datasets into memory.
-- For each record, four **Technical Audit Columns** are injected:
-  1. `_ingested_at`: UTC ISO timestamp of ingestion run (e.g. `2026-09-08T16:00:00Z`).
-  2. `_source_system`: Source identifier (e.g. `servicenow`).
-  3. `_source_table`: Raw table name (e.g. `incident`).
-  4. `_execution_id`: Unique UUID representing the Glue Job run.
-
-### Step 6: Serialization & Two-Phase Staging Write
-- **Serialization**: `serialize_chunk_to_bytes()` ([uax_bronze_load.py:L476](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py#L476))
-  - Uses `pyarrow` to convert Python dictionaries to an Arrow Table, applying Apache Parquet format with Snappy compression (or NDJSON/CSV if configured).
-- **Staging Location**:
-  `s3://<bronze_bucket>/staging/bronze/<execution_id>/<source_system>/<table_name>/part-00000.parquet`
-- **Atomic Promotion**: `promote_staging_to_bronze()` ([uax_bronze_load.py:L632](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py#L632))
-  - Copies all staged chunk files from `staging/` to the final Hive-partitioned path:
-    `s3://<bronze_bucket>/bronze/data/<source_system>/<table_name>/_ingested_at=<TIMESTAMP>/`
-  - Deletes staging files immediately upon successful copy.
-  - If any failure occurs prior to promotion, `cleanup_failed_staging()` deletes all staged chunks, preventing corrupt or orphan files in Bronze.
-
-### Step 7: Dual-Layer State Persistence
-Upon successful data promotion:
-1. **S3 State File**: `update_last_load_date()` writes updated watermark JSON to:
-   `s3://<bronze_bucket>/metadata/bronze/<source_system>/<table_name>_watermark.json`
-2. **Glue Catalog Watermark Table**: `sync_watermark_catalog_table()` updates the centralized `uax_datalake_db_dev.tbl_watermarks` table with `last_load_date`, `record_count`, `duration_seconds`, and `status`.
-
-### Step 8: AWS Glue Data Catalog Auto-Sync (Instant Table & Partition Registration)
-- **Function**: `sync_bronze_catalog_table()` ([uax_bronze_load.py:L766](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py#L766))
-- Automatically creates or updates the table in AWS Glue Data Catalog:
-  - Database: `uax_datalake_db_dev`
-  - Table Name: `raw_tbl_<table_name>` (e.g. `uax_datalake_db_dev.raw_tbl_incident`)
-  - Classification: `parquet`
-  - Partition Key: `_ingested_at` (Type: `string`)
-  - SerDe: `org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe`
-- **Instant Partition Registration**:
-  Calls `glue_client.create_partition()` directly for `_ingested_at=<TIMESTAMP>`. This makes the newly loaded data queryable in Amazon Athena and downstream Silver PySpark jobs immediately without waiting for a crawler!
-
-### Step 9: Crawler Triggering (Optional)
-- **Function**: `trigger_glue_crawler()` ([uax_bronze_load.py:L996](file:///Users/nilkamalmahato/Documents/Data-pipeline/bronze/script/uax_bronze_load.py#L996))
-- If `--TRIGGER_CRAWLER true` is set, calls `glue:StartCrawler` for reconciliation. Handles `CrawlerRunningException` gracefully without failing the job.
-
-### Step 10: Observability & Auditing
-- **CloudWatch Metrics**: `emit_cloudwatch_metrics()` pushes custom metrics under namespace `UAX/DataPipeline/Ingestion`:
-  - `IngestionRecords`
-  - `IngestionDuration`
-  - `IngestionErrors`
-- **Audit Execution Log**: `save_execution_log()` writes an execution summary JSON report to `s3://<bronze_bucket>/logs/bronze/<source_system>/<table_name>/<execution_id>.json`.
+### Thread Safety in `_fetch_parallel`
+- Shards are submitted to `ThreadPoolExecutor(max_workers=max_workers)`.
+- `callback_lock = threading.Lock()` wraps all invocations of `on_chunk_callback`.
+- Ensures S3 staging file part numbers remain strictly monotonically increasing (`part_0001`, `part_0002`, etc.) regardless of which worker finishes first.
 
 ---
 
-## 📂 3. Directory & S3 Path Structure
+## 6. Connector Extensibility Contract
 
-```
-s3://<data-lake-bucket>/
-│
-├── bronze/
-│   └── data/
-│       └── <source_system>/                 # e.g., servicenow, moveworks
-│           └── <table_name>/                # e.g., incident, interactions
-│               └── _ingested_at=20260908T160000Z/
-│                   ├── part-00000.parquet
-│                   └── part-00001.parquet
-│
-├── staging/
-│   └── bronze/
-│       └── <execution_id>/                  # Ephemeral staging during active ingestion
-│
-├── metadata/
-│   └── bronze/
-│       └── <source_system>/
-│           └── <table_name>_watermark.json  # High-watermark JSON tracking file
-│
-└── logs/
-    └── bronze/
-        └── <source_system>/
-            └── <table_name>/
-                └── <execution_id>.json      # Run audit metrics & status
+Every connector implements a single class with a static `fetch_delta()` method:
+
+```python
+class CustomConnector:
+    @staticmethod
+    def fetch_delta(
+        last_load_date: str,
+        secret_dict: Dict[str, Any],
+        table_name: str,
+        source_config: Dict[str, Any],
+        custom_query: Optional[str] = None,
+        on_chunk_callback: Optional[Callable[[List[Dict[str, Any]], int], None]] = None,
+        s3_chunk_size: int = 10000,
+    ) -> List[Dict[str, Any]]:
 ```
 
----
-
-## 🔒 4. Memory & Resource Safety Details
-
-1. **Streaming Paginated Ingestion**:
-   Connectors never accumulate complete upstream datasets in memory. Instead, chunks of records (configurable via `chunk_size`, default 5,000) are extracted, serialized, and streamed to S3.
-2. **Garbage Collection Optimization**:
-   Record chunks are dereferenced and explicitly collected after serialization, keeping PySpark / Python memory footprints well under Glue DPU limits (standard 2 to 4 DPUs).
-3. **Atomic Two-Phase Staging**:
-   Direct-to-partition writes are avoided. By writing to an ephemeral staging prefix and copying only on complete success, partial network drops or API aborts will never leave partial, broken Parquet files in queryable Bronze partitions.
+### Invariants for Connector Implementors:
+1. **Never buffer full datasets in memory**: Buffer records in chunks up to `s3_chunk_size`, call `on_chunk_callback(buffer, part_number)`, and reset the buffer.
+2. **Raise on missing configuration**: Do not provide silent fake defaults for credentials, hostnames, or ports.
+3. **Respect `upper_bound`**: If `source_config.get('upper_bound')` is set, filter or cap extraction at that timestamp.
+4. **Clean Return**: When `on_chunk_callback` is provided, return `[]`. Only return an in-memory list if running without a callback (e.g. unit testing).

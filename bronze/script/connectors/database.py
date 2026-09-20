@@ -1,21 +1,35 @@
 """
-Dynamic Database Connector for Relational Databases (PostgreSQL, MySQL, Oracle, SQL Server).
+Relational Database Connector — AWS Glue Data Pipeline.
 
-Strict Policy: No hardcoded default hostnames, database names, or table names.
-Raises explicit ValueError if any required parameter is missing to prevent wrong data extraction.
+Supports: PostgreSQL, MySQL, MariaDB, SQLite.
+
+Required Secrets Manager keys:
+  db_type  : 'postgresql' | 'mysql' | 'mariadb' | 'sqlite'
+  host     : Database hostname or IP (not required for sqlite)
+  dbname   : Database name
+  username : Database user (not required for sqlite)
+  password : Database password (not required for sqlite)
+  port     : Port number — REQUIRED (PostgreSQL: 5432, MySQL: 3306)
+
+Required bronze_config.json keys (source_systems.<db_type>):
+  db_type         : Same as Secrets Manager (used if 'db_type' absent from secret)
+  query_template  : Optional SQL template with {table_name} and {query_filter} placeholders
+  fetch_size      : Rows fetched per cursor batch (default: 10000)
 """
 
 import logging
-from typing import List, Dict, Any, Optional, Callable
+from typing import Any, Callable, Dict, List, Optional
+
 from config_loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_ENGINES = ('postgresql', 'postgres', 'mysql', 'mariadb', 'sqlite')
+
 
 class DatabaseConnector:
     """
-    Dynamic Database Connector for extracting incremental delta rows from RDBMS sources.
-    Handles cursor batch fetching and streams chunks to S3 callbacks.
+    Incremental database connector with cursor batch fetching and S3 chunk streaming.
     """
 
     @staticmethod
@@ -26,43 +40,42 @@ class DatabaseConnector:
         source_config: Dict[str, Any],
         custom_query: Optional[str] = None,
         on_chunk_callback: Optional[Callable[[List[Dict[str, Any]], int], None]] = None,
-        s3_chunk_size: int = 10000
+        s3_chunk_size: int = 10000,
     ) -> List[Dict[str, Any]]:
         """
-        Extracts incremental rows from a database table modified/updated since last_load_date.
-        Raises ValueError if required parameters or database connection details are missing.
+        Extracts rows from a database table updated since last_load_date.
         """
         if not table_name or not table_name.strip():
-            raise ValueError("Database connector error: 'table_name' parameter is required and cannot be empty.")
-
+            raise ValueError("Database connector: 'table_name' is required.")
         if not last_load_date or not last_load_date.strip():
-            raise ValueError(f"Database connector error: 'last_load_date' is required for table '{table_name}'.")
+            raise ValueError(
+                f"Database connector: 'last_load_date' is required for table '{table_name}'."
+            )
 
-        config = source_config or {}
-        source_name = config.get('db_type') or secret_dict.get('engine') or 'database'
-        
-        query_filter = ConfigLoader.get_table_query_filter(source_name, table_name, last_load_date, custom_query, config)
-        query_template = config.get('query_template') or "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC"
-        
+        config      = source_config or {}
+        source_name = secret_dict.get('db_type') or config.get('db_type') or 'database'
+
+        query_filter  = ConfigLoader.get_table_query_filter(
+            source_name, table_name, last_load_date, custom_query, config,
+            upper_bound=config.get('upper_bound')
+        )
+        query_template = config.get('query_template') or \
+            "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC"
         sql_query = query_template.format(table_name=table_name, query_filter=query_filter)
-        fetch_size = config.get('fetch_size') or secret_dict.get('fetch_size') or 10000
-        fetch_size = int(fetch_size)
 
-        logger.info(f"Connecting to database source '{source_name}' to extract table '{table_name}'...")
-        logger.info(f"Executing SQL Query: {sql_query}")
+        fetch_size = int(secret_dict.get('fetch_size') or config.get('fetch_size') or 10000)
 
-        conn = DatabaseConnector._get_connection(secret_dict, config)
+        logger.info(f"[Database/{table_name}] Connecting to '{source_name}' | SQL: {sql_query}")
+
+        conn   = DatabaseConnector._connect(secret_dict, config)
         cursor = conn.cursor()
-
-        records_buffer = []
-        all_records = []
-        part_number = 1
-        total_extracted = 0
+        all_records:    List[Dict[str, Any]] = []
+        records_buffer: List[Dict[str, Any]] = []
+        total = 0
+        part  = 1
 
         try:
             cursor.execute(sql_query)
-            
-            # Extract column names from cursor description
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
 
             while True:
@@ -70,95 +83,124 @@ class DatabaseConnector:
                 if not rows:
                     break
 
-                batch = [dict(zip(columns, row)) for row in rows]
-                batch_count = len(batch)
-                total_extracted += batch_count
-
-                logger.info(f"Database table '{table_name}': fetched batch of {batch_count} rows (Total: {total_extracted})")
+                batch  = [dict(zip(columns, row)) for row in rows]
+                total += len(batch)
+                logger.info(f"[Database/{table_name}] Batch: {len(batch)} rows | total: {total}")
 
                 if on_chunk_callback:
                     records_buffer.extend(batch)
                     if len(records_buffer) >= s3_chunk_size:
-                        logger.info(f"Chunk threshold reached ({len(records_buffer)} rows). Flushing part {part_number} to S3 STAGING...")
-                        on_chunk_callback(records_buffer, part_number)
+                        on_chunk_callback(records_buffer, part)
                         records_buffer = []
-                        part_number += 1
+                        part += 1
                 else:
                     all_records.extend(batch)
 
             if on_chunk_callback and records_buffer:
-                logger.info(f"Flushing final part {part_number} ({len(records_buffer)} rows) to S3 STAGING...")
-                on_chunk_callback(records_buffer, part_number)
-                records_buffer = []
+                on_chunk_callback(records_buffer, part)
 
-            logger.info(f"Finished database extraction for table '{table_name}'. Total records: {total_extracted}")
+            logger.info(f"[Database/{table_name}] Done. Total: {total}")
             return all_records if not on_chunk_callback else []
 
         except Exception as err:
-            logger.error(f"Error during database extraction for table '{table_name}': {err}")
+            logger.error(f"[Database/{table_name}] Extraction failed: {err}")
             raise
         finally:
             cursor.close()
             conn.close()
 
     @staticmethod
-    def _get_connection(secret_dict: Dict[str, Any], source_config: Dict[str, Any]):
+    def _connect(secret_dict: Dict[str, Any], source_config: Dict[str, Any]):
         """
-        Dynamically establishes DB connection using driver libraries (pg8000, pymysql, psycopg2, sqlite3).
-        Validates host, dbname, and credentials strictly.
+        Establishes a database connection.
+
+        All connection parameters are read from Secrets Manager.
+        'port' is required — raise if missing (no default assumed).
         """
-        db_type = (source_config.get('db_type') or secret_dict.get('engine') or '').lower()
+        db_type = (secret_dict.get('db_type') or source_config.get('db_type') or '').lower()
         if not db_type:
-            raise ValueError("Database connection error: 'db_type' or 'engine' must be specified in config or secret.")
+            raise ValueError(
+                "Database connector: 'db_type' is required. "
+                "Set 'db_type' in Secrets Manager or in bronze_config.json "
+                f"(source_systems.<source>.db_type). Supported: {_SUPPORTED_ENGINES}."
+            )
+        if db_type not in _SUPPORTED_ENGINES:
+            raise ValueError(
+                f"Database connector: unsupported 'db_type': '{db_type}'. "
+                f"Supported engines: {_SUPPORTED_ENGINES}."
+            )
 
         if db_type == 'sqlite':
-            dbname = secret_dict.get('dbname') or secret_dict.get('database')
+            dbname = secret_dict.get('dbname')
             if not dbname:
-                raise ValueError("SQLite connection error: 'dbname' or 'database' path is required.")
+                raise ValueError(
+                    "SQLite connection requires 'dbname' (file path) in Secrets Manager."
+                )
             import sqlite3
             return sqlite3.connect(dbname)
 
-        host = secret_dict.get('host') or secret_dict.get('hostname') or source_config.get('host')
+        # All other engines require host, dbname, username, password, port
+        host = secret_dict.get('host')
         if not host:
-            raise ValueError(f"Database connection error for '{db_type}': Database 'host' / 'hostname' is missing in Secret.")
+            raise ValueError(
+                f"Database connector (db_type='{db_type}'): 'host' is required in Secrets Manager."
+            )
 
-        dbname = secret_dict.get('dbname') or secret_dict.get('database') or source_config.get('dbname')
+        dbname = secret_dict.get('dbname')
         if not dbname:
-            raise ValueError(f"Database connection error for '{db_type}': Database 'dbname' / 'database' is missing in Secret.")
+            raise ValueError(
+                f"Database connector (db_type='{db_type}'): 'dbname' is required in Secrets Manager."
+            )
 
-        user = secret_dict.get('username') or secret_dict.get('user')
-        if not user:
-            raise ValueError(f"Database connection error for '{db_type}': Database 'username' / 'user' is missing in Secret.")
+        username = secret_dict.get('username')
+        if not username:
+            raise ValueError(
+                f"Database connector (db_type='{db_type}'): 'username' is required in Secrets Manager."
+            )
 
         password = secret_dict.get('password', '')
-        port = int(secret_dict.get('port') or source_config.get('port') or (5432 if 'postgre' in db_type else 3306))
+
+        port_raw = secret_dict.get('port')
+        if port_raw is None:
+            raise ValueError(
+                f"Database connector (db_type='{db_type}'): 'port' is required in Secrets Manager. "
+                f"Standard ports — PostgreSQL: 5432, MySQL/MariaDB: 3306."
+            )
+        port = int(port_raw)
 
         if db_type in ('postgresql', 'postgres'):
             try:
-                # pyrefly: ignore [missing-import]
-                import pg8000.native
-                conn = pg8000.native.Connection(user=user, host=host, port=port, database=dbname, password=password)
-                class DBAPIAdapter:
-                    def __init__(self, native_conn): self.native = native_conn
+                import pg8000.native as pg8000
+                native = pg8000.Connection(
+                    user=username, host=host, port=port, database=dbname, password=password
+                )
+
+                class _Adapter:
+                    def __init__(self, c): self._c = c
                     def cursor(self): return self
-                    def execute(self, query): self.res = self.native.run(query)
+                    def execute(self, q): self._r = self._c.run(q)
                     @property
                     def description(self):
-                        return [(col['name'], col['type_oid'], None, None, None, None, None) for col in self.res.columns] if hasattr(self, 'res') and self.res.columns else []
-                    def fetchmany(self, size):
-                        if not hasattr(self, 'res') or not self.res.rows: return []
-                        rows = self.res.rows[:size]
-                        self.res.rows = self.res.rows[size:]
+                        return (
+                            [(col['name'], col['type_oid'], None, None, None, None, None)
+                             for col in self._r.columns]
+                            if hasattr(self, '_r') and self._r.columns else []
+                        )
+                    def fetchmany(self, n):
+                        if not hasattr(self, '_r') or not self._r.rows: return []
+                        rows, self._r.rows = self._r.rows[:n], self._r.rows[n:]
                         return rows
                     def close(self): pass
-                return DBAPIAdapter(conn)
+
+                return _Adapter(native)
             except ImportError:
                 import psycopg2
-                return psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password)
+                return psycopg2.connect(
+                    host=host, port=port, dbname=dbname, user=username, password=password
+                )
 
-        elif db_type in ('mysql', 'mariadb'):
-            import pymysql
-            return pymysql.connect(host=host, port=port, database=dbname, user=user, password=password)
-
-        else:
-            raise ValueError(f"Unsupported database engine type '{db_type}'. Supported engines: postgresql, mysql, mariadb, sqlite.")
+        # mysql / mariadb
+        import pymysql
+        return pymysql.connect(
+            host=host, port=port, database=dbname, user=username, password=password
+        )

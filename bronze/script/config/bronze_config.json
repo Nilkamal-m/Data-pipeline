@@ -1,5 +1,9 @@
 {
+  "_comment": "Bronze Layer Ingestion Configuration — UAX Data Lake Pipeline. All mandatory Secrets Manager keys are documented per source block.",
   "pipeline_defaults": {
+    "bronze_bucket": "",
+    "state_bucket": "",
+    "_note_buckets": "Set bronze_bucket / state_bucket here OR pass --BRONZE_BUCKET / --STATE_BUCKET via CLI. If both are empty the job will raise ValueError at startup.",
     "batch_size": 1000,
     "s3_chunk_size": 10000,
     "max_retries": 3,
@@ -10,7 +14,12 @@
     "flatten_nested_json": true,
     "flatten_separator": "_",
     "error_handling_mode": "CONTINUE_ON_ERROR",
+    "_note_error_modes": "Allowed values: CONTINUE_ON_ERROR (skip failed tables) | HALT_ON_ERROR (stop immediately on first failure)",
     "cloudwatch_namespace": "UAX/DataPipeline/Ingestion",
+    "upper_bound": "",
+    "_note_upper_bound": "Optional: ISO 8601 UTC timestamp (e.g. '2024-03-01T00:00:00Z'). Caps extraction at this upper boundary for backfills/historical loads. If empty or null, defaults to current run time.",
+    "default_initial_load_date": "",
+    "_note_default_initial_load_date": "Optional global fallback. If empty, each table MUST have an entry in table_initial_load_dates or pass --INITIAL_LOAD_DATE via CLI.",
     "glue_catalog": {
       "enabled": true,
       "database_name": "uax_datalake_db_dev",
@@ -23,12 +32,14 @@
   },
   "source_systems": {
     "servicenow": {
+      "_secrets_required": ["auth_type", "api_base_url", "username", "password", "batch_size"],
+      "_note": "auth_type must be 'basic' or 'oauth'. For oauth also add: token_url, client_id, client_secret.",
       "base_url": "https://your-instance.service-now.com",
       "api_endpoint_template": "/api/now/table/{table_name}",
-      "query_param_template": "sysparm_query={query_filter}^ORDERBYsys_updated_on&sysparm_limit={limit}&sysparm_offset={offset}",
       "default_delta_filter": "sys_updated_on>={last_load_date}",
-      "default_tables": ["incident", "change_request", "problem", "sys_user"],
       "response_records_key": "result",
+      "batch_size": 1000,
+      "default_tables": ["incident", "change_request", "problem", "sys_user"],
       "table_initial_load_dates": {
         "incident": "2024-01-01T00:00:00Z",
         "change_request": "2024-03-01T00:00:00Z",
@@ -44,12 +55,14 @@
       }
     },
     "genesys": {
+      "_secrets_required": ["auth_type", "token_url", "client_id", "client_secret", "grant_type", "api_base_url", "batch_size"],
+      "_note": "auth_type must be 'oauth'. grant_type must be 'client_credentials'.",
       "base_url": "https://api.mypurecloud.com",
       "api_endpoint_template": "/api/v2/{table_name}",
-      "query_param_template": "pageSize={limit}&pageNumber={page_number}&interval={last_load_date}",
       "default_delta_filter": "{last_load_date}",
-      "default_tables": ["conversations", "users", "queues"],
       "response_records_key": "entities",
+      "batch_size": 100,
+      "default_tables": ["conversations", "users", "queues"],
       "table_initial_load_dates": {
         "conversations": "2024-01-01T00:00:00Z",
         "users": "2024-01-01T00:00:00Z",
@@ -59,13 +72,16 @@
       "custom_table_endpoints": {}
     },
     "moveworks": {
+      "_secrets_required": ["auth_type", "token_url", "client_id", "client_secret", "grant_type", "api_base_url", "batch_size"],
+      "_note": "auth_type must be 'oauth2'. grant_type must be 'client_credentials'. batch_size max is 500.",
       "base_url": "https://api.moveworks.ai",
       "assistant_name": "acmecorp-conversations-rest-api",
-      "api_endpoint_template": "/export/v1/records/{table_name}",
-      "default_delta_filter": "last_updated_time gt '{last_load_date}'",
-      "default_tables": ["conversations", "interactions", "users"],
+      "api_endpoint_template": "/export/v1beta2/records/{table_name}",
+      "default_delta_filter": "last_updated_time ge '{last_load_date}' and last_updated_time le '{upper_bound}'",
       "response_records_key": "value",
+      "batch_size": 500,
       "orderby": "last_updated_time desc",
+      "default_tables": ["conversations", "interactions", "users"],
       "table_initial_load_dates": {
         "conversations": "2024-01-01T00:00:00Z",
         "interactions": "2024-01-01T00:00:00Z",
@@ -74,18 +90,25 @@
       },
       "table_query_overrides": {},
       "custom_table_endpoints": {
-        "tickets": "/export/v1/records/conversations"
+        "tickets": "/export/v1beta2/records/conversations"
+      },
+      "upper_bound": "",
+      "parallel_processing": {
+        "enabled": true,
+        "max_workers": 5,
+        "shard_window_days": 15
       }
     },
     "postgresql": {
+      "_secrets_required": ["db_type", "host", "dbname", "username", "password", "port"],
+      "_note_port": "'port' MUST be in Secrets Manager (not here). The value here (5432) is documentation only — the connector reads it exclusively from Secrets Manager.",
       "connection_type": "database",
       "db_type": "postgresql",
-      "driver": "org.postgresql.Driver",
-      "port": 5432,
+      "port_reference": 5432,
       "default_delta_filter": "updated_at >= '{last_load_date}'",
-      "default_tables": ["orders", "order_items", "customers"],
       "query_template": "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC",
       "fetch_size": 10000,
+      "default_tables": ["orders", "order_items", "customers"],
       "table_initial_load_dates": {
         "orders": "2024-01-01T00:00:00Z",
         "order_items": "2024-01-01T00:00:00Z",
@@ -96,14 +119,15 @@
       }
     },
     "mysql": {
+      "_secrets_required": ["db_type", "host", "dbname", "username", "password", "port"],
+      "_note_port": "'port' MUST be in Secrets Manager. Standard MySQL/MariaDB port is 3306.",
       "connection_type": "database",
       "db_type": "mysql",
-      "driver": "com.mysql.cj.jdbc.Driver",
-      "port": 3306,
+      "port_reference": 3306,
       "default_delta_filter": "updated_at >= '{last_load_date}'",
-      "default_tables": ["transactions", "users", "accounts"],
       "query_template": "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC",
       "fetch_size": 10000,
+      "default_tables": ["transactions", "users", "accounts"],
       "table_initial_load_dates": {
         "transactions": "2024-01-01T00:00:00Z",
         "users": "2024-01-01T00:00:00Z",
@@ -111,49 +135,52 @@
       },
       "table_query_overrides": {}
     },
-    "database": {
-      "connection_type": "database",
-      "db_type": "generic",
-      "default_delta_filter": "updated_at >= '{last_load_date}'",
-      "default_tables": ["records"],
-      "query_template": "SELECT * FROM {table_name} WHERE {query_filter} ORDER BY updated_at ASC",
-      "fetch_size": 10000,
-      "table_initial_load_dates": {
-        "records": "2024-01-01T00:00:00Z"
-      },
-      "table_query_overrides": {}
-    },
     "vendor_a_s3": {
+      "_note": "Vendor A CSV file feed. 'type' must match a key in connectors CONNECTOR_MAP (use 's3_file').",
       "type": "s3_file",
       "source_bucket": "vendor-a-incoming-bucket",
-      "file_prefix_template": "raw_feed/{table_name}/",
+      "file_prefix": "raw_feed/",
+      "_note_file_prefix": "Global prefix. Per-table paths are set in table_paths override below.",
       "file_format": "csv",
       "delimiter": ",",
       "has_header": true,
       "encoding": "utf-8",
+      "fetch_mode": "all",
+      "_note_fetch_mode": "'all' = all files modified after watermark (incremental). 'latest' = only the most recently modified file (snapshot/full-refresh).",
       "default_tables": ["employee_feed", "orders"],
+      "table_paths": {
+        "employee_feed": "raw_feed/employee_feed/",
+        "orders": "raw_feed/orders/"
+      },
+      "table_fetch_modes": {
+        "employee_feed": "latest",
+        "orders": "all"
+      },
       "table_initial_load_dates": {
         "employee_feed": "2024-01-01T00:00:00Z",
         "orders": "2024-01-01T00:00:00Z"
-      },
-      "table_file_patterns": {
-        "employee_feed": ".csv",
-        "orders": ".csv"
       }
     },
     "vendor_b_s3": {
+      "_note": "Vendor B JSON file feed. 'type' must match a key in connectors CONNECTOR_MAP (use 's3_file').",
       "type": "s3_file",
       "source_bucket": "vendor-b-partner-bucket",
-      "file_prefix_template": "json_feeds/{table_name}/",
+      "file_prefix": "json_feeds/",
       "file_format": "json",
+      "fetch_mode": "all",
+      "encoding": "utf-8",
       "default_tables": ["user_activity", "audit_logs"],
+      "table_paths": {
+        "user_activity": "json_feeds/user_activity/",
+        "audit_logs": "json_feeds/audit_logs/"
+      },
+      "table_fetch_modes": {
+        "user_activity": "all",
+        "audit_logs": "latest"
+      },
       "table_initial_load_dates": {
         "user_activity": "2024-01-01T00:00:00Z",
         "audit_logs": "2024-01-01T00:00:00Z"
-      },
-      "table_file_patterns": {
-        "user_activity": ".json",
-        "audit_logs": ".json"
       }
     }
   }

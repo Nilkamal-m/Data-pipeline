@@ -1,40 +1,70 @@
-from .servicenow import ServiceNowConnector
-from .genesys import GenesysConnector
-from .moveworks import MoveworksConnector
-from .database import DatabaseConnector
-from .s3_file import S3FileConnector
-from .oauth import OAuth2Client
+"""
+Connector registry — AWS Glue Data Pipeline.
 
+Maps source system names to their connector classes.
+All connectors expose a single public method: fetch_delta().
+"""
+
+from .servicenow import ServiceNowConnector
+from .genesys    import GenesysConnector
+from .moveworks  import MoveworksConnector
+from .database   import DatabaseConnector
+from .s3_file    import S3FileConnector
+from .oauth      import OAuth2Client
+
+# Canonical source system → connector class mapping.
+# Add new source systems here only — no other file needs to change.
 CONNECTOR_MAP = {
-    'servicenow': ServiceNowConnector,
-    'genesys': GenesysConnector,
-    'moveworks': MoveworksConnector,
-    'database': DatabaseConnector,
-    'postgresql': DatabaseConnector,
-    'mysql': DatabaseConnector,
-    'oracle': DatabaseConnector,
-    'sqlserver': DatabaseConnector,
-    's3_file': S3FileConnector,
-    's3_bucket': S3FileConnector,
-    's3_source': S3FileConnector
+    'servicenow':  ServiceNowConnector,
+    'genesys':     GenesysConnector,
+    'moveworks':   MoveworksConnector,
+    'postgresql':  DatabaseConnector,
+    'mysql':       DatabaseConnector,
+    'mariadb':     DatabaseConnector,
+    'sqlite':      DatabaseConnector,
+    's3_file':     S3FileConnector,
 }
+
 
 def get_connector(source_system: str, source_config: dict = None):
     """
-    Factory function to retrieve the appropriate source connector instance or class.
-    Checks CONNECTOR_MAP first, or inspects 'type' field in source_config.
+    Returns the connector class for a given source system name.
+
+    Lookup order:
+      1. Exact key match in CONNECTOR_MAP  (e.g. 'moveworks', 's3_file').
+      2. Fallback to source_config['type'] (for named vendor sources such as
+         'vendor_a_s3' with config.type = 's3_file').
+
+    Args:
+        source_system:  Canonical source system key (e.g. 'moveworks', 'vendor_a_s3').
+        source_config:  Optional source config block from bronze_config.json.
+                        Required for vendor sources not directly in CONNECTOR_MAP.
+
+    Raises:
+        ValueError: If the source system is not registered and 'type' is absent or unknown.
     """
-    source_key = source_system.lower()
-    if source_key in CONNECTOR_MAP:
-        return CONNECTOR_MAP[source_key]
+    key = source_system.strip().lower()
 
-    if source_config and isinstance(source_config, dict):
-        connector_type = (source_config.get('type') or source_config.get('connector_type') or '').lower()
-        if connector_type in CONNECTOR_MAP:
-            return CONNECTOR_MAP[connector_type]
+    # 1. Exact match
+    connector = CONNECTOR_MAP.get(key)
+    if connector is not None:
+        return connector
 
-    supported = ", ".join(CONNECTOR_MAP.keys())
-    raise ValueError(f"Unsupported source system: '{source_system}'. Allowed values/types: {supported}")
+    # 2. Type-based routing for vendor/custom sources (e.g. vendor_a_s3 with type='s3_file')
+    if source_config:
+        type_key = str(source_config.get('type', '')).strip().lower()
+        connector = CONNECTOR_MAP.get(type_key)
+        if connector is not None:
+            return connector
+
+    supported = ', '.join(sorted(CONNECTOR_MAP.keys()))
+    raise ValueError(
+        f"Unsupported source system: '{source_system}'. "
+        f"Registered connectors: {supported}. "
+        "For custom vendor sources, add \"type\": \"s3_file\" (or other type) to "
+        "bronze_config.json, or register the source in connectors/__init__.py."
+    )
+
 
 __all__ = [
     'ServiceNowConnector',
@@ -44,5 +74,5 @@ __all__ = [
     'S3FileConnector',
     'OAuth2Client',
     'CONNECTOR_MAP',
-    'get_connector'
+    'get_connector',
 ]

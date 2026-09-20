@@ -671,8 +671,8 @@ class TestHyphenToUnderscoreHandling(unittest.TestCase):
 
 class TestWatermarkExecutionStartTime(unittest.TestCase):
     """
-    Validates that Bronze watermark state records 'last_load_date' as the execution START timestamp
-    rather than completion/end timestamp, preventing data gaps during long-running extractions.
+    Validates that Bronze watermark state records 'last_load_date' as the execution timestamp,
+    preventing data gaps during long-running extractions.
     """
 
     @patch('uax_bronze_load.s3_client')
@@ -683,7 +683,7 @@ class TestWatermarkExecutionStartTime(unittest.TestCase):
             state_key="metadata/bronze/servicenow/incident/watermark.json",
             source_system="servicenow",
             table_name="incident",
-            execution_start_time=execution_start,
+            current_run_time=execution_start,
             total_records=150,
             table_prefix="raw_tbl_"
         )
@@ -691,18 +691,15 @@ class TestWatermarkExecutionStartTime(unittest.TestCase):
         call_kwargs = mock_s3.put_object.call_args[1]
         payload = json.loads(call_kwargs["Body"].decode('utf-8'))
 
-        # Verify last_load_date matches execution start time exactly (prevents data gaps)
         self.assertEqual(payload["last_load_date"], execution_start)
         self.assertEqual(payload["table_name"], "raw_tbl_incident")
         self.assertEqual(payload["source_system"], "servicenow")
         self.assertEqual(payload["records_ingested"], 150)
         self.assertEqual(payload["last_status"], "SUCCESS")
-        # updated_at records the current write timestamp
         self.assertIn("updated_at", payload)
         self.assertTrue(payload["updated_at"].endswith("Z"))
 
 
 if __name__ == "__main__":
     unittest.main()
-
 

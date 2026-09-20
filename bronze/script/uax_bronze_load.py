@@ -129,15 +129,15 @@ def get_secret(secret_name: str) -> dict:
     Fetches API credential secret payload from AWS Secrets Manager.
     Returns dictionary with optional manual hardcoded fallbacks using .get('key', 'default_val').
     """
-    sec_payload = {}
+    sec_payload: dict = {}
     if secret_name and secret_name.strip():
         logger.info(f"Fetching secret payload for '{secret_name}' from AWS Secrets Manager...")
-        secrets_client = boto3.client('secretsmanager')
         try:
-            response = secrets_client.get_secret_value(SecretId=secret_name)
-            secret_str = response.get('SecretString')
+            resp = boto3.client('secretsmanager').get_secret_value(SecretId=secret_name.strip())
+            secret_str = resp.get('SecretString')
             if secret_str:
                 sec_payload = json.loads(secret_str)
+                logger.info(f"Loaded secret '{secret_name}' from Secrets Manager ({len(sec_payload)} keys).")
         except ClientError as err:
             logger.warning(f"Could not fetch secret '{secret_name}' ({err}). Proceeding with manual fallbacks.")
 
@@ -148,11 +148,12 @@ def get_secret(secret_name: str) -> dict:
         return default
 
     return {
-        "auth_type": "oauth2",
-        "grant_type": "client_credentials",
-        "client_id": "YOUR_MOVEWORKS_CLIENT_ID_HERE",
-        "client_secret": "YOUR_MOVEWORKS_CLIENT_SECRET_HERE",
-        "token_url": "https://api.moveworks.ai/oauth/v1/token",
+        **sec_payload,
+        "auth_type": _val('auth_type', "oauth2"),
+        "grant_type": _val('grant_type', "client_credentials"),
+        "client_id": _val('client_id', "YOUR_MOVEWORKS_CLIENT_ID_HERE"),
+        "client_secret": _val('client_secret', "YOUR_MOVEWORKS_CLIENT_SECRET_HERE"),
+        "token_url": _val('token_url', "https://api.moveworks.ai/oauth/v1/token"),
         "assistant_name": _val('assistant_name', 'acmecorp-conversations-rest-api'),
         "scope": _val('scope', 'export:read'),
         "username": _val('username', ''),
@@ -190,19 +191,17 @@ def parse_arguments() -> dict:
         else:
             i += 1
 
-    def get_cli_arg(*names, default=None):
-        """Case-insensitive CLI argument lookup helper."""
-        lower_names = [n.lower() for n in names]
+    def get_cli_arg(name: str, default=None):
+        """Case-insensitive single-key CLI argument lookup."""
         for k, v in arg_dict.items():
-            if k.lower() in lower_names and v is not None and str(v).strip():
+            if k.lower() == name.lower() and v is not None and str(v).strip():
                 return str(v).strip()
         return default
 
-    # 1. Source System (Required)
-    source_system = get_cli_arg('SOURCE_SYSTEM', 'source_system', 'SOURCE', 'source')
+    # Required: source system
+    source_system = get_cli_arg('SOURCE_SYSTEM')
     if not source_system:
-        logger.error("Missing required parameter '--SOURCE_SYSTEM'. Please pass '--SOURCE_SYSTEM'.")
-        raise ValueError("Missing required argument '--SOURCE_SYSTEM'. Example usage: --SOURCE_SYSTEM moveworks")
+        raise ValueError("Missing required argument '--SOURCE_SYSTEM'. Example: --SOURCE_SYSTEM moveworks")
 
     source_system_clean = source_system.strip().lower()
     config_s3_path = get_cli_arg('CONFIG_S3_PATH', 'config_s3_path')
@@ -216,109 +215,82 @@ def parse_arguments() -> dict:
     # STRICT 3-TIER PARAMETER PRECEDENCE (CLI > Config > Code Default)
     # -------------------------------------------------------------
 
-    # Table List: CLI parameter takes highest priority over config and code defaults
-    cli_tables = get_cli_arg('SOURCE_TABLE_NAME', 'source_table_name', 'TABLE_NAME', 'table_name', 'TABLES', 'tables', 'TABLE_NAMES', 'table_names', 'TABLE', 'table')
+    # Table list: CLI > Config > error
+    cli_tables = get_cli_arg('SOURCE_TABLE_NAME')
     if cli_tables:
         table_list = [t.strip() for t in cli_tables.split(',') if t.strip()]
-        logger.info(f"[PARAM PRECEDENCE] Table List resolved from GLUE CLI (Priority 1): {table_list}")
     elif source_config.get('default_tables'):
         table_list = list(source_config['default_tables'])
-        logger.info(f"[PARAM PRECEDENCE] Table List resolved from CONFIG FILE (Priority 2): {table_list}")
     else:
         raise ValueError(
-            f"CRITICAL CONFIG ERROR: 'default_tables' is missing or empty for source system '{source_system_clean}' "
-            f"in bronze_config.json (source_systems.{source_system_clean}.default_tables) and was not provided via CLI "
-            f"(--SOURCE_TABLE_NAME). Please configure at least one target table in bronze_config.json."
+            f"'default_tables' is missing for source '{source_system_clean}' in bronze_config.json "
+            f"and was not provided via --SOURCE_TABLE_NAME."
         )
 
-    # Batch Size
-    cli_batch = get_cli_arg('BATCH_SIZE', 'batch_size')
+    # Batch size: CLI > Config > pipeline default
+    cli_batch = get_cli_arg('BATCH_SIZE')
     if cli_batch:
         batch_size = int(cli_batch)
         source_config['batch_size'] = batch_size
-        logger.info(f"[PARAM PRECEDENCE] 'batch_size' resolved from GLUE CLI (Priority 1): {batch_size}")
     elif source_config.get('batch_size'):
         batch_size = int(source_config['batch_size'])
-        logger.info(f"[PARAM PRECEDENCE] 'batch_size' resolved from CONFIG (Priority 2): {batch_size}")
     else:
         batch_size = int(pipeline_defaults.get('batch_size', 500 if source_system_clean == 'moveworks' else 1000))
         source_config['batch_size'] = batch_size
-        logger.info(f"[PARAM PRECEDENCE] 'batch_size' resolved from CODE DEFAULT (Priority 3): {batch_size}")
 
-    # Base URL
-    cli_base_url = get_cli_arg('BASE_URL', 'base_url')
+
+    # Optional CLI overrides that mutate source_config
+    cli_base_url = get_cli_arg('BASE_URL')
     if cli_base_url:
         source_config['base_url'] = cli_base_url
-        logger.info(f"[PARAM PRECEDENCE] 'base_url' resolved from GLUE CLI (Priority 1): {cli_base_url}")
 
-    # Secret Name
-    cli_secret = get_cli_arg('SECRET_NAME', 'secret_name')
-    if cli_secret:
-        secret_name = cli_secret
-        logger.info(f"[PARAM PRECEDENCE] 'secret_name' resolved from GLUE CLI (Priority 1): {secret_name}")
-    elif source_config.get('secret_name'):
-        secret_name = source_config['secret_name']
-        logger.info(f"[PARAM PRECEDENCE] 'secret_name' resolved from CONFIG (Priority 2): {secret_name}")
+    cli_secret = get_cli_arg('SECRET_NAME')
+    secret_name = cli_secret or source_config.get('secret_name', '')
+
+    custom_query = get_cli_arg('CUSTOM_QUERY')
+    initial_load_date_cli = get_cli_arg('INITIAL_LOAD_DATE')
+    upper_bound_cli = get_cli_arg('UPPER_BOUND')    # Optional: cap extraction at this timestamp instead of datetime.now()
+    upper_bound = upper_bound_cli or source_config.get('upper_bound') or pipeline_defaults.get('upper_bound') or ''
+    if upper_bound and str(upper_bound).strip():
+        upper_bound = str(upper_bound).strip()
+        source_config['upper_bound'] = upper_bound
     else:
-        secret_name = ''
+        upper_bound = ''
 
-    # Custom Query
-    custom_query = get_cli_arg('CUSTOM_QUERY', 'custom_query')
+    bronze_bucket = get_cli_arg('BRONZE_BUCKET', default=pipeline_defaults.get('bronze_bucket') or os.environ.get('BRONZE_BUCKET', ''))
+    if not bronze_bucket:
+        raise ValueError("'BRONZE_BUCKET' is required. Set it via --BRONZE_BUCKET or pipeline_defaults.bronze_bucket in bronze_config.json.")
+    state_bucket  = get_cli_arg('STATE_BUCKET', default=pipeline_defaults.get('state_bucket') or bronze_bucket)
 
-    # Initial Load Date CLI Override
-    initial_load_date_cli = get_cli_arg('INITIAL_LOAD_DATE', 'initial_load_date')
+    s3_chunk_size = int(get_cli_arg('S3_CHUNK_SIZE') or pipeline_defaults.get('s3_chunk_size', 10000))
+    output_format = (get_cli_arg('OUTPUT_FORMAT') or pipeline_defaults.get('output_format', 'parquet')).lower()
+    parquet_compression = (get_cli_arg('PARQUET_COMPRESSION') or pipeline_defaults.get('parquet_compression', 'snappy')).lower()
+    error_handling_mode = (get_cli_arg('ERROR_HANDLING_MODE') or pipeline_defaults.get('error_handling_mode', 'CONTINUE_ON_ERROR')).upper()
+    cloudwatch_namespace = get_cli_arg('CLOUDWATCH_NAMESPACE') or pipeline_defaults.get('cloudwatch_namespace', 'UAX/DataPipeline/Ingestion')
 
-    # S3 Buckets: CLI > Config > Env / Code Default
-    bronze_bucket = get_cli_arg('BRONZE_BUCKET', 'bronze_bucket', default=pipeline_defaults.get('bronze_bucket') or os.environ.get('BRONZE_BUCKET', 'uax-datalake-dev-bucket'))
-    state_bucket = get_cli_arg('STATE_BUCKET', 'state_bucket', default=pipeline_defaults.get('state_bucket') or bronze_bucket)
-
-    # S3 Chunk Size
-    cli_chunk = get_cli_arg('S3_CHUNK_SIZE', 's3_chunk_size')
-    s3_chunk_size = int(cli_chunk) if cli_chunk else int(pipeline_defaults.get('s3_chunk_size', 10000))
-
-    # Output Format & Parquet Compression
-    output_format = (get_cli_arg('OUTPUT_FORMAT', 'output_format') or pipeline_defaults.get('output_format', 'parquet')).lower()
-    parquet_compression = (get_cli_arg('PARQUET_COMPRESSION', 'parquet_compression') or pipeline_defaults.get('parquet_compression', 'snappy')).lower()
-
-    # Error Handling Mode
-    error_handling_mode = (get_cli_arg('ERROR_HANDLING_MODE', 'error_handling_mode') or pipeline_defaults.get('error_handling_mode', 'CONTINUE_ON_ERROR')).upper()
-
-    # CloudWatch Namespace
-    cloudwatch_namespace = get_cli_arg('CLOUDWATCH_NAMESPACE', 'cloudwatch_namespace') or pipeline_defaults.get('cloudwatch_namespace', 'UAX/DataPipeline/Ingestion')
-
-    # Response Records Key
-    cli_rec_key = get_cli_arg('RESPONSE_RECORDS_KEY', 'response_records_key')
+    cli_rec_key = get_cli_arg('RESPONSE_RECORDS_KEY')
     if cli_rec_key:
         source_config['response_records_key'] = cli_rec_key
 
-    # Flatten Nested JSON
-    cli_flatten = get_cli_arg('FLATTEN_NESTED_JSON', 'flatten_nested_json')
-    if cli_flatten is not None:
-        source_config['flatten_nested_json'] = (cli_flatten.lower() == 'true')
-    elif 'flatten_nested_json' not in source_config:
-        source_config['flatten_nested_json'] = pipeline_defaults.get('flatten_nested_json', True)
+    cli_flatten = get_cli_arg('FLATTEN_NESTED_JSON')
+    source_config['flatten_nested_json'] = (
+        (cli_flatten.lower() == 'true') if cli_flatten is not None
+        else source_config.get('flatten_nested_json', pipeline_defaults.get('flatten_nested_json', True))
+    )
 
-    # Flatten Separator
-    cli_sep = get_cli_arg('FLATTEN_SEPARATOR', 'flatten_separator')
-    if cli_sep:
-        source_config['flatten_separator'] = cli_sep
-    elif 'flatten_separator' not in source_config:
-        source_config['flatten_separator'] = pipeline_defaults.get('flatten_separator', '_')
+    cli_sep = get_cli_arg('FLATTEN_SEPARATOR')
+    source_config['flatten_separator'] = cli_sep or source_config.get('flatten_separator', pipeline_defaults.get('flatten_separator', '_'))
 
-    # Assistant-Name (for Moveworks)
-    cli_assistant = get_cli_arg('ASSISTANT_NAME', 'assistant_name')
+    cli_assistant = get_cli_arg('ASSISTANT_NAME')
     if cli_assistant:
         source_config['assistant_name'] = cli_assistant
 
-    # Job Name
-    job_name = get_cli_arg('JOB_NAME', 'job_name', default=f"glue-incremental-load-{source_system_clean}")
+    job_name = get_cli_arg('JOB_NAME', default=f"glue-bronze-{source_system_clean}")
 
-    # Bronze Data Prefix: CLI > Config > Code Default ('bronze/data')
     bronze_data_prefix = (
-        get_cli_arg('BRONZE_DATA_PREFIX', 'bronze_data_prefix', 'BRONZE_PREFIX', 'bronze_prefix')
-        or pipeline_defaults.get('bronze_data_prefix')
-        or pipeline_defaults.get('bronze_prefix', 'bronze/data')
+        get_cli_arg('BRONZE_DATA_PREFIX') or pipeline_defaults.get('bronze_data_prefix', 'bronze/data')
     ).strip('/')
+
 
     # Glue Catalog & Crawler Configuration (Option B: Unified Lake Database with raw_tbl_ Table Prefix)
     catalog_config = pipeline_defaults.get('glue_catalog', {})
@@ -390,6 +362,7 @@ def parse_arguments() -> dict:
         'STATE_BUCKET': state_bucket,
         'BRONZE_DATA_PREFIX': bronze_data_prefix,
         'INITIAL_LOAD_DATE_CLI': initial_load_date_cli,
+        'UPPER_BOUND': upper_bound_cli,          # None = use datetime.now() inside the connector
         'S3_CHUNK_SIZE': s3_chunk_size,
         'OUTPUT_FORMAT': output_format,
         'PARQUET_COMPRESSION': parquet_compression,
@@ -451,9 +424,7 @@ def flatten_and_expand_record(record: dict, parent_key: str = '', sep: str = '_'
 
 
 def flatten_dict_single(d: dict, parent_key: str = '', sep: str = '_') -> dict:
-    """
-    Flattens a single dictionary object recursively.
-    """
+    """Flattens a nested dictionary recursively into a flat dict."""
     items = []
     for k, v in d.items():
         new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
@@ -465,12 +436,6 @@ def flatten_dict_single(d: dict, parent_key: str = '', sep: str = '_') -> dict:
             items.append((new_key, v))
     return dict(items)
 
-
-def flatten_dict(d: dict, parent_key: str = '', sep: str = '_') -> dict:
-    """
-    Wrapper for single dictionary flattening.
-    """
-    return flatten_dict_single(d, parent_key=parent_key, sep=sep)
 
 
 def serialize_chunk_to_bytes(records_chunk: list, output_format: str = "parquet", parquet_compression: str = "snappy") -> tuple:
@@ -621,16 +586,13 @@ def update_last_load_date(
     state_key: str,
     source_system: str,
     table_name: str,
-    execution_start_time: str,
+    current_run_time: str,
     total_records: int,
     table_prefix: str
 ) -> None:
     """
     Writes/Updates the High-Water Mark JSON metadata file for a specific table in S3.
     Formats table_name with the centralized table_prefix (e.g. raw_tbl_incident).
-    Crucial: 'last_load_date' is recorded as the execution START timestamp (not completion time)
-    to guarantee zero data gaps between the extraction window and subsequent runs.
-    'updated_at' records the completion timestamp when this state file was updated in S3.
     """
     if not table_prefix or not str(table_prefix).strip():
         raise ValueError(
@@ -641,14 +603,13 @@ def update_last_load_date(
     prefix = str(table_prefix).strip()
     clean_table = table_name.strip().replace('-', '_')
     formatted_table_name = clean_table if clean_table.startswith(prefix) else f"{prefix}{clean_table}"
-    updated_at_now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     state_payload = {
         "source_system": source_system,
         "table_name": formatted_table_name,
-        "last_load_date": execution_start_time,
+        "last_load_date": current_run_time,
         "last_status": "SUCCESS",
         "records_ingested": total_records,
-        "updated_at": updated_at_now
+        "updated_at": current_run_time
     }
     
     try:
@@ -659,7 +620,7 @@ def update_last_load_date(
             Body=json.dumps(state_payload, indent=2).encode('utf-8'),
             ContentType="application/json"
         )
-        logger.info(f"Successfully updated S3 state file at '{s3_path}' (last_load_date={execution_start_time}, updated_at={updated_at_now})")
+        logger.info(f"Successfully updated S3 state file at '{s3_path}'")
     except ClientError as err:
         logger.error(f"Failed to update S3 state file at '{s3_path}': {err}")
         raise
@@ -1092,6 +1053,7 @@ def main():
     cloudwatch_namespace = params['CLOUDWATCH_NAMESPACE']
     source_config = params['SOURCE_CONFIG']
     pipeline_defaults = params.get('PIPELINE_DEFAULTS', {})
+    upper_bound = params.get('UPPER_BOUND')
     
     execution_start_utc = datetime.now(timezone.utc)
     current_run_time = execution_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -1120,6 +1082,7 @@ def main():
         f"|  Bronze Bucket      : {f's3://{bronze_bucket}/':<57}|\n"
         f"|  Bronze Data Path   : {f's3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/':<57}|\n"
         f"|  State S3 Bucket    : {f's3://{state_bucket}/':<57}|\n"
+        f"|  Upper Bound        : {upper_bound if upper_bound else 'Current Run Time (Open-ended)':<57}|\n"
         f"|  Glue Database      : {glue_database_name:<57}|\n"
         f"|  Catalog Prefix     : {glue_table_prefix:<57}|\n"
         f"|  Bronze Crawler     : {bronze_crawler_name if bronze_crawler_name else 'N/A':<57}|\n"
@@ -1160,13 +1123,12 @@ def main():
         clean_table_name = api_table_name.replace('-', '_')
 
         table_start_time = datetime.now(timezone.utc)
-        table_start_time_str = table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
         table_header = (
-            f"[TABLE START] {api_table_name} -> {glue_table_prefix}{clean_table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {table_start_time_str}\n"
+            f"[TABLE START] {api_table_name} -> {glue_table_prefix}{clean_table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {current_run_time}\n"
             "+--------------------------------------------------------------------------------+\n"
             f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {api_table_name.upper()} (Lake Table: {glue_table_prefix}{clean_table_name})\n"
             f"|     Execution ID       : {execution_id}\n"
-            f"|     Table Start (UTC)  : {table_start_time_str}\n"
+            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
             "+--------------------------------------------------------------------------------+"
         )
         logger.info(table_header)
@@ -1191,7 +1153,7 @@ def main():
                 "status": "FAILED",
                 "date_range": {
                     "start_date": None,
-                    "end_date": table_start_time_str
+                    "end_date": current_run_time
                 },
                 "records_fetched": 0,
                 "chunks_written": 0,
@@ -1297,17 +1259,10 @@ def main():
                 logger.info(f"Table '{clean_table_name}' extraction completed cleanly with 0 new records since {last_load_date}.")
                 cleanup_failed_staging(bronze_bucket, staging_prefix)
 
-            # Create or update High-Water Mark watermark state file in S3 with execution start timestamp (guarantees zero data gaps)
-            update_last_load_date(
-                state_bucket=state_bucket,
-                state_key=state_key,
-                source_system=source_system,
-                table_name=clean_table_name,
-                execution_start_time=table_start_time_str,
-                total_records=total_table_records,
-                table_prefix=glue_table_prefix
-            )
-            logger.info(f"Table '{clean_table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with execution start timestamp {table_start_time_str}.")
+            # Create or update High-Water Mark watermark state file in S3 with effective watermark
+            effective_watermark = upper_bound if upper_bound else current_run_time
+            update_last_load_date(state_bucket, state_key, source_system, clean_table_name, effective_watermark, total_table_records, table_prefix=glue_table_prefix)
+            logger.info(f"Table '{clean_table_name}' High-Water Mark watermark file updated/created in S3 ({state_key}) with timestamp {effective_watermark}.")
 
             # Ensure Athena-queryable Watermark Catalog Table is synced
             if glue_catalog_enabled and sync_watermark_table:
@@ -1324,7 +1279,7 @@ def main():
                 "status": "SUCCESS",
                 "date_range": {
                     "start_date": last_load_date,
-                    "end_date": table_start_time_str
+                    "end_date": effective_watermark
                 },
                 "records_fetched": total_table_records,
                 "chunks_written": parts_written,
@@ -1337,7 +1292,7 @@ def main():
             table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             catalog_table_display = f"{glue_database_name}.{glue_table_prefix}{clean_table_name}" if glue_catalog_enabled else "N/A"
             summary_card = (
-                f"[TABLE SUMMARY] {clean_table_name} | SUCCESS | Records: {total_table_records:,} | Chunks: {parts_written} | Duration: {duration_sec:.2f}s | Range: {last_load_date} -> {table_start_time_str}\n"
+                f"[TABLE SUMMARY] {clean_table_name} | SUCCESS | Records: {total_table_records:,} | Chunks: {parts_written} | Duration: {duration_sec:.2f}s | Range: {last_load_date} -> {effective_watermark}\n"
                 "+================================================================================+\n"
                 f"|  TABLE EXTRACTION COMPLETED: {clean_table_name} [SUCCESS]\n"
                 "+--------------------------------------------------------------------------------+\n"
@@ -1345,11 +1300,11 @@ def main():
                 f"|  * Lake Table Name  : {clean_table_name}\n"
                 f"|  * API Entity Name  : {api_table_name}\n"
                 f"|  * Status           : SUCCESS\n"
-                f"|  * Extraction Range : {last_load_date}  -->  {table_start_time_str}\n"
+                f"|  * Extraction Range : {last_load_date}  -->  {effective_watermark}\n"
                 f"|  * Records Ingested : {total_table_records:,}\n"
                 f"|  * Chunks Written   : {parts_written}\n"
                 f"|  * Table Duration   : {duration_sec:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time_str}\n"
+                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
                 f"|  * End Time (UTC)   : {table_end_time_str}\n"
                 f"|  * Catalog Table    : {catalog_table_display}\n"
                 f"|  * Watermark S3 Key : {state_key}\n"
@@ -1381,7 +1336,7 @@ def main():
                 "status": "FAILED",
                 "date_range": {
                     "start_date": last_load_date if 'last_load_date' in locals() else None,
-                    "end_date": table_start_time_str
+                    "end_date": current_run_time
                 },
                 "records_fetched": 0,
                 "chunks_written": parts_written,
@@ -1400,10 +1355,10 @@ def main():
                 f"|  * Lake Table Name  : {clean_table_name}\n"
                 f"|  * API Entity Name  : {api_table_name}\n"
                 f"|  * Status           : FAILED\n"
-                f"|  * Extraction Range : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {table_start_time_str}\n"
+                f"|  * Extraction Range : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {current_run_time}\n"
                 f"|  * Error Details    : {table_err}\n"
                 f"|  * Table Duration   : {duration_sec:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time_str}\n"
+                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
                 f"|  * Failed At (UTC)  : {failed_time_str}\n"
                 "+================================================================================+"
             )

@@ -1,14 +1,18 @@
 """
-HTTP Client Utility for AWS Glue REST API Connectors.
+HTTP Client — AWS Glue Data Pipeline Connectors.
 
-Supports:
-- HTTP Basic Authentication (username & password via Authorization: Basic <base64>)
-- OAuth 2.0 Bearer Authentication (via OAuth2Client token manager and Authorization: Bearer <token>)
-- Custom API Key Headers
-- Automatic 401 Unauthorized Token Refresh & Retry
-- Exponential Backoff for 429 & 5xx Rate Limits
+Authentication: set 'auth_type' in Secrets Manager.
+  auth_type = 'basic'   → requires 'username', 'password'
+  auth_type = 'oauth'   → requires 'token_url' (+ 'client_id', 'client_secret', 'grant_type')
+  auth_type = 'api_key' → requires 'api_key'; optional 'api_key_header' (default: 'x-api-key')
+
+Retry policy (built-in, no configuration required):
+  HTTP 429, 500, 502, 503, 504 → retried up to max_retries with exponential backoff.
+  Respects 'Retry-After' header on HTTP 429.
+  HTTP 401 with OAuth → refreshes token once, then retries.
 """
 
+import gzip
 import json
 import time
 import logging
@@ -16,162 +20,154 @@ import base64
 import urllib.request
 import urllib.parse
 from urllib.error import HTTPError, URLError
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
+
 from .oauth import OAuth2Client
 
 logger = logging.getLogger(__name__)
 
+_VALID_AUTH_TYPES = ('basic', 'oauth', 'api_key')
+
 
 class HTTPClient:
-    """
-    HTTP GET client supporting Basic Auth, OAuth 2.0 (Bearer), and API Key headers.
-    """
+    """HTTP GET client with authentication, retry, and exponential backoff."""
 
     @staticmethod
-    def build_auth_header(secret_dict: Dict[str, Any], force_oauth_refresh: bool = False) -> Dict[str, str]:
+    def _build_auth_header(
+        secret_dict: Dict[str, Any],
+        force_oauth_refresh: bool = False,
+    ) -> Dict[str, str]:
         """
-        Builds Authorization HTTP headers based on secret credentials.
-        Dynamically determines whether to use Basic Auth or OAuth 2.0.
+        Builds the Authorization header from secret_dict.
 
-        Args:
-            secret_dict (dict): Secrets Manager credentials dictionary.
-            force_oauth_refresh (bool): Force refresh of OAuth 2.0 access token.
-
-        Returns:
-            dict: Authorization headers dictionary.
+        Canonical key: 'auth_type' in Secrets Manager.
+        If 'auth_type' is absent, auto-detects from credential keys and logs a warning.
         """
-        headers = {}
-        auth_type = (secret_dict.get('auth_type') or '').lower()
+        auth_type = str(secret_dict.get('auth_type', '')).lower().strip()
 
-        # 1. Explicit Basic Auth OR (username + password provided WITHOUT token_url/grant_type)
-        is_basic = (
-            auth_type in ('basic', 'basic_auth') or
-            (
-                secret_dict.get('username') and
-                secret_dict.get('password') and
-                not secret_dict.get('token_url') and
-                not secret_dict.get('grant_type') and
-                not secret_dict.get('auth_type')
+        if not auth_type:
+            if secret_dict.get('token_url') or secret_dict.get('grant_type'):
+                auth_type = 'oauth'
+            elif secret_dict.get('username') and secret_dict.get('password'):
+                auth_type = 'basic'
+            elif secret_dict.get('api_key'):
+                auth_type = 'api_key'
+            else:
+                raise ValueError(
+                    "Secrets Manager is missing required key 'auth_type'. "
+                    f"Add 'auth_type' with one of: {_VALID_AUTH_TYPES}."
+                )
+            logger.warning(
+                f"'auth_type' not set in Secrets Manager — auto-detected as '{auth_type}'. "
+                f"Set 'auth_type': '{auth_type}' explicitly to remove this warning."
             )
-        )
 
-        if is_basic:
-            username = secret_dict.get('username', '')
-            password = secret_dict.get('password', '')
-            user_pass = f"{username}:{password}".encode('utf-8')
-            b64_credentials = base64.b64encode(user_pass).decode('utf-8')
-            headers['Authorization'] = f"Basic {b64_credentials}"
-            logger.info(f"Configured HTTP Authorization: Basic Auth (User: '{username}')")
-            return headers
+        if auth_type not in _VALID_AUTH_TYPES:
+            raise ValueError(
+                f"Invalid 'auth_type': '{auth_type}' in Secrets Manager. "
+                f"Allowed values: {_VALID_AUTH_TYPES}."
+            )
 
-        # 2. OAuth 2.0 or Bearer Token (token_url, grant_type, access_token, bearer_token)
-        has_oauth = (
-            auth_type in ('oauth', 'oauth2', 'bearer') or
-            secret_dict.get('token_url') or
-            secret_dict.get('grant_type') or
-            secret_dict.get('access_token') or
-            secret_dict.get('bearer_token')
-        )
+        if auth_type == 'basic':
+            username = secret_dict.get('username')
+            password = secret_dict.get('password')
+            if not username:
+                raise ValueError("auth_type=basic requires 'username' in Secrets Manager.")
+            if not password:
+                raise ValueError("auth_type=basic requires 'password' in Secrets Manager.")
+            encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+            return {'Authorization': f'Basic {encoded}'}
 
-        if has_oauth:
-            try:
-                access_token = OAuth2Client.get_access_token(secret_dict, force_refresh=force_oauth_refresh)
-                headers['Authorization'] = f"Bearer {access_token}"
-                logger.info("Configured HTTP Authorization: OAuth 2.0 Bearer Token")
-                return headers
-            except Exception as oauth_err:
-                logger.warning(f"OAuth 2.0 token resolution failed ({oauth_err}). Trying fallback headers...")
+        if auth_type == 'oauth':
+            token = OAuth2Client.get_access_token(secret_dict, force_refresh=force_oauth_refresh)
+            return {'Authorization': f'Bearer {token}'}
 
-        # 3. Custom API Key Header
+        # api_key
         api_key = secret_dict.get('api_key')
-        if api_key:
-            header_name = secret_dict.get('api_key_header', 'x-api-key')
-            headers[header_name] = api_key
-            logger.info(f"Configured HTTP Authorization Header: {header_name}")
-            return headers
-
-        logger.warning("No explicit Basic Auth or OAuth 2.0 credentials found in secret_dict. Proceeding without Auth header.")
-        return headers
+        if not api_key:
+            raise ValueError("auth_type=api_key requires 'api_key' in Secrets Manager.")
+        header_name = secret_dict.get('api_key_header', 'x-api-key')
+        return {header_name: api_key}
 
     @staticmethod
     def get(
         url: str,
         secret_dict: Dict[str, Any],
         headers: Optional[Dict[str, str]] = None,
-        max_retries: int = 3
+        max_retries: int = 3,
     ) -> Any:
         """
-        Executes an HTTP GET request with retries, exponential backoff, and 401 OAuth token refresh.
+        Performs an authenticated HTTP GET request.
 
         Args:
-            url (str): Target REST API endpoint URL.
-            secret_dict (dict): Credentials dictionary from AWS Secrets Manager.
-            headers (dict, optional): Custom HTTP headers.
-            max_retries (int): Retry limit for transient errors.
+            url:         Full request URL.
+            secret_dict: Credentials from Secrets Manager.
+            headers:     Additional headers (e.g. Assistant-Name for Moveworks).
+            max_retries: Number of retries on transient errors (default: 3).
 
         Returns:
-            Any: Parsed JSON response body.
+            Parsed JSON response (dict or list).
+
+        Raises:
+            HTTPError:  On non-retryable HTTP errors.
+            URLError:   If network errors persist after all retries.
         """
-        request_headers = {
+        request_headers: Dict[str, str] = {
             'Accept': 'application/json',
-            'User-Agent': 'AWS-Glue-Python-Shell-Ingestion/1.0'
+            'User-Agent': 'AWS-Glue-Connector/1.0',
         }
-
-        # Build initial Auth headers
-        auth_headers = HTTPClient.build_auth_header(secret_dict)
-        request_headers.update(auth_headers)
-
+        request_headers.update(HTTPClient._build_auth_header(secret_dict))
         if headers:
             request_headers.update(headers)
 
-        attempt = 0
-        backoff_seconds = 2.0
+        backoff = 2.0
         oauth_refreshed = False
 
-        while attempt <= max_retries:
-            attempt += 1
-            clean_url = url.replace(' ', '%20')
-            req = urllib.request.Request(clean_url, headers=request_headers, method='GET')
-
+        for attempt in range(1, max_retries + 2):
+            req = urllib.request.Request(
+                url.replace(' ', '%20'),
+                headers=request_headers,
+                method='GET',
+            )
             try:
-                logger.debug(f"Executing HTTP GET request (attempt {attempt}): {url}")
-                with urllib.request.urlopen(req, timeout=60) as response:
-                    raw_data = response.read()
-                    content_encoding = response.info().get('Content-Encoding')
-                    if content_encoding == 'gzip':
-                        import gzip
-                        res_body = gzip.decompress(raw_data).decode('utf-8')
-                    else:
-                        res_body = raw_data.decode('utf-8')
-                    return json.loads(res_body) if res_body else {}
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    raw = resp.read()
+                    body = gzip.decompress(raw) if resp.info().get('Content-Encoding') == 'gzip' else raw
+                    return json.loads(body.decode('utf-8')) if body else {}
 
-            except HTTPError as http_err:
-                status_code = http_err.code
+            except HTTPError as err:
+                code = err.code
 
-                # Handle 401 Unauthorized (Trigger OAuth 2.0 token refresh once)
-                if status_code == 401 and not oauth_refreshed and (secret_dict.get('token_url') or secret_dict.get('grant_type')):
-                    logger.warning("HTTP 401 Unauthorized encountered. Refreshing OAuth 2.0 access token...")
+                if code == 401 and not oauth_refreshed:
+                    logger.warning("HTTP 401 — refreshing OAuth token and retrying.")
                     oauth_refreshed = True
-                    new_auth = HTTPClient.build_auth_header(secret_dict, force_oauth_refresh=True)
-                    request_headers.update(new_auth)
-                    time.sleep(1.0)
+                    request_headers.update(
+                        HTTPClient._build_auth_header(secret_dict, force_oauth_refresh=True)
+                    )
                     continue
 
-                if status_code in (429, 500, 502, 503, 504) and attempt <= max_retries:
-                    retry_after = http_err.headers.get('Retry-After')
-                    sleep_time = float(retry_after) if (retry_after and retry_after.isdigit()) else backoff_seconds
-                    logger.warning(f"HTTP GET {status_code} encountered on attempt {attempt}/{max_retries}. Retrying in {sleep_time:.1f}s...")
-                    time.sleep(sleep_time)
-                    backoff_seconds *= 2.0
-                else:
-                    logger.error(f"HTTP GET Error {status_code} for URL '{url}': {http_err.reason}")
-                    raise
+                if code in (429, 500, 502, 503, 504) and attempt <= max_retries:
+                    retry_after = err.headers.get('Retry-After')
+                    wait = float(retry_after) if retry_after and retry_after.isdigit() else backoff
+                    logger.warning(
+                        f"HTTP {code} on attempt {attempt}/{max_retries}. "
+                        f"Retrying in {wait:.1f}s..."
+                    )
+                    time.sleep(wait)
+                    backoff *= 2.0
+                    continue
 
-            except (URLError, TimeoutError) as net_err:
+                logger.error(f"HTTP {code} for '{url}': {err.reason}")
+                raise
+
+            except (URLError, TimeoutError) as err:
                 if attempt <= max_retries:
-                    logger.warning(f"Network error '{net_err}' on HTTP GET attempt {attempt}/{max_retries}. Retrying in {backoff_seconds:.1f}s...")
-                    time.sleep(backoff_seconds)
-                    backoff_seconds *= 2.0
-                else:
-                    logger.error(f"Network error persisted on HTTP GET after {max_retries} attempts: {net_err}")
-                    raise
+                    logger.warning(
+                        f"Network error on attempt {attempt}/{max_retries}: {err}. "
+                        f"Retrying in {backoff:.1f}s..."
+                    )
+                    time.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                logger.error(f"Network error after {max_retries} retries: {err}")
+                raise

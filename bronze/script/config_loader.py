@@ -11,6 +11,7 @@ Supports:
 import os
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -128,13 +129,35 @@ class ConfigLoader:
         table_name: str,
         last_load_date: str,
         custom_query_cli: Optional[str] = None,
-        source_config: Optional[Dict[str, Any]] = None
+        source_config: Optional[Dict[str, Any]] = None,
+        upper_bound: Optional[str] = None,
     ) -> str:
         """
-        Resolves the final query filter for a table by combining CLI query overrides, table query overrides, and default delta filters.
+        Resolves the final OData query filter for a table.
+
+        For Moveworks, builds a bounded 'ge ... le' filter when upper_bound is
+        provided (parallel shard mode), or an open-ended 'ge' filter when
+        upper_bound is None (sequential mode).  Both are backward-compatible
+        with the existing call from uax_bronze_load.py which does not pass
+        upper_bound.
+
+        Args:
+            source_system:     Source system key (e.g. 'moveworks', 'servicenow').
+            table_name:        Entity / table name.
+            last_load_date:    Watermark lower-bound timestamp (inclusive).
+            custom_query_cli:  Optional OData filter override from CLI.
+            source_config:     Source-system config block from bronze_config.json.
+            upper_bound:       Inclusive upper-bound timestamp for shard windows.
+                               None = open-ended (non-parallel / sequential mode).
         """
         config = source_config or cls.get_source_config(source_system)
         table_clean = table_name.strip()
+
+        effective_ub = (
+            str(upper_bound).strip()
+            if upper_bound and str(upper_bound).strip()
+            else datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        )
 
         if custom_query_cli and custom_query_cli.strip():
             cli_query = custom_query_cli.strip()
@@ -143,25 +166,33 @@ class ConfigLoader:
                     delta_part = f"sys_updated_on>={last_load_date}"
                     final_filter = f"{cli_query}^{delta_part}"
                 elif source_system == 'moveworks':
-                    delta_part = f"last_updated_time gt '{last_load_date}'"
+                    delta_part = f"last_updated_time ge '{last_load_date}' and last_updated_time le '{effective_ub}'"
                     final_filter = f"{cli_query} and {delta_part}"
                 else:
                     delta_part = f"updated_at gt '{last_load_date}'"
                     final_filter = f"{cli_query} and {delta_part}"
             else:
-                final_filter = cli_query.replace("{last_load_date}", last_load_date)
+                final_filter = cli_query.replace("{last_load_date}", last_load_date).replace("{upper_bound}", effective_ub)
             logger.info(f"Using CLI Custom Query override for table '{table_clean}': {final_filter}")
             return final_filter
 
         table_overrides = config.get("table_query_overrides", {})
         for key in [table_clean, table_clean.replace('_', '-'), table_clean.replace('-', '_')]:
             if key in table_overrides and table_overrides[key]:
-                configured_query = table_overrides[key].replace("{last_load_date}", last_load_date)
+                configured_query = (
+                    table_overrides[key]
+                    .replace("{last_load_date}", last_load_date)
+                    .replace("{upper_bound}", effective_ub)
+                )
                 logger.info(f"Using Configured Table Query override for table '{table_clean}': {configured_query}")
                 return configured_query
 
         default_filter = config.get("default_delta_filter", "sys_updated_on>={last_load_date}")
-        final_filter = default_filter.replace("{last_load_date}", last_load_date)
+        final_filter = (
+            default_filter
+            .replace("{last_load_date}", last_load_date)
+            .replace("{upper_bound}", effective_ub)
+        )
         logger.info(f"Using Default Delta Filter for table '{table_clean}': {final_filter}")
         return final_filter
 

@@ -1,218 +1,236 @@
 """
-S3 File Source Connector: Extracts flat files, CSV, JSON, Text, or Parquet files
-from external/source S3 buckets and streams records incrementally to Bronze.
+S3 File Source Connector — AWS Glue Data Pipeline.
+
+Extracts flat files (CSV, JSON, NDJSON, Parquet, Text) from an external
+or internal S3 bucket and streams records to the Bronze layer.
+
+Required bronze_config.json keys (source_systems.<name>):
+  source_bucket      : S3 bucket to read files from
+  file_prefix        : S3 key prefix for all files of this source (e.g. 'raw/hr/')
+  file_format        : 'csv' | 'tsv' | 'json' | 'ndjson' | 'parquet' | 'text'
+  fetch_mode         : 'all' — all files modified after watermark (default)
+                       'latest' — only the single most recently modified file
+  table_paths        : Optional per-table path overrides { table_name: "path/prefix/" }
+  table_fetch_modes  : Optional per-table fetch_mode overrides { table_name: "latest" }
+  delimiter          : Column delimiter for CSV/TSV (default: ',')
+  has_header         : Whether CSV has a header row (default: true)
+  encoding           : File encoding (default: 'utf-8')
+
+Cross-account S3 access: if Secrets Manager contains 'aws_access_key_id' and
+'aws_secret_access_key', a cross-account S3 client is used; otherwise the
+Glue execution role (IAM) is used.
 """
 
-import logging
-import json
 import csv
 import io
-import boto3
-from typing import Callable, Optional, Dict, Any
+import json
+import logging
 from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-logger = logging.getLogger("S3FileConnector")
+import boto3
+
+logger = logging.getLogger(__name__)
+
+_SUPPORTED_FORMATS = ('csv', 'tsv', 'json', 'ndjson', 'parquet', 'text')
+_VALID_FETCH_MODES = ('all', 'latest')
 
 
 class S3FileConnector:
     """
-    Ingestion connector for reading files directly from external or internal S3 buckets.
-    Supports CSV, Flat, Text, JSON, NDJSON, and Parquet file formats.
+    Ingestion connector for reading files from S3 source buckets.
+    Supports two fetch modes: 'all' (all new files) or 'latest' (most recent file only).
     """
 
     @classmethod
     def fetch_delta(
         cls,
         last_load_date: str,
-        secret_dict: dict,
+        secret_dict: Dict[str, Any],
         table_name: str,
-        source_config: dict,
+        source_config: Dict[str, Any],
         custom_query: Optional[str] = None,
-        on_chunk_callback: Optional[Callable[[list, int], None]] = None,
-        s3_chunk_size: int = 10000
+        on_chunk_callback: Optional[Callable[[List[Dict[str, Any]], int], None]] = None,
+        s3_chunk_size: int = 10000,
     ) -> None:
         """
-        Scans source S3 bucket for new/updated files since last_load_date and streams records.
+        Scans the source S3 path for files and streams records to Bronze.
+
+        fetch_mode = 'all'   : Reads all files modified after last_load_date.
+        fetch_mode = 'latest': Reads only the most recently modified file in the path,
+                               regardless of the watermark. Useful for full-refresh feeds
+                               (e.g. daily employee export).
         """
-        source_bucket = source_config.get('source_bucket')
+        config = source_config or {}
+
+        source_bucket = config.get('source_bucket')
         if not source_bucket:
-            raise ValueError(f"S3 File Ingestion Error: 'source_bucket' must be configured in bronze_config.json for table '{table_name}'.")
+            raise ValueError(
+                f"S3FileConnector for '{table_name}': 'source_bucket' is not configured. "
+                "Add 'source_bucket' to bronze_config.json "
+                f"(source_systems.<name>.source_bucket)."
+            )
 
-        # Resolve file prefix or pattern for table
-        prefix_template = source_config.get('file_prefix_template', 'raw/{table_name}/')
-        file_prefix = prefix_template.format(table_name=table_name)
-        
-        table_patterns = source_config.get('table_file_patterns', {})
-        file_pattern = table_patterns.get(table_name, '')
+        # Per-table path override, fallback to global file_prefix
+        table_paths = config.get('table_paths', {})
+        file_prefix = table_paths.get(table_name) or config.get('file_prefix', f'raw/{table_name}/')
 
-        file_format = (source_config.get('file_format') or 'csv').lower()
-        delimiter = source_config.get('delimiter', ',')
-        has_header = source_config.get('has_header', True)
-        encoding = source_config.get('encoding', 'utf-8')
+        # Per-table fetch_mode override, fallback to global fetch_mode
+        table_modes  = config.get('table_fetch_modes', {})
+        fetch_mode   = (table_modes.get(table_name) or config.get('fetch_mode', 'all')).lower()
+        if fetch_mode not in _VALID_FETCH_MODES:
+            raise ValueError(
+                f"S3FileConnector for '{table_name}': invalid 'fetch_mode' = '{fetch_mode}'. "
+                f"Allowed: {_VALID_FETCH_MODES}. "
+                "Set 'fetch_mode' in bronze_config.json (source_systems.<name>.fetch_mode)."
+            )
 
-        # Initialize boto3 S3 client (uses cross-account AWS keys if provided in secret_dict, else IAM role)
+        file_format = (config.get('file_format') or 'csv').lower()
+        if file_format not in _SUPPORTED_FORMATS:
+            raise ValueError(
+                f"S3FileConnector for '{table_name}': unsupported 'file_format' = '{file_format}'. "
+                f"Allowed: {_SUPPORTED_FORMATS}."
+            )
+        delimiter  = config.get('delimiter', ',')
+        has_header = bool(config.get('has_header', True))
+        encoding   = config.get('encoding', 'utf-8')
+
+        # Build S3 client (cross-account if explicit credentials provided)
         if secret_dict.get('aws_access_key_id') and secret_dict.get('aws_secret_access_key'):
-            s3_src_client = boto3.client(
+            s3 = boto3.client(
                 's3',
                 aws_access_key_id=secret_dict['aws_access_key_id'],
                 aws_secret_access_key=secret_dict['aws_secret_access_key'],
-                aws_session_token=secret_dict.get('aws_session_token')
+                aws_session_token=secret_dict.get('aws_session_token'),
             )
         else:
-            s3_src_client = boto3.client('s3')
+            s3 = boto3.client('s3')
 
-        # Parse HWM timestamp threshold
+        # Parse watermark and optional upper_bound
         try:
-            hwm_dt = datetime.fromisoformat(last_load_date.replace('Z', '+00:00'))
+            hwm = datetime.fromisoformat(last_load_date.replace('Z', '+00:00'))
         except Exception:
-            hwm_dt = datetime.min.replace(tzinfo=timezone.utc)
+            hwm = datetime.min.replace(tzinfo=timezone.utc)
 
-        logger.info(f"Scanning source S3 bucket 's3://{source_bucket}/{file_prefix}' for files modified after {last_load_date}...")
+        upper_bound_str = config.get('upper_bound')
+        ub_dt = None
+        if upper_bound_str and str(upper_bound_str).strip():
+            try:
+                ub_dt = datetime.fromisoformat(str(upper_bound_str).strip().replace('Z', '+00:00'))
+            except Exception:
+                logger.warning(f"[S3File/{table_name}] Could not parse upper_bound '{upper_bound_str}', ignoring.")
 
-        # Paginate through source bucket objects
-        paginator = s3_src_client.get_paginator('list_objects_v2')
-        matching_keys = []
-
+        # List all matching files
+        candidates: List[Tuple[str, datetime]] = []
+        paginator = s3.get_paginator('list_objects_v2')
         for page in paginator.paginate(Bucket=source_bucket, Prefix=file_prefix):
             for obj in page.get('Contents', []):
                 key = obj['Key']
-                # Skip directory markers
                 if key.endswith('/'):
                     continue
+                mtime = obj['LastModified']
+                within_ub = (ub_dt is None) or (mtime <= ub_dt)
+                if (fetch_mode == 'latest' or mtime > hwm) and within_ub:
+                    candidates.append((key, mtime))
 
-                # Filter by file pattern if specified
-                if file_pattern and not key.lower().endswith(file_pattern.lower()):
-                    continue
-
-                # Check modification date against High-Water Mark
-                obj_mtime = obj['LastModified']
-                if obj_mtime > hwm_dt:
-                    matching_keys.append((key, obj_mtime))
-
-        # Sort matching files by modification time
-        matching_keys.sort(key=lambda x: x[1])
-        logger.info(f"Found {len(matching_keys)} new/updated files in 's3://{source_bucket}/{file_prefix}'.")
-
-        if not matching_keys:
+        if not candidates:
+            logger.info(
+                f"[S3File/{table_name}] No files found in "
+                f"s3://{source_bucket}/{file_prefix} (fetch_mode={fetch_mode})."
+            )
             return
 
-        records_accumulator = []
-        part_number = 1
+        # Apply fetch_mode
+        if fetch_mode == 'latest':
+            selected = [max(candidates, key=lambda x: x[1])]
+            logger.info(f"[S3File/{table_name}] fetch_mode=latest → reading: {selected[0][0]}")
+        else:
+            selected = sorted(candidates, key=lambda x: x[1])
+            logger.info(
+                f"[S3File/{table_name}] fetch_mode=all → {len(selected)} file(s) "
+                f"in s3://{source_bucket}/{file_prefix} modified after {last_load_date}."
+            )
 
-        for key, mtime in matching_keys:
-            logger.info(f"Reading file: 's3://{source_bucket}/{key}' (Modified: {mtime})...")
+        buffer: List[Dict[str, Any]] = []
+        part = 1
+
+        for key, mtime in selected:
+            logger.info(f"[S3File/{table_name}] Reading: s3://{source_bucket}/{key} (modified: {mtime})")
             try:
-                response = s3_src_client.get_object(Bucket=source_bucket, Key=key)
-                body_bytes = response['Body'].read()
-
-                records = cls.parse_file_bytes(
-                    body_bytes=body_bytes,
-                    file_format=file_format,
-                    delimiter=delimiter,
-                    has_header=has_header,
-                    encoding=encoding,
-                    source_key=key
-                )
-
-                records_accumulator.extend(records)
-
-                # Flush accumulator when chunk threshold reached
-                while len(records_accumulator) >= s3_chunk_size:
-                    chunk = records_accumulator[:s3_chunk_size]
-                    records_accumulator = records_accumulator[s3_chunk_size:]
-                    if on_chunk_callback:
-                        on_chunk_callback(chunk, part_number)
-                    part_number += 1
-
+                body_bytes = s3.get_object(Bucket=source_bucket, Key=key)['Body'].read()
+                records    = cls._parse(body_bytes, file_format, delimiter, has_header, encoding, key)
             except Exception as err:
-                logger.error(f"Error reading/parsing file 's3://{source_bucket}/{key}': {err}")
+                logger.error(f"[S3File/{table_name}] Failed to read/parse '{key}': {err}")
                 raise
 
-        # Flush remaining records
-        if records_accumulator:
-            if on_chunk_callback:
-                on_chunk_callback(records_accumulator, part_number)
+            buffer.extend(records)
+            while len(buffer) >= s3_chunk_size:
+                if on_chunk_callback:
+                    on_chunk_callback(buffer[:s3_chunk_size], part)
+                buffer = buffer[s3_chunk_size:]
+                part  += 1
+
+        if buffer and on_chunk_callback:
+            on_chunk_callback(buffer, part)
 
     @classmethod
-    def parse_file_bytes(
+    def _parse(
         cls,
         body_bytes: bytes,
         file_format: str,
-        delimiter: str = ",",
-        has_header: bool = True,
-        encoding: str = "utf-8",
-        source_key: str = ""
-    ) -> list:
-        """
-        Parses byte contents of a file into a list of record dictionaries.
-        """
-        fmt = file_format.strip().lower()
-        text_content = body_bytes.decode(encoding, errors='replace')
+        delimiter: str,
+        has_header: bool,
+        encoding: str,
+        source_key: str,
+    ) -> List[Dict[str, Any]]:
+        """Parses raw file bytes into a list of record dicts."""
+        text = body_bytes.decode(encoding, errors='replace')
 
-        records = []
-
-        if fmt in ('csv', 'flat', 'tsv', 'txt_delimited'):
-            sep = '\t' if fmt == 'tsv' else delimiter
-            lines = text_content.splitlines()
+        if file_format in ('csv', 'tsv'):
+            sep  = '\t' if file_format == 'tsv' else delimiter
+            lines = text.splitlines()
             if not lines:
                 return []
-
             if has_header:
-                reader = csv.DictReader(lines, delimiter=sep)
-                for row in reader:
-                    records.append(dict(row))
-            else:
-                reader = csv.reader(lines, delimiter=sep)
-                for idx, row in enumerate(reader):
-                    rec = {f"col_{i}": val for i, val in enumerate(row)}
-                    records.append(rec)
+                return [dict(row) for row in csv.DictReader(lines, delimiter=sep)]
+            return [
+                {f'col_{i}': v for i, v in enumerate(row)}
+                for row in csv.reader(lines, delimiter=sep)
+            ]
 
-        elif fmt in ('json', 'ndjson', 'jsonlines'):
-            lines = text_content.splitlines()
-            # Try newline-delimited JSON first
-            is_ndjson = False
-            for line in lines:
-                line_str = line.strip()
-                if not line_str:
+        if file_format in ('json', 'ndjson'):
+            records: List[Dict[str, Any]] = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
                     continue
                 try:
-                    obj = json.loads(line_str)
+                    obj = json.loads(line)
                     if isinstance(obj, dict):
                         records.append(obj)
-                        is_ndjson = True
-                except Exception:
+                except json.JSONDecodeError:
                     break
+            if records:
+                return records
+            # Fallback: full JSON array
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                for key in ('data', 'records', 'value', 'entities'):
+                    if key in parsed and isinstance(parsed[key], list):
+                        return parsed[key]
+                return [parsed]
+            return []
 
-            if not is_ndjson or not records:
-                # Try parsing as full JSON array or object
-                full_obj = json.loads(text_content)
-                if isinstance(full_obj, list):
-                    records = full_obj
-                elif isinstance(full_obj, dict):
-                    # Check for result wrapper
-                    if 'data' in full_obj and isinstance(full_obj['data'], list):
-                        records = full_obj['data']
-                    elif 'records' in full_obj and isinstance(full_obj['records'], list):
-                        records = full_obj['records']
-                    else:
-                        records = [full_obj]
+        if file_format == 'text':
+            return [
+                {'line_number': i, 'line_content': line, 'source_file': source_key}
+                for i, line in enumerate(text.splitlines(), start=1)
+            ]
 
-        elif fmt == 'text':
-            lines = text_content.splitlines()
-            for idx, line in enumerate(lines, start=1):
-                records.append({
-                    "line_number": idx,
-                    "line_content": line,
-                    "source_file": source_key
-                })
-
-        elif fmt == 'parquet':
+        if file_format == 'parquet':
             import pandas as pd
-            buffer = io.BytesIO(body_bytes)
-            df = pd.read_parquet(buffer)
-            records = df.to_dict(orient='records')
+            return pd.read_parquet(io.BytesIO(body_bytes)).to_dict(orient='records')
 
-        else:
-            raise ValueError(f"Unsupported file_format: '{file_format}'. Allowed: csv, flat, text, json, ndjson, parquet")
-
-        return records
+        raise ValueError(f"Unsupported file_format: '{file_format}'.")
