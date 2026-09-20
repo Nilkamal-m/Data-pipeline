@@ -44,11 +44,8 @@ from config_loader import ConfigLoader
 logger = logging.getLogger(__name__)
 
 # Inter-page delay per endpoint (seconds on HTTP 200 OK).
-# Source: Official Moveworks sample script.
-# Users requires 2s; all other entities (interactions, conversations, etc.) require 0s.
-_PAGE_DELAY: Dict[str, float] = {
-    'users': 2.0,
-}
+# Uniform rate limit handling: HTTP 429 60s backoff is handled centrally by HTTPClient.
+_PAGE_DELAY: Dict[str, float] = {}
 
 
 class MoveworksConnector:
@@ -137,7 +134,7 @@ class MoveworksConnector:
 
         custom_headers = {'Assistant-Name': str(assistant_name).strip()}
 
-        # ── Route: parallel or sequential ─────────────────────────────────────
+        # ── Route: full initial load, parallel, or sequential ──────────────────
         parallel_cfg      = config.get('parallel_processing', {})
         parallel_enabled  = bool(parallel_cfg.get('enabled', False))
         max_workers       = int(parallel_cfg.get('max_workers', 5))
@@ -148,6 +145,36 @@ class MoveworksConnector:
             if configured_ub and str(configured_ub).strip()
             else datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         )
+
+        is_full_initial_load = (
+            str(last_load_date).strip().startswith('1900') or
+            str(last_load_date).strip().startswith('1970')
+        ) and (
+            not configured_ub or
+            str(configured_ub).strip() == '' or
+            str(configured_ub).strip().startswith('9999') or
+            str(configured_ub).strip().startswith('9998')
+        )
+
+        if is_full_initial_load:
+            logger.info(
+                f"[{table_name}] FULL INITIAL LOAD ({last_load_date}) | cursor pagination via @odata.nextLink (no filter)"
+            )
+            return MoveworksConnector._fetch_single_window(
+                lower_bound=last_load_date,
+                upper_bound=None,
+                base_url=base_url,
+                endpoint=endpoint,
+                response_key=response_key,
+                limit=limit,
+                secret_dict=secret_dict,
+                custom_headers=custom_headers,
+                table_name=table_name,
+                source_config=config,
+                custom_query=custom_query,
+                on_chunk_callback=on_chunk_callback,
+                s3_chunk_size=s3_chunk_size,
+            )
 
         if parallel_enabled and on_chunk_callback:
             logger.info(
@@ -301,12 +328,13 @@ class MoveworksConnector:
             upper_bound=upper_bound,
         )
 
-        first_params = {'$orderby': 'last_updated_time desc', '$top': str(limit)}
+        orderby_col = (source_config or {}).get('orderby', 'id desc')
+        first_params = {'$orderby': orderby_col, '$top': str(limit)}
         if query_filter and query_filter.strip():
             first_params['$filter'] = query_filter.strip()
 
         url = f"{base_url.rstrip('/')}{endpoint}"
-        pacing = _PAGE_DELAY.get(table_name.strip().lower(), 0.0)
+        pacing = float((source_config or {}).get('api_delay_seconds', 0.0))
 
         all_records:    List[Dict[str, Any]] = []
         records_buffer: List[Dict[str, Any]] = []

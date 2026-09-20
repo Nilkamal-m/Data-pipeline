@@ -101,7 +101,7 @@
       "default_delta_filter": "last_updated_time ge '{last_load_date}' and last_updated_time le '{upper_bound}'",
       "response_records_key": "value",
       "batch_size": 500,
-      "orderby": "last_updated_time desc",
+      "orderby": "id desc",
       "parallel_processing": {
         "enabled": true,
         "max_workers": 5,
@@ -109,31 +109,31 @@
       },
       "tables": {
         "conversations": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": ""
         },
         "interactions": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": ""
         },
         "plugin_calls": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": ""
         },
         "plugin_cells": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": ""
         },
         "plugin_resources": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": ""
         },
         "users": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": ""
         },
         "tickets": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": "",
           "custom_endpoint": "/export/v1beta2/records/conversations"
         }

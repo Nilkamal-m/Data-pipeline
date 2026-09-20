@@ -1060,6 +1060,90 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         )
         self.assertEqual(records, [])
 
+    @patch('time.sleep')
+    @patch('urllib.request.urlopen')
+    def test_http_client_429_uniform_60s_backoff_and_retry(self, mock_urlopen, mock_sleep):
+        """Validates that HTTPClient pauses for ~60s on HTTP 429 across any table and retries successfully."""
+        from urllib.error import HTTPError
+        from connectors.http_client import HTTPClient
+
+        # First call raises HTTP 429; second call succeeds with 200 OK
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({"value": [{"id": "rec_1"}]}).encode('utf-8')
+        mock_response.info.return_value = {}
+
+        mock_cm = MagicMock()
+        mock_cm.__enter__.return_value = mock_response
+
+        err_429 = HTTPError('https://api.moveworks.ai/test', 429, 'Too Many Requests', {}, None)
+        mock_urlopen.side_effect = [err_429, mock_cm]
+
+        res = HTTPClient.get(
+            url='https://api.moveworks.ai/test',
+            secret_dict={'auth_type': 'api_key', 'api_key': 'key_123'},
+            max_retries=3
+        )
+
+        self.assertEqual(res, {"value": [{"id": "rec_1"}]})
+        self.assertEqual(mock_urlopen.call_count, 2)
+        mock_sleep.assert_called_once()
+        sleep_arg = mock_sleep.call_args[0][0]
+        self.assertGreaterEqual(sleep_arg, 60.0)
+        self.assertLessEqual(sleep_arg, 63.0)
+
+    def test_moveworks_full_initial_load_1900_empty_filter(self):
+        """Validates that last_load_date=1900-01-01 produces an empty filter for 100% historical extraction."""
+        # 1. Open-ended upper bound (empty) -> empty filter
+        f1 = ConfigLoader.get_table_query_filter(
+            source_system="moveworks",
+            table_name="interactions",
+            last_load_date="1900-01-01 00:00:00",
+            upper_bound=""
+        )
+        self.assertEqual(f1, "")
+
+        # 2. Open-ended sentinel upper bound (9999) -> empty filter
+        f2 = ConfigLoader.get_table_query_filter(
+            source_system="moveworks",
+            table_name="interactions",
+            last_load_date="1900-01-01 00:00:00",
+            upper_bound="9999-01-01 00:00:00"
+        )
+        self.assertEqual(f2, "")
+
+        # 3. Bounded backfill date -> le upper_bound
+        f3 = ConfigLoader.get_table_query_filter(
+            source_system="moveworks",
+            table_name="interactions",
+            last_load_date="1900-01-01 00:00:00",
+            upper_bound="2024-06-01 00:00:00"
+        )
+        self.assertEqual(f3, "last_updated_time le '2024-06-01T00:00:00Z'")
+
+    @patch('connectors.moveworks.MoveworksConnector._fetch_parallel')
+    @patch('connectors.moveworks.MoveworksConnector._fetch_single_window')
+    def test_moveworks_full_initial_load_fetch_delta_routing(self, mock_single, mock_parallel):
+        """Validates that 1900-01-01 routes to single window cursor pagination without sharding."""
+        from connectors.moveworks import MoveworksConnector
+
+        mock_single.return_value = [{"id": "row_1"}, {"id": "row_2"}]
+        cfg = ConfigLoader.load_config(env='dev')
+        mw_cfg = cfg['source_systems']['moveworks']
+
+        records = MoveworksConnector.fetch_delta(
+            last_load_date="1900-01-01 00:00:00",
+            secret_dict={'auth_type': 'oauth2', 'token_url': 'https://token'},
+            table_name="interactions",
+            source_config=mw_cfg,
+        )
+
+        self.assertEqual(records, [{"id": "row_1"}, {"id": "row_2"}])
+        mock_parallel.assert_not_called()
+        mock_single.assert_called_once()
+        # Verify upper_bound passed to _fetch_single_window is None (open-ended cursor pagination)
+        call_kwargs = mock_single.call_args[1]
+        self.assertIsNone(call_kwargs['upper_bound'])
+
 
 if __name__ == "__main__":
     unittest.main()

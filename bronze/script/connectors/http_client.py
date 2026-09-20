@@ -131,8 +131,12 @@ class HTTPClient:
 
         backoff = 2.0
         oauth_refreshed = False
+        max_429_retries = 10
+        retries_429 = 0
+        attempt = 0
 
-        for attempt in range(1, max_retries + 2):
+        while True:
+            attempt += 1
             req = urllib.request.Request(
                 url.replace(' ', '%20'),
                 headers=request_headers,
@@ -155,7 +159,25 @@ class HTTPClient:
                     )
                     continue
 
-                if code in (429, 500, 502, 503, 504) and attempt <= max_retries:
+                if code == 429:
+                    retries_429 += 1
+                    if retries_429 <= max_429_retries:
+                        retry_after = err.headers.get('Retry-After')
+                        if retry_after and retry_after.isdigit():
+                            wait = float(retry_after)
+                        else:
+                            import random
+                            wait = 60.0 + random.uniform(1.0, 2.0)
+                        logger.warning(
+                            f"HTTP 429 Rate Limited on '{url}'. Moveworks org rate limit reached. "
+                            f"Sleeping {wait:.1f}s before retry (attempt {retries_429}/{max_429_retries})..."
+                        )
+                        time.sleep(wait)
+                        continue
+                    logger.error(f"HTTP 429: Exceeded max rate-limit retries ({max_429_retries}) for '{url}'.")
+                    raise
+
+                if code in (500, 502, 503, 504) and attempt <= max_retries:
                     retry_after = err.headers.get('Retry-After')
                     wait = float(retry_after) if retry_after and retry_after.isdigit() else backoff
                     logger.warning(

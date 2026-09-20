@@ -460,6 +460,21 @@ class ConfigLoader:
                 logger.info(f"Using Configured Table Query override from legacy table_query_overrides for table '{table_clean}': {configured_query}")
                 return configured_query
 
+        # Moveworks full initial load: when last_load_date is 1900 or 1970 and upper_bound is open-ended,
+        # omit $filter to allow Moveworks to return all records desde inception without date restriction.
+        if source_system.strip().lower() == 'moveworks' and (str(last_load_date).strip().startswith('1900') or str(last_load_date).strip().startswith('1970')):
+            is_open_ub = not upper_bound or str(upper_bound).strip() == "" or str(upper_bound).strip().startswith('9999') or str(upper_bound).strip().startswith('9998')
+            if is_open_ub:
+                logger.info(
+                    f"Moveworks table '{table_clean}': Full initial load detected (last_load_date='{last_load_date}'). "
+                    f"OData $filter omitted for 100% complete historical extraction."
+                )
+                return ""
+            else:
+                final_filter = f"last_updated_time le '{effective_ub}'"
+                logger.info(f"Moveworks table '{table_clean}': Historical backfill filter: {final_filter}")
+                return final_filter
+
         default_filter = config.get("default_delta_filter", "sys_updated_on>={last_load_date}")
         final_filter = (
             default_filter
