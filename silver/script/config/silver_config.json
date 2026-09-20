@@ -158,7 +158,7 @@
       }
     },
     "moveworks": {
-      "default_tables": ["raw_tbl_interactions", "raw_tbl_users", "raw_tbl_tickets"],
+      "default_tables": ["raw_tbl_interactions", "raw_tbl_conversations", "raw_tbl_plugin_calls", "raw_tbl_plugin_resources", "raw_tbl_users"],
       "table_configs": {
         "raw_tbl_interactions": {
           "nkey": ["id", "interaction_id"],
@@ -173,7 +173,52 @@
           "external_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
-          "custom_transform_script": ""
+          "custom_transform_script": "custom_transforms/moveworks_interactions.py"
+        },
+        "raw_tbl_conversations": {
+          "nkey": ["id", "conversation_id"],
+          "deduplication_keys": ["id", "conversation_id"],
+          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "exclude_columns": [],
+          "external_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": "custom_transforms/moveworks_conversations.py"
+        },
+        "raw_tbl_plugin_calls": {
+          "nkey": ["id", "interaction_id"],
+          "deduplication_keys": ["id"],
+          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "exclude_columns": [],
+          "external_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": "custom_transforms/moveworks_plugin_calls.py"
+        },
+        "raw_tbl_plugin_resources": {
+          "nkey": ["id", "resource_id"],
+          "deduplication_keys": ["id"],
+          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
+          "merge_strategy": "upsert",
+          "scd_type": "scd1",
+          "deduplication_strategy": "latest_by_order_column",
+          "column_renames": {},
+          "column_casts": {},
+          "exclude_columns": [],
+          "external_columns": [],
+          "filter_expression": "",
+          "custom_expressions": {},
+          "custom_transform_script": "custom_transforms/moveworks_plugin_resources.py"
         },
         "raw_tbl_users": {
           "nkey": ["id", "user_id"],
@@ -188,7 +233,7 @@
           "external_columns": [],
           "filter_expression": "",
           "custom_expressions": {},
-          "custom_transform_script": ""
+          "custom_transform_script": "custom_transforms/moveworks_users.py"
         },
         "raw_tbl_tickets": {
           "nkey": ["id", "ticket_id"],

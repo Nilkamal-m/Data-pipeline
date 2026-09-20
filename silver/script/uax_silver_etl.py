@@ -1231,6 +1231,12 @@ def main():
 
             try:
                 # 1. Primary: Read directly from Bronze Glue Catalog external table
+                try:
+                    if hasattr(spark, "catalog") and hasattr(spark.catalog, "refreshTable"):
+                        spark.catalog.refreshTable(f"`{glue_database}`.`{bronze_table_name}`")
+                except Exception as ref_err:
+                    logger.debug(f"Catalog cache refresh skipped: {ref_err}")
+
                 df_bronze = spark.read.table(f"`{glue_database}`.`{bronze_table_name}`")
                 logger.info(f"Successfully loaded Bronze data from Glue Catalog table `{glue_database}`.`{bronze_table_name}`")
             except Exception as cat_err:

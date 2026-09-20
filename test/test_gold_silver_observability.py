@@ -1214,6 +1214,188 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         ep_resources = ConfigLoader.get_table_endpoint('moveworks', 'plugin_resources')
         self.assertEqual(ep_resources, '/export/v1beta2/records/plugin-resources')
 
+    def test_clean_illegal_chars_logic(self):
+        """Validates clean_illegal_chars regex removes control chars."""
+        from custom_transforms.moveworks_interactions import clean_illegal_chars
+        # Test with mock object that implements applymap
+        class MockDF:
+            def __init__(self, data):
+                self.data = data
+            def applymap(self, fn):
+                return MockDF({k: [fn(v) for v in vals] for k, vals in self.data.items()})
+
+        mock_df = MockDF({'text': ['Hello\x00World\x1f!', 'Clean\tText\n']})
+        res = clean_illegal_chars(mock_df)
+        self.assertEqual(res.data['text'][0], 'HelloWorld!')
+        self.assertEqual(res.data['text'][1], 'Clean\tText\n')
+
+    def test_gold_moveworks_interactions_sql_file(self):
+        """Validates that gold/query/moveworks/interactions.sql exists and contains expected CTEs and columns."""
+        sql_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "gold", "query", "moveworks", "interactions.sql"
+        )
+        self.assertTrue(os.path.exists(sql_path), f"File not found: {sql_path}")
+        with open(sql_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Check CTEs
+        self.assertIn("WITH conversation_topics AS", content)
+        self.assertIn("bot_responses AS", content)
+        self.assertIn("plugin_aggregates AS", content)
+        self.assertIn("resource_aggregates AS", content)
+
+        # Check core columns
+        self.assertIn("AS timestamp", content)
+        self.assertIn("AS conversation_id", content)
+        self.assertIn("AS interaction_id", content)
+        self.assertIn("AS bot_response", content)
+        self.assertIn("AS unsuccessful_plugins", content)
+        self.assertIn("AS plugin_served", content)
+        self.assertIn("AS plugin_used", content)
+        self.assertIn("AS resource_domain", content)
+        self.assertIn("AS no_of_citations", content)
+        self.assertIn("AS ticket_type", content)
+        self.assertIn("AS ticket_id", content)
+        self.assertIn("lower(ui.actor) = 'user'", content)
+        self.assertIn("_is_current = 'Y'", content)
+        self.assertIn("_is_deleted = 'N'", content)
+        # Ensure count of active flag filters across all 7 table touchpoints
+        self.assertEqual(content.count("_is_current = 'Y'"), 7)
+        self.assertEqual(content.count("_is_deleted = 'N'"), 7)
+
+    def test_test_bjhbc_sql_active_records_filters(self):
+        """Validates that test/bjhbc.sql enforces _is_current = 'Y' and _is_deleted = 'N' across all tables."""
+        sql_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "test", "bjhbc.sql"
+        )
+        self.assertTrue(os.path.exists(sql_path), f"File not found: {sql_path}")
+        with open(sql_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertEqual(content.count("_is_current = 'Y'"), 7)
+        self.assertEqual(content.count("_is_deleted = 'N'"), 7)
+
+    def test_nested_record_flattener_all_scenarios(self):
+        """Validates all nested array, primitive array, and nested dictionary flattening scenarios."""
+        from uax_bronze_load import flatten_and_expand_record, flatten_dict_single
+
+        # 1. User scenario: detail with content, domain, entity, platform_name
+        rec1 = {
+            "id": "int_001",
+            "detail": {
+                "content": "avavav",
+                "domain": "IT",
+                "entity": "ticket operation",
+                "platform_name": "Assist"
+            }
+        }
+        res1 = flatten_and_expand_record(rec1)[0]
+        self.assertEqual(res1.get("detail_content"), "avavav")
+        self.assertEqual(res1.get("detail_domain"), "IT")
+        self.assertEqual(res1.get("detail_entity"), "ticket operation")
+        self.assertEqual(res1.get("detail_platform_name"), "Assist")
+
+        # 2. Primitive array inside nested dictionary (e.g. entities as list)
+        rec2 = {
+            "id": "int_002",
+            "detail": {
+                "content": "vpn reset",
+                "domain": "IT",
+                "entity": ["ticket operation", "hardware"],
+                "platform_name": "Assist"
+            }
+        }
+        res2 = flatten_and_expand_record(rec2)[0]
+        self.assertEqual(res2.get("detail_entity"), "ticket operation, hardware")
+
+        # 3. Array of dictionaries inside nested dictionary (e.g. detail.resources)
+        rec3 = {
+            "id": "int_003",
+            "detail": {
+                "resources": [
+                    {"id": "res_1", "name": "Cisco VPN"},
+                    {"id": "res_2", "name": "GlobalProtect"}
+                ]
+            }
+        }
+        res3 = flatten_and_expand_record(rec3)[0]
+        self.assertIn("res_1", res3.get("detail_resources"))
+        self.assertEqual(res3.get("detail_resources_id"), "res_1, res_2")
+        self.assertEqual(res3.get("detail_resources_name"), "Cisco VPN, GlobalProtect")
+
+        # 4. Empty array handling
+        rec4 = {"id": "int_004", "detail": {"citations": []}}
+        res4 = flatten_and_expand_record(rec4)[0]
+        self.assertIsNone(res4.get("detail_citations"))
+
+    def test_schema_accumulation_and_glue_evolution(self):
+        """Validates that schema evolution adds newly observed columns to an existing Glue Catalog table."""
+        from datetime import datetime, timezone
+        from uax_bronze_load import sync_bronze_catalog_table
+        from unittest.mock import MagicMock
+
+        mock_glue = MagicMock()
+        # Mock existing table with only detail_content and detail_platform_name
+        mock_glue.get_table.return_value = {
+            'Table': {
+                'Name': 'raw_tbl_interactions',
+                'PartitionKeys': [{'Name': '_ingested_at', 'Type': 'string'}],
+                'StorageDescriptor': {
+                    'Columns': [
+                        {'Name': 'id', 'Type': 'string'},
+                        {'Name': 'detail_content', 'Type': 'string'},
+                        {'Name': 'detail_platform_name', 'Type': 'string'},
+                        {'Name': '_source_system', 'Type': 'string'},
+                        {'Name': '_table_name', 'Type': 'string'},
+                        {'Name': '_execution_id', 'Type': 'string'}
+                    ]
+                }
+            }
+        }
+
+        # Simulated accumulated sample record that now has detail_domain and detail_entity
+        sample_record = {
+            'id': '101',
+            'detail_content': 'avavav',
+            'detail_domain': 'IT',
+            'detail_entity': 'ticket operation',
+            'detail_platform_name': 'Assist',
+            '_source_system': 'moveworks',
+            '_table_name': 'interactions',
+            '_execution_id': 'exec_123'
+        }
+
+        import uax_bronze_load
+        orig_glue = uax_bronze_load.glue_client
+        uax_bronze_load.glue_client = mock_glue
+        try:
+            sync_bronze_catalog_table(
+                database_name='test_db',
+                table_prefix='raw_tbl_',
+                source_system='moveworks',
+                table_name='interactions',
+                bronze_bucket='test_bucket',
+                bronze_data_prefix='bronze/data',
+                partition_date=datetime.now(timezone.utc),
+                sample_record=sample_record,
+                output_format='parquet',
+                ingested_at='2026-09-21T00:00:00Z'
+            )
+
+            # Verify update_table was called to evolve the schema
+            self.assertTrue(mock_glue.update_table.called)
+            call_kwargs = mock_glue.update_table.call_args[1]
+            table_input = call_kwargs['TableInput']
+            evolved_columns = [c['Name'] for c in table_input['StorageDescriptor']['Columns']]
+            self.assertIn('detail_domain', evolved_columns)
+            self.assertIn('detail_entity', evolved_columns)
+            self.assertIn('detail_content', evolved_columns)
+            self.assertIn('detail_platform_name', evolved_columns)
+        finally:
+            uax_bronze_load.glue_client = orig_glue
+
 
 if __name__ == "__main__":
     unittest.main()

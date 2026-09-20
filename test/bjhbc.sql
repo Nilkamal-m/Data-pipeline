@@ -5,7 +5,10 @@ conversation_topics AS (
         conversation_id,
         ARRAY_JOIN(ARRAY_AGG(DISTINCT detail_entity), ', ') AS conversation_topic
     FROM interactions
-    WHERE detail_entity IS NOT NULL AND detail_entity <> ''
+    WHERE _is_current = 'Y' 
+      AND _is_deleted = 'N'
+      AND detail_entity IS NOT NULL 
+      AND detail_entity <> ''
     GROUP BY conversation_id
 ),
 
@@ -17,6 +20,8 @@ plugin_aggregates AS (
         ARRAY_JOIN(ARRAY_AGG(DISTINCT CASE WHEN served THEN plugin_name END), ', ') AS plugin_served,
         ARRAY_JOIN(ARRAY_AGG(DISTINCT CASE WHEN served AND used THEN plugin_name END), ', ') AS plugin_used
     FROM plugin_calls
+    WHERE _is_current = 'Y' 
+      AND _is_deleted = 'N'
     GROUP BY interaction_id
 ),
 
@@ -31,6 +36,8 @@ resource_aggregates AS (
         MAX(CASE WHEN type = 'RESOURCE_TYPE_TICKET' THEN 'user initiated ticket' ELSE '' END) AS ticket_type,
         ARRAY_JOIN(ARRAY_AGG(DISTINCT CASE WHEN type = 'RESOURCE_TYPE_TICKET' THEN detail_external_resource_id END), ', ') AS ticket_id
     FROM plugin_resources
+    WHERE _is_current = 'Y' 
+      AND _is_deleted = 'N'
     GROUP BY interaction_id
 )
 
@@ -73,6 +80,8 @@ FROM interactions ui
 -- Get domain from conversations
 LEFT JOIN conversations c 
     ON ui.conversation_id = c.id
+   AND c._is_current = 'Y'
+   AND c._is_deleted = 'N'
 
 -- Get conversation topics (aggregated)
 LEFT JOIN conversation_topics ct 
@@ -82,6 +91,8 @@ LEFT JOIN conversation_topics ct
 LEFT JOIN interactions bot 
     ON bot.parent_interaction_id = ui.id 
    AND bot.actor = 'bot'
+   AND bot._is_current = 'Y'
+   AND bot._is_deleted = 'N'
 
 -- Get plugin details
 LEFT JOIN plugin_aggregates pa 
@@ -94,8 +105,12 @@ LEFT JOIN resource_aggregates ra
 -- Get user metadata
 LEFT JOIN users u 
     ON ui.user_id = u.id
+   AND u._is_current = 'Y'
+   AND u._is_deleted = 'N'
 
 WHERE ui.actor = 'user'
+  AND ui._is_current = 'Y'
+  AND ui._is_deleted = 'N'
   -- Iceberg Timestamp Filtering (Athena Trino format):
   AND ui.last_updated_time >= TIMESTAMP '2025-07-15 00:00:00.000 UTC'
   AND ui.last_updated_time <= TIMESTAMP '2025-07-15 23:59:59.999 UTC'

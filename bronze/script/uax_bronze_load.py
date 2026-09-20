@@ -416,6 +416,7 @@ def flatten_and_expand_record(record: dict, parent_key: str = '', sep: str = '_'
     """
     Recursively flattens nested dictionaries and explodes arrays of objects into multiple individual rows.
     If a record contains an array of objects (e.g. external_ids), generates N rows—one for each item in the array.
+    Additional arrays are safely unpacked into columns and preserved as JSON arrays.
     """
     base_dict = {}
     list_of_dicts = []
@@ -431,7 +432,24 @@ def flatten_and_expand_record(record: dict, parent_key: str = '', sep: str = '_'
                 list_key_name = new_key
                 list_of_dicts = v
             else:
-                base_dict[new_key] = json.dumps(v) if v is not None else None
+                if not v:
+                    base_dict[new_key] = None
+                elif all(isinstance(x, (str, int, float, bool)) for x in v):
+                    base_dict[new_key] = ', '.join(str(x) for x in v if x is not None)
+                elif any(isinstance(x, dict) for x in v):
+                    base_dict[new_key] = json.dumps(v)
+                    flattened_subitems = [flatten_dict_single(x, sep=sep) if isinstance(x, dict) else {} for x in v]
+                    all_subkeys = []
+                    for sub in flattened_subitems:
+                        for sub_k in sub.keys():
+                            if sub_k not in all_subkeys:
+                                all_subkeys.append(sub_k)
+                    for sub_k in all_subkeys:
+                        col_name = f"{new_key}{sep}{sub_k}"
+                        vals = [str(sub[sub_k]) for sub in flattened_subitems if sub_k in sub and sub[sub_k] is not None]
+                        base_dict[col_name] = ', '.join(vals) if vals else None
+                else:
+                    base_dict[new_key] = json.dumps(v)
         else:
             base_dict[new_key] = v
 
@@ -450,14 +468,36 @@ def flatten_and_expand_record(record: dict, parent_key: str = '', sep: str = '_'
 
 
 def flatten_dict_single(d: dict, parent_key: str = '', sep: str = '_') -> dict:
-    """Flattens a nested dictionary recursively into a flat dict."""
+    """Flattens a nested dictionary recursively into a flat dict.
+    - Recursively unpacks nested dictionaries to arbitrary depth.
+    - Flattens primitive arrays into clean comma-separated strings.
+    - Unpacks arrays of objects into distinct child columns while preserving the JSON array string.
+    - Handles empty arrays gracefully without string schema pollution.
+    """
     items = []
     for k, v in d.items():
         new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
         if isinstance(v, dict):
             items.extend(flatten_dict_single(v, new_key, sep=sep).items())
         elif isinstance(v, list):
-            items.append((new_key, json.dumps(v) if v is not None else None))
+            if not v:
+                items.append((new_key, None))
+            elif all(isinstance(x, (str, int, float, bool)) for x in v):
+                items.append((new_key, ', '.join(str(x) for x in v if x is not None)))
+            elif any(isinstance(x, dict) for x in v):
+                items.append((new_key, json.dumps(v)))
+                flattened_subitems = [flatten_dict_single(x, sep=sep) if isinstance(x, dict) else {} for x in v]
+                all_subkeys = []
+                for sub in flattened_subitems:
+                    for sub_k in sub.keys():
+                        if sub_k not in all_subkeys:
+                            all_subkeys.append(sub_k)
+                for sub_k in all_subkeys:
+                    col_name = f"{new_key}{sep}{sub_k}"
+                    vals = [str(sub[sub_k]) for sub in flattened_subitems if sub_k in sub and sub[sub_k] is not None]
+                    items.append((col_name, ', '.join(vals) if vals else None))
+            else:
+                items.append((new_key, json.dumps(v)))
         else:
             items.append((new_key, v))
     return dict(items)
@@ -901,6 +941,49 @@ def sync_bronze_catalog_table(
             raise ClientError({'Error': {'Code': 'EntityNotFoundException'}}, 'GetTable')
         else:
             logger.info(f"Glue Catalog Table verified: {database_name}.{catalog_table_name} with partition key ['_ingested_at']")
+            # Schema Evolution: detect newly observed columns and update existing Glue Catalog table definition
+            try:
+                table_dict = existing_table.get('Table', {})
+                existing_sd = table_dict.get('StorageDescriptor', {})
+                existing_cols = existing_sd.get('Columns', [])
+                existing_col_names = {c['Name'].lower() for c in existing_cols}
+                new_cols_to_add = [c for c in columns if c['Name'].lower() not in existing_col_names]
+                if new_cols_to_add:
+                    logger.info(
+                        f"[GLUE SCHEMA EVOLUTION] Adding {len(new_cols_to_add)} newly observed column(s) to table "
+                        f"'{database_name}.{catalog_table_name}': {[c['Name'] for c in new_cols_to_add]}"
+                    )
+                    audit_names = {'_source_system', '_table_name', '_execution_id', '_ingested_at'}
+                    cur_business = [c for c in existing_cols if c['Name'].lower() not in audit_names]
+                    cur_audit = [c for c in existing_cols if c['Name'].lower() in audit_names]
+                    for nc in new_cols_to_add:
+                        if nc['Name'].lower() not in audit_names:
+                            cur_business.append(nc)
+                        else:
+                            cur_audit.append(nc)
+                    merged_cols = cur_business + cur_audit
+
+                    updated_table_input = {
+                        'Name': catalog_table_name,
+                        'Description': table_dict.get('Description', f"Bronze raw data table for {source_system}/{table_name}"),
+                        'PartitionKeys': table_dict.get('PartitionKeys', partition_keys),
+                        'TableType': table_dict.get('TableType', 'EXTERNAL_TABLE'),
+                        'Parameters': table_dict.get('Parameters', {
+                            'EXTERNAL': 'TRUE',
+                            'has_encrypted_data': 'true',
+                            'classification': output_format.lower()
+                        }),
+                        'StorageDescriptor': dict(existing_sd, Columns=merged_cols)
+                    }
+                    glue_client.update_table(
+                        DatabaseName=database_name,
+                        TableInput=updated_table_input
+                    )
+                    logger.info(f"[GLUE SCHEMA EVOLUTION] Successfully updated Glue Catalog schema for '{database_name}.{catalog_table_name}'.")
+                    columns = merged_cols
+                    storage_desc['Columns'] = merged_cols
+            except Exception as update_err:
+                logger.warning(f"Could not update Glue Catalog table schema for '{catalog_table_name}': {update_err}")
     except ClientError as e:
         code = e.response.get('Error', {}).get('Code')
         if code in ('EntityNotFoundException', 'NoSuchEntityException'):
@@ -1216,11 +1299,11 @@ def main():
 
         total_table_records = 0
         parts_written = 0
-        first_sample_record = None
+        observed_schema_record = {}
 
         # Memory-safe callback function writing to isolated STAGING directory
         def chunk_writer_callback(records_chunk: list, part_num: int):
-            nonlocal total_table_records, parts_written, first_sample_record
+            nonlocal total_table_records, parts_written, observed_schema_record
             if not records_chunk:
                 return
 
@@ -1238,12 +1321,14 @@ def main():
                         rec['_table_name'] = clean_table_name
                         rec['_execution_id'] = execution_id
                         processed_chunk.append(rec)
+                        # Accumulate union of all observed columns across all records in all chunks
+                        for col_k, col_v in rec.items():
+                            if col_k not in observed_schema_record or (observed_schema_record[col_k] is None and col_v is not None):
+                                observed_schema_record[col_k] = col_v
                 else:
                     processed_chunk.append(record)
 
             records_chunk = processed_chunk
-            if first_sample_record is None and records_chunk:
-                first_sample_record = records_chunk[0]
             total_table_records += len(records_chunk)
             parts_written += 1
             
@@ -1300,7 +1385,7 @@ def main():
                         bronze_bucket=bronze_bucket,
                         bronze_data_prefix=bronze_data_prefix,
                         partition_date=execution_start_utc,
-                        sample_record=first_sample_record,
+                        sample_record=observed_schema_record,
                         output_format=output_format,
                         ingested_at=current_run_time
                     )
