@@ -1652,6 +1652,70 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         self.assertIn("_source_system", deserialized[0])
         self.assertNotIn("_ingested_at", deserialized[0])
 
+    def test_fix_glue_catalog_table_standalone_script(self):
+        """Validates standalone fix_glue_catalog_table removes _ingested_at from Columns."""
+        from fix_catalog_schema import fix_glue_catalog_table
+        mock_glue = MagicMock()
+        mock_glue.get_table.return_value = {
+            'Table': {
+                'Name': 'raw_tbl_interactions',
+                'DatabaseName': 'uax_datalake_db_dev',
+                'PartitionKeys': [{'Name': '_ingested_at', 'Type': 'string'}],
+                'StorageDescriptor': {
+                    'Columns': [
+                        {'Name': 'id', 'Type': 'string'},
+                        {'Name': '_ingested_at', 'Type': 'string'},
+                        {'Name': '_source_system', 'Type': 'string'}
+                    ]
+                }
+            }
+        }
+        res = fix_glue_catalog_table(
+            database_name='uax_datalake_db_dev',
+            table_name='raw_tbl_interactions',
+            exclude_columns=['_ingested_at'],
+            glue_client=mock_glue
+        )
+        self.assertEqual(res['status'], 'SUCCEEDED')
+        self.assertEqual(res['removed_columns'], ['_ingested_at'])
+        self.assertEqual(res['remaining_columns_count'], 2)
+        mock_glue.update_table.assert_called_once()
+        table_input = mock_glue.update_table.call_args[1]['TableInput']
+        cols = [c['Name'] for c in table_input['StorageDescriptor']['Columns']]
+        self.assertNotIn('_ingested_at', cols)
+        self.assertIn('id', cols)
+
+    def test_lambda_fix_catalog_columns_event_routing(self):
+        """Validates that Lambda routes catalog maintenance events properly."""
+        from lambda_function import is_catalog_maintenance_event, lambda_handler
+        event = {
+            "action": "fix_catalog_table",
+            "database": "uax_datalake_db_dev",
+            "table": "raw_tbl_interactions",
+            "exclude_columns": ["_ingested_at"]
+        }
+        self.assertTrue(is_catalog_maintenance_event(event))
+
+        with patch('lambda_function.glue_client') as mock_glue:
+            mock_glue.get_table.return_value = {
+                'Table': {
+                    'Name': 'raw_tbl_interactions',
+                    'PartitionKeys': [{'Name': '_ingested_at', 'Type': 'string'}],
+                    'StorageDescriptor': {
+                        'Columns': [
+                            {'Name': 'id', 'Type': 'string'},
+                            {'Name': '_ingested_at', 'Type': 'string'}
+                        ]
+                    }
+                }
+            }
+            resp = lambda_handler(event, None)
+            self.assertEqual(resp['statusCode'], 200)
+            body = json.loads(resp['body'])
+            self.assertEqual(body['status'], 'SUCCEEDED')
+            self.assertIn('_ingested_at', body['removed_columns'])
+            mock_glue.update_table.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

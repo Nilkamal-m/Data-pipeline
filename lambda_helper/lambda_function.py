@@ -503,6 +503,115 @@ def trigger_and_monitor_crawler(event: Dict[str, Any], context: Any) -> Dict[str
     }
 
 
+def is_catalog_maintenance_event(event: Dict[str, Any]) -> bool:
+    """
+    Detects if the incoming Lambda payload is intended for Glue Catalog schema maintenance.
+    Recognizes:
+      - 'action': 'fix_catalog_table', 'fix_columns', 'clean_catalog_table', 'update_schema', 'catalog_fix'
+      - 'layer': 'catalog', 'glue_catalog'
+      - Explicit field: 'exclude_columns'
+    """
+    action = str(event.get('action', '')).strip().lower()
+    layer = str(event.get('layer', '')).strip().lower()
+    return (
+        action in ('fix_catalog_table', 'fix_columns', 'clean_catalog_table', 'update_schema', 'catalog_fix')
+        or layer in ('catalog', 'glue_catalog')
+        or 'exclude_columns' in event
+    )
+
+
+def fix_catalog_table_columns(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Removes specified columns from an AWS Glue Data Catalog table's StorageDescriptor.Columns.
+    This resolves duplicate column issues in Athena/Spark (e.g. when _ingested_at was written
+    both as a file column and an S3 partition key) without rewriting any S3 data.
+    """
+    database = (
+        event.get('database')
+        or event.get('database_name')
+        or event.get('DATABASE')
+        or event.get('DATABASE_NAME')
+        or os.environ.get('DEFAULT_GLUE_DATABASE', 'uax_datalake_db_dev')
+    )
+    table_name = (
+        event.get('table')
+        or event.get('table_name')
+        or event.get('TABLE')
+        or event.get('TABLE_NAME')
+    )
+    if not table_name:
+        raise ValueError("Missing required parameter 'table' or 'table_name' for catalog maintenance.")
+
+    raw_exclude = event.get('exclude_columns', ['_ingested_at'])
+    if isinstance(raw_exclude, str):
+        exclude_cols = {c.strip().lower() for c in raw_exclude.split(',') if c.strip()}
+    elif isinstance(raw_exclude, list):
+        exclude_cols = {str(c).strip().lower() for c in raw_exclude if str(c).strip()}
+    else:
+        exclude_cols = {'_ingested_at'}
+
+    logger.info(f"Inspecting Glue Catalog table: {database}.{table_name}...")
+    response = glue_client.get_table(DatabaseName=database, Name=table_name)
+    table = response['Table']
+
+    sd = table.get('StorageDescriptor', {})
+    original_cols = sd.get('Columns', [])
+    cleaned_cols = [c for c in original_cols if c.get('Name', '').strip().lower() not in exclude_cols]
+    removed_cols = [c.get('Name') for c in original_cols if c.get('Name', '').strip().lower() in exclude_cols]
+
+    pkeys = [pk.get('Name') for pk in table.get('PartitionKeys', [])]
+
+    if not removed_cols:
+        msg = f"No columns matching {list(exclude_cols)} found in StorageDescriptor.Columns for {database}.{table_name}."
+        logger.info(f"✓ {msg}")
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'status': 'NO_CHANGE',
+                'database': database,
+                'table': table_name,
+                'message': msg,
+                'remaining_columns_count': len(cleaned_cols),
+                'partition_keys': pkeys
+            })
+        }
+
+    read_only_keys = [
+        'DatabaseName', 'CreateTime', 'UpdateTime', 'CreatedBy',
+        'IsRegisteredWithLakeFormation', 'CatalogId', 'VersionId',
+        'FederatedTable', 'Owner'
+    ]
+    table_input = {k: v for k, v in table.items() if k not in read_only_keys}
+    table_input['StorageDescriptor']['Columns'] = cleaned_cols
+
+    logger.info(
+        f"Updating {database}.{table_name}: removing {removed_cols} from StorageDescriptor.Columns. "
+        f"Remaining columns: {len(cleaned_cols)}, Partition keys: {pkeys}"
+    )
+    glue_client.update_table(
+        DatabaseName=database,
+        TableInput=table_input
+    )
+    success_msg = (
+        f"Successfully removed duplicate column(s) {removed_cols} from StorageDescriptor.Columns of {database}.{table_name}. "
+        f"Column is now defined purely as PartitionKey: {pkeys}."
+    )
+    logger.info(f"✓ {success_msg}")
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'status': 'SUCCEEDED',
+            'database': database,
+            'table': table_name,
+            'removed_columns': removed_cols,
+            'partition_keys': pkeys,
+            'remaining_columns_count': len(cleaned_cols),
+            'message': success_msg
+        })
+    }
+
+
 def is_athena_query_event(event: Dict[str, Any]) -> bool:
     """
     Detects if the incoming Lambda payload is intended for Athena query execution.
@@ -1169,7 +1278,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.info("Athena query request detected in payload. Routing to execute_athena_query...")
             return execute_athena_query(event, context)
 
-        # Route 2: Glue Crawler Trigger & Monitoring
+        # Route 2: Glue Catalog Schema Maintenance (e.g. fix duplicate partition/data columns)
+        if is_catalog_maintenance_event(event):
+            logger.info("Catalog maintenance request detected in payload. Routing to fix_catalog_table_columns...")
+            return fix_catalog_table_columns(event, context)
+
+        # Route 3: Glue Crawler Trigger & Monitoring
         if is_crawler_event(event):
             logger.info("Glue Crawler request detected in payload. Routing to trigger_and_monitor_crawler...")
             return trigger_and_monitor_crawler(event, context)

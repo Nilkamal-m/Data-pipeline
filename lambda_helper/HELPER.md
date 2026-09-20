@@ -15,6 +15,7 @@ The Helper Lambda function provides a unified control plane and execution interf
 | Operation | Trigger Indicator | Target Engine | Purpose |
 | :--- | :--- | :--- | :--- |
 | **Glue Crawler** | `"layer": "crawler"` or `"crawler_name"` | AWS Glue Crawler | Triggers and monitors Glue Crawlers to discover newly ingested S3 partitions & evolve table schemas. |
+| **Catalog Maintenance** | `"action": "fix_catalog_table"` or `"layer": "catalog"` | AWS Glue Data Catalog | Removes duplicate columns (e.g. `_ingested_at`) from `StorageDescriptor.Columns` in 2 seconds without rewriting S3 data. |
 | **Athena SQL Query** | `"query"`, `"sql"`, or `"query_file"` | Amazon Athena v3 | Executes multiline queries, SQL files (e.g. `interactions.sql`), or ad-hoc queries with CLI tables in logs. |
 | **Bronze Ingestion** | `"layer": "bronze"` | Glue Python Shell 3.9 | Ingests raw source data from APIs/databases into S3 Bronze partitioned by `_ingested_at=<ISO_TIMESTAMP>`. |
 | **Silver Iceberg ETL** | `"layer": "silver"` | Glue PySpark 4.0 | Deduplicates Bronze raw data, applies audit columns, and merges into Iceberg tables (`tbl_<name>`). |
@@ -387,6 +388,30 @@ Executes the full multiline Gold aggregation query from the repository:
   "query": "SELECT source_system, table_name, last_load_date, last_status, records_ingested, updated_at FROM raw_tbl_watermarks ORDER BY updated_at DESC",
   "database": "uax_datalake_db_dev"
 }
+```
+
+---
+
+### G. AWS Glue Data Catalog Schema Maintenance (`action: "fix_catalog_table"`)
+
+#### 27. Remove Duplicate Partition Column from Catalog StorageDescriptor (`raw_tbl_interactions`)
+> **Use Case**: Fixes existing tables where `_ingested_at` was written into both `StorageDescriptor.Columns` and `PartitionKeys` by a crawler. Updates the Glue Catalog in-place in 2 seconds with **zero data movement, zero rewrites, and zero data loss in S3**:
+```json
+{
+  "action": "fix_catalog_table",
+  "database": "uax_datalake_db_dev",
+  "table": "raw_tbl_interactions",
+  "exclude_columns": ["_ingested_at"]
+}
+```
+
+#### 28. Run via Standalone CLI Script or AWS CloudShell
+```bash
+# Run locally or in CloudShell:
+python bronze/script/fix_catalog_schema.py \
+  --database uax_datalake_db_dev \
+  --table raw_tbl_interactions \
+  --exclude _ingested_at
 ```
 
 ---

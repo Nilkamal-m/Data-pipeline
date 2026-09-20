@@ -78,12 +78,22 @@ resource "aws_iam_policy" "lambda_glue_trigger_policy" {
           "glue:StartCrawler",
           "glue:GetCrawler",
           "glue:GetCrawlers",
-          "glue:StopCrawler"
+          "glue:StopCrawler",
+          "glue:GetTable",
+          "glue:GetTables",
+          "glue:UpdateTable",
+          "glue:GetDatabase",
+          "glue:GetDatabases",
+          "glue:GetPartition",
+          "glue:GetPartitions"
         ]
         Resource = [
           "arn:aws:glue:${var.aws_region}:*:job/${var.app_name}*",
           "arn:aws:glue:${var.aws_region}:*:crawler/${var.app_name}*",
-          "arn:aws:glue:${var.aws_region}:*:crawler/*"
+          "arn:aws:glue:${var.aws_region}:*:crawler/*",
+          "arn:aws:glue:${var.aws_region}:*:catalog",
+          "arn:aws:glue:${var.aws_region}:*:database/*",
+          "arn:aws:glue:${var.aws_region}:*:table/*/*"
         ]
       },
       {
