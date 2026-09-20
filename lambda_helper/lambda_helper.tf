@@ -74,10 +74,26 @@ resource "aws_iam_policy" "lambda_glue_trigger_policy" {
           "glue:StartJobRun",
           "glue:GetJobRun",
           "glue:GetJobRuns",
-          "glue:BatchStopJobRun"
+          "glue:BatchStopJobRun",
+          "glue:StartCrawler",
+          "glue:GetCrawler",
+          "glue:GetCrawlers",
+          "glue:StopCrawler"
         ]
         Resource = [
-          "arn:aws:glue:${var.aws_region}:*:job/${var.app_name}*"
+          "arn:aws:glue:${var.aws_region}:*:job/${var.app_name}*",
+          "arn:aws:glue:${var.aws_region}:*:crawler/${var.app_name}*",
+          "arn:aws:glue:${var.aws_region}:*:crawler/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::*"
         ]
       },
       {
@@ -131,10 +147,11 @@ resource "aws_lambda_function" "glue_trigger_lambda" {
 
   environment {
     variables = {
-      DEFAULT_BRONZE_JOB = "${var.app_name}-bronze-ingestion-${var.environment}"
-      DEFAULT_SILVER_JOB = "${var.app_name}-silver-etl-${var.environment}"
-      DEFAULT_GOLD_JOB   = "${var.app_name}-silver-etl-${var.environment}"
-      ENVIRONMENT        = var.environment
+      DEFAULT_BRONZE_JOB   = "${var.app_name}-bronze-ingestion-${var.environment}"
+      DEFAULT_SILVER_JOB   = "${var.app_name}-silver-etl-${var.environment}"
+      DEFAULT_GOLD_JOB     = "${var.app_name}-silver-etl-${var.environment}"
+      DEFAULT_CRAWLER_NAME = "${var.app_name}-bronze-crawler-${var.environment}"
+      ENVIRONMENT          = var.environment
     }
   }
 

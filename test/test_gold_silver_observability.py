@@ -566,6 +566,235 @@ class TestLambdaHelper(unittest.TestCase):
         self.assertEqual(mock_glue.start_job_run.call_count, 2)
 
 
+class TestLambdaCrawlerAndMultilineSql(unittest.TestCase):
+    """
+    Validates Helper Lambda functionality for:
+    1. Glue Crawler triggering and synchronous/asynchronous monitoring.
+    2. Crawler running as a stage in multi-stage pipelines (Bronze -> Crawler -> Silver).
+    3. Multiline SQL query resolution and statement splitting (like interactions.sql).
+    4. Reading SQL queries from files and S3 URIs with parameter substitution.
+    """
+
+    def test_is_crawler_event_detection(self):
+        from lambda_function import is_crawler_event
+        self.assertTrue(is_crawler_event({"layer": "crawler"}))
+        self.assertTrue(is_crawler_event({"layer": "glue_crawler"}))
+        self.assertTrue(is_crawler_event({"action": "run_crawler"}))
+        self.assertTrue(is_crawler_event({"crawler_name": "uax-datalake-bronze-crawler-dev"}))
+        self.assertFalse(is_crawler_event({"layer": "bronze", "source_system": "moveworks"}))
+        self.assertFalse(is_crawler_event({"query": "SELECT 1"}))
+
+    @patch('lambda_function.glue_client')
+    def test_crawler_execution_synchronous_success(self, mock_glue):
+        from lambda_function import lambda_handler
+        mock_glue.start_crawler.return_value = {}
+        mock_glue.get_crawler.return_value = {
+            'Crawler': {
+                'State': 'READY',
+                'LastCrawl': {
+                    'Status': 'SUCCEEDED',
+                    'LogGroup': '/aws-glue/crawlers',
+                    'LogStream': 'stream-123'
+                },
+                'Metrics': {
+                    'TablesCreated': 2,
+                    'TablesUpdated': 3,
+                    'TablesDeleted': 0,
+                    'PartitionsCreated': 10,
+                    'PartitionsUpdated': 5,
+                    'PartitionsDeleted': 0
+                }
+            }
+        }
+        event = {
+            "layer": "crawler",
+            "crawler_name": "uax-datalake-bronze-crawler-dev",
+            "wait_until_completion": True,
+            "poll_interval_seconds": 0.01
+        }
+        resp = lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 200)
+        body = json.loads(resp["body"])
+        self.assertEqual(body["status"], "SUCCEEDED")
+        self.assertEqual(body["crawler_name"], "uax-datalake-bronze-crawler-dev")
+        self.assertEqual(body["tables_created"], 2)
+        self.assertEqual(body["tables_updated"], 3)
+        mock_glue.start_crawler.assert_called_once_with(Name="uax-datalake-bronze-crawler-dev")
+
+    @patch('lambda_function.glue_client')
+    def test_crawler_execution_already_running_handled(self, mock_glue):
+        from lambda_function import lambda_handler
+        from botocore.exceptions import ClientError
+        error_response = {'Error': {'Code': 'CrawlerRunningException', 'Message': 'Crawler is already running'}}
+        mock_glue.start_crawler.side_effect = ClientError(error_response, 'StartCrawler')
+        mock_glue.get_crawler.return_value = {
+            'Crawler': {
+                'State': 'READY',
+                'LastCrawl': {'Status': 'SUCCEEDED'},
+                'Metrics': {'TablesUpdated': 1}
+            }
+        }
+        event = {
+            "action": "crawler",
+            "crawler_name": "uax-datalake-bronze-crawler-dev",
+            "wait_until_completion": True,
+            "poll_interval_seconds": 0.01
+        }
+        resp = lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 200)
+        body = json.loads(resp["body"])
+        self.assertEqual(body["status"], "SUCCEEDED")
+
+    @patch('lambda_function.glue_client')
+    @patch('lambda_function.poll_glue_job_run')
+    def test_crawler_in_multi_stage_pipeline(self, mock_poll_job, mock_glue):
+        from lambda_function import lambda_handler
+        mock_glue.start_job_run.side_effect = [
+            {"JobRunId": "jr_bronze_10"},
+            {"JobRunId": "jr_silver_20"}
+        ]
+        mock_poll_job.side_effect = [
+            {"JobState": "SUCCEEDED", "ExecutionTimeSeconds": 20, "LogGroupName": "log1"},
+            {"JobState": "SUCCEEDED", "ExecutionTimeSeconds": 30, "LogGroupName": "log2"}
+        ]
+        mock_glue.start_crawler.return_value = {}
+        mock_glue.get_crawler.return_value = {
+            'Crawler': {
+                'State': 'READY',
+                'LastCrawl': {'Status': 'SUCCEEDED'},
+                'Metrics': {'TablesUpdated': 4}
+            }
+        }
+        event = {
+            "layers": ["bronze", "crawler", "silver"],
+            "source_system": "moveworks",
+            "crawler_name": "uax-datalake-bronze-crawler-dev",
+            "poll_interval_seconds": 0.01
+        }
+        resp = lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 200)
+        body = json.loads(resp["body"])
+        self.assertEqual(body["status"], "SUCCEEDED")
+        self.assertIn("bronze", body["stage_results"])
+        self.assertIn("crawler", body["stage_results"])
+        self.assertIn("silver", body["stage_results"])
+        self.assertEqual(body["stage_results"]["crawler"]["status"], "SUCCEEDED")
+
+    def test_split_sql_statements_multiline_cte_and_quotes(self):
+        from lambda_function import split_sql_statements
+        # 1. Multiline CTE query (like interactions.sql) with comments and trailing semicolon
+        multiline_sql = """
+        -- Header comments
+        -- Table: interactions
+        WITH conversation_topics AS (
+            SELECT conversation_id, concat_ws(', ', collect_set(detail_entity)) AS topic
+            FROM tbl_interactions
+            WHERE _is_current = 'Y' AND _is_deleted = 'N'
+            GROUP BY conversation_id
+        )
+        SELECT * FROM conversation_topics;
+        -- Trailing comment
+        """
+        stmts = split_sql_statements(multiline_sql)
+        self.assertEqual(len(stmts), 1)
+        self.assertFalse(stmts[0].endswith(";"))
+        self.assertIn("WITH conversation_topics", stmts[0])
+
+        # 2. Multiple statements with semicolon inside string literals
+        multi_stmt_sql = """
+        CREATE TABLE test_table (id int, name varchar);
+        INSERT INTO test_table VALUES (1, 'value; with; semicolons');
+        SELECT * FROM test_table WHERE name != 'semi;colon';
+        """
+        stmts2 = split_sql_statements(multi_stmt_sql)
+        self.assertEqual(len(stmts2), 3)
+        self.assertEqual(stmts2[0], "CREATE TABLE test_table (id int, name varchar)")
+        self.assertEqual(stmts2[1], "INSERT INTO test_table VALUES (1, 'value; with; semicolons')")
+        self.assertFalse(stmts2[2].endswith(";"))
+
+    def test_resolve_sql_query_local_file_and_template_params(self):
+        from lambda_function import resolve_sql_query
+        # Reading interactions.sql directly from gold/query/moveworks/interactions.sql
+        event = {
+            "query_file": "gold/query/moveworks/interactions.sql",
+            "table_replacements": {
+                "tbl_interactions": "silver_tbl_moveworks_interactions"
+            },
+            "params": {
+                "source_system": "moveworks"
+            }
+        }
+        resolved = resolve_sql_query(event)
+        self.assertIn("silver_tbl_moveworks_interactions", resolved)
+        self.assertNotIn("FROM\n    tbl_interactions", resolved)
+        self.assertIn("conversation_topics", resolved)
+
+    @patch('lambda_function.s3_client')
+    def test_resolve_sql_query_s3_uri(self, mock_s3):
+        from lambda_function import resolve_sql_query
+        mock_body = MagicMock()
+        mock_body.read.return_value = b"SELECT * FROM tbl_interactions WHERE id = '${id}';"
+        mock_s3.get_object.return_value = {'Body': mock_body}
+
+        event = {
+            "sql_s3_path": "s3://my-test-bucket/gold/query/moveworks/interactions.sql",
+            "params": {"id": "int_12345"}
+        }
+        resolved = resolve_sql_query(event)
+        self.assertEqual(resolved, "SELECT * FROM tbl_interactions WHERE id = 'int_12345';")
+        mock_s3.get_object.assert_called_once_with(Bucket="my-test-bucket", Key="gold/query/moveworks/interactions.sql")
+
+    @patch('lambda_function.athena_client')
+    def test_execute_athena_query_multiline_interactions(self, mock_athena):
+        from lambda_function import lambda_handler
+        mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qe_12345"}
+        mock_athena.get_query_execution.return_value = {
+            'QueryExecution': {
+                'Status': {'State': 'SUCCEEDED'},
+                'Statistics': {
+                    'EngineExecutionTimeInMillis': 450,
+                    'DataScannedInBytes': 1048576
+                }
+            }
+        }
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                'ResultSet': {
+                    'Rows': [
+                        {'Data': [{'VarCharValue': 'conversation_id'}, {'VarCharValue': 'topic'}]},
+                        {'Data': [{'VarCharValue': 'conv_001'}, {'VarCharValue': 'ticket operation'}]}
+                    ]
+                }
+            }
+        ]
+        mock_athena.get_paginator.return_value = mock_paginator
+
+        multiline_sql = """
+        WITH conversation_topics AS (
+            SELECT conversation_id, detail_entity AS topic
+            FROM tbl_interactions
+            WHERE _is_current = 'Y' AND _is_deleted = 'N'
+        )
+        SELECT * FROM conversation_topics LIMIT 10;
+        """
+        event = {
+            "query": multiline_sql,
+            "database": "uax_datalake_db_dev",
+            "poll_interval_seconds": 0.01
+        }
+        resp = lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 200)
+        body = json.loads(resp["body"])
+        self.assertEqual(body["status"], "SUCCEEDED")
+        self.assertEqual(body["query_execution_id"], "qe_12345")
+        self.assertEqual(body["row_count"], 1)
+        self.assertEqual(body["records"][0]["conversation_id"], "conv_001")
+        # Verify that start_query_execution was called without the trailing semicolon
+        call_query = mock_athena.start_query_execution.call_args[1]["QueryString"]
+        self.assertFalse(call_query.endswith(";"))
+
+
 
 class TestHyphenToUnderscoreHandling(unittest.TestCase):
     """

@@ -43,6 +43,7 @@ Supported Operations:
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -55,6 +56,7 @@ logger.setLevel(logging.INFO)
 
 glue_client = boto3.client('glue')
 athena_client = boto3.client('athena')
+s3_client = boto3.client('s3')
 
 try:
     import pandas as pd
@@ -69,10 +71,14 @@ TERMINAL_STATES = {'SUCCEEDED', 'FAILED', 'STOPPED', 'TIMEOUT'}
 DEFAULT_BRONZE_JOB = os.environ.get('DEFAULT_BRONZE_JOB', 'uax-datalake-bronze-ingestion-dev')
 DEFAULT_SILVER_JOB = os.environ.get('DEFAULT_SILVER_JOB', 'uax-datalake-silver-etl-dev')
 DEFAULT_GOLD_JOB = os.environ.get('DEFAULT_GOLD_JOB', DEFAULT_SILVER_JOB)
+DEFAULT_CRAWLER_NAME = os.environ.get('DEFAULT_CRAWLER_NAME', 'uax-datalake-bronze-crawler-dev')
 
 DEFAULT_ATHENA_DATABASE = os.environ.get('DEFAULT_ATHENA_DATABASE', 'uax_datalake_db_dev')
 DEFAULT_ATHENA_WORKGROUP = os.environ.get('DEFAULT_ATHENA_WORKGROUP', 'uax-datalake-workgroup-dev')
 DEFAULT_ATHENA_OUTPUT_LOCATION = os.environ.get('DEFAULT_ATHENA_OUTPUT_LOCATION', '')
+
+# Root directory of workspace for local SQL file lookups
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
@@ -306,20 +312,390 @@ def poll_glue_job_run(job_name: str, run_id: str, poll_interval: int, timeout_se
         time.sleep(poll_interval)
 
 
+def is_crawler_event(event: Dict[str, Any]) -> bool:
+    """
+    Detects if the incoming Lambda payload is intended for Glue Crawler execution.
+    Recognizes:
+      - Explicit layer: "crawler", "glue_crawler", "crawl", "crawlers"
+      - Explicit action: "crawler", "run_crawler", "start_crawler", "trigger_crawler", "crawl"
+      - Presence of "crawler_name" / "CRAWLER_NAME" when layer is not a Glue job layer or athena
+    Excludes multi-stage pipelines (e.g. layers: [...] or layer='all').
+    """
+    if isinstance(event.get('layers'), list):
+        return False
+    layer = str(event.get('layer', '')).strip().lower()
+    if layer in ('all', 'pipeline', 'e2e', 'full'):
+        return False
+    action = str(event.get('action', '')).strip().lower()
+    if action in ('run_all', 'pipeline', 'e2e', 'all'):
+        return False
+
+    if layer in ('crawler', 'glue_crawler', 'crawl', 'crawlers'):
+        return True
+    if action in ('crawler', 'run_crawler', 'start_crawler', 'trigger_crawler', 'crawl'):
+        return True
+    
+    crawler_field = event.get('crawler_name') or event.get('CRAWLER_NAME') or event.get('crawler')
+    if crawler_field and layer not in ('bronze', 'silver', 'gold', 'athena'):
+        return True
+    return False
+
+
+def resolve_crawler_name(event: Dict[str, Any]) -> str:
+    """
+    Resolves the Glue crawler name from event payload or environment fallback.
+    """
+    crawler_name = (
+        event.get('crawler_name')
+        or event.get('CRAWLER_NAME')
+        or event.get('crawler')
+        or event.get('bronze_crawler_name')
+        or event.get('silver_crawler_name')
+    )
+    if crawler_name and str(crawler_name).strip():
+        return str(crawler_name).strip()
+
+    source_system = event.get('source_system') or event.get('SOURCE_SYSTEM')
+    env = event.get('env') or event.get('ENV') or os.environ.get('ENVIRONMENT', 'dev')
+
+    layer = str(event.get('layer', '')).strip().lower()
+    if 'silver' in layer:
+        return f"uax-datalake-silver-crawler-{env}"
+    elif source_system:
+        return f"uax-datalake-bronze-crawler-{env}"
+    return DEFAULT_CRAWLER_NAME
+
+
+def poll_glue_crawler(crawler_name: str, poll_interval: int = 5, timeout_seconds: int = 540) -> Dict[str, Any]:
+    """
+    Synchronously polls AWS Glue Crawler status until it returns to READY state.
+    """
+    logger.info(f"Monitoring Glue Crawler '{crawler_name}' every {poll_interval}s (timeout: {timeout_seconds}s)...")
+    start_time = time.time()
+
+    # Small pause to allow AWS to transition state out of initial READY if just started
+    time.sleep(min(2.0, float(poll_interval)))
+
+    while True:
+        elapsed = int(time.time() - start_time)
+        if elapsed > timeout_seconds:
+            raise TimeoutError(
+                f"Glue Crawler '{crawler_name}' exceeded timeout limit of {timeout_seconds}s. "
+                f"Crawler is still running in AWS Glue."
+            )
+
+        resp = glue_client.get_crawler(Name=crawler_name)
+        crawler_data = resp.get('Crawler', {})
+        state = crawler_data.get('State', 'READY')  # READY, RUNNING, STOPPING
+        last_crawl = crawler_data.get('LastCrawl', {})
+        metrics = crawler_data.get('Metrics', {})
+        crawl_status = last_crawl.get('Status', 'UNKNOWN')  # SUCCEEDED, CANCELLED, FAILED
+
+        logger.info(f"[{elapsed}s] Crawler '{crawler_name}' state: {state} (LastCrawl Status: {crawl_status})")
+
+        if state == 'READY':
+            if crawl_status == 'FAILED':
+                err_msg = last_crawl.get('ErrorMessage', 'Crawler run failed with unknown error')
+                logger.error(f"Glue Crawler '{crawler_name}' FAILED: {err_msg}")
+                return {
+                    'Status': 'FAILED',
+                    'State': 'READY',
+                    'CrawlStatus': 'FAILED',
+                    'ExecutionTimeSeconds': elapsed,
+                    'ErrorMessage': err_msg,
+                    'Metrics': metrics,
+                    'LastCrawl': last_crawl
+                }
+            elif crawl_status == 'CANCELLED':
+                err_msg = last_crawl.get('ErrorMessage', 'Crawler run was cancelled')
+                logger.warning(f"Glue Crawler '{crawler_name}' CANCELLED: {err_msg}")
+                return {
+                    'Status': 'CANCELLED',
+                    'State': 'READY',
+                    'CrawlStatus': 'CANCELLED',
+                    'ExecutionTimeSeconds': elapsed,
+                    'ErrorMessage': err_msg,
+                    'Metrics': metrics,
+                    'LastCrawl': last_crawl
+                }
+            else:
+                logger.info(f"Glue Crawler '{crawler_name}' SUCCEEDED in {elapsed}s.")
+                return {
+                    'Status': 'SUCCEEDED',
+                    'State': 'READY',
+                    'CrawlStatus': 'SUCCEEDED',
+                    'ExecutionTimeSeconds': elapsed,
+                    'Metrics': metrics,
+                    'LastCrawl': last_crawl
+                }
+
+        time.sleep(poll_interval)
+
+
+def trigger_and_monitor_crawler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Triggers an AWS Glue Crawler and optionally monitors it until completion.
+    """
+    crawler_name = resolve_crawler_name(event)
+    logger.info(f"Starting AWS Glue Crawler: '{crawler_name}'")
+
+    already_running = False
+    try:
+        glue_client.start_crawler(Name=crawler_name)
+        logger.info(f"Successfully started Glue Crawler '{crawler_name}'.")
+    except ClientError as ce:
+        err_code = ce.response.get('Error', {}).get('Code')
+        if err_code == 'CrawlerRunningException':
+            logger.warning(f"Glue Crawler '{crawler_name}' is already running. Monitoring active crawl run.")
+            already_running = True
+        else:
+            raise
+
+    wait_until_completion = event.get('wait_until_completion', True)
+    if isinstance(wait_until_completion, str):
+        wait_until_completion = wait_until_completion.strip().lower() in ('true', '1', 'yes')
+
+    poll_interval = int(event.get('poll_interval_seconds', 5))
+    timeout_seconds = int(event.get('timeout_seconds', 540))
+
+    if not wait_until_completion:
+        logger.info("Asynchronous mode selected for Crawler. Returning 202 Accepted.")
+        return {
+            'statusCode': 202,
+            'body': json.dumps({
+                'status': 'STARTING' if not already_running else 'ALREADY_RUNNING',
+                'message': f"Glue Crawler '{crawler_name}' started asynchronously.",
+                'crawler_name': crawler_name
+            })
+        }
+
+    crawl_res = poll_glue_crawler(
+        crawler_name=crawler_name,
+        poll_interval=poll_interval,
+        timeout_seconds=timeout_seconds
+    )
+
+    is_success = crawl_res['Status'] == 'SUCCEEDED'
+    metrics = crawl_res.get('Metrics', {})
+    last_crawl = crawl_res.get('LastCrawl', {})
+
+    response_payload = {
+        'status': crawl_res['Status'],
+        'crawler_name': crawler_name,
+        'state': crawl_res.get('State', 'READY'),
+        'crawl_status': crawl_res.get('CrawlStatus'),
+        'execution_time_seconds': crawl_res.get('ExecutionTimeSeconds', 0),
+        'tables_created': metrics.get('TablesCreated', 0),
+        'tables_updated': metrics.get('TablesUpdated', 0),
+        'tables_deleted': metrics.get('TablesDeleted', 0),
+        'partitions_created': metrics.get('PartitionsCreated', 0),
+        'partitions_updated': metrics.get('PartitionsUpdated', 0),
+        'partitions_deleted': metrics.get('PartitionsDeleted', 0),
+        'log_group': last_crawl.get('LogGroup', '/aws-glue/crawlers'),
+        'log_stream': last_crawl.get('LogStream'),
+        'error_message': crawl_res.get('ErrorMessage')
+    }
+
+    status_code = 200 if is_success else 500
+    return {
+        'statusCode': status_code,
+        'body': json.dumps(response_payload, default=str)
+    }
+
+
 def is_athena_query_event(event: Dict[str, Any]) -> bool:
     """
     Detects if the incoming Lambda payload is intended for Athena query execution.
     Recognizes:
-      - Explicit query fields: "query", "athena_query", "sql"
+      - Explicit query fields: "query", "athena_query", "sql", "query_file", "sql_file",
+        "query_path", "sql_path", "sql_s3_path", "s3_query_uri", "query_s3_path", "query_name"
       - Action: "query", "athena", "run_query"
       - Layer: "athena"
     """
-    for q_key in ('query', 'athena_query', 'sql', 'QUERY', 'ATHENA_QUERY', 'SQL'):
+    for q_key in (
+        'query', 'athena_query', 'sql', 'query_file', 'sql_file',
+        'query_path', 'sql_path', 'sql_s3_path', 's3_query_uri',
+        'query_s3_path', 'query_name', 'file_path', 'QUERY', 'ATHENA_QUERY', 'SQL'
+    ):
         if event.get(q_key) and str(event[q_key]).strip():
             return True
     layer = str(event.get('layer', '')).strip().lower()
     action = str(event.get('action', '')).strip().lower()
     return layer == 'athena' or action in ('query', 'athena', 'run_query')
+
+
+def strip_comments_from_sql(sql_text: str) -> str:
+    """Removes single-line and multi-line comments from SQL text to verify if actual SQL statements remain."""
+    clean = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL)
+    clean = re.sub(r'--[^\r\n]*', '', clean)
+    return clean.strip()
+
+
+def split_sql_statements(sql_text: str) -> List[str]:
+    """
+    Parses and splits a multiline SQL query string into individual executable statements.
+    Accurately handles:
+      - Trailing semicolons (which cause Athena Presto/Trino syntax errors)
+      - Semicolons inside single-quoted strings ('hello; world')
+      - Semicolons inside double-quoted identifiers ("my;col")
+      - Semicolons inside single-line (-- ...) and block (/* ... */) comments
+      - Skips empty chunks and trailing comment-only sections
+    """
+    statements = []
+    current: List[str] = []
+    in_single_quote = False
+    in_double_quote = False
+    in_line_comment = False
+    in_block_comment = False
+    i = 0
+    n = len(sql_text)
+
+    while i < n:
+        ch = sql_text[i]
+        next_ch = sql_text[i + 1] if i + 1 < n else ''
+
+        # Line comment: starts with -- until newline
+        if not in_single_quote and not in_double_quote and not in_block_comment and ch == '-' and next_ch == '-':
+            in_line_comment = True
+            current.append(ch)
+            current.append(next_ch)
+            i += 2
+            continue
+        elif in_line_comment and ch == '\n':
+            in_line_comment = False
+            current.append(ch)
+            i += 1
+            continue
+
+        # Block comment: starts with /* until */
+        elif not in_single_quote and not in_double_quote and not in_line_comment and ch == '/' and next_ch == '*':
+            in_block_comment = True
+            current.append(ch)
+            current.append(next_ch)
+            i += 2
+            continue
+        elif in_block_comment and ch == '*' and next_ch == '/':
+            in_block_comment = False
+            current.append(ch)
+            current.append(next_ch)
+            i += 2
+            continue
+
+        # String literals and statement terminator
+        if not in_line_comment and not in_block_comment:
+            if ch == "'" and not in_double_quote:
+                in_single_quote = not in_single_quote
+            elif ch == '"' and not in_single_quote:
+                in_double_quote = not in_double_quote
+            elif ch == ';' and not in_single_quote and not in_double_quote:
+                stmt_str = "".join(current).strip().rstrip(';').strip()
+                if strip_comments_from_sql(stmt_str):
+                    statements.append(stmt_str)
+                current = []
+                i += 1
+                continue
+
+        current.append(ch)
+        i += 1
+
+    remaining_stmt = "".join(current).strip().rstrip(';').strip()
+    if strip_comments_from_sql(remaining_stmt):
+        statements.append(remaining_stmt)
+
+    return statements
+
+
+def resolve_sql_query(event: Dict[str, Any]) -> str:
+    """
+    Resolves an SQL query from event payload.
+    Supports:
+      1. Direct multiline SQL string: event['query'], event['sql'], event['athena_query']
+      2. Local or repository file path: event['query_file'], event['sql_file'], event['query_path'], event['sql_path']
+      3. S3 URI: 's3://bucket/key/to/query.sql' passed via query, sql_s3_path, s3_query_uri, etc.
+      4. Named query lookup: event['query_name'] + event['source_system']
+    Also performs template/parameter replacements if provided.
+    """
+    raw_query = None
+    for q_key in (
+        'query', 'sql', 'athena_query', 'query_file', 'sql_file',
+        'query_path', 'sql_path', 'sql_s3_path', 's3_query_uri',
+        'query_s3_path', 'file_path', 'QUERY', 'SQL', 'ATHENA_QUERY'
+    ):
+        val = event.get(q_key)
+        if val and str(val).strip():
+            raw_query = str(val).strip()
+            break
+
+    # If query_name is passed with source_system (e.g. query_name="interactions.sql", source_system="moveworks")
+    if not raw_query and event.get('query_name'):
+        q_name = str(event['query_name']).strip()
+        src = str(event.get('source_system') or event.get('SOURCE_SYSTEM') or '').strip().lower()
+        if src:
+            potential_path = os.path.join(repo_root, "gold", "query", src, q_name)
+            if os.path.isfile(potential_path):
+                raw_query = potential_path
+            else:
+                raw_query = f"gold/query/{src}/{q_name}"
+
+    if not raw_query:
+        raise ValueError(
+            "Missing SQL query in payload. Please provide 'query', 'sql', 'query_file', or 'sql_s3_path'.\n"
+            "Example: {'query_file': 'gold/query/moveworks/interactions.sql'} or {'query': 'SELECT * FROM raw_tbl_interactions'}"
+        )
+
+    # Check if raw_query is an S3 URI (s3://bucket/path/to/query.sql)
+    if raw_query.startswith('s3://'):
+        logger.info(f"Loading SQL query from S3 URI: {raw_query}")
+        s3_path = raw_query[5:]
+        bucket_name, key_name = s3_path.split('/', 1)
+        resp = s3_client.get_object(Bucket=bucket_name, Key=key_name)
+        sql_content = resp['Body'].read().decode('utf-8')
+    # Check if raw_query is a local file path (e.g. gold/query/moveworks/interactions.sql)
+    elif os.path.isfile(raw_query):
+        logger.info(f"Loading SQL query from local file path: {raw_query}")
+        with open(raw_query, 'r', encoding='utf-8') as f:
+            sql_content = f.read()
+    elif os.path.isfile(os.path.join(repo_root, raw_query)):
+        resolved_path = os.path.join(repo_root, raw_query)
+        logger.info(f"Loading SQL query from workspace file path: {resolved_path}")
+        with open(resolved_path, 'r', encoding='utf-8') as f:
+            sql_content = f.read()
+    else:
+        # Inline SQL string (potentially multiline)
+        sql_content = raw_query
+
+    # Apply parameter / template substitution if parameters are supplied
+    params = event.get('params') or event.get('parameters') or event.get('template_vars') or {}
+    database = (
+        event.get('database')
+        or event.get('db')
+        or event.get('glue_database')
+        or event.get('DATABASE')
+        or DEFAULT_ATHENA_DATABASE
+    )
+    source_system = event.get('source_system') or event.get('SOURCE_SYSTEM') or ''
+
+    substitutions = dict(params)
+    if 'database' not in substitutions and database:
+        substitutions['database'] = database
+    if 'source_system' not in substitutions and source_system:
+        substitutions['source_system'] = source_system
+
+    # Table replacements (e.g. mapping tbl_interactions -> raw_tbl_interactions if running against Bronze)
+    table_replacements = event.get('table_replacements') or event.get('table_mapping') or {}
+    if isinstance(table_replacements, dict):
+        for old_t, new_t in table_replacements.items():
+            sql_content = re.sub(rf'\b{re.escape(old_t)}\b', new_t, sql_content)
+
+    for k, v in substitutions.items():
+        val_str = str(v)
+        sql_content = sql_content.replace(f"${{{k}}}", val_str)
+        sql_content = sql_content.replace(f"{{{{{k}}}}}", val_str)
+        sql_content = sql_content.replace(f"{{{k}}}", val_str)
+        sql_content = sql_content.replace(f"<{k}>", val_str)
+        sql_content = re.sub(rf':{re.escape(k)}\b', val_str, sql_content)
+
+    return sql_content
 
 
 def format_as_database_table(
@@ -380,21 +756,15 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Executes an SQL query against Amazon Athena, polls for completion, formats
     the tabular results into the Lambda execution logs, and returns the records.
+    Supports multiline SQL queries, files (e.g. interactions.sql), S3 paths, and multi-statement queries.
     """
-    # 1. Resolve SQL Query string
-    query_str = None
-    for q_key in ('query', 'athena_query', 'sql', 'QUERY', 'ATHENA_QUERY', 'SQL'):
-        if event.get(q_key) and str(event[q_key]).strip():
-            query_str = str(event[q_key]).strip()
-            break
-
-    if not query_str:
-        raise ValueError(
-            "Missing SQL query in payload. Please provide 'query' (e.g., {'query': 'SELECT * FROM uax_datalake_db_dev.raw_tbl_incident LIMIT 10'})."
-        )
+    # 1. Resolve SQL Query string (supports multiline, files, S3 URIs, and template params)
+    raw_query_str = resolve_sql_query(event)
+    statements = split_sql_statements(raw_query_str)
+    if not statements:
+        raise ValueError("No valid SQL statement found in query payload.")
 
     # 2. Resolve Database, Workgroup, Output Location
-    # Database is completely optional if your query passes <database>.<table_name> directly (e.g. uax_datalake_db_dev.raw_tbl_incident)
     database = (
         event.get('database')
         or event.get('db')
@@ -420,11 +790,9 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     )
     output_location = str(output_location).strip() if output_location else ''
 
-    # Region resolution: payload override > ATHENA_REGION env > default client
     athena_region = event.get('region') or event.get('athena_region') or os.environ.get('ATHENA_REGION')
     client = boto3.client('athena', region_name=athena_region.strip()) if athena_region and athena_region.strip() else athena_client
 
-    # Resolve max_results: if not provided or 'all', fetch all records without restriction
     raw_max = event.get('max_results') if event.get('max_results') is not None else event.get('MAX_RESULTS')
     if raw_max is None or str(raw_max).strip().lower() in ('none', 'all', '', '0', '-1'):
         max_results = None
@@ -445,87 +813,103 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info(f"Athena Workgroup: {workgroup}")
     logger.info(f"Athena Region   : {athena_region or 'Default'}")
     logger.info(f"Max Results     : {max_results if max_results is not None else 'ALL (No restriction)'}")
-    logger.info(f"Query String    :\n{query_str}")
+    logger.info(f"Total Statements: {len(statements)}")
     logger.info("=" * 80)
 
-    # 3. Start Athena Query Execution
-    start_params: Dict[str, Any] = {
-        'QueryString': query_str,
-        'WorkGroup': workgroup
-    }
-    if database:
-        start_params['QueryExecutionContext'] = {'Database': database}
-    
-    if output_location:
-        start_params['ResultConfiguration'] = {'OutputLocation': output_location}
+    execution_ids = []
+    final_query_execution_id = None
+    final_query_execution = None
 
-    try:
-        start_response = client.start_query_execution(**start_params)
-    except ClientError as ce:
-        err_msg = str(ce)
-        # Workgroups with enforced output location may reject explicit ResultConfiguration
-        if 'InvalidRequestException' in err_msg and 'workgroup' in err_msg.lower() and ('outputlocation' in err_msg.lower() or 'configuration' in err_msg.lower()):
-            logger.info("Workgroup enforces output location. Retrying without explicit ResultConfiguration...")
-            start_params.pop('ResultConfiguration', None)
-            start_response = client.start_query_execution(**start_params)
+    for stmt_idx, stmt in enumerate(statements, 1):
+        line_count = len(stmt.splitlines())
+        logger.info(f"--- [Statement {stmt_idx}/{len(statements)}] ({line_count} lines) ---")
+        if line_count <= 20:
+            logger.info(f"SQL:\n{stmt}")
         else:
-            raise
+            first_5 = "\n".join(stmt.splitlines()[:5])
+            last_5 = "\n".join(stmt.splitlines()[-5:])
+            logger.info(f"SQL (showing preview of {line_count} lines):\n{first_5}\n...\n{last_5}")
 
-    query_execution_id = start_response['QueryExecutionId']
-    logger.info(f"Submitted to Athena. QueryExecutionId: {query_execution_id}")
+        start_params: Dict[str, Any] = {
+            'QueryString': stmt,
+            'WorkGroup': workgroup
+        }
+        if database:
+            start_params['QueryExecutionContext'] = {'Database': database}
+        if output_location:
+            start_params['ResultConfiguration'] = {'OutputLocation': output_location}
 
-    # 4. Polling loop
-    start_time = time.time()
-    while True:
-        elapsed = time.time() - start_time
-        if elapsed > timeout_seconds:
-            try:
-                client.stop_query_execution(QueryExecutionId=query_execution_id)
-            except Exception:
-                pass
-            raise TimeoutError(
-                f"Athena query '{query_execution_id}' timed out after {timeout_seconds}s."
-            )
+        try:
+            start_response = client.start_query_execution(**start_params)
+        except ClientError as ce:
+            err_msg = str(ce)
+            if 'InvalidRequestException' in err_msg and 'workgroup' in err_msg.lower() and ('outputlocation' in err_msg.lower() or 'configuration' in err_msg.lower()):
+                logger.info("Workgroup enforces output location. Retrying without explicit ResultConfiguration...")
+                start_params.pop('ResultConfiguration', None)
+                start_response = client.start_query_execution(**start_params)
+            else:
+                raise
 
-        response = client.get_query_execution(QueryExecutionId=query_execution_id)
-        query_execution = response.get('QueryExecution', {})
-        status_info = query_execution.get('Status', {})
-        state = status_info.get('State', 'UNKNOWN')
+        query_execution_id = start_response['QueryExecutionId']
+        execution_ids.append(query_execution_id)
+        final_query_execution_id = query_execution_id
+        logger.info(f"Submitted to Athena. QueryExecutionId: {query_execution_id}")
 
-        if state == 'SUCCEEDED':
-            logger.info(f"Athena Query '{query_execution_id}' SUCCEEDED in {elapsed:.2f}s")
-            break
-        elif state in ('FAILED', 'CANCELLED'):
-            reason = status_info.get('StateChangeReason', 'Unknown error')
-            logger.error(f"Athena Query '{query_execution_id}' {state}: {reason}")
-            return {
-                'statusCode': 500 if state == 'FAILED' else 400,
-                'body': json.dumps({
-                    'query_execution_id': query_execution_id,
-                    'status': state,
-                    'query': query_str,
-                    'database': database,
-                    'workgroup': workgroup,
-                    'error_message': reason
-                })
-            }
+        # Polling loop for current statement
+        start_time = time.time()
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > timeout_seconds:
+                try:
+                    client.stop_query_execution(QueryExecutionId=query_execution_id)
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    f"Athena query '{query_execution_id}' (Statement {stmt_idx}) timed out after {timeout_seconds}s."
+                )
 
-        time.sleep(poll_interval)
+            response = client.get_query_execution(QueryExecutionId=query_execution_id)
+            query_execution = response.get('QueryExecution', {})
+            status_info = query_execution.get('Status', {})
+            state = status_info.get('State', 'UNKNOWN')
 
-    # 5. Fetch Query Execution Statistics
-    stats = query_execution.get('Statistics', {})
+            if state == 'SUCCEEDED':
+                logger.info(f"Statement {stmt_idx} ('{query_execution_id}') SUCCEEDED in {elapsed:.2f}s")
+                final_query_execution = query_execution
+                break
+            elif state in ('FAILED', 'CANCELLED'):
+                reason = status_info.get('StateChangeReason', 'Unknown error')
+                logger.error(f"Athena Statement {stmt_idx} ('{query_execution_id}') {state}: {reason}")
+                return {
+                    'statusCode': 500 if state == 'FAILED' else 400,
+                    'body': json.dumps({
+                        'query_execution_id': query_execution_id,
+                        'execution_ids': execution_ids,
+                        'failed_statement_index': stmt_idx,
+                        'total_statements': len(statements),
+                        'status': state,
+                        'query': stmt,
+                        'database': database,
+                        'workgroup': workgroup,
+                        'error_message': reason
+                    })
+                }
+
+            time.sleep(poll_interval)
+
+    # Fetch results for the final statement
+    stats = final_query_execution.get('Statistics', {}) if final_query_execution else {}
     exec_time_ms = stats.get('EngineExecutionTimeInMillis', 0)
     data_scanned_bytes = stats.get('DataScannedInBytes', 0)
     data_scanned_mb = data_scanned_bytes / (1024.0 * 1024.0)
 
-    # 6. Fetch Query Results
     results_paginator = client.get_paginator('get_query_results')
     column_names: List[str] = []
     records: List[Dict[str, Any]] = []
     raw_table_rows: List[List[str]] = []
     is_first_page = True
 
-    paginate_kwargs: Dict[str, Any] = {'QueryExecutionId': query_execution_id}
+    paginate_kwargs: Dict[str, Any] = {'QueryExecutionId': final_query_execution_id}
     if max_results is not None and max_results > 0:
         paginate_kwargs['PaginationConfig'] = {'MaxItems': max_results}
 
@@ -538,7 +922,6 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         start_row_idx = 0
         if is_first_page:
-            # Row 0 contains column names
             column_names = [col.get('VarCharValue', f'col_{idx}') for idx, col in enumerate(rows[0].get('Data', []))]
             start_row_idx = 1
             is_first_page = False
@@ -554,28 +937,25 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             records.append(record_dict)
             raw_table_rows.append(record_values)
 
-    # 7. Format & Print Pretty Table in Lambda Logs
     logger.info("=" * 80)
     logger.info("ATHENA QUERY EXECUTION RESULT SUMMARY")
-    logger.info(f"Query           : {query_str}")
     logger.info(f"Database        : {database}")
     logger.info(f"WorkGroup       : {workgroup}")
-    logger.info(f"Execution ID    : {query_execution_id}")
+    logger.info(f"Execution ID    : {final_query_execution_id}")
+    if len(execution_ids) > 1:
+        logger.info(f"All ExecutionIDs: {', '.join(execution_ids)}")
     logger.info(f"Engine Time     : {exec_time_ms} ms ({exec_time_ms / 1000.0:.2f} s)")
     logger.info(f"Data Scanned    : {data_scanned_bytes:,} bytes ({data_scanned_mb:.4f} MB)")
     logger.info(f"Rows Returned   : {len(records)}" + (f" (capped at {max_results})" if max_results else " (ALL records)"))
     logger.info("-" * 80)
 
     if column_names and (records or raw_table_rows):
-        # 1. Format and display using Pandas DataFrame
         if HAS_PANDAS:
             try:
                 df = pd.DataFrame(records, columns=column_names)
                 if not df.empty:
                     df.index = range(1, len(df) + 1)
                     df.index.name = '#'
-
-                # Configure pandas display settings for full database-style console output
                 pd.set_option('display.max_columns', None)
                 pd.set_option('display.max_rows', None)
                 pd.set_option('display.width', 1000)
@@ -589,7 +969,6 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             except Exception as df_err:
                 logger.warning(f"Failed to render pandas DataFrame: {df_err}")
 
-        # 2. Format and display as SQL Database CLI Table Grid (+-----+-----+)
         logger.info("DATABASE TABLE VIEW:")
         db_table_str = format_as_database_table(
             headers=column_names,
@@ -601,16 +980,14 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     else:
         logger.info("Query returned 0 data rows.")
 
-    logger.info("JSON Records Output:")
-    logger.info(json.dumps(records, indent=2, default=str))
-    logger.info("=" * 80)
-
     return {
         'statusCode': 200,
         'body': json.dumps({
-            'query_execution_id': query_execution_id,
+            'query_execution_id': final_query_execution_id,
+            'execution_ids': execution_ids,
+            'statements_executed': len(statements),
             'status': 'SUCCEEDED',
-            'query': query_str,
+            'query': raw_query_str,
             'database': database,
             'workgroup': workgroup,
             'execution_time_ms': exec_time_ms,
@@ -659,7 +1036,47 @@ def execute_pipeline_stages(event: Dict[str, Any], context: Any) -> Dict[str, An
         stage_event = dict(event)
         stage_event['layer'] = stage
 
-        # Resolve job name for stage
+        # Resolve stage type: crawler or glue job
+        if stage in ('crawler', 'glue_crawler', 'crawl'):
+            stage_crawler_name = resolve_crawler_name(stage_event)
+            logger.info(f"Triggering Glue Crawler for stage '{stage}': '{stage_crawler_name}'")
+            try:
+                glue_client.start_crawler(Name=stage_crawler_name)
+            except ClientError as ce:
+                if ce.response.get('Error', {}).get('Code') == 'CrawlerRunningException':
+                    logger.warning(f"Crawler '{stage_crawler_name}' is already running.")
+                else:
+                    raise
+
+            crawl_res = poll_glue_crawler(
+                crawler_name=stage_crawler_name,
+                poll_interval=poll_interval,
+                timeout_seconds=timeout_seconds
+            )
+            crawl_status = crawl_res['Status']
+            stage_results[stage] = {
+                'crawler_name': stage_crawler_name,
+                'status': crawl_status,
+                'execution_time_seconds': crawl_res.get('ExecutionTimeSeconds', 0),
+                'metrics': crawl_res.get('Metrics', {}),
+                'error_message': crawl_res.get('ErrorMessage')
+            }
+            if crawl_status != 'SUCCEEDED':
+                total_time = int(time.time() - pipeline_start_time)
+                err_msg = crawl_res.get('ErrorMessage') or f"Stage '{stage}' failed."
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({
+                        'status': 'FAILED',
+                        'failed_stage': stage,
+                        'error_message': err_msg,
+                        'total_duration_seconds': total_time,
+                        'stage_results': stage_results
+                    })
+                }
+            logger.info(f"[PIPELINE STAGE {idx}/{len(cleaned_layers)}] Stage '{stage.upper()}' SUCCEEDED in {crawl_res.get('ExecutionTimeSeconds', 0)}s.")
+            continue
+
         if stage == 'bronze':
             stage_job = stage_event.get('bronze_job_name') or DEFAULT_BRONZE_JOB
         elif stage == 'silver':
@@ -667,7 +1084,7 @@ def execute_pipeline_stages(event: Dict[str, Any], context: Any) -> Dict[str, An
         elif stage == 'gold':
             stage_job = stage_event.get('gold_job_name') or DEFAULT_GOLD_JOB
         else:
-            raise ValueError(f"Unknown pipeline stage layer: '{stage}'. Expected 'bronze', 'silver', or 'gold'.")
+            raise ValueError(f"Unknown pipeline stage layer: '{stage}'. Expected 'bronze', 'crawler', 'silver', or 'gold'.")
 
         stage_args = build_glue_arguments(stage_event)
         logger.info(f"Triggering Glue Job for stage '{stage}': '{stage_job}' with args: {json.dumps(stage_args)}")
@@ -751,6 +1168,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if is_athena_query_event(event):
             logger.info("Athena query request detected in payload. Routing to execute_athena_query...")
             return execute_athena_query(event, context)
+
+        # Route 2: Glue Crawler Trigger & Monitoring
+        if is_crawler_event(event):
+            logger.info("Glue Crawler request detected in payload. Routing to trigger_and_monitor_crawler...")
+            return trigger_and_monitor_crawler(event, context)
 
         # Route 2: Multi-Stage Pipeline Execution ("all", "pipeline", "e2e", or layers list)
         layer = str(event.get('layer', 'bronze')).strip().lower()

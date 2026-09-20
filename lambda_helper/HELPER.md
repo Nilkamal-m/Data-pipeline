@@ -14,33 +14,54 @@ The Helper Lambda function provides a unified control plane and execution interf
 
 | Operation | Trigger Indicator | Target Engine | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Athena SQL Query** | `"query"`, `"sql"`, or `"athena_query"` | Amazon Athena v3 | Executes ad-hoc or validation queries against Data Catalog / Iceberg tables with formatted CLI tables in logs. |
+| **Glue Crawler** | `"layer": "crawler"` or `"crawler_name"` | AWS Glue Crawler | Triggers and monitors Glue Crawlers to discover newly ingested S3 partitions & evolve table schemas. |
+| **Athena SQL Query** | `"query"`, `"sql"`, or `"query_file"` | Amazon Athena v3 | Executes multiline queries, SQL files (e.g. `interactions.sql`), or ad-hoc queries with CLI tables in logs. |
 | **Bronze Ingestion** | `"layer": "bronze"` | Glue Python Shell 3.9 | Ingests raw source data from APIs/databases into S3 Bronze partitioned by `_ingested_at=<ISO_TIMESTAMP>`. |
 | **Silver Iceberg ETL** | `"layer": "silver"` | Glue PySpark 4.0 | Deduplicates Bronze raw data, applies audit columns, and merges into Iceberg tables (`tbl_<name>`). |
 | **Gold Serving Marts** | `"layer": "gold"` | Glue PySpark 4.0 | Runs source-specific SQL marts (`bucket/gold/query/<source>/*.sql`) and publishes to shared MySQL with atomic swap. |
-| **End-to-End Pipeline** | `"layer": "all"` or `"layers": [...]` | Multi-Stage Sequential | Sequentially executes `Bronze -> Silver -> Gold` (or `Silver -> Gold`), failing fast if any stage fails. |
+| **End-to-End Pipeline** | `"layer": "all"` or `"layers": [...]` | Multi-Stage Sequential | Sequentially executes stages (e.g. `Bronze -> Crawler -> Silver -> Gold`), failing fast if any stage fails. |
 
 ---
 
 ## 2. Event Payload Parameters Reference
 
-### 2.1 Athena Query Parameters
+### 2.1 Glue Crawler Parameters
 
-If `"query"`, `"athena_query"`, or `"sql"` is provided in the event payload, Lambda routes directly to Athena:
+If `"layer": "crawler"`, `"action": "crawler"`, or `"crawler_name"` is provided, Lambda triggers and monitors an AWS Glue Crawler:
 
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `query` / `sql` | string | **Required** | - | The SQL query string to execute (e.g. `SELECT * FROM tbl_incident LIMIT 10`). |
+| `layer` / `action` | string | Optional | - | Set to `"crawler"`, `"glue_crawler"`, or `"run_crawler"`. |
+| `crawler_name` | string | Optional | `uax-datalake-bronze-crawler-dev` | Name of the Glue Crawler to trigger. |
+| `wait_until_completion` | boolean | Optional | `true` | When `true`, polls until `READY` and reports metrics. When `false`, returns HTTP 202 immediately. |
+| `poll_interval_seconds` | integer | Optional | `5` | Crawler polling interval in seconds. |
+| `timeout_seconds` | integer | Optional | `540` | Maximum wait duration before timeout. |
+
+---
+
+### 2.2 Athena Query & Multiline SQL Parameters
+
+If `"query"`, `"sql"`, `"athena_query"`, or `"query_file"` is provided, Lambda routes directly to Athena. Supports **multiline SQL queries**, **CTE pipelines**, **SQL file references**, and **multi-statement execution**:
+
+| Parameter | Type | Required | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `query` / `sql` | string | Optional* | - | Multiline SQL query string (e.g. `WITH ... SELECT ...`). Trailing semicolons are automatically stripped. |
+| `query_file` / `sql_file` | string | Optional* | - | Path to a local SQL file (e.g. `gold/query/moveworks/interactions.sql`). |
+| `sql_s3_path` / `query_s3_path` | string | Optional* | - | S3 URI to a SQL query (e.g. `s3://<bucket>/gold/query/moveworks/interactions.sql`). |
 | `database` | string | Optional | `uax_datalake_db_dev` | Target AWS Glue Data Catalog database. Optional if query specifies `<db>.<table>`. |
 | `workgroup` | string | Optional | `uax-datalake-workgroup-dev` | Amazon Athena workgroup name. |
-| `output_location` | string | Optional | Workgroup default | S3 bucket path for query results (e.g. `s3://uax-datalake-dev-bucket/athena-results/`). |
+| `output_location` | string | Optional | Workgroup default | S3 bucket path for query results. |
+| `params` / `parameters` | object | Optional | `{}` | Key-value dictionary for template substitution (`${VAR}`, `{VAR}`, `<VAR>`, `:VAR`). |
+| `table_replacements` | object | Optional | `{}` | Dictionary mapping table names (e.g. `{"tbl_interactions": "raw_tbl_interactions"}`). |
 | `max_results` | integer | Optional | `None` (All records) | Maximum rows to retrieve and print. Defaults to `null` to return **ALL** records. |
 | `timeout_seconds` | integer | Optional | `120` | Query polling timeout in seconds before cancellation. |
 | `poll_interval_seconds` | number | Optional | `1.0` | Athena status check polling interval in seconds. |
 
+*\*At least one of `query`, `sql`, `query_file`, or `sql_s3_path` must be provided.*
+
 ---
 
-### 2.2 Glue Job & Pipeline Parameters (Bronze, Silver, Gold, All)
+### 2.3 Glue Job & Pipeline Parameters (Bronze, Silver, Gold, All)
 
 | Parameter | Type | Applicable Layers | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -72,7 +93,7 @@ If `"query"`, `"athena_query"`, or `"sql"` is provided in the event payload, Lam
 
 ### A. Bronze Layer Ingestion Payloads (`layer: "bronze"`)
 
-#### 1. Single Table Bronze Ingestion (`incident`)
+#### 1. Single Table Ingestion (ServiceNow `incident`)
 ```json
 {
   "layer": "bronze",
@@ -82,7 +103,19 @@ If `"query"`, `"athena_query"`, or `"sql"` is provided in the event payload, Lam
 }
 ```
 
-#### 2. Multi-Table Bronze Ingestion (`["incident", "sys_user"]`)
+#### 2. Moveworks Full Initial Historical Ingestion (`interactions`)
+Extracts 100% of historical data using cursor pagination via `@odata.nextLink`:
+```json
+{
+  "layer": "bronze",
+  "source_system": "moveworks",
+  "source_table_name": "interactions",
+  "initial_load_date": "1900-01-01 00:00:00",
+  "wait_until_completion": true
+}
+```
+
+#### 3. Multi-Table Ingestion (`["incident", "sys_user"]`)
 ```json
 {
   "layer": "bronze",
@@ -92,13 +125,14 @@ If `"query"`, `"athena_query"`, or `"sql"` is provided in the event payload, Lam
 }
 ```
 
-#### 3. Delta Ingestion with Custom Load Date
+#### 4. Incremental Delta Ingestion with Custom Watermark Window
 ```json
 {
   "layer": "bronze",
   "source_system": "servicenow",
   "source_table_name": "incident",
-  "initial_load_date": "2026-01-01T00:00:00Z",
+  "initial_load_date": "2026-01-01 00:00:00",
+  "upper_bound": "2026-06-01 00:00:00",
   "wait_until_completion": true
 }
 ```
@@ -107,7 +141,7 @@ If `"query"`, `"athena_query"`, or `"sql"` is provided in the event payload, Lam
 
 ### B. Silver Layer Iceberg ETL Payloads (`layer: "silver"`)
 
-#### 4. Incremental Silver Iceberg ETL (`raw_tbl_incident`)
+#### 5. Incremental Silver Iceberg ETL (`raw_tbl_incident`)
 ```json
 {
   "layer": "silver",
@@ -118,7 +152,18 @@ If `"query"`, `"athena_query"`, or `"sql"` is provided in the event payload, Lam
 }
 ```
 
-#### 5. Full Historical Refresh
+#### 6. Moveworks Silver Cleanse with Custom Transform (`raw_tbl_interactions`)
+Applies illegal character removal and Moveworks domain/entity mapping:
+```json
+{
+  "layer": "silver",
+  "source_system": "moveworks",
+  "source_table_name": "raw_tbl_interactions",
+  "wait_until_completion": true
+}
+```
+
+#### 7. Full Historical Refresh (Ignore Watermark)
 ```json
 {
   "layer": "silver",
@@ -129,12 +174,12 @@ If `"query"`, `"athena_query"`, or `"sql"` is provided in the event payload, Lam
 }
 ```
 
-#### 6. Multi-Table Silver ETL
+#### 8. Multi-Table Silver Batch Ingestion
 ```json
 {
   "layer": "silver",
-  "source_system": "servicenow",
-  "source_table_name": ["raw_tbl_incident", "raw_tbl_sys_user"],
+  "source_system": "moveworks",
+  "source_table_name": ["raw_tbl_interactions", "raw_tbl_conversations", "raw_tbl_plugin_calls", "raw_tbl_users"],
   "wait_until_completion": true
 }
 ```
@@ -143,7 +188,7 @@ If `"query"`, `"athena_query"`, or `"sql"` is provided in the event payload, Lam
 
 ### C. Gold Serving Mart Payloads (`layer: "gold"`)
 
-#### 7. Gold Serving Execution with AWS Secrets Manager
+#### 9. Gold Serving Execution with AWS Secrets Manager
 Executes `s3://<bucket>/gold/query/servicenow/*.sql` and publishes into the MySQL schema using credentials from Secrets Manager.
 ```json
 {
@@ -155,7 +200,7 @@ Executes `s3://<bucket>/gold/query/servicenow/*.sql` and publishes into the MySQ
 }
 ```
 
-#### 8. Gold Serving Execution with Manual Password Override
+#### 10. Gold Serving Execution with Manual Password Override
 ```json
 {
   "layer": "gold",
@@ -167,15 +212,16 @@ Executes `s3://<bucket>/gold/query/servicenow/*.sql` and publishes into the MySQ
 }
 ```
 
-#### 9. Gold Serving with Custom Query Path & Connection
+#### 11. Gold Serving with Custom Query Path & Connection
 ```json
 {
   "layer": "gold",
-  "source_system": "servicenow",
+  "source_system": "moveworks",
   "gold_schema": "enterprise_reporting",
   "rds_secret_name": "prod/rds/mysql_credentials",
-  "gold_query_s3_path": "s3://uax-datalake-dev-bucket/gold/query/servicenow/incident_kpi.sql",
-  "connection_name": "uax-datalake-rds-connection-dev"
+  "gold_query_s3_path": "s3://uax-datalake-dev-bucket/gold/query/moveworks/interactions.sql",
+  "connection_name": "uax-datalake-rds-connection-dev",
+  "wait_until_completion": true
 }
 ```
 
@@ -183,8 +229,7 @@ Executes `s3://<bucket>/gold/query/servicenow/*.sql` and publishes into the MySQ
 
 ### D. End-to-End Multi-Stage Pipeline Payloads ("Run All")
 
-#### 10. Run All: Bronze $\rightarrow$ Silver $\rightarrow$ Gold Sequentially
-Executes Bronze Ingestion, then Silver Iceberg ETL, then Gold Marts publishing in sequence. Halts immediately if any stage fails.
+#### 12. Run All: Bronze $\rightarrow$ Silver $\rightarrow$ Gold Sequentially
 ```json
 {
   "layer": "all",
@@ -197,7 +242,7 @@ Executes Bronze Ingestion, then Silver Iceberg ETL, then Gold Marts publishing i
 }
 ```
 
-#### 11. Run Pipeline: Silver $\rightarrow$ Gold Only (`skip_bronze: true`)
+#### 13. Run Pipeline: Silver $\rightarrow$ Gold Only (`skip_bronze: true`)
 ```json
 {
   "layer": "all",
@@ -209,65 +254,138 @@ Executes Bronze Ingestion, then Silver Iceberg ETL, then Gold Marts publishing i
 }
 ```
 
-#### 12. Run Pipeline with Explicit Custom Stages (`layers: [...]`)
+#### 14. Full Pipeline with Catalog Crawler Chaining (`Bronze -> Crawler -> Silver -> Gold`)
+Discovers new Bronze partitions & newly evolved Parquet columns before Silver runs:
 ```json
 {
-  "layers": ["silver", "gold"],
-  "source_system": "servicenow",
-  "source_table_name": "raw_tbl_incident",
+  "layers": ["bronze", "crawler", "silver", "gold"],
+  "source_system": "moveworks",
+  "crawler_name": "uax-datalake-bronze-crawler-dev",
   "gold_schema": "enterprise_reporting",
   "rds_secret_name": "prod/rds/mysql_credentials"
 }
 ```
 
+#### 15. Custom Pipeline Stages (`Crawler -> Silver`)
+```json
+{
+  "layers": ["crawler", "silver"],
+  "source_system": "moveworks",
+  "crawler_name": "uax-datalake-bronze-crawler-dev",
+  "source_table_name": "raw_tbl_interactions"
+}
+```
+
 ---
 
-### E. Athena SQL Query Payloads (`"query"`)
+### E. AWS Glue Crawler Payloads (`layer: "crawler"`)
 
-#### 13. Inspect Available Data Catalog Tables
+#### 16. Trigger Bronze Data Catalog Crawler (Synchronous with Metrics)
+```json
+{
+  "layer": "crawler",
+  "crawler_name": "uax-datalake-bronze-crawler-dev",
+  "wait_until_completion": true,
+  "poll_interval_seconds": 5
+}
+```
+
+#### 17. Trigger Crawler Asynchronously (Fire-and-Forget)
+```json
+{
+  "layer": "crawler",
+  "crawler_name": "uax-datalake-bronze-crawler-dev",
+  "wait_until_completion": false
+}
+```
+
+#### 18. Trigger Source-Specific Crawler by `source_system`
+```json
+{
+  "layer": "crawler",
+  "source_system": "moveworks"
+}
+```
+
+---
+
+### F. Athena Multiline SQL & File Query Payloads (`"query"` / `"query_file"`)
+
+#### 19. Execute Moveworks Gold Query File (`interactions.sql`)
+Executes the full multiline Gold aggregation query from the repository:
+```json
+{
+  "query_file": "gold/query/moveworks/interactions.sql",
+  "database": "uax_datalake_db_dev",
+  "table_replacements": {
+    "tbl_interactions": "silver_tbl_moveworks_interactions",
+    "tbl_conversations": "silver_tbl_moveworks_conversations",
+    "tbl_plugin_calls": "silver_tbl_moveworks_plugin_calls",
+    "tbl_plugin_resources": "silver_tbl_moveworks_plugin_resources",
+    "tbl_users": "silver_tbl_moveworks_users"
+  }
+}
+```
+
+#### 20. Execute SQL Query Directly from S3 URI with Dynamic Parameters
+```json
+{
+  "sql_s3_path": "s3://uax-datalake-dev-bucket/gold/query/moveworks/interactions.sql",
+  "database": "uax_datalake_db_dev",
+  "params": {
+    "start_time": "2025-07-15 00:00:00.000 UTC",
+    "end_time": "2025-07-15 23:59:59.999 UTC"
+  }
+}
+```
+
+#### 21. Execute Multiline CTE Query with Active Record Filtering
+```json
+{
+  "query": "WITH conversation_topics AS (\n    SELECT conversation_id, ARRAY_JOIN(ARRAY_AGG(DISTINCT detail_entity), ', ') AS conversation_topic\n    FROM raw_tbl_interactions\n    WHERE _is_current = 'Y' AND _is_deleted = 'N' AND detail_entity IS NOT NULL\n    GROUP BY conversation_id\n)\nSELECT ui.id, ui.detail_content, ct.conversation_topic\nFROM raw_tbl_interactions ui\nLEFT JOIN conversation_topics ct ON ui.conversation_id = ct.conversation_id\nWHERE ui.actor = 'user' AND ui._is_current = 'Y' AND ui._is_deleted = 'N'\nLIMIT 10;",
+  "database": "uax_datalake_db_dev",
+  "max_results": 10
+}
+```
+
+#### 22. Inspect Available Data Catalog Tables
 ```json
 {
   "query": "SHOW TABLES IN uax_datalake_db_dev"
 }
 ```
 
-#### 14. Query Bronze Raw Data Table (`raw_tbl_incident`)
+#### 23. Query Bronze Raw Data Table with Flattened Nested Columns
 ```json
 {
-  "query": "SELECT sys_id, number, priority, state, _ingested_at FROM raw_tbl_incident ORDER BY _ingested_at DESC LIMIT 10",
+  "query": "SELECT id, detail_content, detail_domain, detail_entity, detail_platform_name, _ingested_at FROM raw_tbl_interactions WHERE _is_current = 'Y' LIMIT 10",
   "database": "uax_datalake_db_dev",
   "max_results": 10
 }
 ```
 
-#### 15. Query Silver Iceberg Table (`tbl_incident`)
+#### 24. Query Silver Iceberg Table with Active SCD Flags
 ```json
 {
-  "query": "SELECT incident_number, priority, state, _is_current, _valid_from, _updated_at FROM tbl_incident WHERE _is_current = 'Y' LIMIT 10",
+  "query": "SELECT id, detail_content, detail_domain, detail_entity, _is_current, _valid_from, _updated_at FROM tbl_interactions WHERE _is_current = 'Y' AND _is_deleted = 'N' LIMIT 10",
   "database": "uax_datalake_db_dev",
   "max_results": 10
 }
 ```
 
-#### 16. Compare Bronze Raw Counts vs. Silver Iceberg Current Counts
+#### 25. Compare Bronze Raw Counts vs. Silver Iceberg Current Counts
 ```json
 {
-  "query": "SELECT 'bronze_raw' AS layer, COUNT(*) AS cnt FROM raw_tbl_incident UNION ALL SELECT 'silver_current' AS layer, COUNT(*) AS cnt FROM tbl_incident WHERE _is_current = 'Y'",
+  "query": "SELECT 'bronze_raw' AS layer, COUNT(*) AS cnt FROM raw_tbl_interactions UNION ALL SELECT 'silver_current' AS layer, COUNT(*) AS cnt FROM tbl_interactions WHERE _is_current = 'Y' AND _is_deleted = 'N'",
   "database": "uax_datalake_db_dev"
 }
 ```
 
-#### 17. Inspect High-Watermark Progress Table (`tbl_watermarks`)
+#### 26. Inspect High-Watermark Progress Table (`raw_tbl_watermarks`)
 ```json
 {
-  "query": "SELECT source_system, table_name, last_watermark, updated_at FROM tbl_watermarks ORDER BY updated_at DESC"
-}
-```
-
-#### 18. Ad-Hoc Analytical Mart Validation Query
-```json
-{
-  "query": "SELECT priority, state, count(*) AS total_incidents, AVG(CAST(reassignment_count AS double)) AS avg_reassignments FROM tbl_incident WHERE _is_current = 'Y' GROUP BY priority, state ORDER BY priority, state"
+  "query": "SELECT source_system, table_name, last_load_date, last_status, records_ingested, updated_at FROM raw_tbl_watermarks ORDER BY updated_at DESC",
+  "database": "uax_datalake_db_dev"
 }
 ```
 
