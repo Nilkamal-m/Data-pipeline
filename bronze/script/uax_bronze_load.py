@@ -218,9 +218,14 @@ def parse_arguments() -> dict:
     logger.info(f"Target deployment environment resolved: '{env}'")
 
     config_s3_path = get_cli_arg('CONFIG_S3_PATH')
+    if not config_s3_path:
+        bucket_hint = get_cli_arg('BRONZE_BUCKET', 'STATE_BUCKET') or f"uax-datalake-{env}-bucket"
+        clean_bucket = bucket_hint.replace('{env}', env).replace('{ENV}', env)
+        config_s3_path = f"s3://{clean_bucket}/bronze/script/config/bronze_config.json"
 
     # Load centralized Bronze configuration with dynamic {env} interpolation
     full_config = ConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client, env=env)
+    ConfigLoader.set_loaded_config(full_config, env=env)
     pipeline_defaults = ConfigLoader.get_pipeline_defaults(full_config, env=env)
     source_config = ConfigLoader.get_source_config(source_system_clean, full_config, env=env)
 

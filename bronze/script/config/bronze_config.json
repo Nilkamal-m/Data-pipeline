@@ -116,6 +116,14 @@
           "initial_load_date": "2024-01-01 00:00:00",
           "upper_bound": ""
         },
+        "plugin_cells": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "plugin_resources": {
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
         "users": {
           "initial_load_date": "2024-01-01 00:00:00",
           "upper_bound": ""

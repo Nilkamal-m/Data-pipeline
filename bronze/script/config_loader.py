@@ -22,11 +22,24 @@ class ConfigLoader:
     Centralized Configuration Loader supporting custom tables, table-specific load dates, and query overrides.
     """
     _config_cache: Dict[str, Dict[str, Any]] = {}
+    _latest_config: Optional[Dict[str, Any]] = None
+    _cached_s3_path: Optional[str] = None
+    _cached_s3_client: Optional[Any] = None
 
     @classmethod
     def clear_cache(cls) -> None:
         """Clears cached configuration (useful for testing or runtime environment switches)."""
         cls._config_cache.clear()
+        cls._latest_config = None
+        cls._cached_s3_path = None
+        cls._cached_s3_client = None
+
+    @classmethod
+    def set_loaded_config(cls, config_dict: Dict[str, Any], env: Optional[str] = None) -> None:
+        """Explicitly registers a loaded config into the cache to guarantee all subsequent calls reuse it."""
+        effective_env = (env or 'dev').strip().lower()
+        cls._config_cache[effective_env] = config_dict
+        cls._latest_config = config_dict
 
     @classmethod
     def interpolate_env(cls, obj: Any, env: str) -> Any:
@@ -58,48 +71,112 @@ class ConfigLoader:
     ) -> Dict[str, Any]:
         """
         Loads the centralized Bronze configuration JSON file and dynamically interpolates all {env} placeholders.
+        Implements multi-tiered caching so any subsequent call in the same runtime immediately reuses the loaded config.
         """
         effective_env = (env or os.environ.get('ENV') or os.environ.get('ENVIRONMENT') or 'dev').strip().lower()
-        cache_key = f"{config_s3_path or 'local'}:{effective_env}"
 
+        # Remember S3 parameters if provided
+        if config_s3_path and str(config_s3_path).strip():
+            cls._cached_s3_path = str(config_s3_path).strip()
+        if s3_client:
+            cls._cached_s3_client = s3_client
+
+        # 1. Exact match by cache key
+        cache_key = f"{config_s3_path or 'local'}:{effective_env}"
         if cache_key in cls._config_cache:
             return cls._config_cache[cache_key]
 
+        # 2. When called without explicit S3 path, reuse cached config for this specific env
+        if not config_s3_path and effective_env in cls._config_cache:
+            return cls._config_cache[effective_env]
+
+        # 3. Determine effective S3 path and S3 client
+        target_s3_path = config_s3_path or cls._cached_s3_path or os.environ.get('CONFIG_S3_PATH')
+        target_client = s3_client or cls._cached_s3_client
+
         raw_config: Optional[Dict[str, Any]] = None
 
-        if config_s3_path and config_s3_path.startswith("s3://") and s3_client:
-            try:
-                path_parts = config_s3_path.replace("s3://", "").split("/", 1)
-                bucket_name, object_key = path_parts[0], path_parts[1]
-                logger.info(f"Loading Bronze configuration from S3: '{config_s3_path}'")
-                response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
-                content = response['Body'].read().decode('utf-8')
-                raw_config = json.loads(content)
-            except Exception as err:
-                logger.warning(f"Failed to load config from S3 path '{config_s3_path}': {err}. Falling back to local config.")
+        if target_s3_path and str(target_s3_path).startswith("s3://"):
+            if target_client is None:
+                try:
+                    import boto3
+                    target_client = boto3.client('s3')
+                    cls._cached_s3_client = target_client
+                except Exception as b3_err:
+                    logger.warning(f"Could not initialize boto3 S3 client: {b3_err}")
 
+            if target_client:
+                try:
+                    path_parts = str(target_s3_path).replace("s3://", "").split("/", 1)
+                    bucket_name, object_key = path_parts[0], path_parts[1]
+                    logger.info(f"Loading Bronze configuration from S3: '{target_s3_path}'")
+                    response = target_client.get_object(Bucket=bucket_name, Key=object_key)
+                    content = response['Body'].read().decode('utf-8')
+                    raw_config = json.loads(content)
+                except Exception as err:
+                    logger.warning(f"Failed to load config from S3 path '{target_s3_path}': {err}. Falling back to local config search.")
+
+        # 4. Search exhaustive local paths
         if raw_config is None:
             current_dir = os.path.dirname(os.path.abspath(__file__))
+            cwd = os.getcwd()
             possible_paths = [
                 os.path.join(current_dir, "config", "bronze_config.json"),
+                os.path.join(current_dir, "bronze_config.json"),
+                os.path.join(cwd, "bronze_config.json"),
+                os.path.join(cwd, "config", "bronze_config.json"),
+                os.path.join(cwd, "bronze", "script", "config", "bronze_config.json"),
+                os.path.join("/tmp", "bronze_config.json"),
+                os.path.join("/tmp", "config", "bronze_config.json"),
                 "bronze/script/config/bronze_config.json",
-                "glue_jobs/bronze/config/bronze_config.json"
+                "glue_jobs/bronze/config/bronze_config.json",
+                "config/bronze_config.json",
+                "bronze_config.json"
             ]
 
             for path in possible_paths:
                 if os.path.exists(path):
                     logger.info(f"Loading Bronze configuration from local file: '{path}' (environment: '{effective_env}')")
-                    with open(path, "r", encoding="utf-8") as f:
-                        raw_config = json.load(f)
-                        break
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            raw_config = json.load(f)
+                            break
+                    except Exception as read_err:
+                        logger.warning(f"Failed reading local config at '{path}': {read_err}")
+
+        # 5. Fallback: try standard data lake bucket path if running in Glue
+        if raw_config is None:
+            fallback_bucket = os.environ.get('BRONZE_BUCKET') or f"uax-datalake-{effective_env}-bucket"
+            fallback_s3_path = f"s3://{fallback_bucket}/bronze/script/config/bronze_config.json"
+            if target_client is None:
+                try:
+                    import boto3
+                    target_client = boto3.client('s3')
+                    cls._cached_s3_client = target_client
+                except Exception:
+                    pass
+            if target_client:
+                try:
+                    logger.info(f"Attempting fallback S3 config lookup at '{fallback_s3_path}'...")
+                    path_parts = fallback_s3_path.replace("s3://", "").split("/", 1)
+                    response = target_client.get_object(Bucket=path_parts[0], Key=path_parts[1])
+                    raw_config = json.loads(response['Body'].read().decode('utf-8'))
+                    cls._cached_s3_path = fallback_s3_path
+                except Exception:
+                    pass
 
         if raw_config is None:
-            logger.error("Bronze configuration file 'bronze_config.json' not found.")
+            if cls._latest_config is not None:
+                logger.warning("Config not found at new location; reusing previously loaded configuration from memory.")
+                return cls._latest_config
+            logger.error("Bronze configuration file 'bronze_config.json' not found in S3 or local paths.")
             raise FileNotFoundError("Bronze configuration file 'bronze_config.json' not found.")
 
         # Interpolate {env} and {ENV} throughout the entire config tree
         interpolated = cls.interpolate_env(raw_config, effective_env)
         cls._config_cache[cache_key] = interpolated
+        cls._config_cache[effective_env] = interpolated
+        cls._latest_config = interpolated
         return interpolated
 
     @classmethod
@@ -112,7 +189,7 @@ class ConfigLoader:
         """
         Retrieves configuration for a specific source system.
         """
-        config = config_dict or cls.load_config(env=env)
+        config = config_dict or cls._latest_config or cls.load_config(env=env)
         sources = config.get("source_systems", {})
         source_key = source_system.strip().lower()
 
@@ -205,7 +282,7 @@ class ConfigLoader:
             return matched_date
 
         # 4. Check global default_initial_load_date in bronze_config.json defaults
-        global_default = cls.get_default_setting("default_initial_load_date", None)
+        global_default = cls.get_default_setting("default_initial_load_date", None, config_dict=cls._latest_config)
         if global_default and str(global_default).strip():
             logger.info(f"Using global initial_load_date for table '{table_clean}': {global_default.strip()}")
             return global_default.strip()
@@ -271,7 +348,7 @@ class ConfigLoader:
             return str(source_ub).strip()
 
         # 5. Check global pipeline_defaults.upper_bound in bronze_config.json
-        global_ub = cls.get_default_setting("upper_bound", None)
+        global_ub = cls.get_default_setting("upper_bound", None, config_dict=cls._latest_config)
         if global_ub and str(global_ub).strip():
             logger.info(f"Using global pipeline_defaults upper_bound for table '{table_clean}': {str(global_ub).strip()}")
             return str(global_ub).strip()
@@ -479,7 +556,9 @@ class ConfigLoader:
     @classmethod
     def get_pipeline_defaults(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> Dict[str, Any]:
         """Retrieves pipeline default settings."""
-        config = config_dict or cls.load_config(env=env)
+        if config_dict and "pipeline_defaults" in config_dict:
+            return config_dict.get("pipeline_defaults", {})
+        config = config_dict or cls._latest_config or cls.load_config(env=env)
         return config.get("pipeline_defaults", {})
 
     @classmethod
@@ -491,13 +570,15 @@ class ConfigLoader:
         env: Optional[str] = None
     ) -> Any:
         """Retrieves a specific setting from pipeline_defaults with fallback."""
-        defaults = cls.get_pipeline_defaults(config_dict, env=env)
+        cfg = config_dict or cls._latest_config
+        defaults = cls.get_pipeline_defaults(cfg, env=env)
         return defaults.get(key, fallback_value)
 
     @classmethod
     def get_glue_catalog_config(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> Dict[str, Any]:
         """Retrieves glue_catalog configuration from pipeline_defaults."""
-        defaults = cls.get_pipeline_defaults(config_dict, env=env)
+        cfg = config_dict or cls._latest_config
+        defaults = cls.get_pipeline_defaults(cfg, env=env)
         return defaults.get("glue_catalog", {})
 
     @classmethod
