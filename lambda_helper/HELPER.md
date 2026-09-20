@@ -392,26 +392,52 @@ Executes the full multiline Gold aggregation query from the repository:
 
 ---
 
-### G. AWS Glue Data Catalog Schema Maintenance (`action: "fix_catalog_table"`)
+### G. S3 Parquet File Column Deletion & AWS Glue Data Catalog Synchronization
 
-#### 27. Remove Duplicate Partition Column from Catalog StorageDescriptor (`raw_tbl_interactions`)
-> **Use Case**: Fixes existing tables where `_ingested_at` was written into both `StorageDescriptor.Columns` and `PartitionKeys` by a crawler. Updates the Glue Catalog in-place in 2 seconds with **zero data movement, zero rewrites, and zero data loss in S3**:
+#### 27. Delete Column Entirely from S3 Parquet Files & Glue Data Catalog (Recommended)
+> **Use Case**: Eliminates the extra `_ingested_at` column entirely from the physical `.parquet` files in S3 across all partitions, and removes it from `StorageDescriptor.Columns` in the Glue Data Catalog. Even if an AWS Glue Crawler runs again, it discovers NO `_ingested_at` inside the Parquet files!
 ```json
 {
-  "action": "fix_catalog_table",
+  "action": "delete_from_parquet",
   "database": "uax_datalake_db_dev",
   "table": "raw_tbl_interactions",
-  "exclude_columns": ["_ingested_at"]
+  "column_name": "_ingested_at"
+}
+```
+*Also accepted as `action: "delete_column"` (by default deletes from both S3 Parquet files and Glue Catalog unless `"catalog_only": true` is passed).*
+
+#### 28. Delete Column by Explicit S3 Path & Table
+> **Use Case**: When you want to explicitly target an S3 prefix or execute a dry-run check:
+```json
+{
+  "action": "delete_from_parquet",
+  "database": "uax_datalake_db_dev",
+  "table": "raw_tbl_interactions",
+  "s3_path": "s3://uax-datalake-bronze-bucket-dev/bronze/data/moveworks/interactions/",
+  "column_name": "_ingested_at"
 }
 ```
 
-#### 28. Run via Standalone CLI Script or AWS CloudShell
-```bash
-# Run locally or in CloudShell:
-python bronze/script/fix_catalog_schema.py \
-  --database uax_datalake_db_dev \
-  --table raw_tbl_interactions \
-  --exclude _ingested_at
+#### 29. Fast Catalog-Only Fix (Zero S3 I/O)
+> **Use Case**: Only removes the column from the AWS Glue Data Catalog table schema without touching S3 files:
+```json
+{
+  "action": "delete_column",
+  "database": "uax_datalake_db_dev",
+  "table": "raw_tbl_interactions",
+  "column_name": "_ingested_at",
+  "catalog_only": true
+}
+```
+
+#### 30. Rewrite Table to Clean Parquet Files via Athena CTAS from Lambda
+> **Use Case**: Alternative serverless rewrite using Athena CTAS if PyArrow layer is not yet attached to Lambda:
+```json
+{
+  "layer": "athena",
+  "database": "uax_datalake_db_dev",
+  "query": "CREATE TABLE uax_datalake_db_dev.raw_tbl_interactions_clean WITH (format = 'PARQUET', parquet_compression = 'SNAPPY', external_location = 's3://uax-datalake-bronze-bucket-dev/bronze/data/moveworks/interactions_clean/', partitioned_by = ARRAY['_ingested_at']) AS SELECT * FROM uax_datalake_db_dev.raw_tbl_interactions"
+}
 ```
 
 ---

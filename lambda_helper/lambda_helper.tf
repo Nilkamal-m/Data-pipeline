@@ -30,6 +30,12 @@ variable "use_existing_glue_role" {
   description = "If true, reuses the existing AWS Glue execution role ARN."
 }
 
+variable "pandas_layer_arn" {
+  type        = string
+  default     = ""
+  description = "Optional ARN for AWS SDK for Pandas (AWSSDKPandas) Lambda layer containing pyarrow and pandas. When left empty, defaults to the official AWS managed layer for python3.9 in the target region."
+}
+
 # ------------------------------------------------------------------------------
 # 1. IAM Execution Role for Helper Lambda (Or Reuse Glue Role)
 # ------------------------------------------------------------------------------
@@ -100,11 +106,24 @@ resource "aws_iam_policy" "lambda_glue_trigger_policy" {
         Effect = "Allow"
         Action = [
           "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
           "s3:ListBucket"
         ]
         Resource = [
           "arn:aws:s3:::*"
         ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "athena:StartQueryExecution",
+          "athena:GetQueryExecution",
+          "athena:GetQueryResults",
+          "athena:StopQueryExecution",
+          "athena:GetWorkGroup"
+        ]
+        Resource = "*"
       },
       {
         Effect = "Allow"
@@ -153,7 +172,13 @@ resource "aws_lambda_function" "glue_trigger_lambda" {
   handler          = "lambda_function.lambda_handler"
   runtime          = "python3.9"
   timeout          = 900  # 15 minutes max timeout for synchronous polling
-  memory_size      = 256
+  memory_size      = 2048
+
+  # Attach AWS managed AWSSDKPandas layer (contains PyArrow, Pandas, AWS Wrangler)
+  # Maintained by AWS SDK team across all standard AWS commercial regions
+  layers = [
+    var.pandas_layer_arn != "" ? var.pandas_layer_arn : "arn:aws:lambda:${var.aws_region}:336392948345:layer:AWSSDKPandas-Python39:26"
+  ]
 
   environment {
     variables = {

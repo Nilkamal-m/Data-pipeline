@@ -1652,41 +1652,8 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         self.assertIn("_source_system", deserialized[0])
         self.assertNotIn("_ingested_at", deserialized[0])
 
-    def test_fix_glue_catalog_table_standalone_script(self):
-        """Validates standalone fix_glue_catalog_table removes _ingested_at from Columns."""
-        from fix_catalog_schema import fix_glue_catalog_table
-        mock_glue = MagicMock()
-        mock_glue.get_table.return_value = {
-            'Table': {
-                'Name': 'raw_tbl_interactions',
-                'DatabaseName': 'uax_datalake_db_dev',
-                'PartitionKeys': [{'Name': '_ingested_at', 'Type': 'string'}],
-                'StorageDescriptor': {
-                    'Columns': [
-                        {'Name': 'id', 'Type': 'string'},
-                        {'Name': '_ingested_at', 'Type': 'string'},
-                        {'Name': '_source_system', 'Type': 'string'}
-                    ]
-                }
-            }
-        }
-        res = fix_glue_catalog_table(
-            database_name='uax_datalake_db_dev',
-            table_name='raw_tbl_interactions',
-            exclude_columns=['_ingested_at'],
-            glue_client=mock_glue
-        )
-        self.assertEqual(res['status'], 'SUCCEEDED')
-        self.assertEqual(res['removed_columns'], ['_ingested_at'])
-        self.assertEqual(res['remaining_columns_count'], 2)
-        mock_glue.update_table.assert_called_once()
-        table_input = mock_glue.update_table.call_args[1]['TableInput']
-        cols = [c['Name'] for c in table_input['StorageDescriptor']['Columns']]
-        self.assertNotIn('_ingested_at', cols)
-        self.assertIn('id', cols)
-
     def test_lambda_fix_catalog_columns_event_routing(self):
-        """Validates that Lambda routes catalog maintenance events properly."""
+        """Validates that Lambda routes catalog maintenance events properly and deletes extra columns."""
         from lambda_function import is_catalog_maintenance_event, lambda_handler
         event = {
             "action": "fix_catalog_table",
@@ -1713,7 +1680,112 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
             self.assertEqual(resp['statusCode'], 200)
             body = json.loads(resp['body'])
             self.assertEqual(body['status'], 'SUCCEEDED')
-            self.assertIn('_ingested_at', body['removed_columns'])
+            self.assertIn('_ingested_at', body['deleted_columns'])
+            mock_glue.update_table.assert_called_once()
+            table_input = mock_glue.update_table.call_args[1]['TableInput']
+            cols = [c['Name'] for c in table_input['StorageDescriptor']['Columns']]
+            self.assertNotIn('_ingested_at', cols)
+
+    def test_lambda_delete_column_action(self):
+        """Validates that Lambda handles action='delete_column' with 'column_name'."""
+        from lambda_function import is_catalog_maintenance_event, lambda_handler
+        event = {
+            "action": "delete_column",
+            "database": "uax_datalake_db_dev",
+            "table": "raw_tbl_interactions",
+            "column_name": "_ingested_at"
+        }
+        self.assertTrue(is_catalog_maintenance_event(event))
+
+        with patch('lambda_function.glue_client') as mock_glue:
+            mock_glue.get_table.return_value = {
+                'Table': {
+                    'Name': 'raw_tbl_interactions',
+                    'PartitionKeys': [{'Name': '_ingested_at', 'Type': 'string'}],
+                    'StorageDescriptor': {
+                        'Columns': [
+                            {'Name': 'id', 'Type': 'string'},
+                            {'Name': '_ingested_at', 'Type': 'string'}
+                        ]
+                    }
+                }
+            }
+            resp = lambda_handler(event, None)
+            self.assertEqual(resp['statusCode'], 200)
+            body = json.loads(resp['body'])
+            self.assertEqual(body['status'], 'SUCCEEDED')
+            self.assertIn('_ingested_at', body['deleted_columns'])
+
+    def test_lambda_delete_from_parquet_and_catalog(self):
+        """Validates that Lambda rewrites S3 Parquet files to drop columns entirely and syncs catalog."""
+        from lambda_function import is_catalog_maintenance_event, lambda_handler
+        import sys
+
+        event = {
+            "action": "delete_from_parquet",
+            "database": "uax_datalake_db_dev",
+            "table": "raw_tbl_interactions",
+            "column_name": "_ingested_at",
+            "s3_path": "s3://test-bucket/bronze/data/moveworks/interactions/"
+        }
+        self.assertTrue(is_catalog_maintenance_event(event))
+
+        # Mock PyArrow Table
+        mock_arrow_table = MagicMock()
+        mock_arrow_table.column_names = ['id', 'session_id', '_ingested_at']
+        mock_cleaned_table = MagicMock()
+        mock_arrow_table.drop.return_value = mock_cleaned_table
+        mock_arrow_table.__len__.return_value = 500
+
+        mock_pq = MagicMock()
+        mock_pq.read_table.return_value = mock_arrow_table
+
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {'Contents': [{'Key': 'bronze/data/moveworks/interactions/_ingested_at=2026-09-20-00-00-00/part-0.parquet'}]}
+        ]
+
+        mock_pyarrow = MagicMock()
+        mock_pyarrow.parquet = mock_pq
+
+        with patch('lambda_function.glue_client') as mock_glue, \
+             patch('lambda_function.s3_client') as mock_s3, \
+             patch.dict(sys.modules, {'pyarrow': mock_pyarrow, 'pyarrow.parquet': mock_pq}):
+
+            mock_glue.get_table.return_value = {
+                'Table': {
+                    'Name': 'raw_tbl_interactions',
+                    'PartitionKeys': [{'Name': '_ingested_at', 'Type': 'string'}],
+                    'StorageDescriptor': {
+                        'Location': 's3://test-bucket/bronze/data/moveworks/interactions/',
+                        'Columns': [
+                            {'Name': 'id', 'Type': 'string'},
+                            {'Name': '_ingested_at', 'Type': 'string'}
+                        ]
+                    }
+                }
+            }
+            mock_s3.get_paginator.return_value = mock_paginator
+            mock_s3.get_object.return_value = {'Body': MagicMock(read=lambda: b'PARQUET_BYTES')}
+
+            resp = lambda_handler(event, None)
+            self.assertEqual(resp['statusCode'], 200)
+            body = json.loads(resp['body'])
+
+            self.assertEqual(body['status'], 'SUCCEEDED')
+            self.assertIn('_ingested_at', body['deleted_columns'])
+
+            # Verify Parquet rewrite occurred
+            parquet_res = body['parquet_sanitization']
+            self.assertEqual(parquet_res['status'], 'SUCCEEDED')
+            self.assertEqual(parquet_res['files_scanned'], 1)
+            self.assertEqual(parquet_res['files_rewritten'], 1)
+            mock_arrow_table.drop.assert_called_with(['_ingested_at'])
+            mock_s3.put_object.assert_called_once()
+
+            # Verify Catalog update occurred
+            catalog_res = body['catalog_update']
+            self.assertEqual(catalog_res['status'], 'SUCCEEDED')
             mock_glue.update_table.assert_called_once()
 
 
