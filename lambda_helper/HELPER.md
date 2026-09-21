@@ -73,6 +73,7 @@ If `"query"`, `"sql"`, `"athena_query"`, or `"query_file"` is provided, Lambda r
 | `source_table_name` | string \| list | Bronze, Silver | Config defaults | Target table name(s). Accepts single string (`"incident"`), array (`["incident", "sys_user"]`), or comma-separated string (`"incident, sys_user"`). |
 | `job_name` | string | Bronze, Silver, Gold | Auto-resolved | Explicit Glue job name override. |
 | `gold_schema` | string | Gold, All | **Required for Gold** | Target MySQL schema name (e.g. `enterprise_reporting`). **Zero fallback permitted**. |
+| `athena_workgroup` | string | Gold, All | `uax-datalake-workgroup-dev` | Target Athena workgroup for view registration. Defaults to dedicated data lake workgroup. |
 | `rds_secret_name` | string | Gold, All | Optional | AWS Secrets Manager secret name or ARN containing MySQL credentials. |
 | `rds_password` | string | Gold, All | Optional | Manual MySQL password override. |
 | `rds_host` | string | Gold, All | Optional | RDS MySQL host override. |

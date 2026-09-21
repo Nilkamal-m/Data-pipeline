@@ -318,6 +318,21 @@ def parse_spark_arguments() -> dict:
     rds_user = get_cli_arg('RDS_USER', 'rds_user', 'RDS_USERNAME', 'rds_username', 'USER', 'user')
     rds_password = get_cli_arg('RDS_PASSWORD', 'rds_password', 'PASSWORD', 'password')
 
+    # Athena Workgroup: CLI > Env > Default (uax-datalake-workgroup-{env})
+    env = 'dev'
+    if glue_database:
+        parts = glue_database.split('_')
+        if len(parts) > 1 and parts[-1] in ('dev', 'qa', 'staging', 'prod', 'test'):
+            env = parts[-1]
+    default_athena_wg = os.environ.get('ATHENA_WORKGROUP') or f"uax-datalake-workgroup-{env}"
+    athena_workgroup = get_cli_arg(
+        'ATHENA_WORKGROUP', 'athena_workgroup',
+        'WORKGROUP', 'workgroup',
+        default=default_athena_wg
+    )
+    if athena_workgroup and str(athena_workgroup).strip().lower() == 'primary':
+        athena_workgroup = default_athena_wg
+
     # External DW: Redshift & Snowflake parameters
     redshift_schema = get_cli_arg('REDSHIFT_SCHEMA', 'redshift_schema', default='gold_spectrum_schema')
     redshift_iam_role = get_cli_arg('REDSHIFT_IAM_ROLE', 'redshift_iam_role')
@@ -357,6 +372,8 @@ def parse_spark_arguments() -> dict:
         'RDS_PORT': rds_port,
         'RDS_USER': rds_user,
         'RDS_PASSWORD': rds_password,
+        'ATHENA_WORKGROUP': athena_workgroup,
+        'WORKGROUP': athena_workgroup,
         'REDSHIFT_SCHEMA': redshift_schema,
         'REDSHIFT_IAM_ROLE': redshift_iam_role,
         'REDSHIFT_SECRET_NAME': redshift_secret_name,

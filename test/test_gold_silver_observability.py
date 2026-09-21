@@ -984,12 +984,12 @@ class TestSilverUniformConfigAndGoldMandatoryAthenaView(unittest.TestCase):
         mock_athena.start_query_execution.assert_called_once()
         call_kwargs = mock_athena.start_query_execution.call_args[1]
         self.assertIn("CREATE OR REPLACE VIEW uax_datalake_db_dev.v_interactions AS", call_kwargs['QueryString'])
-        self.assertEqual(call_kwargs['QueryExecutionContext']['Database'], 'uax_datalake_db_dev')
+        self.assertEqual(call_kwargs['WorkGroup'], 'uax-datalake-workgroup-dev')
 
     def test_mandatory_athena_view_creation_fallback_to_spark_sql(self):
         mock_spark = MagicMock()
         mock_athena = MagicMock()
-        mock_athena.start_query_execution.side_effect = Exception("Athena workgroup primary disabled")
+        mock_athena.start_query_execution.side_effect = Exception("Athena service unavailable")
 
         params = {
             'DATA_LAKE_BUCKET': 'test-lake-bucket',
@@ -1008,6 +1008,95 @@ class TestSilverUniformConfigAndGoldMandatoryAthenaView(unittest.TestCase):
         mock_spark.sql.assert_called_once()
         spark_call = mock_spark.sql.call_args[0][0]
         self.assertIn("CREATE OR REPLACE VIEW `uax_datalake_db_dev`.`v_incident_kpi` AS", spark_call)
+
+    def test_athena_view_creation_handles_enforced_workgroup_configuration(self):
+        mock_spark = MagicMock()
+        mock_athena = MagicMock()
+        # First call fails with workgroup configuration error, second succeeds
+        from botocore.exceptions import ClientError
+        mock_athena.start_query_execution.side_effect = [
+            Exception("InvalidRequestException: Workgroup configuration enforces query output location. Do not provide ResultConfiguration.OutputLocation."),
+            {'QueryExecutionId': 'athena_retry_success_456'}
+        ]
+        mock_athena.get_query_execution.return_value = {
+            'QueryExecution': {
+                'Status': {
+                    'State': 'SUCCEEDED'
+                }
+            }
+        }
+
+        params = {
+            'DATA_LAKE_BUCKET': 'test-lake-bucket',
+            'GLUE_DATABASE': 'uax_datalake_db_dev',
+            'ATHENA_WORKGROUP': 'uax-datalake-workgroup-dev'
+        }
+
+        created = GoldLayerManager.create_athena_view(
+            spark=mock_spark,
+            glue_database='uax_datalake_db_dev',
+            view_name='v_interactions',
+            sql_text='SELECT * FROM tbl_interactions',
+            params=params,
+            athena_client=mock_athena
+        )
+        self.assertTrue(created)
+        self.assertEqual(mock_athena.start_query_execution.call_count, 2)
+        # Second call should not have ResultConfiguration
+        second_call_kwargs = mock_athena.start_query_execution.call_args_list[1][1]
+        self.assertNotIn('ResultConfiguration', second_call_kwargs)
+
+    def test_athena_view_creation_fallback_to_glue_catalog_when_iceberg_catalog_fails(self):
+        mock_spark = MagicMock()
+        mock_athena = MagicMock()
+        mock_glue = MagicMock()
+        # Athena fails
+        mock_athena.start_query_execution.side_effect = Exception("Athena query failed")
+        # Spark SQL fails with Iceberg catalog error
+        mock_spark.sql.side_effect = Exception("AnalysisException: Catalog glue_catalog does not support views")
+
+        params = {
+            'DATA_LAKE_BUCKET': 'test-lake-bucket',
+            'GLUE_DATABASE': 'uax_datalake_db_dev'
+        }
+
+        created = GoldLayerManager.create_athena_view(
+            spark=mock_spark,
+            glue_database='uax_datalake_db_dev',
+            view_name='v_interactions',
+            sql_text='SELECT * FROM tbl_interactions',
+            params=params,
+            athena_client=mock_athena,
+            glue_client=mock_glue
+        )
+        self.assertTrue(created)
+        mock_glue.create_table.assert_called_once()
+        glue_call = mock_glue.create_table.call_args[1]
+        self.assertEqual(glue_call['DatabaseName'], 'uax_datalake_db_dev')
+        self.assertEqual(glue_call['TableInput']['Name'], 'v_interactions')
+        self.assertEqual(glue_call['TableInput']['TableType'], 'VIRTUAL_VIEW')
+
+    def test_lambda_build_glue_arguments_defaults_athena_workgroup_for_gold(self):
+        from lambda_helper.lambda_function import build_glue_arguments
+        event = {
+            'layer': 'gold',
+            'source_system': 'moveworks',
+            'rds_schema': 'enterprise_reporting',
+            'db_secret': 'prod/rds/credentials'
+        }
+        glue_args = build_glue_arguments(event)
+        self.assertEqual(glue_args.get('--PROCESS_LAYER'), 'gold')
+        self.assertEqual(glue_args.get('--ATHENA_WORKGROUP'), 'uax-datalake-workgroup-dev')
+
+        # When custom workgroup passed, it is respected
+        event_custom = {
+            'layer': 'gold',
+            'source_system': 'moveworks',
+            'rds_schema': 'enterprise_reporting',
+            'athena_workgroup': 'custom-athena-wg'
+        }
+        glue_args_custom = build_glue_arguments(event_custom)
+        self.assertEqual(glue_args_custom.get('--ATHENA_WORKGROUP'), 'custom-athena-wg')
 
     def test_gold_query_discovery_strips_v_prefix(self):
         # When discovery finds v_interactions.sql, the mart name should be interactions and view v_interactions

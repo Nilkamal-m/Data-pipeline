@@ -249,7 +249,12 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         'external_columns': '--EXTERNAL_COLUMNS',
         'EXTERNAL_COLUMNS': '--EXTERNAL_COLUMNS',
         'process_layer': '--PROCESS_LAYER',
-        'PROCESS_LAYER': '--PROCESS_LAYER'
+        'PROCESS_LAYER': '--PROCESS_LAYER',
+        # Athena Workgroup parameters
+        'athena_workgroup': '--ATHENA_WORKGROUP',
+        'ATHENA_WORKGROUP': '--ATHENA_WORKGROUP',
+        'workgroup': '--ATHENA_WORKGROUP',
+        'WORKGROUP': '--ATHENA_WORKGROUP'
     }
 
     for event_key, glue_arg_key in param_mappings.items():
@@ -278,6 +283,11 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
             glue_args['--PROCESS_LAYER'] = 'gold'
         else:
             glue_args['--PROCESS_LAYER'] = 'silver'
+
+    # Ensure Gold layer receives dedicated Athena workgroup if not specified
+    if glue_args.get('--PROCESS_LAYER') in ('gold', 'both') or layer == 'gold':
+        if not glue_args.get('--ATHENA_WORKGROUP') or glue_args.get('--ATHENA_WORKGROUP', '').lower() == 'primary':
+            glue_args['--ATHENA_WORKGROUP'] = DEFAULT_ATHENA_WORKGROUP
 
     # Strict Gold Schema Validation (Enterprise Shared DB Policy - Zero Fallback)
     if glue_args.get('--PROCESS_LAYER') == 'gold':

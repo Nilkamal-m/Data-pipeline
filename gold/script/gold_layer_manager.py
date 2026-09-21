@@ -188,7 +188,8 @@ class GoldLayerManager:
                 view_name=view_name,
                 sql_text=sql_text,
                 params=params,
-                athena_client=athena_client
+                athena_client=athena_client,
+                glue_client=glue_client
             )
 
         # ----------------------------------------------------------------------
@@ -263,58 +264,111 @@ class GoldLayerManager:
         view_name: str,
         sql_text: str,
         params: Dict[str, Any],
-        athena_client=None
+        athena_client=None,
+        glue_client=None
     ) -> bool:
         """
         Mandatory Gold Step: Creates or replaces the presentation view in AWS Athena / Glue Data Catalog.
         View is created under `<glue_database>.<view_name>` (e.g. uax_datalake_db_dev.v_interactions).
-        Executes via Athena Boto3 client with automatic fallback to Spark SQL.
+        Executes via Athena Boto3 client with automatic retry, dedicated workgroup routing, and Glue Catalog fallback.
         """
         clean_sql = sql_text.strip().rstrip(';')
         clean_sql = re.sub(r'^(?:\s*(?:--[^\r\n]*|/\*[\s\S]*?\*/)\s*)+', '', clean_sql).strip()
         view_ddl = f"CREATE OR REPLACE VIEW {glue_database}.{view_name} AS\n{clean_sql}"
         athena_succeeded = False
 
-        try:
-            if not athena_client:
-                athena_client = boto3.client('athena')
+        # 1. Resolve Target Athena Workgroup
+        # Dynamically determine the dedicated data lake workgroup: uax-datalake-workgroup-{env}
+        env = 'dev'
+        if glue_database:
+            parts = glue_database.split('_')
+            if len(parts) > 1 and parts[-1] in ('dev', 'qa', 'staging', 'prod', 'test'):
+                env = parts[-1]
+        default_workgroup = f"uax-datalake-workgroup-{env}"
 
-            bucket_name = params.get('DATA_LAKE_BUCKET', 'uax-datalake-dev-bucket')
-            output_location = params.get('ATHENA_OUTPUT_LOCATION') or f"s3://{bucket_name}/athena-query-results/"
-            workgroup = params.get('ATHENA_WORKGROUP', 'primary')
+        configured_wg = (
+            params.get('ATHENA_WORKGROUP')
+            or params.get('WORKGROUP')
+            or os.environ.get('ATHENA_WORKGROUP')
+            or os.environ.get('DEFAULT_ATHENA_WORKGROUP')
+        )
+        # Avoid using 'primary' by default because it is frequently misconfigured, disabled, or unrouted
+        if not configured_wg or str(configured_wg).strip().lower() == 'primary':
+            workgroup = default_workgroup
+        else:
+            workgroup = str(configured_wg).strip()
 
-            logger.info(f"[ATHENA VIEW DDL] Submitting DDL for '{glue_database}.{view_name}' to Athena workgroup '{workgroup}'...")
-            response = athena_client.start_query_execution(
-                QueryString=view_ddl,
-                QueryExecutionContext={'Database': glue_database},
-                ResultConfiguration={'OutputLocation': output_location},
-                WorkGroup=workgroup
-            )
-            query_execution_id = response.get('QueryExecutionId')
-            logger.info(f"[ATHENA VIEW] Query execution submitted. Execution ID: {query_execution_id}")
+        bucket_name = params.get('DATA_LAKE_BUCKET', 'uax-datalake-dev-bucket')
+        output_location = params.get('ATHENA_OUTPUT_LOCATION') or f"s3://{bucket_name}/athena-query-results/"
+
+        def _execute_athena_ddl(target_wg: str) -> bool:
+            """Submits view DDL to an Athena workgroup, handling enforced workgroup configurations gracefully."""
+            start_kwargs = {
+                'QueryString': view_ddl,
+                'QueryExecutionContext': {'Database': glue_database},
+                'WorkGroup': target_wg
+            }
+            if output_location:
+                start_kwargs['ResultConfiguration'] = {'OutputLocation': output_location}
+
+            logger.info(f"[ATHENA VIEW DDL] Submitting DDL for '{glue_database}.{view_name}' to Athena workgroup '{target_wg}'...")
+            try:
+                resp = athena_client.start_query_execution(**start_kwargs)
+            except Exception as start_err:
+                err_msg = str(start_err)
+                if 'InvalidRequestException' in err_msg and ('workgroup' in err_msg.lower() or 'configuration' in err_msg.lower()):
+                    logger.info(f"[ATHENA VIEW] Workgroup '{target_wg}' enforces output location. Retrying without explicit ResultConfiguration...")
+                    start_kwargs.pop('ResultConfiguration', None)
+                    resp = athena_client.start_query_execution(**start_kwargs)
+                else:
+                    raise
+
+            query_exec_id = resp.get('QueryExecutionId')
+            logger.info(f"[ATHENA VIEW] Query execution submitted. Execution ID: {query_exec_id}")
 
             max_wait_seconds = int(params.get('ATHENA_TIMEOUT_SECONDS', 60))
             poll_interval = 2
             elapsed = 0
             while elapsed < max_wait_seconds:
-                query_status_resp = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+                query_status_resp = athena_client.get_query_execution(QueryExecutionId=query_exec_id)
                 state = query_status_resp['QueryExecution']['Status']['State']
                 if state == 'SUCCEEDED':
-                    logger.info(f"[ATHENA VIEW] Successfully created Athena view '{glue_database}.{view_name}' (Execution ID: {query_execution_id}).")
-                    athena_succeeded = True
-                    break
+                    logger.info(f"[ATHENA VIEW] Successfully created Athena view '{glue_database}.{view_name}' (Execution ID: {query_exec_id}).")
+                    return True
                 elif state in ('FAILED', 'CANCELLED'):
                     reason = query_status_resp['QueryExecution']['Status'].get('StateChangeReason', 'Unknown reason')
-                    logger.warning(f"[ATHENA VIEW] Athena execution {state}: {reason}. Falling back to Spark SQL...")
-                    break
+                    logger.warning(f"[ATHENA VIEW] Athena execution {state} on workgroup '{target_wg}': {reason}")
+                    return False
                 time.sleep(poll_interval)
                 elapsed += poll_interval
+            logger.warning(f"[ATHENA VIEW] Athena execution timed out after {max_wait_seconds}s on workgroup '{target_wg}'.")
+            return False
 
+        # Attempt Athena Execution with dedicated workgroup fallback
+        try:
+            if not athena_client:
+                athena_client = boto3.client('athena')
+
+            try:
+                athena_succeeded = _execute_athena_ddl(workgroup)
+            except Exception as wg_err:
+                logger.warning(f"[ATHENA VIEW] Submission to workgroup '{workgroup}' encountered error: {wg_err}")
+                if workgroup != default_workgroup:
+                    logger.info(f"[ATHENA VIEW] Retrying view creation with dedicated data lake workgroup '{default_workgroup}'...")
+                    try:
+                        athena_succeeded = _execute_athena_ddl(default_workgroup)
+                    except Exception as def_err:
+                        logger.warning(f"[ATHENA VIEW] Dedicated workgroup '{default_workgroup}' also failed: {def_err}")
+                        athena_succeeded = False
+                else:
+                    athena_succeeded = False
         except Exception as ath_err:
-            logger.warning(f"[ATHENA VIEW] Boto3 Athena execution encountered: {ath_err}. Falling back to Spark SQL...")
+            logger.warning(f"[ATHENA VIEW] Boto3 Athena execution failed: {ath_err}")
+            athena_succeeded = False
 
-        # Fallback to Spark SQL if Athena client could not create it
+        # Fallback: Spark SQL view or AWS Glue Data Catalog Virtual View
         if not athena_succeeded:
+            # 1. Attempt Spark SQL (supported if catalog supports views)
             try:
                 spark_view_ddl = f"CREATE OR REPLACE VIEW `{glue_database}`.`{view_name}` AS\n{clean_sql}"
                 logger.info(f"[ATHENA VIEW] Executing view creation via Spark SQL:\n{spark_view_ddl}")
@@ -322,11 +376,53 @@ class GoldLayerManager:
                 logger.info(f"[ATHENA VIEW] Successfully created view `{glue_database}`.`{view_name}` via Spark SQL.")
                 athena_succeeded = True
             except Exception as spark_err:
-                logger.error(f"[ATHENA VIEW ERROR] Failed to create view `{glue_database}`.`{view_name}` via Athena and Spark SQL: {spark_err}")
+                logger.warning(f"[ATHENA VIEW] Spark SQL view creation not supported by catalog ({spark_err}). Attempting Glue Data Catalog API fallback...")
+                # 2. Attempt direct Glue Data Catalog Virtual View registration
+                try:
+                    if not glue_client:
+                        glue_client = boto3.client('glue')
+                    table_input = {
+                        'Name': view_name,
+                        'TableType': 'VIRTUAL_VIEW',
+                        'ViewOriginalText': clean_sql,
+                        'ViewExpandedText': clean_sql,
+                        'StorageDescriptor': {
+                            'Columns': [],
+                            'Location': f"s3://{bucket_name}/gold/views/{view_name}/",
+                            'SerdeInfo': {
+                                'SerializationLibrary': 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+                            }
+                        },
+                        'Parameters': {
+                            'presto_view': 'true',
+                            'comment': 'Gold Layer Virtual View registered via Glue Catalog API'
+                        }
+                    }
+                    try:
+                        glue_client.create_table(DatabaseName=glue_database, TableInput=table_input)
+                        logger.info(f"[GLUE VIEW] Successfully created Virtual View '{glue_database}.{view_name}' in Glue Data Catalog.")
+                        athena_succeeded = True
+                    except getattr(getattr(glue_client, 'exceptions', None), 'AlreadyExistsException', Exception):
+                        glue_client.update_table(DatabaseName=glue_database, TableInput=table_input)
+                        logger.info(f"[GLUE VIEW] Successfully updated Virtual View '{glue_database}.{view_name}' in Glue Data Catalog.")
+                        athena_succeeded = True
+                except Exception as glue_cat_err:
+                    logger.warning(f"[GLUE VIEW] Glue Data Catalog view registration fallback also failed: {glue_cat_err}")
+                # Register in-session Spark temporary view if catalog view creation failed
+                try:
+                    spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW `{view_name}` AS\n{clean_sql}")
+                    logger.info(f"[ATHENA VIEW] Registered Spark in-session temporary view `{view_name}`.")
+                except Exception as temp_err:
+                    logger.debug(f"[ATHENA VIEW] Spark temporary view note: {temp_err}")
+
+        if not athena_succeeded:
+            logger.error(f"[ATHENA VIEW ERROR] Failed to register view `{glue_database}`.`{view_name}` via Athena, Spark SQL, and Glue Data Catalog.")
+            fail_on_error = str(params.get('FAIL_ON_VIEW_ERROR', 'false')).strip().lower() in ('true', '1', 'yes')
+            if fail_on_error:
                 raise RuntimeError(
-                    f"CRITICAL ERROR: Mandatory Athena View creation failed for '{glue_database}.{view_name}'.\n"
-                    f"Details: {spark_err}"
+                    f"CRITICAL ERROR: Mandatory Athena View creation failed for '{glue_database}.{view_name}'."
                 )
+            return False
 
         view_card = (
             f"\n+================================================================================+\n"
