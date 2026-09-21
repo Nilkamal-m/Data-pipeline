@@ -5,8 +5,8 @@ Responsibilities:
 1. Mandatory Athena View First: Creates/refreshes enterprise presentation view (v_<table_name>)
    directly in AWS Glue Data Catalog / Athena as the mandatory source of truth before any downstream export.
 2. Multi-Target Downstream Routing: Parameter-driven routing for Aurora MySQL, Amazon Redshift Spectrum, and Snowflake.
-3. Zero-DDL Schema Verification: Verifies target schema exists in MySQL via INFORMATION_SCHEMA.SCHEMATA. Fails fast if missing.
-4. Shared Database Guardrails: Strictly isolates operations to 'gold_tbl_<table_name>' and 'v_<table_name>'. Never modifies external tables.
+3. Zero-DDL Schema Verification: Verifies target schema exists in MySQL via non-privileged SHOW DATABASES / USE (zero INFORMATION_SCHEMA access needed). Fails fast if missing.
+4. Shared Database Guardrails: Strictly isolates operations to 'gold_*' (tables) and 'v_*' (views). Pre-checks all objects before DROP, RENAME, ALTER, and CREATE. Never modifies external tables.
 5. Complete Column Schema Introspection: Logs all columns and data types for query outputs and target tables.
 6. Schema Evolution Tracking: Compares incoming columns against existing serving tables and alerts on any newly added columns.
 7. DDL Audit Logs: Explicitly records all DROP, CREATE, SWAP, and VIEW operations.
@@ -474,9 +474,12 @@ class GoldLayerManager:
             old_backup_table = f"gold_tbl_{clean_base_name}_old"
             view_name = f"v_{clean_base_name}"
 
-            assert target_table.startswith("gold_tbl_"), f"Safety Error: Invalid table name {target_table}"
-            assert staging_table.startswith("gold_tbl_") and staging_table.endswith("_staging"), f"Safety Error: Invalid staging table {staging_table}"
-            assert view_name.startswith("v_"), f"Safety Error: Invalid view name {view_name}"
+            cls._validate_gold_table_name(target_table)
+            cls._validate_gold_table_name(staging_table)
+            cls._validate_gold_table_name(old_backup_table)
+            cls._validate_view_name(view_name)
+            assert staging_table.endswith("_staging"), f"Safety Error: Invalid staging table {staging_table}"
+            assert old_backup_table.endswith("_old"), f"Safety Error: Invalid backup table {old_backup_table}"
 
             logger.info(
                 f"\n+--------------------------------------------------------------------------------+\n"
@@ -653,13 +656,33 @@ class GoldLayerManager:
     # Database Safety & Schema Pre-existence
     # --------------------------------------------------------------------------
     @classmethod
+    def _validate_gold_table_name(cls, table_name: str) -> None:
+        """
+        Enforces that Gold table names strictly start with 'gold_'.
+        Prevents operations from affecting any non-Gold tables.
+        """
+        if not isinstance(table_name, str) or not table_name.startswith("gold_"):
+            raise AssertionError(f"Safety Error: Gold table name '{table_name}' must start with 'gold_'")
+
+    @classmethod
+    def _validate_view_name(cls, view_name: str) -> None:
+        """
+        Enforces that Gold view names strictly start with 'v_'.
+        Prevents operations from affecting any non-Gold views.
+        """
+        if not isinstance(view_name, str) or not view_name.startswith("v_"):
+            raise AssertionError(f"Safety Error: View name '{view_name}' must start with 'v_'")
+
+    @classmethod
     def _verify_schema_exists_or_raise(cls, jdbc_info: Dict[str, Any], schema_name: str) -> None:
         """
-        Verifies that the target schema pre-exists in MySQL via INFORMATION_SCHEMA.SCHEMATA.
-        If it does not exist, raises an immediate RuntimeError and aborts.
+        Verifies that the target schema pre-exists and is accessible in MySQL without querying
+        INFORMATION_SCHEMA.SCHEMATA (which requires global grants that application users lack).
+        Uses non-privileged 'SHOW DATABASES LIKE %s' (or direct 'USE `<schema>`' fallback).
+        If it does not exist or user lacks access, raises an immediate RuntimeError and aborts.
         NEVER executes CREATE DATABASE or CREATE SCHEMA.
         """
-        query = "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = %s"
+        query = "SHOW DATABASES LIKE %s"
         try:
             results = cls._execute_sql_query(jdbc_info, query, (schema_name,))
             if not results:
@@ -673,7 +696,26 @@ class GoldLayerManager:
         except Exception as e:
             if "CRITICAL SHARED-DB POLICY ERROR" in str(e):
                 raise
-            raise RuntimeError(f"Failed to query INFORMATION_SCHEMA.SCHEMATA on MySQL: {e}")
+            # Attempt direct USE verification fallback if SHOW DATABASES was restricted
+            try:
+                cls._execute_ddl(jdbc_info, f"USE `{schema_name}`")
+            except Exception as use_err:
+                err_msg = str(use_err)
+                if "1049" in err_msg or "Unknown database" in err_msg:
+                    raise RuntimeError(
+                        f"CRITICAL SHARED-DB POLICY ERROR: Target schema '{schema_name}' does not exist "
+                        f"in MySQL instance '{jdbc_info.get('host')}'.\n"
+                        f"In accordance with enterprise shared database policy, this pipeline NEVER executes "
+                        f"CREATE DATABASE / CREATE SCHEMA.\n"
+                        f"Please contact your Database Administrator (DBA) to provision schema '{schema_name}'."
+                    )
+                elif "1044" in err_msg or "Access denied" in err_msg:
+                    raise RuntimeError(
+                        f"CRITICAL SHARED-DB POLICY ERROR: User '{jdbc_info.get('user')}' does not have access "
+                        f"to target schema '{schema_name}' in MySQL instance '{jdbc_info.get('host')}'.\n"
+                        f"Please contact your Database Administrator (DBA) to grant access to schema '{schema_name}'."
+                    )
+                raise RuntimeError(f"Failed to verify schema '{schema_name}' on MySQL: {use_err}")
 
     # --------------------------------------------------------------------------
     # Schema Introspection & Evolution Detection
@@ -704,17 +746,15 @@ class GoldLayerManager:
         df_mart: DataFrame
     ) -> None:
         """
-        Introspects the target MySQL table columns via INFORMATION_SCHEMA.COLUMNS.
+        Introspects the target MySQL table columns via SHOW COLUMNS FROM `<schema>`.`<table>`.
+        Does NOT query INFORMATION_SCHEMA.COLUMNS so non-privileged shared-DB users succeed.
         If table exists, compares incoming columns against target table and alerts on newly added columns.
         """
-        col_query = (
-            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE "
-            "FROM INFORMATION_SCHEMA.COLUMNS "
-            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
-            "ORDER BY ORDINAL_POSITION"
-        )
+        cls._validate_gold_table_name(target_table)
+
+        col_query = f"SHOW COLUMNS FROM `{schema_name}`.`{target_table}`"
         try:
-            target_cols_raw = cls._execute_sql_query(jdbc_info, col_query, (schema_name, target_table))
+            target_cols_raw = cls._execute_sql_query(jdbc_info, col_query)
             if not target_cols_raw:
                 logger.info(f"[SCHEMA INTROSPECTION] Target table '{schema_name}.{target_table}' does not yet exist. First-time deployment.")
                 return
@@ -781,8 +821,16 @@ class GoldLayerManager:
         """
         Writes DataFrame to the isolated staging table 'gold_tbl_<mart>_staging' via Spark JDBC.
         Uses 'overwrite' mode to drop/recreate the staging table safely.
+        Enforces that staging_table starts with 'gold_' and ends with '_staging'.
+        Enforces SSL encrypted transport for JDBC connection to satisfy AWS RDS --require_secure_transport=ON.
         """
-        jdbc_url = f"jdbc:mysql://{jdbc_info['host']}:{jdbc_info['port']}/{schema_name}?useSSL=true&allowPublicKeyRetrieval=true"
+        cls._validate_gold_table_name(staging_table)
+        assert staging_table.endswith("_staging"), f"Safety Error: Staging table '{staging_table}' must end with '_staging'"
+
+        jdbc_url = (
+            f"jdbc:mysql://{jdbc_info['host']}:{jdbc_info['port']}/{schema_name}"
+            f"?useSSL=true&requireSSL=true&verifyServerCertificate=false&allowPublicKeyRetrieval=true"
+        )
         logger.info(f"[DDL AUDIT - STAGING WRITE] Writing records to staging table: '{schema_name}.{staging_table}' via Spark JDBC...")
         df_mart.write \
             .format("jdbc") \
@@ -798,6 +846,23 @@ class GoldLayerManager:
     # --------------------------------------------------------------------------
     # Zero-Downtime Isolated Atomic Table Swap & Presentation View Refresh
     # --------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Zero-Downtime Isolated Atomic Table Swap & Presentation View Refresh
+    # --------------------------------------------------------------------------
+    @classmethod
+    def _table_exists(cls, jdbc_info: Dict[str, Any], schema_name: str, table_or_view_name: str) -> bool:
+        """
+        Checks whether a table or view exists in the given MySQL schema without querying INFORMATION_SCHEMA.TABLES.
+        Uses 'SHOW TABLES FROM `<schema>` LIKE %s' which works with standard schema-level privileges.
+        """
+        try:
+            query = f"SHOW TABLES FROM `{schema_name}` LIKE %s"
+            results = cls._execute_sql_query(jdbc_info, query, (table_or_view_name,))
+            return bool(results and len(results) > 0)
+        except Exception as e:
+            logger.warning(f"Error checking existence of '{schema_name}.{table_or_view_name}': {e}")
+            return False
+
     @classmethod
     def _execute_isolated_atomic_swap(
         cls,
@@ -810,22 +875,38 @@ class GoldLayerManager:
     ) -> None:
         """
         Executes zero-downtime RENAME TABLE atomic swap in MySQL.
+        Performs strict pre-checks before DROP, RENAME, ALTER, and CREATE operations:
+          - Target, staging, and backup tables must start with 'gold_'.
+          - Presentation views must start with 'v_'.
+          - Never queries INFORMATION_SCHEMA.
+          - Pre-checks table existence before DROP and RENAME.
         """
-        assert target_table.startswith("gold_tbl_"), f"Safety Error: Invalid target table {target_table}"
-        assert staging_table.startswith("gold_tbl_") and staging_table.endswith("_staging"), f"Safety Error: Invalid staging table {staging_table}"
-        assert old_backup_table.startswith("gold_tbl_") and old_backup_table.endswith("_old"), f"Safety Error: Invalid backup table {old_backup_table}"
-        assert view_name.startswith("v_"), f"Safety Error: Invalid view name {view_name}"
+        # Guardrail: validate naming conventions
+        cls._validate_gold_table_name(target_table)
+        cls._validate_gold_table_name(staging_table)
+        cls._validate_gold_table_name(old_backup_table)
+        cls._validate_view_name(view_name)
+        assert staging_table.endswith("_staging"), f"Safety Error: Invalid staging table {staging_table}"
+        assert old_backup_table.endswith("_old"), f"Safety Error: Invalid backup table {old_backup_table}"
 
-        chk_query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s"
-        target_exists = bool(cls._execute_sql_query(jdbc_info, chk_query, (schema_name, target_table)))
+        # Pre-check before RENAME: Verify that staging table exists before attempting swap
+        staging_exists = cls._table_exists(jdbc_info, schema_name, staging_table)
+        if not staging_exists:
+            raise RuntimeError(
+                f"Pre-check failed before RENAME: Staging table '{schema_name}.{staging_table}' does not exist. "
+                f"Cannot promote staging table to target table."
+            )
 
-        # Clean up existing backup table if left over
-        backup_exists = bool(cls._execute_sql_query(jdbc_info, chk_query, (schema_name, old_backup_table)))
+        # Pre-check before DROP: Clean up existing backup table if left over
+        backup_exists = cls._table_exists(jdbc_info, schema_name, old_backup_table)
         if backup_exists:
-            logger.info(f"[DDL AUDIT - CLEANUP] Dropping leftover backup table '{schema_name}.{old_backup_table}'...")
+            logger.info(f"[DDL AUDIT - PRE-CHECK DROP] Leftover backup table '{schema_name}.{old_backup_table}' exists. Dropping safely...")
+            cls._validate_gold_table_name(old_backup_table)
             cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{old_backup_table}`")
 
-        # Execute Atomic RENAME TABLE
+        # Pre-check before RENAME: Check if target table already exists
+        target_exists = cls._table_exists(jdbc_info, schema_name, target_table)
+
         if target_exists:
             swap_ddl = (
                 f"RENAME TABLE "
@@ -837,14 +918,25 @@ class GoldLayerManager:
                         f"  -> {schema_name}.{staging_table} -->  {schema_name}.{target_table}")
             cls._execute_ddl(jdbc_info, swap_ddl)
 
-            logger.info(f"[DDL AUDIT - CLEANUP] Dropping previous table version '{schema_name}.{old_backup_table}'...")
-            cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{old_backup_table}`")
+            # Pre-check before DROP: Remove previous table version
+            if cls._table_exists(jdbc_info, schema_name, old_backup_table):
+                logger.info(f"[DDL AUDIT - PRE-CHECK DROP] Dropping previous table version '{schema_name}.{old_backup_table}'...")
+                cls._validate_gold_table_name(old_backup_table)
+                cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{old_backup_table}`")
         else:
             initial_rename = f"RENAME TABLE `{schema_name}`.`{staging_table}` TO `{schema_name}`.`{target_table}`"
             logger.info(f"[DDL AUDIT - INITIAL DEPLOY] Promoting staging to target table:\n  -> {initial_rename}")
             cls._execute_ddl(jdbc_info, initial_rename)
 
-        # Presentation View Creation / Refresh
+        # Pre-check before CREATE VIEW: Ensure target table exists and view starts with v_
+        cls._validate_view_name(view_name)
+        cls._validate_gold_table_name(target_table)
+        if not cls._table_exists(jdbc_info, schema_name, target_table):
+            raise RuntimeError(
+                f"Pre-check failed before CREATE VIEW: Target table '{schema_name}.{target_table}' does not exist. "
+                f"Cannot create presentation view '{view_name}'."
+            )
+
         view_sql = (
             f"CREATE OR REPLACE VIEW `{schema_name}`.`{view_name}` AS "
             f"SELECT * FROM `{schema_name}`.`{target_table}`"
@@ -853,77 +945,96 @@ class GoldLayerManager:
         cls._execute_ddl(jdbc_info, view_sql)
 
     # --------------------------------------------------------------------------
-    # SQL Execution Helpers
+    # SQL Execution Helpers with SSL / TLS Support
     # --------------------------------------------------------------------------
     @classmethod
-    def _execute_sql_query(cls, jdbc_info: Dict[str, Any], query: str, params: Tuple = ()) -> List[Tuple]:
-        """Executes a parameterized SQL query via pymysql or mysql.connector."""
+    def _build_mysql_ssl_context(cls):
+        """
+        Builds an SSL context for MySQL connections to satisfy AWS RDS --require_secure_transport=ON.
+        Disables hostname and cert verification to allow connecting securely via TLS without
+        requiring external CA bundle configurations.
+        """
+        import ssl
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+        except Exception:
+            return {"check_hostname": False}
+
+    @classmethod
+    def _get_mysql_connection(cls, jdbc_info: Dict[str, Any], database: Optional[str] = None):
+        """
+        Establishes an SSL/TLS-encrypted connection to MySQL using pymysql or mysql.connector.
+        Enforces encrypted transport to comply with AWS RDS/Aurora MySQL --require_secure_transport=ON.
+        """
+        ssl_ctx = cls._build_mysql_ssl_context()
+        target_db = database if database is not None else (jdbc_info.get('database') or None)
+
         try:
             import pymysql
-            conn = pymysql.connect(
-                host=jdbc_info['host'],
-                port=int(jdbc_info['port']),
-                user=jdbc_info['user'],
-                password=jdbc_info['password'],
-                database=jdbc_info.get('database') or None,
-                connect_timeout=15
-            )
+            connect_kwargs = {
+                "host": jdbc_info['host'],
+                "port": int(jdbc_info['port']),
+                "user": jdbc_info['user'],
+                "password": jdbc_info['password'],
+                "database": target_db,
+                "connect_timeout": 15,
+                "ssl": ssl_ctx
+            }
             try:
-                with conn.cursor() as cursor:
-                    cursor.execute(query, params)
-                    return cursor.fetchall()
-            finally:
-                conn.close()
+                return pymysql.connect(**connect_kwargs)
+            except TypeError:
+                # Fallback if pymysql version expects dict
+                connect_kwargs["ssl"] = {"check_hostname": False}
+                return pymysql.connect(**connect_kwargs)
         except ImportError:
             import mysql.connector
-            conn = mysql.connector.connect(
+            return mysql.connector.connect(
                 host=jdbc_info['host'],
                 port=int(jdbc_info['port']),
                 user=jdbc_info['user'],
                 password=jdbc_info['password'],
-                database=jdbc_info.get('database') or None,
-                connection_timeout=15
+                database=target_db,
+                connection_timeout=15,
+                ssl_disabled=False,
+                ssl_verify_cert=False
             )
-            try:
-                cursor = conn.cursor()
-                cursor.execute(query, params)
-                return cursor.fetchall()
-            finally:
-                conn.close()
+
+    @classmethod
+    def _execute_sql_query(cls, jdbc_info: Dict[str, Any], query: str, params: Tuple = ()) -> List[Tuple]:
+        """Executes a parameterized SQL query via an SSL-encrypted MySQL connection."""
+        conn = cls._get_mysql_connection(jdbc_info)
+        cursor = None
+        try:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return cursor.fetchall()
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            conn.close()
 
     @classmethod
     def _execute_ddl(cls, jdbc_info: Dict[str, Any], ddl: str) -> None:
-        """Executes a DDL statement."""
+        """Executes a DDL statement via an SSL-encrypted MySQL connection."""
+        conn = cls._get_mysql_connection(jdbc_info)
+        cursor = None
         try:
-            import pymysql
-            conn = pymysql.connect(
-                host=jdbc_info['host'],
-                port=int(jdbc_info['port']),
-                user=jdbc_info['user'],
-                password=jdbc_info['password'],
-                connect_timeout=15
-            )
-            try:
-                with conn.cursor() as cursor:
-                    cursor.execute(ddl)
-                conn.commit()
-            finally:
-                conn.close()
-        except ImportError:
-            import mysql.connector
-            conn = mysql.connector.connect(
-                host=jdbc_info['host'],
-                port=int(jdbc_info['port']),
-                user=jdbc_info['user'],
-                password=jdbc_info['password'],
-                connection_timeout=15
-            )
-            try:
-                cursor = conn.cursor()
-                cursor.execute(ddl)
-                conn.commit()
-            finally:
-                conn.close()
+            cursor = conn.cursor()
+            cursor.execute(ddl)
+            conn.commit()
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            conn.close()
 
     # --------------------------------------------------------------------------
     # Query Discovery

@@ -200,7 +200,94 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
         # Negative test: unauthorized table name
         invalid_table = "tbl_financial_records"
         with self.assertRaises(AssertionError):
-            assert invalid_table.startswith("gold_tbl_"), "Safety Error"
+            GoldLayerManager._validate_gold_table_name(invalid_table)
+
+    def test_gold_table_and_view_validation_helpers(self):
+        """Tests strict validation that views start with 'v_' and tables start with 'gold_'."""
+        # Valid gold tables
+        for tbl in ["gold_tbl_interactions", "gold_interactions", "gold_tbl_interactions_staging", "gold_tbl_interactions_old"]:
+            GoldLayerManager._validate_gold_table_name(tbl)
+
+        # Invalid gold tables
+        for invalid_tbl in ["interactions", "tbl_interactions", "raw_tbl_interactions", "v_interactions", ""]:
+            with self.assertRaises(AssertionError):
+                GoldLayerManager._validate_gold_table_name(invalid_tbl)
+
+        # Valid views
+        for view in ["v_interactions", "v_incident_kpi", "v_gold_interactions"]:
+            GoldLayerManager._validate_view_name(view)
+
+        # Invalid views
+        for invalid_view in ["interactions", "interactions_view", "tbl_interactions", "gold_interactions", ""]:
+            with self.assertRaises(AssertionError):
+                GoldLayerManager._validate_view_name(invalid_view)
+
+    def test_table_exists_helper_uses_show_tables(self):
+        """Tests that _table_exists uses SHOW TABLES without querying INFORMATION_SCHEMA."""
+        jdbc_info = {"host": "mock-db", "port": "3306", "user": "user", "password": "pwd"}
+
+        with patch.object(GoldLayerManager, '_execute_sql_query', return_value=[("gold_tbl_interactions",)]) as mock_exec:
+            exists = GoldLayerManager._table_exists(jdbc_info, "enterprise_reporting", "gold_tbl_interactions")
+            self.assertTrue(exists)
+            mock_exec.assert_called_once()
+            call_sql = mock_exec.call_args[0][1]
+            self.assertIn("SHOW TABLES FROM `enterprise_reporting` LIKE %s", call_sql)
+            self.assertNotIn("INFORMATION_SCHEMA", call_sql)
+
+    def test_atomic_swap_pre_check_fails_if_staging_missing(self):
+        """Pre-check before RENAME must abort if staging table does not exist."""
+        jdbc_info = {"host": "mock-db", "port": "3306", "user": "user", "password": "pwd"}
+
+        # Staging table check returns False
+        with patch.object(GoldLayerManager, '_table_exists', return_value=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                GoldLayerManager._execute_isolated_atomic_swap(
+                    jdbc_info=jdbc_info,
+                    schema_name="enterprise_reporting",
+                    target_table="gold_tbl_interactions",
+                    staging_table="gold_tbl_interactions_staging",
+                    old_backup_table="gold_tbl_interactions_old",
+                    view_name="v_interactions"
+                )
+            self.assertIn("Pre-check failed before RENAME: Staging table", str(ctx.exception))
+
+    def test_atomic_swap_pre_checks_and_executes_ddl(self):
+        """Pre-checks existence and executes DROP, RENAME, and CREATE VIEW with proper guardrails."""
+        jdbc_info = {"host": "mock-db", "port": "3306", "user": "user", "password": "pwd"}
+
+        # Simulate: staging exists, old backup exists, target exists
+        def mock_table_exists(info, schema, tbl):
+            return True
+
+        with patch.object(GoldLayerManager, '_table_exists', side_effect=mock_table_exists):
+            with patch.object(GoldLayerManager, '_execute_ddl') as mock_ddl:
+                GoldLayerManager._execute_isolated_atomic_swap(
+                    jdbc_info=jdbc_info,
+                    schema_name="enterprise_reporting",
+                    target_table="gold_tbl_interactions",
+                    staging_table="gold_tbl_interactions_staging",
+                    old_backup_table="gold_tbl_interactions_old",
+                    view_name="v_interactions"
+                )
+                executed_ddls = [call[0][1] for call in mock_ddl.call_args_list]
+                # 1. Drops leftover backup before swap
+                self.assertTrue(any("DROP TABLE IF EXISTS `enterprise_reporting`.`gold_tbl_interactions_old`" in d for d in executed_ddls))
+                # 2. Atomic rename
+                self.assertTrue(any("RENAME TABLE `enterprise_reporting`.`gold_tbl_interactions`" in d for d in executed_ddls))
+                # 3. Drops old backup after swap
+                self.assertTrue(any("DROP TABLE IF EXISTS `enterprise_reporting`.`gold_tbl_interactions_old`" in d for d in executed_ddls))
+                # 4. View creation starting with v_
+                self.assertTrue(any("CREATE OR REPLACE VIEW `enterprise_reporting`.`v_interactions`" in d for d in executed_ddls))
+
+    def test_mysql_ssl_context_builder(self):
+        """Tests that _build_mysql_ssl_context creates an SSLContext with verify_mode CERT_NONE."""
+        ssl_ctx = GoldLayerManager._build_mysql_ssl_context()
+        import ssl
+        if isinstance(ssl_ctx, ssl.SSLContext):
+            self.assertFalse(ssl_ctx.check_hostname)
+            self.assertEqual(ssl_ctx.verify_mode, ssl.CERT_NONE)
+        else:
+            self.assertEqual(ssl_ctx.get("check_hostname"), False)
 
     def test_password_manual_option(self):
         """Tests that manual password via --RDS_PASSWORD is used."""
