@@ -213,9 +213,9 @@ COALESCE(ui.platform, '') AS interaction_surface,
 COALESCE(u.user_preferred_language, '') AS user_preferred_language,
 
 -- Placeholder Dimensions for External HR/Identity Enrichment
-CAST(NULL AS VARCHAR) AS user_department,
-CAST(NULL AS VARCHAR) AS user_location,
-CAST(NULL AS VARCHAR) AS user_country,
+CAST(NULL AS VARCHAR(255)) AS user_department,
+CAST(NULL AS VARCHAR(255)) AS user_location,
+CAST(NULL AS VARCHAR(255)) AS user_country,
 
 -- Audit Timestamp
 CURRENT_TIMESTAMP AS _data_as_of

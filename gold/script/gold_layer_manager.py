@@ -20,6 +20,7 @@ import json
 import logging
 import time
 import traceback
+import re
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -270,6 +271,7 @@ class GoldLayerManager:
         Executes via Athena Boto3 client with automatic fallback to Spark SQL.
         """
         clean_sql = sql_text.strip().rstrip(';')
+        clean_sql = re.sub(r'^(?:\s*(?:--[^\r\n]*|/\*[\s\S]*?\*/)\s*)+', '', clean_sql).strip()
         view_ddl = f"CREATE OR REPLACE VIEW {glue_database}.{view_name} AS\n{clean_sql}"
         athena_succeeded = False
 

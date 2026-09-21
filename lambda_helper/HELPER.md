@@ -189,37 +189,48 @@ Applies illegal character removal and Moveworks domain/entity mapping:
 
 ### C. Gold Serving Mart Payloads (`layer: "gold"`)
 
-#### 9. Gold Serving Execution with AWS Secrets Manager
-Executes `s3://<bucket>/gold/query/servicenow/*.sql` and publishes into the MySQL schema using credentials from Secrets Manager.
-```json
-{
-  "layer": "gold",
-  "source_system": "servicenow",
-  "gold_schema": "enterprise_reporting",
-  "rds_secret_name": "prod/rds/mysql_credentials",
-  "wait_until_completion": true
-}
-```
+#### 9. Trigger Gold Layer with Manual DB Connection Details
+> **Use Case**: Manually pass all RDS MySQL database credentials (`rds_schema`, `rds_url`, `rds_port`, `rds_username`, `rds_password`).
+> Ideal for ad-hoc runs, staging/testing environments, or when credentials are not stored in AWS Secrets Manager.
 
-#### 10. Gold Serving Execution with Manual Password Override
-```json
-{
-  "layer": "gold",
-  "source_system": "servicenow",
-  "gold_schema": "enterprise_reporting",
-  "rds_password": "manual_database_password",
-  "rds_user": "reporting_user",
-  "wait_until_completion": true
-}
-```
-
-#### 11. Gold Serving with Custom Query Path & Connection
 ```json
 {
   "layer": "gold",
   "source_system": "moveworks",
-  "gold_schema": "enterprise_reporting",
-  "rds_secret_name": "prod/rds/mysql_credentials",
+  "rds_schema": "enterprise_reporting",
+  "rds_url": "aurora-mysql-prod.cluster-xyz.us-east-1.rds.amazonaws.com",
+  "rds_port": 3306,
+  "rds_username": "reporting_user",
+  "rds_password": "manual_database_password",
+  "wait_until_completion": true,
+  "poll_interval_seconds": 10
+}
+```
+*Note: Also supports parameter aliases `rds_host` (for `rds_url`), `rds_user` (for `rds_username`), and `gold_schema` (for `rds_schema`).*
+
+#### 10. Trigger Gold Layer using AWS Secrets Manager DB Secret
+> **Use Case**: Pass the AWS Secrets Manager secret name via `db_secret` (or `rds_secret_name`).
+> Production-grade zero-hardcoded-credential invocation: AWS Glue automatically extracts `host`, `port`, `username`, and `password` directly from the secret JSON in AWS Secrets Manager.
+
+```json
+{
+  "layer": "gold",
+  "source_system": "moveworks",
+  "rds_schema": "enterprise_reporting",
+  "db_secret": "prod/rds/mysql_credentials",
+  "wait_until_completion": true,
+  "poll_interval_seconds": 10
+}
+```
+*Note: You can pass either `"db_secret"` or `"rds_secret_name"`. Both map directly to the secret name in AWS Secrets Manager.*
+
+#### 11. Gold Serving with Custom Query Path & Connection Name
+```json
+{
+  "layer": "gold",
+  "source_system": "moveworks",
+  "rds_schema": "enterprise_reporting",
+  "db_secret": "prod/rds/mysql_credentials",
   "gold_query_s3_path": "s3://uax-datalake-dev-bucket/gold/query/moveworks/v_interactions.sql",
   "connection_name": "uax-datalake-rds-connection-dev",
   "wait_until_completion": true
@@ -328,15 +339,24 @@ Executes the full multiline Gold aggregation query from the repository:
 }
 ```
 
-#### 20. Execute SQL Query Directly from S3 URI with Dynamic Parameters
+#### 20. Execute SQL Query Directly from S3 URI with Dynamic Table Replacements
+> **Note on Athena Execution & `InvalidRequestException`**:
+> 1. **Logical Tables**: `v_interactions.sql` uses template logical tables (`tbl_interactions`, `tbl_conversations`, etc.). When running directly in Athena, supply `"table_replacements"` mapping them to your physical Glue Catalog tables (`silver_tbl_moveworks_interactions`, etc.).
+> 2. **Leading Comment Sanitization**: The Lambda helper automatically strips header comments (`-- ...`) before dispatching to Athena `StartQueryExecution`, preventing `InvalidRequestException: Query of this type are not supported`.
+> 3. **Universal Data Types**: Dimensions use `CAST(NULL AS VARCHAR(255))` and `CURRENT_TIMESTAMP` (without parentheses) for 100% interoperability across Athena Presto/Trino, Spark SQL (which requires a length parameter for VARCHAR), and MySQL.
+
 ```json
 {
   "sql_s3_path": "s3://uax-datalake-dev-bucket/gold/query/moveworks/v_interactions.sql",
   "database": "uax_datalake_db_dev",
-  "params": {
-    "start_time": "2025-07-15 00:00:00.000 UTC",
-    "end_time": "2025-07-15 23:59:59.999 UTC"
-  }
+  "table_replacements": {
+    "tbl_interactions": "silver_tbl_moveworks_interactions",
+    "tbl_conversations": "silver_tbl_moveworks_conversations",
+    "tbl_plugin_calls": "silver_tbl_moveworks_plugin_calls",
+    "tbl_plugin_resources": "silver_tbl_moveworks_plugin_resources",
+    "tbl_users": "silver_tbl_moveworks_users"
+  },
+  "max_results": 10
 }
 ```
 

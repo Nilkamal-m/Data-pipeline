@@ -2457,9 +2457,9 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         with open(sql_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # STRING is Hive specific; Trino / Presto in Athena requires VARCHAR
+        # STRING is Hive specific; Trino and Spark SQL require parameterized VARCHAR(length)
         self.assertNotIn("CAST(NULL AS STRING)", content)
-        self.assertIn("CAST(NULL AS VARCHAR)", content)
+        self.assertIn("CAST(NULL AS VARCHAR(255))", content)
 
         # Trino / Presto requires CURRENT_TIMESTAMP without parentheses
         self.assertNotIn("CURRENT_TIMESTAMP()", content)
