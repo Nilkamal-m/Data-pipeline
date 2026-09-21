@@ -151,6 +151,27 @@ WITH conversation_topics AS (
             AND interaction_id IS NOT NULL
         GROUP BY
             interaction_id
+    ),
+    ranked_users AS (
+        -- Rank users based on id and take the 1st record to ensure 1:1 join
+        SELECT
+            *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY id
+                    ORDER BY COALESCE(_updated_at, _inserted_at) DESC
+                ) AS rnk
+            FROM tbl_users
+            WHERE
+                _is_current = 'Y'
+                AND _is_deleted = 'N'
+                AND id IS NOT NULL
+                AND trim(id) != ''
+        ) AS u_sub
+        WHERE
+            u_sub.rnk = 1
     )
 SELECT
     -- Base Interaction Attributes
@@ -211,10 +232,8 @@ LEFT JOIN plugin_aggregates pa ON ui.id = pa.interaction_id
 -- Join aggregated plugin resources & citations
 LEFT JOIN resource_aggregates ra ON ui.id = ra.interaction_id
 
--- Join user identity & preferred language (active records only)
-LEFT JOIN tbl_users u ON ui.user_id = u.id
-AND u._is_current = 'Y'
-AND u._is_deleted = 'N'
+-- Join user identity & preferred language from 1st-ranked user record
+LEFT JOIN ranked_users u ON ui.user_id = u.id
 WHERE
     -- Filter strictly for active, non-deleted user-led interactions
     ui._is_current = 'Y'

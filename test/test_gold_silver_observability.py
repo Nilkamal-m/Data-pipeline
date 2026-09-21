@@ -1612,6 +1612,7 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         self.assertIn("bot_responses AS", content)
         self.assertIn("plugin_aggregates AS", content)
         self.assertIn("resource_aggregates AS", content)
+        self.assertIn("ranked_users AS", content)
 
         # Check core columns
         self.assertIn("AS timestamp", content)
