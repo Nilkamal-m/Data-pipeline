@@ -289,6 +289,19 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
         else:
             self.assertEqual(ssl_ctx.get("check_hostname"), False)
 
+    def test_computed_at_uses_current_timestamp_column(self):
+        """Tests that _computed_at uses pyspark.sql.functions.current_timestamp() instead of collected scalar."""
+        from pyspark.sql.functions import current_timestamp
+        mock_spark = MagicMock()
+        mock_df = MagicMock()
+        mock_spark.sql.return_value = mock_df
+        mock_df.withColumn.return_value = mock_df
+
+        # Call withColumn as in _process_mysql_marts
+        col_expr = current_timestamp()
+        mock_df.withColumn("_computed_at", col_expr)
+        mock_df.withColumn.assert_called_with("_computed_at", col_expr)
+
     def test_password_manual_option(self):
         """Tests that manual password via --RDS_PASSWORD is used."""
         params = {

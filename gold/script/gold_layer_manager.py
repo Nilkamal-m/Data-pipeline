@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 import boto3
 from botocore.exceptions import ClientError
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.functions import current_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -494,7 +495,7 @@ class GoldLayerManager:
                 # 1. Spark SQL Execution
                 logger.info(f"Executing Spark SQL query for '{clean_base_name}'...")
                 df_mart = spark.sql(sql_text)
-                df_mart = df_mart.withColumn("_computed_at", df_mart.sql_ctx.sql("select current_timestamp()").collect()[0][0])
+                df_mart = df_mart.withColumn("_computed_at", current_timestamp())
                 row_count = df_mart.count()
                 logger.info(f"Query executed successfully. Computed {row_count:,} records.")
                 cls._log_schema_introspection(df_mart, f"Gold Query Output Schema: '{clean_base_name}'")
