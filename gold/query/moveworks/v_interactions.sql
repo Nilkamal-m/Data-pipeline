@@ -16,7 +16,8 @@
 --   - User language preferences and identity placeholders
 -- ==============================================================================
 
-WITH conversation_topics AS (
+WITH
+    conversation_topics AS (
         -- Aggregate distinct entity topics across all interactions in each conversation
         SELECT
             conversation_id,
@@ -39,23 +40,31 @@ WITH conversation_topics AS (
         SELECT
             parent_interaction_id,
             detail_content AS bot_response
-        FROM tbl_interactions
+        FROM (
+                SELECT
+                    parent_interaction_id, detail_content, ROW_NUMBER() OVER (
+                        PARTITION BY
+                            parent_interaction_id
+                        ORDER BY id ASC -- mirrors pandas iloc[0] based on record order
+                    ) AS rn
+                FROM tbl_interactions
+                WHERE
+                    _is_current = 'Y'
+                    AND _is_deleted = 'N'
+                    AND lower(actor) = 'bot'
+                    AND parent_interaction_id IS NOT NULL
+                    AND detail_content IS NOT NULL
+                    AND trim(detail_content) != ''
+            ) sub
         WHERE
-            _is_current = 'Y'
-            AND _is_deleted = 'N'
-            AND lower(actor) = 'bot'
-            AND parent_interaction_id IS NOT NULL
-            AND detail_content IS NOT NULL
-            AND trim(detail_content) != ''
-        GROUP BY
-            parent_interaction_id
+            rn = 1
     ),
     plugin_aggregates AS (
         -- Aggregate plugin execution metrics per interaction
         SELECT
             interaction_id,
-            array_join(
-                array_agg(
+            array_join (
+                array_agg (
                     DISTINCT CASE
                         WHEN (
                             served = false
@@ -69,16 +78,16 @@ WITH conversation_topics AS (
                 ),
                 ', '
             ) AS unsuccessful_plugins,
-            array_join(
-                array_agg(
+            array_join (
+                array_agg (
                     DISTINCT CASE
                         WHEN served = true THEN plugin_name
                     END
                 ),
                 ', '
             ) AS plugin_served,
-            array_join(
-                array_agg(
+            array_join (
+                array_agg (
                     DISTINCT CASE
                         WHEN served = true
                         AND used = true THEN plugin_name
@@ -100,8 +109,8 @@ WITH conversation_topics AS (
         -- Aggregate knowledge citations, content items, and generated tickets per interaction
         SELECT
             interaction_id,
-            array_join(
-                array_agg(
+            array_join (
+                array_agg (
                     DISTINCT CASE
                         WHEN detail_domain IS NOT NULL
                         AND trim(detail_domain) != '' THEN detail_domain
@@ -110,8 +119,8 @@ WITH conversation_topics AS (
                 ', '
             ) AS resource_domain,
             count(DISTINCT resource_id) AS no_of_citations,
-            array_join(
-                array_agg(
+            array_join (
+                array_agg (
                     DISTINCT CASE
                         WHEN detail_name IS NOT NULL
                         AND trim(detail_name) != '' THEN detail_name
@@ -119,8 +128,8 @@ WITH conversation_topics AS (
                 ),
                 ', '
             ) AS content_item_name,
-            array_join(
-                array_agg(
+            array_join (
+                array_agg (
                     DISTINCT CASE
                         WHEN detail_external_resource_id IS NOT NULL
                         AND trim(detail_external_resource_id) != '' THEN detail_external_resource_id
@@ -134,8 +143,8 @@ WITH conversation_topics AS (
                     ELSE NULL
                 END
             ) AS ticket_type,
-            array_join(
-                array_agg(
+            array_join (
+                array_agg (
                     DISTINCT CASE
                         WHEN type = 'RESOURCE_TYPE_TICKET'
                         AND detail_external_resource_id IS NOT NULL
@@ -154,65 +163,62 @@ WITH conversation_topics AS (
     ),
     ranked_users AS (
         -- Rank users based on id and take the 1st record to ensure 1:1 join
-        SELECT
-            *
+        SELECT *
         FROM (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY id
-                    ORDER BY COALESCE(_updated_at, _inserted_at) DESC
-                ) AS rnk
-            FROM tbl_users
-            WHERE
-                _is_current = 'Y'
-                AND _is_deleted = 'N'
-                AND id IS NOT NULL
-                AND trim(id) != ''
-        ) AS u_sub
+                SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY
+                            id
+                        ORDER BY COALESCE(_updated_at, _inserted_at) DESC
+                    ) AS rnk
+                FROM tbl_users
+                WHERE
+                    _is_current = 'Y'
+                    AND _is_deleted = 'N'
+                    AND id IS NOT NULL
+                    AND trim(id) != ''
+            ) AS u_sub
         WHERE
             u_sub.rnk = 1
     )
 SELECT
     -- Base Interaction Attributes
-    ui.created_time                                          AS timestamp,
-    ui.conversation_id                                       AS conversation_id,
-    ui.id                                                    AS interaction_id,
-    COALESCE(ui.type, 'UNKNOWN')                             AS interaction_type,
+    ui.created_time AS timestamp,
+    ui.conversation_id AS conversation_id,
+    ui.id AS interaction_id,
+    COALESCE(ui.type, 'UNKNOWN') AS interaction_type,
 
-    -- Conversation Details
-    COALESCE(c.primary_domain, '')                           AS conversation_domain,
-    COALESCE(ct.conversation_topic, '')                      AS conversation_topic,
+-- Conversation Details
+COALESCE(c.primary_domain, '') AS conversation_domain,
+COALESCE(ct.conversation_topic, '') AS conversation_topic,
 
-    -- Content & Bot Response
-    COALESCE(ui.detail_content, '')                          AS interaction_content,
-    COALESCE(br.bot_response, '')                            AS bot_response,
+-- Content & Bot Response
+COALESCE(ui.detail_content, '') AS interaction_content,
+COALESCE(br.bot_response, '') AS bot_response,
 
-    -- Plugin Activity
-    COALESCE(pa.unsuccessful_plugins, '')                    AS unsuccessful_plugins,
-    COALESCE(pa.plugin_served, '')                           AS plugin_served,
-    COALESCE(pa.plugin_used, '')                             AS plugin_used,
+-- Plugin Activity
+COALESCE(pa.unsuccessful_plugins, '') AS unsuccessful_plugins,
+COALESCE(pa.plugin_served, '') AS plugin_served,
+COALESCE(pa.plugin_used, '') AS plugin_used,
 
-    -- Resource & Citation Details
-    COALESCE(ra.resource_domain, '')                         AS resource_domain,
-    COALESCE(ra.no_of_citations, 0)                          AS no_of_citations,
-    COALESCE(ra.content_item_name, '')                       AS content_item_name,
-    COALESCE(ra.content_item_id, '')                         AS content_item_id,
-    COALESCE(ra.ticket_type, '')                             AS ticket_type,
-    COALESCE(ra.ticket_id, '')                               AS ticket_id,
+-- Resource & Citation Details
+COALESCE(ra.resource_domain, '') AS resource_domain,
+COALESCE(ra.no_of_citations, 0) AS no_of_citations,
+COALESCE(ra.content_item_name, '') AS content_item_name,
+COALESCE(ra.content_item_id, '') AS content_item_id,
+COALESCE(ra.ticket_type, '') AS ticket_type,
+COALESCE(ra.ticket_id, '') AS ticket_id,
 
-    -- Surface Platform & User Identity
-    COALESCE(ui.platform, '')                                AS interaction_surface,
-    COALESCE(u.user_preferred_language, '')                  AS user_preferred_language,
+-- Surface Platform & User Identity
+COALESCE(ui.platform, '') AS interaction_surface,
+COALESCE(u.user_preferred_language, '') AS user_preferred_language,
 
-    -- Placeholder Dimensions for External HR/Identity Enrichment
-    CAST(NULL AS VARCHAR)                                    AS user_department,
-    CAST(NULL AS VARCHAR)                                    AS user_location,
-    CAST(NULL AS VARCHAR)                                    AS user_country,
+-- Placeholder Dimensions for External HR/Identity Enrichment
+CAST(NULL AS VARCHAR) AS user_department,
+CAST(NULL AS VARCHAR) AS user_location,
+CAST(NULL AS VARCHAR) AS user_country,
 
-    -- Audit Timestamp
-    CURRENT_TIMESTAMP                                        AS _data_as_of
-
+-- Audit Timestamp
+CURRENT_TIMESTAMP AS _data_as_of
 FROM tbl_interactions ui
 
 -- Join conversation domain from conversations table (active records only)
