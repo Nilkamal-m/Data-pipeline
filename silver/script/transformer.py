@@ -15,9 +15,10 @@ import sys
 import logging
 import inspect
 import importlib.util
+import re
 from typing import Dict, Any, Optional
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, expr, lit, when, current_timestamp, upper, coalesce, to_timestamp
+from pyspark.sql.functions import col, expr, lit, when, current_timestamp, upper, coalesce, to_timestamp, regexp_replace
 
 logger = logging.getLogger(__name__)
 
@@ -69,46 +70,119 @@ class SilverTransformer:
         logger.info("\n".join(lines))
 
     @classmethod
+    def clean_illegal_chars(cls, df: Any, pattern: Optional[str] = None) -> Any:
+        """
+        Cleans illegal characters using the expression provided from configuration.
+        If no expression/pattern is provided, ignores and returns DataFrame unchanged.
+
+        Supports both pandas DataFrames (via applymap/map) and PySpark DataFrames (via dynamic regexp_replace).
+        """
+        if not pattern or not isinstance(pattern, str) or not pattern.strip():
+            return df
+
+        def remove_illegal_chars(value):
+            if isinstance(value, str):
+                return re.sub(pattern, '', value)
+            return value
+
+        # Pandas DataFrame support (via applymap or map)
+        if hasattr(df, 'applymap'):
+            try:
+                return df.applymap(remove_illegal_chars)
+            except Exception:
+                pass
+        if hasattr(df, 'map') and not hasattr(df, '_jdf'):
+            try:
+                return df.map(remove_illegal_chars)
+            except Exception:
+                pass
+
+        # PySpark DataFrame support (native distributed regex across all columns dynamically)
+        if hasattr(df, 'columns') and hasattr(df, 'withColumn'):
+            for col_name in df.columns:
+                df = df.withColumn(
+                    col_name,
+                    regexp_replace(col(col_name).cast("string"), pattern, '')
+                )
+            return df
+
+        return df
+
+    @classmethod
     def apply_transformations(
         cls,
         df: DataFrame,
+        table_cfg: Dict[str, Any],
         source_system: str,
         table_name: str,
-        table_cfg: Dict[str, Any],
-        order_col_name: Optional[str] = None,
-        nkeys: Optional[Any] = None,
         spark=None,
+        nkeys=None,
+        bronze_metadata_cols=None,
+        order_col_name: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None
     ) -> DataFrame:
         """
-        Executes all configured declarative, API enrichment, and custom file transformations for a table.
-        Strips Bronze system columns and enriches DataFrame with Silver technical audit columns.
+        Applies declarative transformations in strict deterministic order:
+        1. Custom Transform Script (table-specific Python script)
+        2. Bronze System Metadata Exclusions (drops ingest runtime columns)
+        3. Default String Column Casting (casts all incoming business payload columns to string)
+        4. Clean Illegal Characters (dynamically applied if expression is configured for this table)
+        5. Filter Expression
+        6. Column Casts
+        7. Custom SQL Expressions
+        8. Column Renames
+        9. Exclude Columns (drops unneeded columns, protecting keys & audit cols)
+        10. Append Silver Technical Audit Metadata
         """
-        logger.info(f"Applying transformations for '{source_system}.{table_name}'...")
+        logger.info(f"Applying Silver transformations for '{source_system}.{table_name}'...")
 
         # 1. Log incoming schema introspection
         cls.log_schema_introspection(df, f"Incoming Schema: '{source_system}.{table_name}'")
 
-        # 2. Resolve primary ordering column if not explicitly supplied
         if not order_col_name:
             cfg_order = table_cfg.get('deduplication_order_by') or table_cfg.get('order_by')
             if cfg_order:
                 order_col_name = cfg_order[0] if isinstance(cfg_order, list) else cfg_order
 
-        # 3. Strip Bronze system-generated columns so they NEVER pass into Silver
-        bronze_system_cols = {'_ingested_at', '_source_system', '_table_name', '_execution_id', '_batch_id', '_raw_payload'}
-        bronze_drops = [c for c in df.columns if c in bronze_system_cols]
+        # 1. Custom Transform Script (table-specific hook)
+        custom_script = table_cfg.get('custom_transform_script') or table_cfg.get('custom_transform_file')
+        if custom_script:
+            df = cls._execute_custom_script(df, custom_script, spark, source_system, table_name)
+
+        # 2. Drop Bronze System Metadata Columns
+        drops = bronze_metadata_cols or [
+            '_raw_data', '_ingest_timestamp', '_extracted_at', '_batch_id',
+            '_source_system', '_source_table', '_file_name', '_file_path', '_row_num',
+            '_ingested_at', '_table_name', '_execution_id', '_raw_payload'
+        ]
+        bronze_drops = [c for c in drops if c in df.columns]
         if bronze_drops:
             logger.info(f"Removing Bronze system metadata columns from Silver processing: {bronze_drops}")
             df = df.drop(*bronze_drops)
 
-        # 4. Apply Filter Expression if specified
+        # 3. Make all columns string by default (unless explicitly cast in column_casts)
+        # Guarantees schema consistency across batches and prevents type conflicts with nested structs/primitives
+        cast_all_str = table_cfg.get('cast_all_columns_to_string', True)
+        if cast_all_str:
+            logger.info(f"Casting all payload columns to string by default for '{source_system}.{table_name}'...")
+            silver_tech = {'_valid_from', '_valid_to', '_is_current', '_is_deleted', '_inserted_at', '_updated_at'}
+            for c in df.columns:
+                if c not in silver_tech:
+                    df = df.withColumn(c, col(c).cast("string"))
+
+        # 4. Clean illegal characters dynamically if expression is configured for this table
+        illegal_expr = table_cfg.get('clean_illegal_chars_expression') or table_cfg.get('clean_illegal_chars_pattern')
+        if illegal_expr and isinstance(illegal_expr, str) and illegal_expr.strip():
+            logger.info(f"Dynamically cleaning illegal characters for '{source_system}.{table_name}' using config expression: '{illegal_expr}'...")
+            df = cls.clean_illegal_chars(df, pattern=illegal_expr)
+
+        # 5. Apply Filter Expression if specified
         filter_expr = table_cfg.get('filter_expression')
         if filter_expr and isinstance(filter_expr, str) and filter_expr.strip():
             logger.info(f"Applying filter expression: '{filter_expr}'")
             df = df.filter(expr(filter_expr))
 
-        # 5. Apply Column Casts
+        # 7. Apply Column Casts
         column_casts = table_cfg.get('column_casts', {})
         for column_name, target_type in column_casts.items():
             if column_name in df.columns:
@@ -351,3 +425,7 @@ class SilverTransformer:
             raise
 
         return df
+
+
+# Module-level alias for direct invocation
+clean_illegal_chars = SilverTransformer.clean_illegal_chars

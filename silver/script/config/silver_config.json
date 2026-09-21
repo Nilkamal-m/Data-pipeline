@@ -58,7 +58,9 @@
     },
     "_note_env": "Dynamic environment templating: '{env}' or '{ENV}' dynamically resolved at runtime from --ENV / --ENVIRONMENT Glue parameter (defaults to 'dev').",
     "exclude_columns": [],
-    "external_columns": []
+    "external_columns": [],
+    "cast_all_columns_to_string": true,
+    "_note_cast_all_columns_to_string": "When true, all incoming business payload columns are cast to string by default to prevent type mismatch and schema merge exceptions."
   },
   "source_systems": {
     "servicenow": {
@@ -243,6 +245,7 @@
           "column_casts": {},
           "exclude_columns": [],
           "external_columns": [],
+          "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_interactions.py"
@@ -269,6 +272,7 @@
           "column_casts": {},
           "exclude_columns": [],
           "external_columns": [],
+          "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_conversations.py"
@@ -294,6 +298,7 @@
           "column_casts": {},
           "exclude_columns": [],
           "external_columns": [],
+          "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_plugin_calls.py"
@@ -319,6 +324,7 @@
           "column_casts": {},
           "exclude_columns": [],
           "external_columns": [],
+          "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_plugin_resources.py"
@@ -345,6 +351,7 @@
           "column_casts": {},
           "exclude_columns": [],
           "external_columns": [],
+          "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_users.py"
@@ -371,6 +378,7 @@
           "column_casts": {},
           "exclude_columns": [],
           "external_columns": [],
+          "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
           "custom_transform_script": ""

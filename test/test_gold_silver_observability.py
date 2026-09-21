@@ -2227,6 +2227,146 @@ class TestCheckIcebergTableExists(unittest.TestCase):
         mock_glue.delete_table.assert_not_called()
 
 
+class TestCleanIllegalCharsAndDefaultString(unittest.TestCase):
+    """Verifies that clean_illegal_chars and default string column casting work across Silver."""
+
+    def test_clean_illegal_chars_pandas_applymap(self):
+        from transformer import SilverTransformer, clean_illegal_chars
+        class MockDF:
+            def __init__(self, data):
+                self.data = data
+            def applymap(self, fn):
+                return MockDF({k: [fn(v) for v in vals] for k, vals in self.data.items()})
+
+        # Contains \x00, \x08, \x0b, \x0c, \x1f, \ufffd, and legal \t, \n, \r
+        raw_text = "Bad\x00Char\x08Test\x0bVT\x0cFF\x1fUS\ufffdEnd\tTab\nNewline\rCR"
+        expected = "BadCharTestVTFFUSEnd\tTab\nNewline\rCR"
+        pattern = r'[\x00-\x08\x0B\x0C\x0E-\x1F\ufffd]'
+
+        mock_df = MockDF({'col1': [raw_text, "Clean"]})
+
+        # When pattern is provided, it cleans
+        res = clean_illegal_chars(mock_df, pattern=pattern)
+        self.assertEqual(res.data['col1'][0], expected)
+        self.assertEqual(res.data['col1'][1], "Clean")
+
+        # Classmethod invocation
+        res2 = SilverTransformer.clean_illegal_chars(mock_df, pattern=pattern)
+        self.assertEqual(res2.data['col1'][0], expected)
+
+        # When pattern is NOT provided, it ignores and returns df unchanged
+        res_ignored = clean_illegal_chars(mock_df, pattern=None)
+        self.assertEqual(res_ignored.data['col1'][0], raw_text)
+
+    def test_clean_illegal_chars_pyspark_with_column(self):
+        from transformer import SilverTransformer
+        pattern = r'[\x00-\x08\x0B\x0C\x0E-\x1F\ufffd]'
+        mock_df = MagicMock()
+        mock_df.columns = ["id", "detail", "meta"]
+        # Ensure it does NOT have applymap or map so it exercises PySpark withColumn branch
+        del mock_df.applymap
+        del mock_df.map
+        mock_df.withColumn.return_value = mock_df
+
+        # When pattern is provided, withColumn is called
+        res = SilverTransformer.clean_illegal_chars(mock_df, pattern=pattern)
+        self.assertEqual(mock_df.withColumn.call_count, 3)
+
+        # When pattern is None, ignores
+        mock_df.reset_mock()
+        res_ignored = SilverTransformer.clean_illegal_chars(mock_df, pattern=None)
+        self.assertEqual(mock_df.withColumn.call_count, 0)
+
+    def test_moveworks_custom_transforms_export(self):
+        from custom_transforms.moveworks_plugin_resources import clean_illegal_chars as pr_clean
+        from custom_transforms.moveworks_users import clean_illegal_chars as u_clean
+        pattern = r'[\x00-\x08\x0B\x0C\x0E-\x1F\ufffd]'
+
+        class MockDF:
+            def __init__(self, data):
+                self.data = data
+            def applymap(self, fn):
+                return MockDF({k: [fn(v) for v in vals] for k, vals in self.data.items()})
+
+        df1 = MockDF({'text': ['Hello\x00World\x1f!']})
+        r1 = pr_clean(df1, pattern=pattern)
+        self.assertEqual(r1.data['text'][0], 'HelloWorld!')
+
+        # If no pattern is provided, ignore
+        r1_no_pat = pr_clean(df1, pattern=None)
+        self.assertEqual(r1_no_pat.data['text'][0], 'Hello\x00World\x1f!')
+
+        df2 = MockDF({'name': ['User\x0b\x0cName\ufffd']})
+        r2 = u_clean(df2, pattern=pattern)
+        self.assertEqual(r2.data['name'][0], 'UserName')
+
+
+    def test_silver_config_isolation(self):
+        import json
+        config_path = os.path.join(os.path.dirname(__file__), "..", "silver", "script", "config", "silver_config.json")
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+
+        # Global defaults: clean_illegal_chars must be completely removed from global pipeline_defaults
+        self.assertNotIn("clean_illegal_chars", cfg["pipeline_defaults"])
+        self.assertNotIn("clean_illegal_chars_expression", cfg["pipeline_defaults"])
+        self.assertTrue(cfg["pipeline_defaults"]["cast_all_columns_to_string"])
+
+        # Moveworks tables must have clean_illegal_chars_expression configured table-specifically
+        mw_tables = cfg["source_systems"]["moveworks"]["tables"]
+        for tname, tcfg in mw_tables.items():
+            self.assertTrue(
+                tcfg.get("clean_illegal_chars_expression"),
+                f"Moveworks table {tname} should have clean_illegal_chars_expression"
+            )
+
+        # ServiceNow tables must NOT have clean_illegal_chars_expression
+        sn_tables = cfg["source_systems"]["servicenow"]["tables"]
+        for tname, tcfg in sn_tables.items():
+            self.assertNotIn(
+                "clean_illegal_chars_expression",
+                tcfg,
+                f"ServiceNow table {tname} should NOT have clean_illegal_chars_expression"
+            )
+
+    def test_transformer_scopes_illegal_chars_to_moveworks_only(self):
+        from transformer import SilverTransformer
+
+        # Test with ServiceNow: no clean_illegal_chars_expression -> clean_illegal_chars must NOT be called
+        with patch.object(SilverTransformer, 'clean_illegal_chars') as mock_clean:
+            mock_df = MagicMock()
+            mock_df.columns = ["sys_id", "number"]
+            mock_df.drop.return_value = mock_df
+            mock_df.withColumn.return_value = mock_df
+
+            table_cfg = {}
+            SilverTransformer.apply_transformations(
+                df=mock_df,
+                table_cfg=table_cfg,
+                source_system="servicenow",
+                table_name="tbl_incident",
+            )
+            mock_clean.assert_not_called()
+
+        # Test with Moveworks: clean_illegal_chars_expression set -> clean_illegal_chars MUST be called with that expression
+        mw_pattern = "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]"
+        with patch.object(SilverTransformer, 'clean_illegal_chars') as mock_clean:
+            mock_clean.return_value = mock_df
+            mock_df = MagicMock()
+            mock_df.columns = ["id", "detail"]
+            mock_df.drop.return_value = mock_df
+            mock_df.withColumn.return_value = mock_df
+
+            table_cfg = {"clean_illegal_chars_expression": mw_pattern}
+            SilverTransformer.apply_transformations(
+                df=mock_df,
+                table_cfg=table_cfg,
+                source_system="moveworks",
+                table_name="tbl_interactions",
+            )
+            mock_clean.assert_called_once_with(mock_df, pattern=mw_pattern)
+
+
 if __name__ == "__main__":
     unittest.main()
 
