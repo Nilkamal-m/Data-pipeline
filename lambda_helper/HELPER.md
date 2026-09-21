@@ -16,10 +16,10 @@ The Helper Lambda function provides a unified control plane and execution interf
 | :--- | :--- | :--- | :--- |
 | **Glue Crawler** | `"layer": "crawler"` or `"crawler_name"` | AWS Glue Crawler | Triggers and monitors Glue Crawlers to discover newly ingested S3 partitions & evolve table schemas. |
 | **Catalog Maintenance** | `"action": "fix_catalog_table"` or `"layer": "catalog"` | AWS Glue Data Catalog | Removes duplicate columns (e.g. `_ingested_at`) from `StorageDescriptor.Columns` in 2 seconds without rewriting S3 data. |
-| **Athena SQL Query** | `"query"`, `"sql"`, or `"query_file"` | Amazon Athena v3 | Executes multiline queries, SQL files (e.g. `interactions.sql`), or ad-hoc queries with CLI tables in logs. |
+| **Athena SQL Query** | `"query"`, `"sql"`, or `"query_file"` | Amazon Athena v3 | Executes multiline queries, SQL files (e.g. `v_interactions.sql`), or ad-hoc queries with CLI tables in logs. |
 | **Bronze Ingestion** | `"layer": "bronze"` | Glue Python Shell 3.9 | Ingests raw source data from APIs/databases into S3 Bronze partitioned by `_ingested_at=<ISO_TIMESTAMP>`. |
 | **Silver Iceberg ETL** | `"layer": "silver"` | Glue PySpark 4.0 | Deduplicates Bronze raw data, applies audit columns, and merges into Iceberg tables (`tbl_<name>`). |
-| **Gold Serving Marts** | `"layer": "gold"` | Glue PySpark 4.0 | Runs source-specific SQL marts (`bucket/gold/query/<source>/*.sql`) and publishes to shared MySQL with atomic swap. |
+| **Gold Serving Marts** | `"layer": "gold"` | Glue PySpark 4.0 | Runs source-specific SQL marts (`bucket/gold/query/<source>/v_*.sql`) and publishes to shared MySQL with atomic swap. |
 | **End-to-End Pipeline** | `"layer": "all"` or `"layers": [...]` | Multi-Stage Sequential | Sequentially executes stages (e.g. `Bronze -> Crawler -> Silver -> Gold`), failing fast if any stage fails. |
 
 ---
@@ -47,8 +47,8 @@ If `"query"`, `"sql"`, `"athena_query"`, or `"query_file"` is provided, Lambda r
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `query` / `sql` | string | Optional* | - | Multiline SQL query string (e.g. `WITH ... SELECT ...`). Trailing semicolons are automatically stripped. |
-| `query_file` / `sql_file` | string | Optional* | - | Path to a local SQL file (e.g. `gold/query/moveworks/interactions.sql`). |
-| `sql_s3_path` / `query_s3_path` | string | Optional* | - | S3 URI to a SQL query (e.g. `s3://<bucket>/gold/query/moveworks/interactions.sql`). |
+| `query_file` / `sql_file` | string | Optional* | - | Path to a local SQL file (e.g. `gold/query/moveworks/v_interactions.sql`). |
+| `sql_s3_path` / `query_s3_path` | string | Optional* | - | S3 URI to a SQL query (e.g. `s3://<bucket>/gold/query/moveworks/v_interactions.sql`). |
 | `database` | string | Optional | `uax_datalake_db_dev` | Target AWS Glue Data Catalog database. Optional if query specifies `<db>.<table>`. |
 | `workgroup` | string | Optional | `uax-datalake-workgroup-dev` | Amazon Athena workgroup name. |
 | `output_location` | string | Optional | Workgroup default | S3 bucket path for query results. |
@@ -220,7 +220,7 @@ Executes `s3://<bucket>/gold/query/servicenow/*.sql` and publishes into the MySQ
   "source_system": "moveworks",
   "gold_schema": "enterprise_reporting",
   "rds_secret_name": "prod/rds/mysql_credentials",
-  "gold_query_s3_path": "s3://uax-datalake-dev-bucket/gold/query/moveworks/interactions.sql",
+  "gold_query_s3_path": "s3://uax-datalake-dev-bucket/gold/query/moveworks/v_interactions.sql",
   "connection_name": "uax-datalake-rds-connection-dev",
   "wait_until_completion": true
 }
@@ -312,11 +312,11 @@ Discovers new Bronze partitions & newly evolved Parquet columns before Silver ru
 
 ### F. Athena Multiline SQL & File Query Payloads (`"query"` / `"query_file"`)
 
-#### 19. Execute Moveworks Gold Query File (`interactions.sql`)
+#### 19. Execute Moveworks Gold Query File (`v_interactions.sql`)
 Executes the full multiline Gold aggregation query from the repository:
 ```json
 {
-  "query_file": "gold/query/moveworks/interactions.sql",
+  "query_file": "gold/query/moveworks/v_interactions.sql",
   "database": "uax_datalake_db_dev",
   "table_replacements": {
     "tbl_interactions": "silver_tbl_moveworks_interactions",
@@ -331,7 +331,7 @@ Executes the full multiline Gold aggregation query from the repository:
 #### 20. Execute SQL Query Directly from S3 URI with Dynamic Parameters
 ```json
 {
-  "sql_s3_path": "s3://uax-datalake-dev-bucket/gold/query/moveworks/interactions.sql",
+  "sql_s3_path": "s3://uax-datalake-dev-bucket/gold/query/moveworks/v_interactions.sql",
   "database": "uax_datalake_db_dev",
   "params": {
     "start_time": "2025-07-15 00:00:00.000 UTC",

@@ -17,6 +17,7 @@ An enterprise-grade, modular, and config-driven serverless data lake pipeline bu
 ### 2. Analytical Storage & Transformation (Silver & Athena Layer)
 *   **Apache Iceberg Table Format**: High-performance ACID transactions, time-travel queries, and schema evolution.
 *   **PySpark Iceberg ETL Engine**: Performs deduplication, custom data transformations, and SQL `MERGE INTO` (UPSERT / SCD Type 2) into AWS Glue Data Catalog tables.
+*   **Silver Master Guide**: See [SILVER_LAYER_GUIDE.md](silver/SILVER_LAYER_GUIDE.md) for end-to-end architecture, configuration details, and AWS Secrets Manager external API enrichment examples.
 *   **Automated Schema Crawling**: AWS Glue Crawlers scan Iceberg metadata to sync catalog tables dynamically.
 *   **Amazon Athena Analytics Engine**: Dedicated query workgroup enforcing isolated S3 query result storage (`s3://<bucket>/athena-results/`).
 

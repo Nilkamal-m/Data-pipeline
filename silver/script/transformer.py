@@ -139,7 +139,12 @@ class SilverTransformer:
         if not nkey_list:
             cfg_nkey = table_cfg.get('nkey') or table_cfg.get('deduplication_keys') or table_cfg.get('primary_key')
             if cfg_nkey:
-                nkey_list = cfg_nkey if isinstance(cfg_nkey, list) else [cfg_nkey]
+                if isinstance(cfg_nkey, list):
+                    nkey_list = [str(k).strip() for k in cfg_nkey if str(k).strip()]
+                elif isinstance(cfg_nkey, str) and ',' in cfg_nkey:
+                    nkey_list = [k.strip() for k in cfg_nkey.split(',') if k.strip()]
+                else:
+                    nkey_list = [str(cfg_nkey).strip()]
 
         protected_cols = set(nkey_list)
         if order_col_name:

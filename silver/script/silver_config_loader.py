@@ -2,6 +2,8 @@
 Silver Layer Configuration Loader for PySpark Apache Iceberg ETL.
 
 Loads configuration from local file or S3 path (s3://<bucket>/scripts/silver/config/silver_config.json).
+Supports uniform config structure with pipeline_defaults, glue_catalog, and backward-compatibility with silver_defaults.
+Tables are keyed by Silver name tbl_<tablename> with source_table_name raw_tbl_<tablename>.
 """
 
 import os
@@ -56,6 +58,14 @@ class SilverConfigLoader:
         return {}
 
     @classmethod
+    def get_defaults(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Retrieves defaults block, supporting both pipeline_defaults and silver_defaults.
+        """
+        config = config_dict or cls._config_cache or cls.load_config()
+        return config.get("pipeline_defaults") or config.get("silver_defaults", {})
+
+    @classmethod
     def get_source_config(cls, source_system: str, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Retrieves configuration for a specific source system in Silver layer.
@@ -68,36 +78,58 @@ class SilverConfigLoader:
     def get_default_tables(cls, source_system: str, config_dict: Optional[Dict[str, Any]] = None) -> list:
         """
         Retrieves default tables for a source system.
+        If default_tables is not explicitly present, discovers all tables under 'tables' (or 'table_configs').
         """
         source_cfg = cls.get_source_config(source_system, config_dict)
-        return source_cfg.get("default_tables", [])
+        default_tables = source_cfg.get("default_tables")
+        if default_tables is not None:
+            return default_tables
+        tables = source_cfg.get("tables") or source_cfg.get("table_configs", {})
+        return list(tables.keys())
 
     @classmethod
     def get_table_config(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Retrieves table-specific configuration (nkey, order_by, scd_type, etc.).
-        Supports lookup by raw_tbl_<table_name> or base <table_name> with hyphens or underscores.
+        Supports lookup in both 'tables' and 'table_configs'.
+        Supports lookup by tbl_<name>, raw_tbl_<name>, or base <name> with hyphens or underscores.
         """
         source_cfg = cls.get_source_config(source_system, config_dict)
-        table_configs = source_cfg.get("table_configs", {})
+        table_configs = source_cfg.get("tables") or source_cfg.get("table_configs", {})
         clean = table_name.strip().lower()
 
-        candidates = [clean]
-        if clean.startswith("raw_tbl_"):
-            candidates.append(clean[len("raw_tbl_"):])
-        else:
-            candidates.append(f"raw_tbl_{clean}")
+        base = clean
+        if base.startswith("raw_tbl_"):
+            base = base[len("raw_tbl_"):]
+        elif base.startswith("tbl_"):
+            base = base[len("tbl_"):]
 
-        expanded_candidates = list(candidates)
+        candidates = [
+            clean,
+            f"tbl_{base}",
+            f"raw_tbl_{base}",
+            base
+        ]
+
+        expanded_candidates = []
         for cand in candidates:
+            if cand not in expanded_candidates:
+                expanded_candidates.append(cand)
             if '-' in cand:
-                expanded_candidates.append(cand.replace('-', '_'))
+                alt = cand.replace('-', '_')
+                if alt not in expanded_candidates:
+                    expanded_candidates.append(alt)
             if '_' in cand:
-                expanded_candidates.append(cand.replace('_', '-'))
+                alt = cand.replace('_', '-')
+                if alt not in expanded_candidates:
+                    expanded_candidates.append(alt)
 
         for cand in expanded_candidates:
             if cand in table_configs:
-                return table_configs[cand]
+                cfg = dict(table_configs[cand])
+                if "target_table_name" not in cfg:
+                    cfg["target_table_name"] = cand if cand.startswith("tbl_") else f"tbl_{base}"
+                return cfg
         return {}
 
     @classmethod
@@ -110,13 +142,42 @@ class SilverConfigLoader:
         return table_cfg.get('nkey') or table_cfg.get('deduplication_keys') or table_cfg.get('primary_key')
 
     @classmethod
+    def get_nkey_list(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> list:
+        """
+        Retrieves natural key(s) as a normalized list of strings.
+        Supports single string, comma-separated string, or list of strings.
+        """
+        nkey = cls.get_nkey(source_system, table_name, config_dict)
+        if not nkey:
+            return []
+        if isinstance(nkey, list):
+            return [str(k).strip() for k in nkey if str(k).strip()]
+        if isinstance(nkey, str) and ',' in nkey:
+            return [k.strip() for k in nkey.split(',') if k.strip()]
+        return [str(nkey).strip()]
+
+    @classmethod
+    def get_bronze_technical_columns(cls, config_dict: Optional[Dict[str, Any]] = None) -> list:
+        """
+        Retrieves list of Bronze technical/system audit columns to exclude when reading Bronze payloads into Silver.
+        Bronze only adds: _ingested_at, _source_system, _table_name, _execution_id.
+        """
+        defaults = cls.get_defaults(config_dict)
+        configured = defaults.get("bronze_technical_columns")
+        if configured and isinstance(configured, list):
+            return [c.strip() for c in configured if str(c).strip()]
+        return [
+            "_ingested_at", "_source_system", "_table_name", "_execution_id"
+        ]
+
+    @classmethod
     def get_exclude_columns(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> list:
         """
         Retrieves list of columns to exclude from Silver table.
-        Combines silver_defaults.exclude_columns with table_configs.<table_name>.exclude_columns (or drop_columns).
+        Combines defaults.exclude_columns with table.exclude_columns (or drop_columns).
         """
         config = config_dict or cls._config_cache or cls.load_config()
-        defaults = config.get("silver_defaults", {})
+        defaults = cls.get_defaults(config)
         default_excludes = defaults.get("exclude_columns") or defaults.get("drop_columns") or []
         if isinstance(default_excludes, str):
             default_excludes = [c.strip() for c in default_excludes.split(',') if c.strip()]
@@ -133,10 +194,10 @@ class SilverConfigLoader:
     def get_external_columns(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> list:
         """
         Retrieves list of external columns configured for Silver table.
-        Combines silver_defaults.external_columns with table_configs.<table_name>.external_columns.
+        Combines defaults.external_columns with table.external_columns.
         """
         config = config_dict or cls._config_cache or cls.load_config()
-        defaults = config.get("silver_defaults", {})
+        defaults = cls.get_defaults(config)
         default_ext = defaults.get("external_columns") or defaults.get("api_enrichment_columns") or defaults.get("api_columns") or []
         if isinstance(default_ext, str):
             default_ext = [c.strip() for c in default_ext.split(',') if c.strip()]
@@ -152,41 +213,38 @@ class SilverConfigLoader:
     @classmethod
     def get_technical_columns(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Retrieves technical columns configuration from silver_defaults.
+        Retrieves technical columns configuration from defaults.
         """
-        config = config_dict or cls._config_cache or cls.load_config()
-        defaults = config.get("silver_defaults", {})
+        defaults = cls.get_defaults(config_dict)
         return defaults.get("technical_columns", {})
 
     @classmethod
     def get_table_prefix(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
         """
-        Retrieves table prefix for Silver layer tables from centralized silver_defaults.
+        Retrieves table prefix for Silver layer tables from centralized defaults.
         Raises ValueError if table_prefix is missing or empty.
         """
-        config = config_dict or cls._config_cache or cls.load_config()
-        defaults = config.get("silver_defaults", {})
-        prefix = defaults.get("table_prefix")
+        defaults = cls.get_defaults(config_dict)
+        prefix = defaults.get("table_prefix") or defaults.get("glue_catalog", {}).get("table_prefix")
         if not prefix or not str(prefix).strip():
             raise ValueError(
                 "CRITICAL CONFIG ERROR: 'table_prefix' is missing or empty in silver_config.json "
-                "(silver_defaults.table_prefix). Please configure it (e.g. 'tbl_')."
+                "(pipeline_defaults.table_prefix or glue_catalog.table_prefix). Please configure it (e.g. 'tbl_')."
             )
         return str(prefix).strip()
 
     @classmethod
     def get_glue_database(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
         """
-        Retrieves glue_database for Silver layer tables from centralized silver_defaults.
+        Retrieves glue_database for Silver layer tables from centralized defaults.
         Raises ValueError if glue_database is missing or empty.
         """
-        config = config_dict or cls._config_cache or cls.load_config()
-        defaults = config.get("silver_defaults", {})
-        db = defaults.get("glue_database")
+        defaults = cls.get_defaults(config_dict)
+        db = defaults.get("glue_database") or defaults.get("glue_catalog", {}).get("database_name")
         if not db or not str(db).strip():
             raise ValueError(
                 "CRITICAL CONFIG ERROR: 'glue_database' is missing or empty in silver_config.json "
-                "(silver_defaults.glue_database). Please configure it (e.g. 'uax_datalake_db_dev')."
+                "(pipeline_defaults.glue_database or glue_catalog.database_name). Please configure it (e.g. 'uax_datalake_db_dev')."
             )
         return str(db).strip()
 
@@ -201,27 +259,32 @@ class SilverConfigLoader:
     ) -> str:
         """
         Resolves the full Silver Iceberg table identifier (e.g. uax_datalake_db_dev.tbl_incident).
-        Allows table-specific override via 'target_table_name' in table_configs.
+        Allows table-specific override via 'target_table_name' in table_configs or tables.
         Pulls table_prefix and glue_database from centralized config if not provided.
-        Strips 'raw_tbl_' prefix from input table_name so output is always tbl_<base_name>.
+        Strips 'raw_tbl_' or 'tbl_' prefix from input table_name so output is always tbl_<base_name>.
         """
         prefix = table_prefix or cls.get_table_prefix(config_dict)
         db = glue_database or cls.get_glue_database(config_dict)
         table_cfg = cls.get_table_config(source_system, table_name, config_dict)
         table_clean = table_name.strip().lower()
-        base_name = table_clean[len("raw_tbl_"):] if table_clean.startswith("raw_tbl_") else table_clean
+
+        base_name = table_clean
+        if base_name.startswith("raw_tbl_"):
+            base_name = base_name[len("raw_tbl_"):]
+        elif base_name.startswith("tbl_"):
+            base_name = base_name[len("tbl_"):]
         base_name = base_name.replace("-", "_")
+
         target_name = (table_cfg.get("target_table_name") or f"{prefix}{base_name}").replace("-", "_")
         return f"{db}.{target_name}"
 
     @classmethod
     def get_watermark_config(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Retrieves watermark configuration from silver_defaults.
+        Retrieves watermark configuration from defaults.
         """
-        config = config_dict or cls._config_cache or cls.load_config()
-        defaults = config.get("silver_defaults", {})
-        return defaults.get("watermark", {
+        defaults = cls.get_defaults(config_dict)
+        wm = defaults.get("watermark", {
             "enabled": True,
             "metadata_prefix": "metadata/silver",
             "watermark_column": "_ingested_at",
@@ -229,6 +292,9 @@ class SilverConfigLoader:
             "watermark_table_name": "tbl_watermarks",
             "full_refresh": False
         })
+        if not wm.get("watermark_table_name"):
+            wm["watermark_table_name"] = defaults.get("glue_catalog", {}).get("watermark_table_name", "tbl_watermarks")
+        return wm
 
     @classmethod
     def is_watermark_enabled(cls, config_dict: Optional[Dict[str, Any]] = None) -> bool:
@@ -240,7 +306,7 @@ class SilverConfigLoader:
     @classmethod
     def get_watermark_table_name(cls, config_dict: Optional[Dict[str, Any]] = None) -> str:
         """
-        Retrieves watermark_table_name from silver_defaults.watermark.
+        Retrieves watermark_table_name from defaults.watermark or glue_catalog.
         Raises ValueError if watermark_table_name is missing or empty.
         """
         wm_cfg = cls.get_watermark_config(config_dict)
@@ -248,7 +314,6 @@ class SilverConfigLoader:
         if not tbl_name or not str(tbl_name).strip():
             raise ValueError(
                 "CRITICAL CONFIG ERROR: 'watermark_table_name' is missing or empty in silver_config.json "
-                "(silver_defaults.watermark.watermark_table_name). Please configure it (e.g. 'tbl_watermarks')."
+                "(pipeline_defaults.watermark.watermark_table_name or glue_catalog.watermark_table_name). Please configure it (e.g. 'tbl_watermarks')."
             )
         return str(tbl_name).strip()
-

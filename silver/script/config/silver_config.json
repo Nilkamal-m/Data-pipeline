@@ -1,11 +1,23 @@
 {
-  "silver_defaults": {
+  "_comment": "Silver Layer Iceberg Transformation Configuration \u2014 UAX Data Lake Pipeline. Modeled uniformly with Bronze Layer configuration.",
+  "pipeline_defaults": {
+    "silver_bucket": "",
+    "state_bucket": "",
+    "_note_buckets": "Set silver_bucket / state_bucket here OR pass --DATA_LAKE_BUCKET / --STATE_BUCKET via CLI. If both are empty the job uses environment default.",
     "target_format": "iceberg",
     "table_prefix": "tbl_",
     "merge_strategy": "upsert",
     "scd_type": "scd1",
     "bronze_data_prefix": "bronze/data",
     "silver_data_prefix": "silver/data",
+    "state_prefix": "metadata/silver",
+    "bronze_technical_columns": [
+      "_ingested_at",
+      "_source_system",
+      "_table_name",
+      "_execution_id"
+    ],
+    "_note_bronze_technical_columns": "System technical and audit columns excluded when reading Bronze payload into Silver Iceberg tables.",
     "technical_columns": {
       "is_deleted_column": "_is_deleted",
       "inserted_at_column": "_inserted_at",
@@ -21,7 +33,6 @@
       "is_current_column": "_is_current",
       "high_date_value": "9999-01-01 00:00:00"
     },
-    "glue_database": "uax_datalake_db_dev",
     "deduplication": {
       "enabled": true,
       "strategy": "latest_by_order_column",
@@ -36,17 +47,31 @@
       "watermark_table_name": "tbl_watermarks",
       "full_refresh": false
     },
+    "glue_catalog": {
+      "enabled": true,
+      "database_name": "uax_datalake_db_{env}",
+      "crawler_name": "uax-datalake-silver-crawler-{env}",
+      "trigger_crawler": true,
+      "sync_watermark_table": true,
+      "watermark_table_name": "tbl_watermarks"
+    },
+    "_note_env": "Dynamic environment templating: '{env}' or '{ENV}' dynamically resolved at runtime from --ENV / --ENVIRONMENT Glue parameter (defaults to 'dev').",
     "exclude_columns": [],
     "external_columns": []
   },
   "source_systems": {
     "servicenow": {
-      "default_tables": ["raw_tbl_incident", "raw_tbl_change_request", "raw_tbl_problem", "raw_tbl_sys_user"],
-      "table_configs": {
-        "raw_tbl_incident": {
+      "tables": {
+        "tbl_incident": {
+          "source_table_name": "raw_tbl_incident",
           "nkey": "sys_id",
-          "deduplication_keys": ["sys_id"],
-          "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
+          "deduplication_keys": [
+            "sys_id"
+          ],
+          "deduplication_order_by": [
+            "sys_updated_on",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -60,10 +85,16 @@
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/servicenow_incident.py"
         },
-        "raw_tbl_change_request": {
+        "tbl_change_request": {
+          "source_table_name": "raw_tbl_change_request",
           "nkey": "sys_id",
-          "deduplication_keys": ["sys_id"],
-          "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
+          "deduplication_keys": [
+            "sys_id"
+          ],
+          "deduplication_order_by": [
+            "sys_updated_on",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd2",
           "deduplication_strategy": "latest_by_order_column",
@@ -75,10 +106,16 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "raw_tbl_problem": {
+        "tbl_problem": {
+          "source_table_name": "raw_tbl_problem",
           "nkey": "sys_id",
-          "deduplication_keys": ["sys_id"],
-          "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
+          "deduplication_keys": [
+            "sys_id"
+          ],
+          "deduplication_order_by": [
+            "sys_updated_on",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -90,10 +127,16 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "raw_tbl_sys_user": {
+        "tbl_sys_user": {
+          "source_table_name": "raw_tbl_sys_user",
           "nkey": "sys_id",
-          "deduplication_keys": ["sys_id"],
-          "deduplication_order_by": ["sys_updated_on", "_ingested_at"],
+          "deduplication_keys": [
+            "sys_id"
+          ],
+          "deduplication_order_by": [
+            "sys_updated_on",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -108,12 +151,18 @@
       }
     },
     "genesys": {
-      "default_tables": ["raw_tbl_conversations", "raw_tbl_users", "raw_tbl_queues"],
-      "table_configs": {
-        "raw_tbl_conversations": {
+      "tables": {
+        "tbl_conversations": {
+          "source_table_name": "raw_tbl_conversations",
           "nkey": "id",
-          "deduplication_keys": ["id"],
-          "deduplication_order_by": ["conversation_end", "conversation_start", "_ingested_at"],
+          "deduplication_keys": [
+            "id"
+          ],
+          "deduplication_order_by": [
+            "conversation_end",
+            "conversation_start",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -125,10 +174,16 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "raw_tbl_users": {
+        "tbl_users": {
+          "source_table_name": "raw_tbl_users",
           "nkey": "id",
-          "deduplication_keys": ["id"],
-          "deduplication_order_by": ["date_modified", "_ingested_at"],
+          "deduplication_keys": [
+            "id"
+          ],
+          "deduplication_order_by": [
+            "date_modified",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -140,10 +195,16 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "raw_tbl_queues": {
+        "tbl_queues": {
+          "source_table_name": "raw_tbl_queues",
           "nkey": "id",
-          "deduplication_keys": ["id"],
-          "deduplication_order_by": ["date_modified", "_ingested_at"],
+          "deduplication_keys": [
+            "id"
+          ],
+          "deduplication_order_by": [
+            "date_modified",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -158,12 +219,22 @@
       }
     },
     "moveworks": {
-      "default_tables": ["raw_tbl_interactions", "raw_tbl_conversations", "raw_tbl_plugin_calls", "raw_tbl_plugin_resources", "raw_tbl_users"],
-      "table_configs": {
-        "raw_tbl_interactions": {
-          "nkey": ["id", "interaction_id"],
-          "deduplication_keys": ["id", "interaction_id"],
-          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
+      "tables": {
+        "tbl_interactions": {
+          "source_table_name": "raw_tbl_interactions",
+          "nkey": [
+            "id",
+            "interaction_id"
+          ],
+          "deduplication_keys": [
+            "id",
+            "interaction_id"
+          ],
+          "deduplication_order_by": [
+            "last_updated_time",
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -175,10 +246,21 @@
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_interactions.py"
         },
-        "raw_tbl_conversations": {
-          "nkey": ["id", "conversation_id"],
-          "deduplication_keys": ["id", "conversation_id"],
-          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
+        "tbl_conversations": {
+          "source_table_name": "raw_tbl_conversations",
+          "nkey": [
+            "id",
+            "conversation_id"
+          ],
+          "deduplication_keys": [
+            "id",
+            "conversation_id"
+          ],
+          "deduplication_order_by": [
+            "last_updated_time",
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -190,10 +272,20 @@
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_conversations.py"
         },
-        "raw_tbl_plugin_calls": {
-          "nkey": ["id", "interaction_id"],
-          "deduplication_keys": ["id"],
-          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
+        "tbl_plugin_calls": {
+          "source_table_name": "raw_tbl_plugin_calls",
+          "nkey": [
+            "id",
+            "interaction_id"
+          ],
+          "deduplication_keys": [
+            "id"
+          ],
+          "deduplication_order_by": [
+            "last_updated_time",
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -205,10 +297,20 @@
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_plugin_calls.py"
         },
-        "raw_tbl_plugin_resources": {
-          "nkey": ["id", "resource_id"],
-          "deduplication_keys": ["id"],
-          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
+        "tbl_plugin_resources": {
+          "source_table_name": "raw_tbl_plugin_resources",
+          "nkey": [
+            "id",
+            "resource_id"
+          ],
+          "deduplication_keys": [
+            "id"
+          ],
+          "deduplication_order_by": [
+            "last_updated_time",
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -220,10 +322,21 @@
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_plugin_resources.py"
         },
-        "raw_tbl_users": {
-          "nkey": ["id", "user_id"],
-          "deduplication_keys": ["id", "user_id"],
-          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
+        "tbl_users": {
+          "source_table_name": "raw_tbl_users",
+          "nkey": [
+            "id",
+            "user_id"
+          ],
+          "deduplication_keys": [
+            "id",
+            "user_id"
+          ],
+          "deduplication_order_by": [
+            "last_updated_time",
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -235,10 +348,21 @@
           "custom_expressions": {},
           "custom_transform_script": "custom_transforms/moveworks_users.py"
         },
-        "raw_tbl_tickets": {
-          "nkey": ["id", "ticket_id"],
-          "deduplication_keys": ["id", "ticket_id"],
-          "deduplication_order_by": ["last_updated_time", "updated_at", "_ingested_at"],
+        "tbl_tickets": {
+          "source_table_name": "raw_tbl_tickets",
+          "nkey": [
+            "id",
+            "ticket_id"
+          ],
+          "deduplication_keys": [
+            "id",
+            "ticket_id"
+          ],
+          "deduplication_order_by": [
+            "last_updated_time",
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -253,12 +377,18 @@
       }
     },
     "postgresql": {
-      "default_tables": ["raw_tbl_orders", "raw_tbl_order_items", "raw_tbl_customers"],
-      "table_configs": {
-        "raw_tbl_orders": {
+      "tables": {
+        "tbl_orders": {
+          "source_table_name": "raw_tbl_orders",
           "nkey": "order_id",
-          "deduplication_keys": ["order_id"],
-          "deduplication_order_by": ["updated_at", "order_date", "_ingested_at"],
+          "deduplication_keys": [
+            "order_id"
+          ],
+          "deduplication_order_by": [
+            "updated_at",
+            "order_date",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -270,10 +400,20 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "raw_tbl_order_items": {
-          "nkey": ["order_id", "item_id"],
-          "deduplication_keys": ["order_id", "item_id"],
-          "deduplication_order_by": ["updated_at", "_ingested_at"],
+        "tbl_order_items": {
+          "source_table_name": "raw_tbl_order_items",
+          "nkey": [
+            "order_id",
+            "item_id"
+          ],
+          "deduplication_keys": [
+            "order_id",
+            "item_id"
+          ],
+          "deduplication_order_by": [
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -285,10 +425,16 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "raw_tbl_customers": {
+        "tbl_customers": {
+          "source_table_name": "raw_tbl_customers",
           "nkey": "customer_id",
-          "deduplication_keys": ["customer_id"],
-          "deduplication_order_by": ["updated_at", "_ingested_at"],
+          "deduplication_keys": [
+            "customer_id"
+          ],
+          "deduplication_order_by": [
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd2",
           "deduplication_strategy": "latest_by_order_column",
@@ -303,12 +449,18 @@
       }
     },
     "mysql": {
-      "default_tables": ["raw_tbl_transactions", "raw_tbl_users", "raw_tbl_accounts"],
-      "table_configs": {
-        "raw_tbl_transactions": {
+      "tables": {
+        "tbl_transactions": {
+          "source_table_name": "raw_tbl_transactions",
           "nkey": "transaction_id",
-          "deduplication_keys": ["transaction_id"],
-          "deduplication_order_by": ["transaction_time", "updated_at", "_ingested_at"],
+          "deduplication_keys": [
+            "transaction_id"
+          ],
+          "deduplication_order_by": [
+            "transaction_time",
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -320,10 +472,16 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "raw_tbl_users": {
+        "tbl_users": {
+          "source_table_name": "raw_tbl_users",
           "nkey": "user_id",
-          "deduplication_keys": ["user_id"],
-          "deduplication_order_by": ["updated_at", "_ingested_at"],
+          "deduplication_keys": [
+            "user_id"
+          ],
+          "deduplication_order_by": [
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",
@@ -335,10 +493,16 @@
           "custom_expressions": {},
           "custom_transform_script": ""
         },
-        "raw_tbl_accounts": {
+        "tbl_accounts": {
+          "source_table_name": "raw_tbl_accounts",
           "nkey": "account_id",
-          "deduplication_keys": ["account_id"],
-          "deduplication_order_by": ["updated_at", "_ingested_at"],
+          "deduplication_keys": [
+            "account_id"
+          ],
+          "deduplication_order_by": [
+            "updated_at",
+            "_ingested_at"
+          ],
           "merge_strategy": "upsert",
           "scd_type": "scd1",
           "deduplication_strategy": "latest_by_order_column",

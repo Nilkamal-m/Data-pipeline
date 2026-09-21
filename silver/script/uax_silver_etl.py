@@ -133,14 +133,14 @@ def parse_spark_arguments() -> dict:
     # Load Silver centralized configuration file
     s3_client = boto3.client('s3') if config_s3_path else None
     silver_full_config = SilverConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client)
-    defaults_cfg = silver_full_config.get('silver_defaults', {})
+    defaults_cfg = SilverConfigLoader.get_defaults(silver_full_config)
 
-    # Process Layer Routing: Strictly 2 Options ('silver' or 'gold')
+    # Process Layer Routing: Supports 'silver', 'gold', or 'both'
     process_layer = (get_cli_arg('PROCESS_LAYER', 'process_layer', default='silver')).lower().strip()
-    if process_layer not in ('silver', 'gold'):
+    if process_layer not in ('silver', 'gold', 'both'):
         raise ValueError(
             f"Invalid --PROCESS_LAYER value '{process_layer}'. "
-            f"Strictly 2 options are supported: '--PROCESS_LAYER=silver' or '--PROCESS_LAYER=gold'."
+            f"Strictly 2 options are supported: '--PROCESS_LAYER=silver' or '--PROCESS_LAYER=gold' (or '--PROCESS_LAYER=both')."
         )
 
     source_system = get_cli_arg('SOURCE_SYSTEM', 'source_system')
@@ -165,11 +165,12 @@ def parse_spark_arguments() -> dict:
     glue_database = (
         get_cli_arg('GLUE_DATABASE', 'glue_database', 'GLUE_DB_NAME', 'glue_db_name')
         or defaults_cfg.get('glue_database')
+        or defaults_cfg.get('glue_catalog', {}).get('database_name')
     )
     if not glue_database or not str(glue_database).strip():
         raise ValueError(
             "CRITICAL CONFIG ERROR: 'glue_database' is missing or empty in silver_config.json "
-            "(silver_defaults.glue_database) and was not provided via CLI. "
+            "(pipeline_defaults.glue_database or glue_catalog.database_name) and was not provided via CLI. "
             "Please configure 'glue_database' (e.g. 'uax_datalake_db_dev')."
         )
     glue_database = str(glue_database).strip()
@@ -192,11 +193,12 @@ def parse_spark_arguments() -> dict:
     table_prefix = (
         get_cli_arg('TABLE_PREFIX', 'table_prefix', 'SILVER_TABLE_PREFIX', 'silver_table_prefix')
         or defaults_cfg.get('table_prefix')
+        or defaults_cfg.get('glue_catalog', {}).get('table_prefix')
     )
     if not table_prefix or not str(table_prefix).strip():
         raise ValueError(
             "CRITICAL CONFIG ERROR: 'table_prefix' is missing or empty in silver_config.json "
-            "(silver_defaults.table_prefix) and was not provided via CLI. "
+            "(pipeline_defaults.table_prefix or glue_catalog.table_prefix) and was not provided via CLI. "
             "Please configure 'table_prefix' (e.g. 'tbl_')."
         )
     table_prefix = str(table_prefix).strip()
@@ -288,17 +290,21 @@ def parse_spark_arguments() -> dict:
         trigger_crawler = None
 
     # Gold Serving Layer Parameters
+    gold_targets_raw = get_cli_arg('GOLD_TARGETS', 'gold_targets', 'GOLD_TARGET', 'gold_target', default='aurora')
+    gold_targets = [t.strip().lower() for t in str(gold_targets_raw).split(',') if t.strip()]
+    gold_target = gold_targets[0] if gold_targets else 'aurora'
+
     gold_schema = get_cli_arg('GOLD_SCHEMA', 'gold_schema')
-    if process_layer == 'gold' and (not gold_schema or not str(gold_schema).strip()):
+    needs_mysql = any(t in gold_targets for t in ('aurora', 'rds', 'mysql'))
+    if process_layer in ('gold', 'both') and needs_mysql and (not gold_schema or not str(gold_schema).strip()):
         raise ValueError(
             "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_SCHEMA'.\n"
-            "In accordance with enterprise shared database policy, no fallback schema is permitted.\n"
+            "Downstream target includes Aurora/MySQL, where no fallback schema is permitted.\n"
             "Please explicitly specify the target MySQL schema name (e.g. --GOLD_SCHEMA enterprise_reporting)."
         )
     if gold_schema:
         gold_schema = str(gold_schema).strip()
 
-    gold_target = (get_cli_arg('GOLD_TARGET', 'gold_target', default='aurora')).lower().strip()
     default_gold_query = f"s3://{data_lake_bucket}/gold/query/{source_system_clean}"
     default_gold_data = f"s3://{data_lake_bucket}/gold/data/{source_system_clean}"
     gold_query_s3_path = get_cli_arg('GOLD_QUERY_S3_PATH', 'gold_query_s3_path', default=default_gold_query)
@@ -309,6 +315,15 @@ def parse_spark_arguments() -> dict:
     rds_port = get_cli_arg('RDS_PORT', 'rds_port', default='3306')
     rds_user = get_cli_arg('RDS_USER', 'rds_user')
     rds_password = get_cli_arg('RDS_PASSWORD', 'rds_password')
+
+    # External DW: Redshift & Snowflake parameters
+    redshift_schema = get_cli_arg('REDSHIFT_SCHEMA', 'redshift_schema', default='gold_spectrum_schema')
+    redshift_iam_role = get_cli_arg('REDSHIFT_IAM_ROLE', 'redshift_iam_role')
+    redshift_secret_name = get_cli_arg('REDSHIFT_SECRET_NAME', 'redshift_secret_name')
+    snowflake_database = get_cli_arg('SNOWFLAKE_DATABASE', 'snowflake_database', default='UAX_ANALYTICS_DB')
+    snowflake_schema = get_cli_arg('SNOWFLAKE_SCHEMA', 'snowflake_schema', default='GOLD_MARTS')
+    snowflake_external_volume = get_cli_arg('SNOWFLAKE_EXTERNAL_VOLUME', 'snowflake_external_volume', default='UAX_S3_ICEBERG_VOLUME')
+    snowflake_secret_name = get_cli_arg('SNOWFLAKE_SECRET_NAME', 'snowflake_secret_name')
 
     return {
         'PROCESS_LAYER': process_layer,
@@ -331,6 +346,7 @@ def parse_spark_arguments() -> dict:
         'SILVER_FULL_CONFIG': silver_full_config,
         'GOLD_SCHEMA': gold_schema,
         'GOLD_TARGET': gold_target,
+        'GOLD_TARGETS': ','.join(gold_targets),
         'GOLD_QUERY_S3_PATH': gold_query_s3_path,
         'GOLD_DATA_S3_PATH': gold_data_s3_path,
         'CONNECTION_NAME': connection_name,
@@ -339,6 +355,13 @@ def parse_spark_arguments() -> dict:
         'RDS_PORT': rds_port,
         'RDS_USER': rds_user,
         'RDS_PASSWORD': rds_password,
+        'REDSHIFT_SCHEMA': redshift_schema,
+        'REDSHIFT_IAM_ROLE': redshift_iam_role,
+        'REDSHIFT_SECRET_NAME': redshift_secret_name,
+        'SNOWFLAKE_DATABASE': snowflake_database,
+        'SNOWFLAKE_SCHEMA': snowflake_schema,
+        'SNOWFLAKE_EXTERNAL_VOLUME': snowflake_external_volume,
+        'SNOWFLAKE_SECRET_NAME': snowflake_secret_name,
         'ARG_DICT': arg_dict
     }
 
@@ -426,10 +449,13 @@ def update_silver_watermark(
 
     try:
         logger.info(f"Updating Silver watermark at '{s3_path}' with payload: {state_payload}")
+        # Athena OpenX JsonSerDe requires single-line JSON (JSON Lines / NDJSON).
+        # Multi-line pretty-printed JSON causes TextInputFormat to parse line-by-line and return NULL for all columns.
+        single_line_payload = json.dumps(state_payload) + '\n'
         s3_client.put_object(
             Bucket=bucket,
             Key=state_key,
-            Body=json.dumps(state_payload, indent=2).encode('utf-8'),
+            Body=single_line_payload.encode('utf-8'),
             ContentType="application/json"
         )
         logger.info(f"Successfully updated Silver S3 watermark at '{s3_path}'")
@@ -437,12 +463,50 @@ def update_silver_watermark(
         logger.warning(f"Failed to update Silver watermark at '{s3_path}': {err}")
 
 
+def sanitize_watermark_files(s3_cli, bucket: str, prefix: str) -> int:
+    """
+    Scans all watermark.json files under s3://{bucket}/{prefix}/.
+    If any file is formatted as multi-line JSON (pretty-printed), rewrites it as single-line JSON Lines (NDJSON).
+    Athena OpenX JsonSerDe reads files line-by-line; pretty-printed JSON results in NULL values for all columns.
+    """
+    if not s3_cli or not bucket or not prefix:
+        return 0
+    clean_prefix = prefix.strip('/')
+    fixed_count = 0
+    try:
+        paginator = s3_cli.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=clean_prefix):
+            for obj in page.get('Contents', []):
+                key = obj.get('Key', '')
+                if key.endswith('watermark.json'):
+                    try:
+                        resp = s3_cli.get_object(Bucket=bucket, Key=key)
+                        raw_body = resp['Body'].read().decode('utf-8')
+                        if '\n' in raw_body.strip():
+                            parsed = json.loads(raw_body)
+                            single_line = json.dumps(parsed) + '\n'
+                            s3_cli.put_object(
+                                Bucket=bucket,
+                                Key=key,
+                                Body=single_line.encode('utf-8'),
+                                ContentType="application/json"
+                            )
+                            fixed_count += 1
+                            logger.info(f"[SILVER WATERMARK SANITIZER] Re-saved multi-line watermark as single-line JSON: s3://{bucket}/{key}")
+                    except Exception as parse_err:
+                        logger.warning(f"Could not sanitize watermark file s3://{bucket}/{key}: {parse_err}")
+    except Exception as list_err:
+        logger.warning(f"Could not list watermark files for sanitization under s3://{bucket}/{clean_prefix}: {list_err}")
+    return fixed_count
+
+
 def sync_silver_watermark_catalog_table(
     glue_client,
     database_name: str,
     watermark_table_name: str,
     bucket: str,
-    metadata_prefix: str = "metadata/silver"
+    metadata_prefix: str = "metadata/silver",
+    s3_client=None
 ) -> str:
     """
     Creates or ensures an Athena-queryable AWS Glue Catalog external table for all Silver High-Water Mark state files.
@@ -455,6 +519,10 @@ def sync_silver_watermark_catalog_table(
 
     clean_prefix = metadata_prefix.strip('/')
     watermark_location = f"s3://{bucket}/{clean_prefix}/"
+
+    # Automatically sanitize any legacy multi-line watermark.json files
+    if s3_client:
+        sanitize_watermark_files(s3_client, bucket, clean_prefix)
 
     columns = [
         {'Name': 'source_system', 'Type': 'string'},
@@ -476,36 +544,46 @@ def sync_silver_watermark_catalog_table(
             'SerializationLibrary': 'org.openx.data.jsonserde.JsonSerDe',
             'Parameters': {
                 'ignore.malformed.json': 'true',
+                'case.insensitive': 'true',
+                'dots.in.keys': 'false',
                 'mapping.source_system': 'source_system',
                 'mapping.table_name': 'table_name',
                 'mapping.last_load_date': 'last_load_date',
                 'mapping.last_status': 'last_status',
                 'mapping.records_processed': 'records_processed',
+                'mapping.records_ingested': 'records_processed',
                 'mapping.updated_at': 'updated_at'
             }
         }
     }
 
+    table_input = {
+        'Name': watermark_table_name,
+        'Description': 'Athena queryable table for all Silver High-Water Mark state files',
+        'TableType': 'EXTERNAL_TABLE',
+        'Parameters': {
+            'EXTERNAL': 'TRUE',
+            'classification': 'json',
+            'recursive.directories': 'true'
+        },
+        'StorageDescriptor': storage_desc
+    }
+
     try:
         glue_client.get_table(DatabaseName=database_name, Name=watermark_table_name)
         logger.info(f"Silver Watermark Catalog Table verified: {database_name}.{watermark_table_name}")
+        try:
+            glue_client.update_table(DatabaseName=database_name, TableInput=table_input)
+            logger.info(f"Updated Silver Watermark Catalog Table definition for {database_name}.{watermark_table_name}")
+        except Exception as update_err:
+            logger.warning(f"Could not update existing Silver Watermark table definition: {update_err}")
     except ClientError as e:
         code = e.response.get('Error', {}).get('Code')
         if code in ('EntityNotFoundException', 'NoSuchEntityException'):
             try:
                 glue_client.create_table(
                     DatabaseName=database_name,
-                    TableInput={
-                        'Name': watermark_table_name,
-                        'Description': 'Athena queryable table for all Silver High-Water Mark state files',
-                        'TableType': 'EXTERNAL_TABLE',
-                        'Parameters': {
-                            'EXTERNAL': 'TRUE',
-                            'classification': 'json',
-                            'recursive.directories': 'true'
-                        },
-                        'StorageDescriptor': storage_desc
-                    }
+                    TableInput=table_input
                 )
                 logger.info(f"Created Athena Silver Watermark Catalog Table: {database_name}.{watermark_table_name} at '{watermark_location}'")
             except ClientError as ce:
@@ -675,12 +753,12 @@ def trigger_silver_iceberg_crawler(glue_client, crawler_name: str):
 
 
 
-def get_payload_columns(all_columns: list, nkeys) -> list:
+def get_payload_columns(all_columns: list, nkeys, config_dict: Optional[dict] = None) -> list:
     """
     Returns sorted list of non-key, non-technical business payload columns used for runtime change detection.
     Technical audit columns, system columns, and natural keys are excluded so changes to timestamps do not trigger false diffs.
     """
-    technical_cols = {
+    technical_cols = set(SilverConfigLoader.get_bronze_technical_columns(config_dict)) | {
         '_is_deleted', '_inserted_at', '_updated_at',
         '_valid_from', '_valid_to', '_is_current',
         '_ingested_at', '_source_system', '_table_name', '_execution_id',
@@ -1168,13 +1246,18 @@ def main():
 
     for table_idx, table_name in enumerate(table_list, start=1):
         table_clean = table_name.strip().lower()
-        raw_base_name = table_clean[len("raw_tbl_"):] if table_clean.startswith("raw_tbl_") else table_clean
+        raw_base_name = table_clean
+        if raw_base_name.startswith("raw_tbl_"):
+            raw_base_name = raw_base_name[len("raw_tbl_"):]
+        elif raw_base_name.startswith("tbl_"):
+            raw_base_name = raw_base_name[len("tbl_"):]
         base_table_name = raw_base_name.replace("-", "_")
-        bronze_table_name = f"raw_tbl_{base_table_name}"
-        table_start_time = datetime.now(timezone.utc)
 
         table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
-        defaults_cfg = silver_full_config.get('silver_defaults', {})
+        bronze_table_name = table_cfg.get('source_table_name') or f"raw_tbl_{base_table_name}"
+        table_start_time = datetime.now(timezone.utc)
+
+        defaults_cfg = SilverConfigLoader.get_defaults(silver_full_config)
         scd2_cfg = defaults_cfg.get('scd_type2_config', {})
 
         target_table_name = (table_cfg.get('target_table_name') or f"{table_prefix}{base_table_name}").replace("-", "_")
@@ -1323,7 +1406,12 @@ def main():
                         f"(source_systems.{source_system}.table_configs.{table_clean}.nkey). "
                         f"Please specify the key column in silver_config.json or pass --NKEY via CLI."
                     )
-                raw_nkeys = cfg_nkey if isinstance(cfg_nkey, list) else [cfg_nkey]
+                if isinstance(cfg_nkey, list):
+                    raw_nkeys = [str(k).strip() for k in cfg_nkey if str(k).strip()]
+                elif isinstance(cfg_nkey, str) and ',' in cfg_nkey:
+                    raw_nkeys = [k.strip() for k in cfg_nkey.split(',') if k.strip()]
+                else:
+                    raw_nkeys = [str(cfg_nkey).strip()]
                 nkeys = [k for k in raw_nkeys if k in columns]
                 if not nkeys:
                     raise ValueError(
@@ -1371,10 +1459,10 @@ def main():
             df_dedup = perform_deduplication(df_bronze, nkeys, order_cols, dedup_strategy)
 
             # 2. Strip Bronze layer system metadata columns so they NEVER pass into Silver tables
-            bronze_system_cols = {'_ingested_at', '_source_system', '_table_name', '_execution_id', '_batch_id', '_raw_payload'}
+            bronze_system_cols = set(SilverConfigLoader.get_bronze_technical_columns(silver_full_config))
             bronze_cols_to_drop = [c for c in df_dedup.columns if c in bronze_system_cols]
             if bronze_cols_to_drop:
-                logger.info(f"Stripping Bronze system columns before Silver processing: {bronze_cols_to_drop}")
+                logger.info(f"Stripping Bronze technical columns before Silver processing: {bronze_cols_to_drop}")
                 df_dedup = df_dedup.drop(*bronze_cols_to_drop)
 
             logger.info(
@@ -1390,7 +1478,9 @@ def main():
                 "base_table_name": base_table_name,
                 "data_lake_bucket": bucket_name,
                 "silver_data_prefix": silver_data_prefix,
-                "table_cfg": table_cfg
+                "table_cfg": table_cfg,
+                "cli_args": cli_args,
+                "job_name": job_name
             }
             df_transformed = SilverTransformer.apply_transformations(
                 df=df_dedup,
@@ -1580,7 +1670,8 @@ def main():
                         database_name=glue_database,
                         watermark_table_name=watermark_table_name,
                         bucket=bucket_name,
-                        metadata_prefix=metadata_prefix
+                        metadata_prefix=metadata_prefix,
+                        s3_client=s3_client
                     )
 
             table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
@@ -1736,6 +1827,21 @@ def main():
         raise RuntimeError(err_summary)
 
     logger.info("All Silver Apache Iceberg ETL transformations completed successfully.")
+
+    # Process Layer Chaining: When --PROCESS_LAYER=both, seamlessly execute Gold after successful Silver
+    if process_layer == 'both':
+        logger.info(
+            f"\n+================================================================================+\n"
+            f"|  CHAINING EXECUTION: SILVER SUCCEEDED -> NOW RUNNING GOLD SERVING ENGINE       |\n"
+            f"+================================================================================+"
+        )
+        GoldLayerManager.run_gold_pipeline(
+            spark=spark,
+            params=params,
+            glue_client=glue_client,
+            s3_client=s3_client
+        )
+        logger.info("All Gold serving layer operations completed successfully.")
 
 
 if __name__ == "__main__":

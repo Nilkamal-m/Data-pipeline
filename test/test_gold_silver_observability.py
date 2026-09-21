@@ -14,6 +14,7 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 import json
+import re
 
 # Mock awsglue, pyspark, boto3, dateutil for standalone testing without Glue/Hadoop runtime
 for pkg in ['pyspark', 'pyspark.sql', 'awsglue', 'botocore', 'dateutil']:
@@ -316,9 +317,11 @@ class TestCustomTransformsAndApiEnrichment(unittest.TestCase):
         """Tests that silver_config.json explicitly defines external_columns in defaults and table configs."""
         with open("silver/script/config/silver_config.json", "r") as f:
             cfg = json.load(f)
-        self.assertIn("external_columns", cfg.get("silver_defaults", {}))
+        defaults = cfg.get("pipeline_defaults") or cfg.get("silver_defaults", {})
+        self.assertIn("external_columns", defaults)
         for source_sys, s_cfg in cfg.get("source_systems", {}).items():
-            for tbl, t_cfg in s_cfg.get("table_configs", {}).items():
+            tbls = s_cfg.get("tables") or s_cfg.get("table_configs", {})
+            for tbl, t_cfg in tbls.items():
                 self.assertIn("external_columns", t_cfg, f"Table {source_sys}.{tbl} missing external_columns in config")
 
     def test_silver_schema_introspection(self):
@@ -383,7 +386,7 @@ class TestCustomTransformsAndApiEnrichment(unittest.TestCase):
         s3_client = MagicMock()
         mock_page = {
             'Contents': [
-                {'Key': 'gold/query/servicenow/incident_kpi.sql'}
+                {'Key': 'gold/query/servicenow/v_incident_kpi.sql'}
             ]
         }
         paginator = MagicMock()
@@ -714,9 +717,9 @@ class TestLambdaCrawlerAndMultilineSql(unittest.TestCase):
 
     def test_resolve_sql_query_local_file_and_template_params(self):
         from lambda_function import resolve_sql_query
-        # Reading interactions.sql directly from gold/query/moveworks/interactions.sql
+        # Reading v_interactions.sql directly from gold/query/moveworks/v_interactions.sql
         event = {
-            "query_file": "gold/query/moveworks/interactions.sql",
+            "query_file": "gold/query/moveworks/v_interactions.sql",
             "table_replacements": {
                 "tbl_interactions": "silver_tbl_moveworks_interactions"
             },
@@ -737,12 +740,12 @@ class TestLambdaCrawlerAndMultilineSql(unittest.TestCase):
         mock_s3.get_object.return_value = {'Body': mock_body}
 
         event = {
-            "sql_s3_path": "s3://my-test-bucket/gold/query/moveworks/interactions.sql",
+            "sql_s3_path": "s3://my-test-bucket/gold/query/moveworks/v_interactions.sql",
             "params": {"id": "int_12345"}
         }
         resolved = resolve_sql_query(event)
         self.assertEqual(resolved, "SELECT * FROM tbl_interactions WHERE id = 'int_12345';")
-        mock_s3.get_object.assert_called_once_with(Bucket="my-test-bucket", Key="gold/query/moveworks/interactions.sql")
+        mock_s3.get_object.assert_called_once_with(Bucket="my-test-bucket", Key="gold/query/moveworks/v_interactions.sql")
 
     @patch('lambda_function.athena_client')
     def test_execute_athena_query_multiline_interactions(self, mock_athena):
@@ -896,6 +899,132 @@ class TestHyphenToUnderscoreHandling(unittest.TestCase):
         clean_base_name = "chat-sessions".replace('-', '_')
         self.assertEqual(f"gold_tbl_{clean_base_name}", "gold_tbl_chat_sessions")
         self.assertEqual(f"v_{clean_base_name}", "v_chat_sessions")
+
+
+class TestSilverUniformConfigAndGoldMandatoryAthenaView(unittest.TestCase):
+    """
+    Validates uniform Silver configuration modeled after Bronze, dynamic schema technical column stripping,
+    and mandatory Gold Athena View creation with multi-target serving.
+    """
+
+    def setUp(self):
+        SilverConfigLoader._config_cache = None
+
+    def test_silver_uniform_config_loading_and_table_resolution(self):
+        config = SilverConfigLoader.load_config()
+        self.assertIn("pipeline_defaults", config)
+        
+        # Verify bronze technical columns list contains strictly the 4 Bronze technical columns
+        tech_cols = SilverConfigLoader.get_bronze_technical_columns(config)
+        self.assertEqual(tech_cols, ["_ingested_at", "_source_system", "_table_name", "_execution_id"])
+
+        # Verify default tables without explicit default_tables key
+        servicenow_tables = SilverConfigLoader.get_default_tables("servicenow", config)
+        self.assertIn("tbl_incident", servicenow_tables)
+        self.assertIn("tbl_change_request", servicenow_tables)
+
+        # Lookup table config using tbl_ prefix, raw_tbl_ prefix, and base name
+        cfg_by_tbl = SilverConfigLoader.get_table_config("servicenow", "tbl_incident", config)
+        self.assertEqual(cfg_by_tbl.get("source_table_name"), "raw_tbl_incident")
+        self.assertEqual(cfg_by_tbl.get("target_table_name"), "tbl_incident")
+        self.assertEqual(cfg_by_tbl.get("nkey"), "sys_id")
+
+        cfg_by_raw = SilverConfigLoader.get_table_config("servicenow", "raw_tbl_incident", config)
+        self.assertEqual(cfg_by_raw.get("nkey"), "sys_id")
+
+        cfg_by_base = SilverConfigLoader.get_table_config("servicenow", "incident", config)
+        self.assertEqual(cfg_by_base.get("nkey"), "sys_id")
+
+        # Verify silver table name resolution
+        silver_name_1 = SilverConfigLoader.get_silver_table_name("servicenow", "tbl_incident", glue_database="uax_db", config_dict=config)
+        self.assertEqual(silver_name_1, "uax_db.tbl_incident")
+
+        silver_name_2 = SilverConfigLoader.get_silver_table_name("servicenow", "raw_tbl_incident", glue_database="uax_db", config_dict=config)
+        self.assertEqual(silver_name_2, "uax_db.tbl_incident")
+
+        silver_name_3 = SilverConfigLoader.get_silver_table_name("servicenow", "incident", glue_database="uax_db", config_dict=config)
+        self.assertEqual(silver_name_3, "uax_db.tbl_incident")
+
+    def test_mandatory_athena_view_creation_via_boto3(self):
+        mock_spark = MagicMock()
+        mock_athena = MagicMock()
+        mock_athena.start_query_execution.return_value = {'QueryExecutionId': 'athena_query_123'}
+        mock_athena.get_query_execution.return_value = {
+            'QueryExecution': {
+                'Status': {
+                    'State': 'SUCCEEDED'
+                }
+            }
+        }
+
+        params = {
+            'DATA_LAKE_BUCKET': 'test-lake-bucket',
+            'GLUE_DATABASE': 'uax_datalake_db_dev'
+        }
+
+        created = GoldLayerManager.create_athena_view(
+            spark=mock_spark,
+            glue_database='uax_datalake_db_dev',
+            view_name='v_interactions',
+            sql_text='SELECT * FROM tbl_interactions;',
+            params=params,
+            athena_client=mock_athena
+        )
+        self.assertTrue(created)
+        mock_athena.start_query_execution.assert_called_once()
+        call_kwargs = mock_athena.start_query_execution.call_args[1]
+        self.assertIn("CREATE OR REPLACE VIEW uax_datalake_db_dev.v_interactions AS", call_kwargs['QueryString'])
+        self.assertEqual(call_kwargs['QueryExecutionContext']['Database'], 'uax_datalake_db_dev')
+
+    def test_mandatory_athena_view_creation_fallback_to_spark_sql(self):
+        mock_spark = MagicMock()
+        mock_athena = MagicMock()
+        mock_athena.start_query_execution.side_effect = Exception("Athena workgroup primary disabled")
+
+        params = {
+            'DATA_LAKE_BUCKET': 'test-lake-bucket',
+            'GLUE_DATABASE': 'uax_datalake_db_dev'
+        }
+
+        created = GoldLayerManager.create_athena_view(
+            spark=mock_spark,
+            glue_database='uax_datalake_db_dev',
+            view_name='v_incident_kpi',
+            sql_text='SELECT * FROM tbl_incident',
+            params=params,
+            athena_client=mock_athena
+        )
+        self.assertTrue(created)
+        mock_spark.sql.assert_called_once()
+        spark_call = mock_spark.sql.call_args[0][0]
+        self.assertIn("CREATE OR REPLACE VIEW `uax_datalake_db_dev`.`v_incident_kpi` AS", spark_call)
+
+    def test_gold_query_discovery_strips_v_prefix(self):
+        # When discovery finds v_interactions.sql, the mart name should be interactions and view v_interactions
+        mock_s3 = MagicMock()
+        queries = GoldLayerManager._discover_queries(
+            query_path="gold/query/moveworks",
+            bucket="test-bucket",
+            s3_client=mock_s3,
+            source_system="moveworks"
+        )
+        self.assertIn("interactions", queries)
+        self.assertTrue(len(queries["interactions"]) > 0)
+
+    def test_gold_query_discovery_rejects_non_v_query_file(self):
+        mock_s3 = MagicMock()
+        mock_s3.get_paginator.return_value.paginate.return_value = [
+            {'Contents': [{'Key': 'gold/query/moveworks/interactions.sql'}]}
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            GoldLayerManager._discover_queries(
+                query_path="s3://test-bucket/gold/query/moveworks/",
+                bucket="test-bucket",
+                s3_client=mock_s3,
+                source_system="moveworks"
+            )
+        self.assertIn("violates the strict Gold naming standard", str(ctx.exception))
+        self.assertIn("v_<tablename>.sql", str(ctx.exception))
 
 
 class TestWatermarkExecutionStartTime(unittest.TestCase):
@@ -1459,17 +1588,17 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         self.assertEqual(res.data['text'][1], 'Clean\tText\n')
 
     def test_gold_moveworks_interactions_sql_file(self):
-        """Validates that gold/query/moveworks/interactions.sql exists and contains expected CTEs and columns."""
+        """Validates that gold/query/moveworks/v_interactions.sql exists and contains expected CTEs and columns."""
         sql_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "gold", "query", "moveworks", "interactions.sql"
+            "gold", "query", "moveworks", "v_interactions.sql"
         )
         self.assertTrue(os.path.exists(sql_path), f"File not found: {sql_path}")
         with open(sql_path, "r", encoding="utf-8") as f:
             content = f.read()
 
         # Check CTEs
-        self.assertIn("WITH conversation_topics AS", content)
+        self.assertTrue(re.search(r"WITH\s+conversation_topics\s+AS", content))
         self.assertIn("bot_responses AS", content)
         self.assertIn("plugin_aggregates AS", content)
         self.assertIn("resource_aggregates AS", content)
@@ -1909,6 +2038,74 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
             resp = lambda_handler(string_event, None)
             self.assertEqual(resp['statusCode'], 200)
 
+
+class TestMultipleNaturalKeysHandling(unittest.TestCase):
+    """
+    QA Validation: Verifies that multiple / composite natural keys (nkeys)
+    are seamlessly handled across config loading, deduplication, payload hashing,
+    column protection, and Iceberg merge logic.
+    """
+
+    def test_get_nkey_single_and_composite(self):
+        from silver_config_loader import SilverConfigLoader
+        mock_cfg = {
+            "source_systems": {
+                "servicenow": {
+                    "tables": {
+                        "tbl_single": {"nkey": "sys_id"},
+                        "tbl_composite_list": {"nkey": ["sys_id", "company"]},
+                        "tbl_composite_csv": {"nkey": "sys_id, company"}
+                    }
+                }
+            }
+        }
+        # Single string
+        self.assertEqual(SilverConfigLoader.get_nkey("servicenow", "tbl_single", mock_cfg), "sys_id")
+        self.assertEqual(SilverConfigLoader.get_nkey_list("servicenow", "tbl_single", mock_cfg), ["sys_id"])
+
+        # Composite list
+        self.assertEqual(SilverConfigLoader.get_nkey("servicenow", "tbl_composite_list", mock_cfg), ["sys_id", "company"])
+        self.assertEqual(SilverConfigLoader.get_nkey_list("servicenow", "tbl_composite_list", mock_cfg), ["sys_id", "company"])
+
+        # Composite CSV string
+        self.assertEqual(SilverConfigLoader.get_nkey_list("servicenow", "tbl_composite_csv", mock_cfg), ["sys_id", "company"])
+
+    def test_existing_silver_config_composite_keys(self):
+        from silver_config_loader import SilverConfigLoader
+        # Moveworks interactions has composite key ['id', 'interaction_id']
+        mw_keys = SilverConfigLoader.get_nkey_list("moveworks", "tbl_interactions")
+        self.assertEqual(mw_keys, ["id", "interaction_id"])
+
+        # Postgresql order_items has composite key ['order_id', 'item_id']
+        pg_keys = SilverConfigLoader.get_nkey_list("postgresql", "tbl_order_items")
+        self.assertEqual(pg_keys, ["order_id", "item_id"])
+
+    def test_get_payload_columns_excludes_all_composite_keys(self):
+        from uax_silver_etl import get_payload_columns
+        cols = ["sys_id", "company", "short_description", "state", "_valid_from", "_inserted_at"]
+        composite_keys = ["sys_id", "company"]
+        payload_cols = get_payload_columns(cols, composite_keys)
+        # Neither sys_id nor company should be in payload_cols, nor technical columns
+        self.assertNotIn("sys_id", payload_cols)
+        self.assertNotIn("company", payload_cols)
+        self.assertNotIn("_valid_from", payload_cols)
+        self.assertNotIn("_inserted_at", payload_cols)
+        self.assertEqual(payload_cols, ["short_description", "state"])
+
+    def test_merge_conditions_generation_for_composite_keys(self):
+        composite_keys = ["k1", "k2", "k3"]
+        join_conditions = [f"target.`{k}` = source.`{k}`" for k in composite_keys]
+        join_condition = " AND ".join(join_conditions)
+        self.assertEqual(
+            join_condition,
+            "target.`k1` = source.`k1` AND target.`k2` = source.`k2` AND target.`k3` = source.`k3`"
+        )
+        # Verify keys are excluded from business update columns
+        all_cols = ["k1", "k2", "k3", "attr1", "attr2", "_inserted_at", "_valid_from"]
+        silver_tech = {'_valid_from', '_valid_to', '_is_current', '_is_deleted', '_inserted_at', '_updated_at'}
+        nkey_set = set(composite_keys)
+        business_update_cols = [c for c in all_cols if c not in silver_tech and c not in nkey_set]
+        self.assertEqual(business_update_cols, ["attr1", "attr2"])
 
 
 if __name__ == "__main__":

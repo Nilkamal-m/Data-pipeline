@@ -1,10 +1,10 @@
 -- ==============================================================================
--- Gold Mart Query: incident_kpi.sql
+-- Gold Mart Query: v_incident_kpi.sql
 -- Source System: servicenow
--- Hierarchy: s3://<bucket>/gold/query/servicenow/incident_kpi.sql
+-- Hierarchy: s3://<bucket>/gold/query/servicenow/v_incident_kpi.sql
 -- Produces:
---   - Physical Table : gold_tbl_incident_kpi
---   - Presentation View: v_incident_kpi
+--   - Athena Mandatory View : v_incident_kpi
+--   - Downstream MySQL Mart : gold_tbl_incident_kpi (View: v_incident_kpi)
 -- S3 Storage: s3://<bucket>/gold/data/servicenow/incident_kpi/
 -- ==============================================================================
 

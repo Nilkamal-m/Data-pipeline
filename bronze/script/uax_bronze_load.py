@@ -686,10 +686,13 @@ def update_last_load_date(
     
     try:
         logger.info(f"Updating state file at '{s3_path}' with payload: {state_payload}")
+        # Athena OpenX JsonSerDe requires single-line JSON (JSON Lines / NDJSON).
+        # Multi-line pretty-printed JSON causes TextInputFormat to parse line-by-line and return NULL for all columns.
+        single_line_payload = json.dumps(state_payload) + '\n'
         s3_client.put_object(
             Bucket=state_bucket,
             Key=state_key,
-            Body=json.dumps(state_payload, indent=2).encode('utf-8'),
+            Body=single_line_payload.encode('utf-8'),
             ContentType="application/json"
         )
         logger.info(f"Successfully updated S3 state file at '{s3_path}'")
@@ -1052,6 +1055,43 @@ def sync_bronze_catalog_table(
     return f"{database_name}.{catalog_table_name}"
 
 
+def sanitize_watermark_files(s3_cli, bucket: str, prefix: str) -> int:
+    """
+    Scans all watermark.json files under s3://{bucket}/{prefix}/.
+    If any file is formatted as multi-line JSON (pretty-printed), rewrites it as single-line JSON Lines (NDJSON).
+    Athena OpenX JsonSerDe reads files line-by-line; pretty-printed JSON results in NULL values for all columns.
+    """
+    if not s3_cli or not bucket or not prefix:
+        return 0
+    clean_prefix = prefix.strip('/')
+    fixed_count = 0
+    try:
+        paginator = s3_cli.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=clean_prefix):
+            for obj in page.get('Contents', []):
+                key = obj.get('Key', '')
+                if key.endswith('watermark.json'):
+                    try:
+                        resp = s3_cli.get_object(Bucket=bucket, Key=key)
+                        raw_body = resp['Body'].read().decode('utf-8')
+                        if '\n' in raw_body.strip():
+                            parsed = json.loads(raw_body)
+                            single_line = json.dumps(parsed) + '\n'
+                            s3_cli.put_object(
+                                Bucket=bucket,
+                                Key=key,
+                                Body=single_line.encode('utf-8'),
+                                ContentType="application/json"
+                            )
+                            fixed_count += 1
+                            logger.info(f"[WATERMARK SANITIZER] Re-saved multi-line watermark as single-line JSON: s3://{bucket}/{key}")
+                    except Exception as parse_err:
+                        logger.warning(f"Could not sanitize watermark file s3://{bucket}/{key}: {parse_err}")
+    except Exception as list_err:
+        logger.warning(f"Could not list watermark files for sanitization under s3://{bucket}/{clean_prefix}: {list_err}")
+    return fixed_count
+
+
 def sync_watermark_catalog_table(
     database_name: str,
     watermark_table_name: str,
@@ -1066,6 +1106,9 @@ def sync_watermark_catalog_table(
     """
     clean_prefix = state_prefix.strip('/')
     watermark_location = f"s3://{state_bucket}/{clean_prefix}/"
+
+    # Automatically sanitize any legacy multi-line watermark.json files
+    sanitize_watermark_files(s3_client, state_bucket, clean_prefix)
 
     columns = [
         {'Name': 'source_system', 'Type': 'string'},
@@ -1087,6 +1130,8 @@ def sync_watermark_catalog_table(
             'SerializationLibrary': 'org.openx.data.jsonserde.JsonSerDe',
             'Parameters': {
                 'ignore.malformed.json': 'true',
+                'case.insensitive': 'true',
+                'dots.in.keys': 'false',
                 'mapping.source_system': 'source_system',
                 'mapping.table_name': 'table_name',
                 'mapping.last_load_date': 'last_load_date',
@@ -1099,26 +1144,33 @@ def sync_watermark_catalog_table(
 
     ensure_glue_database(database_name)
 
+    table_input = {
+        'Name': watermark_table_name,
+        'Description': 'Athena queryable table for all Bronze High-Water Mark state files',
+        'TableType': 'EXTERNAL_TABLE',
+        'Parameters': {
+            'EXTERNAL': 'TRUE',
+            'classification': 'json',
+            'recursive.directories': 'true'
+        },
+        'StorageDescriptor': storage_desc
+    }
+
     try:
         glue_client.get_table(DatabaseName=database_name, Name=watermark_table_name)
         logger.info(f"Watermark Catalog Table verified: {database_name}.{watermark_table_name}")
+        try:
+            glue_client.update_table(DatabaseName=database_name, TableInput=table_input)
+            logger.info(f"Updated Watermark Catalog Table definition for {database_name}.{watermark_table_name}")
+        except Exception as update_err:
+            logger.warning(f"Could not update existing Watermark table definition: {update_err}")
     except ClientError as e:
         code = e.response.get('Error', {}).get('Code')
         if code in ('EntityNotFoundException', 'NoSuchEntityException'):
             try:
                 glue_client.create_table(
                     DatabaseName=database_name,
-                    TableInput={
-                        'Name': watermark_table_name,
-                        'Description': 'Athena queryable table for all Bronze High-Water Mark state files',
-                        'TableType': 'EXTERNAL_TABLE',
-                        'Parameters': {
-                            'EXTERNAL': 'TRUE',
-                            'classification': 'json',
-                            'recursive.directories': 'true'
-                        },
-                        'StorageDescriptor': storage_desc
-                    }
+                    TableInput=table_input
                 )
                 logger.info(f"Created Athena Watermark Catalog Table: {database_name}.{watermark_table_name} at '{watermark_location}'")
             except ClientError as ce:

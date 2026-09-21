@@ -892,7 +892,7 @@ def resolve_sql_query(event: Dict[str, Any]) -> str:
             raw_query = str(val).strip()
             break
 
-    # If query_name is passed with source_system (e.g. query_name="interactions.sql", source_system="moveworks")
+    # If query_name is passed with source_system (e.g. query_name="v_interactions.sql", source_system="moveworks")
     if not raw_query and event.get('query_name'):
         q_name = str(event['query_name']).strip()
         src = str(event.get('source_system') or event.get('SOURCE_SYSTEM') or '').strip().lower()
@@ -906,7 +906,7 @@ def resolve_sql_query(event: Dict[str, Any]) -> str:
     if not raw_query:
         raise ValueError(
             "Missing SQL query in payload. Please provide 'query', 'sql', 'query_file', or 'sql_s3_path'.\n"
-            "Example: {'query_file': 'gold/query/moveworks/interactions.sql'} or {'query': 'SELECT * FROM raw_tbl_interactions'}"
+            "Example: {'query_file': 'gold/query/moveworks/v_interactions.sql'} or {'query': 'SELECT * FROM raw_tbl_interactions'}"
         )
 
     # Check if raw_query is an S3 URI (s3://bucket/path/to/query.sql)
@@ -916,7 +916,7 @@ def resolve_sql_query(event: Dict[str, Any]) -> str:
         bucket_name, key_name = s3_path.split('/', 1)
         resp = s3_client.get_object(Bucket=bucket_name, Key=key_name)
         sql_content = resp['Body'].read().decode('utf-8')
-    # Check if raw_query is a local file path (e.g. gold/query/moveworks/interactions.sql)
+    # Check if raw_query is a local file path (e.g. gold/query/moveworks/v_interactions.sql)
     elif os.path.isfile(raw_query):
         logger.info(f"Loading SQL query from local file path: {raw_query}")
         with open(raw_query, 'r', encoding='utf-8') as f:
@@ -1419,15 +1419,72 @@ def execute_pipeline_stages(event: Dict[str, Any], context: Any) -> Dict[str, An
     }
 
 
+def sanitize_all_watermarks(bucket: str, prefixes: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Scans S3 for all watermark.json files under metadata/bronze and metadata/silver.
+    Rewrites any multi-line / pretty-printed JSON into single-line NDJSON format.
+    Fixes the issue where Athena returns NULL values for all columns.
+    """
+    if prefixes is None:
+        prefixes = ["metadata/bronze", "metadata/silver"]
+
+    results = {}
+    total_fixed = 0
+    total_scanned = 0
+
+    for pfx in prefixes:
+        clean_pfx = pfx.strip('/')
+        scanned_in_pfx = 0
+        fixed_in_pfx = 0
+        paginator = s3_client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=clean_pfx):
+            for obj in page.get('Contents', []):
+                key = obj.get('Key', '')
+                if key.endswith('watermark.json'):
+                    scanned_in_pfx += 1
+                    try:
+                        resp = s3_client.get_object(Bucket=bucket, Key=key)
+                        raw = resp['Body'].read().decode('utf-8')
+                        if '\n' in raw.strip():
+                            parsed = json.loads(raw)
+                            single_line = json.dumps(parsed) + '\n'
+                            s3_client.put_object(
+                                Bucket=bucket,
+                                Key=key,
+                                Body=single_line.encode('utf-8'),
+                                ContentType="application/json"
+                            )
+                            fixed_in_pfx += 1
+                            logger.info(f"[WATERMARK SANITIZER] Re-saved multi-line watermark to single-line JSON: s3://{bucket}/{key}")
+                    except Exception as e:
+                        logger.warning(f"Could not sanitize s3://{bucket}/{key}: {e}")
+
+        results[clean_pfx] = {
+            "scanned": scanned_in_pfx,
+            "repaired_to_single_line": fixed_in_pfx
+        }
+        total_scanned += scanned_in_pfx
+        total_fixed += fixed_in_pfx
+
+    return {
+        "status": "SUCCEEDED",
+        "bucket": bucket,
+        "total_scanned": total_scanned,
+        "total_repaired": total_fixed,
+        "prefix_details": results
+    }
+
+
 def lambda_handler(event: Any, context: Any) -> Dict[str, Any]:
     """
     Main Lambda entrypoint.
     Supports:
       1. Athena query execution (if 'query', 'athena_query', or 'sql' is in event)
       2. Glue Catalog / Parquet sanitization (delete_from_parquet / s3_path / column_name)
-      3. Glue Crawler Trigger & Monitoring (if crawler_name / action="crawler")
-      4. Multi-Stage Pipeline Execution (if layer="all" / "pipeline" / "e2e" or "layers" list)
-      5. Single AWS Glue Job Triggering & Monitoring (Bronze, Silver, or Gold)
+      3. Watermark sanitization / repair (if action="sanitize_watermarks")
+      4. Glue Crawler Trigger & Monitoring (if crawler_name / action="crawler")
+      5. Multi-Stage Pipeline Execution (if layer="all" / "pipeline" / "e2e" or "layers" list)
+      6. Single AWS Glue Job Triggering & Monitoring (Bronze, Silver, or Gold)
     """
     if isinstance(event, str):
         try:
@@ -1450,6 +1507,18 @@ def lambda_handler(event: Any, context: Any) -> Dict[str, Any]:
 
 
     try:
+        # Route 0: Watermark Sanitization / Repair
+        if event.get('action') in ('sanitize_watermarks', 'repair_watermarks', 'fix_watermarks'):
+            bucket = event.get('bucket') or event.get('state_bucket') or event.get('data_lake_bucket') or os.environ.get('DATA_LAKE_BUCKET', '')
+            if not bucket:
+                raise ValueError("Missing required parameter 'bucket' (or 'state_bucket') for watermark sanitization.")
+            prefixes = event.get('prefixes')
+            res = sanitize_all_watermarks(bucket, prefixes)
+            return {
+                'statusCode': 200,
+                'body': json.dumps(res)
+            }
+
         # Route 1: Athena Query Execution
         if is_athena_query_event(event):
             logger.info("Athena query request detected in payload. Routing to execute_athena_query...")
