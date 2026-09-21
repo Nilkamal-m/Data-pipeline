@@ -826,11 +826,18 @@ class GoldLayerManager:
         cls._validate_gold_table_name(staging_table)
         assert staging_table.endswith("_staging"), f"Safety Error: Staging table '{staging_table}' must end with '_staging'"
 
+        # Pre-drop staging table if left over to ensure clean creation with utf8mb4
+        if cls._table_exists(jdbc_info, schema_name, staging_table):
+            logger.info(f"[DDL AUDIT - STAGING PRE-CLEANUP] Dropping existing staging table '{schema_name}.{staging_table}'...")
+            cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{staging_table}`")
+
         jdbc_url = (
             f"jdbc:mysql://{jdbc_info['host']}:{jdbc_info['port']}/{schema_name}"
             f"?useSSL=true&requireSSL=true&verifyServerCertificate=false&allowPublicKeyRetrieval=true"
+            f"&useUnicode=true&characterEncoding=UTF-8&connectionCollation=utf8mb4_unicode_ci"
+            f"&sessionVariables=character_set_client=utf8mb4,character_set_connection=utf8mb4,character_set_results=utf8mb4,collation_connection=utf8mb4_unicode_ci"
         )
-        logger.info(f"[DDL AUDIT - STAGING WRITE] Writing records to staging table: '{schema_name}.{staging_table}' via Spark JDBC...")
+        logger.info(f"[DDL AUDIT - STAGING WRITE] Writing records to staging table: '{schema_name}.{staging_table}' via Spark JDBC (utf8mb4 enabled)...")
         df_mart.write \
             .format("jdbc") \
             .option("url", jdbc_url) \
@@ -838,13 +845,11 @@ class GoldLayerManager:
             .option("user", jdbc_info['user']) \
             .option("password", jdbc_info['password']) \
             .option("driver", "com.mysql.cj.jdbc.Driver") \
+            .option("createTableOptions", "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci") \
             .mode("overwrite") \
             .save()
         logger.info(f"[DDL AUDIT - STAGING WRITE] Successfully wrote staging table '{schema_name}.{staging_table}'.")
 
-    # --------------------------------------------------------------------------
-    # Zero-Downtime Isolated Atomic Table Swap & Presentation View Refresh
-    # --------------------------------------------------------------------------
     # --------------------------------------------------------------------------
     # Zero-Downtime Isolated Atomic Table Swap & Presentation View Refresh
     # --------------------------------------------------------------------------
@@ -980,7 +985,8 @@ class GoldLayerManager:
                 "password": jdbc_info['password'],
                 "database": target_db,
                 "connect_timeout": 15,
-                "ssl": ssl_ctx
+                "ssl": ssl_ctx,
+                "charset": "utf8mb4"
             }
             try:
                 return pymysql.connect(**connect_kwargs)
@@ -998,7 +1004,8 @@ class GoldLayerManager:
                 database=target_db,
                 connection_timeout=15,
                 ssl_disabled=False,
-                ssl_verify_cert=False
+                ssl_verify_cert=False,
+                charset="utf8mb4"
             )
 
     @classmethod

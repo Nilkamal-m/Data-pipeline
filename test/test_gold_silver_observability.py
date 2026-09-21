@@ -300,6 +300,39 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
         self.assertIs(df_result, mock_df)
         mock_df.withColumn.assert_not_called()
 
+    def test_write_staging_table_utf8mb4_options(self):
+        """Tests that _write_staging_table writes with utf8mb4 createTableOptions and URL encoding."""
+        jdbc_info = {"host": "mock-db", "port": "3306", "user": "user", "password": "pwd"}
+        mock_spark = MagicMock()
+        mock_df = MagicMock()
+        mock_writer = MagicMock()
+        mock_df.write.format.return_value = mock_writer
+        mock_writer.option.return_value = mock_writer
+        mock_writer.mode.return_value = mock_writer
+
+        with patch.object(GoldLayerManager, '_table_exists', return_value=True):
+            with patch.object(GoldLayerManager, '_execute_ddl') as mock_ddl:
+                GoldLayerManager._write_staging_table(
+                    spark=mock_spark,
+                    df_mart=mock_df,
+                    jdbc_info=jdbc_info,
+                    schema_name="enterprise_reporting",
+                    staging_table="gold_tbl_interactions_staging"
+                )
+                # Verify pre-drop of staging table
+                mock_ddl.assert_called_with(
+                    jdbc_info, "DROP TABLE IF EXISTS `enterprise_reporting`.`gold_tbl_interactions_staging`"
+                )
+
+                # Verify write options include utf8mb4
+                option_calls = {call[0][0]: call[0][1] for call in mock_writer.option.call_args_list}
+                self.assertIn("utf8mb4", option_calls.get("createTableOptions", ""))
+                self.assertIn("utf8mb4_unicode_ci", option_calls.get("createTableOptions", ""))
+                self.assertIn("characterEncoding=UTF-8", option_calls.get("url", ""))
+                self.assertIn("connectionCollation=utf8mb4_unicode_ci", option_calls.get("url", ""))
+                self.assertIn("useUnicode=true", option_calls.get("url", ""))
+                mock_writer.save.assert_called_once()
+
     def test_password_manual_option(self):
         """Tests that manual password via --RDS_PASSWORD is used."""
         params = {
