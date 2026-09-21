@@ -252,7 +252,7 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
             self.assertIn("Pre-check failed before RENAME: Staging table", str(ctx.exception))
 
     def test_atomic_swap_pre_checks_and_executes_ddl(self):
-        """Pre-checks existence and executes DROP, RENAME, and CREATE VIEW with proper guardrails."""
+        """Pre-checks existence, executes DROP, RENAME, cleans staging table, and omits view creation by default."""
         jdbc_info = {"host": "mock-db", "port": "3306", "user": "user", "password": "pwd"}
 
         # Simulate: staging exists, old backup exists, target exists
@@ -261,23 +261,43 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
 
         with patch.object(GoldLayerManager, '_table_exists', side_effect=mock_table_exists):
             with patch.object(GoldLayerManager, '_execute_ddl') as mock_ddl:
+                # Default: create_view=False (table only for Power BI)
                 GoldLayerManager._execute_isolated_atomic_swap(
                     jdbc_info=jdbc_info,
                     schema_name="enterprise_reporting",
                     target_table="gold_tbl_interactions",
                     staging_table="gold_tbl_interactions_staging",
                     old_backup_table="gold_tbl_interactions_old",
-                    view_name="v_interactions"
+                    view_name="v_interactions",
+                    create_view=False
                 )
                 executed_ddls = [call[0][1] for call in mock_ddl.call_args_list]
                 # 1. Drops leftover backup before swap
                 self.assertTrue(any("DROP TABLE IF EXISTS `enterprise_reporting`.`gold_tbl_interactions_old`" in d for d in executed_ddls))
-                # 2. Atomic rename
+                # 2. Atomic rename for zero downtime
                 self.assertTrue(any("RENAME TABLE `enterprise_reporting`.`gold_tbl_interactions`" in d for d in executed_ddls))
                 # 3. Drops old backup after swap
                 self.assertTrue(any("DROP TABLE IF EXISTS `enterprise_reporting`.`gold_tbl_interactions_old`" in d for d in executed_ddls))
-                # 4. View creation starting with v_
+                # 4. Cleans up staging table
+                self.assertTrue(any("DROP TABLE IF EXISTS `enterprise_reporting`.`gold_tbl_interactions_staging`" in d for d in executed_ddls))
+                # 5. View creation is omitted by default (user lacks CREATE VIEW)
+                self.assertFalse(any("CREATE OR REPLACE VIEW" in d for d in executed_ddls))
+
+        # Explicit create_view=True executes view creation
+        with patch.object(GoldLayerManager, '_table_exists', side_effect=mock_table_exists):
+            with patch.object(GoldLayerManager, '_execute_ddl') as mock_ddl:
+                GoldLayerManager._execute_isolated_atomic_swap(
+                    jdbc_info=jdbc_info,
+                    schema_name="enterprise_reporting",
+                    target_table="gold_tbl_interactions",
+                    staging_table="gold_tbl_interactions_staging",
+                    old_backup_table="gold_tbl_interactions_old",
+                    view_name="v_interactions",
+                    create_view=True
+                )
+                executed_ddls = [call[0][1] for call in mock_ddl.call_args_list]
                 self.assertTrue(any("CREATE OR REPLACE VIEW `enterprise_reporting`.`v_interactions`" in d for d in executed_ddls))
+
 
     def test_mysql_ssl_context_builder(self):
         """Tests that _build_mysql_ssl_context creates an SSLContext with verify_mode CERT_NONE."""

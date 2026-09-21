@@ -486,7 +486,7 @@ class GoldLayerManager:
                 f"|  PROCESSING MYSQL GOLD MART: '{clean_base_name}'\n"
                 f"|  * Target Table  : {gold_schema}.{target_table}\n"
                 f"|  * Staging Table : {gold_schema}.{staging_table}\n"
-                f"|  * Serving View  : {gold_schema}.{view_name}\n"
+                f"|  * Power BI Feed : {gold_schema}.{target_table} (Zero-Downtime Physical Table)\n"
                 f"+--------------------------------------------------------------------------------+"
             )
 
@@ -507,21 +507,22 @@ class GoldLayerManager:
                 cls._detect_schema_evolution(jdbc_conn_info, gold_schema, target_table, df_mart)
                 cls._write_staging_table(spark, df_mart, jdbc_conn_info, gold_schema, staging_table)
 
-                # 4. Atomic Swap & Presentation View Refresh
+                # 4. Atomic Swap & Cleanup (Zero-Downtime Table Swap for Power BI)
                 cls._execute_isolated_atomic_swap(
                     jdbc_info=jdbc_conn_info,
                     schema_name=gold_schema,
                     target_table=target_table,
                     staging_table=staging_table,
                     old_backup_table=old_backup_table,
-                    view_name=view_name
+                    view_name=view_name,
+                    create_view=False
                 )
 
                 mart_duration = (datetime.now(timezone.utc) - mart_start).total_seconds()
                 mart_stats.append({
                     "mart_name": clean_base_name,
                     "target_table": f"{gold_schema}.{target_table}",
-                    "view_name": f"{gold_schema}.{view_name}",
+                    "view_name": f"{gold_schema}.{target_table}",
                     "status": "SUCCESS",
                     "rows_served": row_count,
                     "duration_seconds": round(mart_duration, 2),
@@ -875,21 +876,24 @@ class GoldLayerManager:
         target_table: str,
         staging_table: str,
         old_backup_table: str,
-        view_name: str
+        view_name: Optional[str] = None,
+        create_view: bool = False
     ) -> None:
         """
         Executes zero-downtime RENAME TABLE atomic swap in MySQL.
-        Performs strict pre-checks before DROP, RENAME, ALTER, and CREATE operations:
+        Performs strict pre-checks before DROP, RENAME, and cleanup operations:
           - Target, staging, and backup tables must start with 'gold_'.
-          - Presentation views must start with 'v_'.
-          - Never queries INFORMATION_SCHEMA.
-          - Pre-checks table existence before DROP and RENAME.
+          - Zero downtime for Power BI consumers: target table is atomically swapped.
+          - Drops old backup table and any leftover staging tables.
+          - View creation in MySQL is disabled by default because database users lack CREATE VIEW privileges;
+            Power BI connects directly to the physical Gold table (gold_tbl_<mart>).
         """
         # Guardrail: validate naming conventions
         cls._validate_gold_table_name(target_table)
         cls._validate_gold_table_name(staging_table)
         cls._validate_gold_table_name(old_backup_table)
-        cls._validate_view_name(view_name)
+        if view_name:
+            cls._validate_view_name(view_name)
         assert staging_table.endswith("_staging"), f"Safety Error: Invalid staging table {staging_table}"
         assert old_backup_table.endswith("_old"), f"Safety Error: Invalid backup table {old_backup_table}"
 
@@ -917,7 +921,7 @@ class GoldLayerManager:
                 f"`{schema_name}`.`{target_table}` TO `{schema_name}`.`{old_backup_table}`, "
                 f"`{schema_name}`.`{staging_table}` TO `{schema_name}`.`{target_table}`"
             )
-            logger.info(f"[DDL AUDIT - ATOMIC SWAP] Executing atomic table swap:\n"
+            logger.info(f"[DDL AUDIT - ATOMIC SWAP] Executing zero-downtime atomic table swap for Power BI:\n"
                         f"  -> {schema_name}.{target_table}  -->  {schema_name}.{old_backup_table}\n"
                         f"  -> {schema_name}.{staging_table} -->  {schema_name}.{target_table}")
             cls._execute_ddl(jdbc_info, swap_ddl)
@@ -932,21 +936,42 @@ class GoldLayerManager:
             logger.info(f"[DDL AUDIT - INITIAL DEPLOY] Promoting staging to target table:\n  -> {initial_rename}")
             cls._execute_ddl(jdbc_info, initial_rename)
 
-        # Pre-check before CREATE VIEW: Ensure target table exists and view starts with v_
-        cls._validate_view_name(view_name)
-        cls._validate_gold_table_name(target_table)
-        if not cls._table_exists(jdbc_info, schema_name, target_table):
-            raise RuntimeError(
-                f"Pre-check failed before CREATE VIEW: Target table '{schema_name}.{target_table}' does not exist. "
-                f"Cannot create presentation view '{view_name}'."
-            )
+        # Post-swap cleanup: Ensure staging table is completely removed
+        if cls._table_exists(jdbc_info, schema_name, staging_table):
+            logger.info(f"[DDL AUDIT - CLEANUP] Dropping leftover staging table '{schema_name}.{staging_table}'...")
+            cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{staging_table}`")
 
-        view_sql = (
-            f"CREATE OR REPLACE VIEW `{schema_name}`.`{view_name}` AS "
-            f"SELECT * FROM `{schema_name}`.`{target_table}`"
-        )
-        logger.info(f"[DDL AUDIT - VIEW] Creating or refreshing presentation view: '{schema_name}.{view_name}'")
-        cls._execute_ddl(jdbc_info, view_sql)
+        # Optional Presentation View Creation (Skipped by default for MySQL shared DB)
+        if create_view and view_name:
+            cls._validate_view_name(view_name)
+            cls._validate_gold_table_name(target_table)
+            if not cls._table_exists(jdbc_info, schema_name, target_table):
+                raise RuntimeError(
+                    f"Pre-check failed before CREATE VIEW: Target table '{schema_name}.{target_table}' does not exist. "
+                    f"Cannot create presentation view '{view_name}'."
+                )
+
+            view_sql = (
+                f"CREATE OR REPLACE VIEW `{schema_name}`.`{view_name}` AS "
+                f"SELECT * FROM `{schema_name}`.`{target_table}`"
+            )
+            logger.info(f"[DDL AUDIT - VIEW] Creating or refreshing presentation view: '{schema_name}.{view_name}'")
+            try:
+                cls._execute_ddl(jdbc_info, view_sql)
+            except Exception as e:
+                err_str = str(e)
+                if "1142" in err_str or "denied" in err_str.lower() or "permission" in err_str.lower():
+                    logger.warning(
+                        f"[DDL AUDIT - VIEW] Database user lacks CREATE VIEW permission in MySQL: {e}. "
+                        f"Skipping view creation; Power BI users query physical Gold table '{schema_name}.{target_table}' directly."
+                    )
+                else:
+                    raise
+        else:
+            logger.info(
+                f"[DDL AUDIT - MYSQL TABLE] Zero-downtime Gold table '{schema_name}.{target_table}' is active for Power BI consumers. "
+                f"MySQL view creation omitted (user lacks CREATE VIEW permission; physical Gold table is authoritative)."
+            )
 
     # --------------------------------------------------------------------------
     # SQL Execution Helpers with SSL / TLS Support
