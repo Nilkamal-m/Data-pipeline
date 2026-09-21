@@ -296,7 +296,7 @@ def parse_spark_arguments() -> dict:
     gold_targets = [t.strip().lower() for t in str(gold_targets_raw).split(',') if t.strip()]
     gold_target = gold_targets[0] if gold_targets else 'aurora'
 
-    gold_schema = get_cli_arg('GOLD_SCHEMA', 'gold_schema')
+    gold_schema = get_cli_arg('GOLD_SCHEMA', 'gold_schema', 'RDS_SCHEMA', 'rds_schema')
     needs_mysql = any(t in gold_targets for t in ('aurora', 'rds', 'mysql'))
     if process_layer in ('gold', 'both') and needs_mysql and (not gold_schema or not str(gold_schema).strip()):
         raise ValueError(
@@ -312,11 +312,11 @@ def parse_spark_arguments() -> dict:
     gold_query_s3_path = get_cli_arg('GOLD_QUERY_S3_PATH', 'gold_query_s3_path', default=default_gold_query)
     gold_data_s3_path = get_cli_arg('GOLD_DATA_S3_PATH', 'gold_data_s3_path', default=default_gold_data)
     connection_name = get_cli_arg('CONNECTION_NAME', 'connection_name', 'GLUE_CONNECTION_NAME', 'glue_connection_name')
-    rds_secret_name = get_cli_arg('RDS_SECRET_NAME', 'rds_secret_name', 'SECRET_NAME', 'secret_name', 'DB_SECRET_NAME', 'db_secret_name')
-    rds_host = get_cli_arg('RDS_HOST', 'rds_host')
-    rds_port = get_cli_arg('RDS_PORT', 'rds_port', default='3306')
-    rds_user = get_cli_arg('RDS_USER', 'rds_user')
-    rds_password = get_cli_arg('RDS_PASSWORD', 'rds_password')
+    rds_secret_name = get_cli_arg('RDS_SECRET_NAME', 'rds_secret_name', 'SECRET_NAME', 'secret_name', 'DB_SECRET_NAME', 'db_secret_name', 'DB_SECRET', 'db_secret')
+    rds_host = get_cli_arg('RDS_HOST', 'rds_host', 'RDS_URL', 'rds_url', 'HOST', 'host')
+    rds_port = get_cli_arg('RDS_PORT', 'rds_port', 'PORT', 'port', default='3306')
+    rds_user = get_cli_arg('RDS_USER', 'rds_user', 'RDS_USERNAME', 'rds_username', 'USER', 'user')
+    rds_password = get_cli_arg('RDS_PASSWORD', 'rds_password', 'PASSWORD', 'password')
 
     # External DW: Redshift & Snowflake parameters
     redshift_schema = get_cli_arg('REDSHIFT_SCHEMA', 'redshift_schema', default='gold_spectrum_schema')

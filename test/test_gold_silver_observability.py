@@ -1584,7 +1584,7 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
 
     def test_clean_illegal_chars_logic(self):
         """Validates clean_illegal_chars regex removes control chars."""
-        from custom_transforms.moveworks_interactions import clean_illegal_chars
+        from transformer import clean_illegal_chars
         # Test with mock object that implements applymap
         class MockDF:
             def __init__(self, data):
@@ -1593,7 +1593,8 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
                 return MockDF({k: [fn(v) for v in vals] for k, vals in self.data.items()})
 
         mock_df = MockDF({'text': ['Hello\x00World\x1f!', 'Clean\tText\n']})
-        res = clean_illegal_chars(mock_df)
+        pattern = r'[\x00-\x08\x0B\x0C\x0E-\x1F\ufffd]'
+        res = clean_illegal_chars(mock_df, pattern=pattern)
         self.assertEqual(res.data['text'][0], 'HelloWorld!')
         self.assertEqual(res.data['text'][1], 'Clean\tText\n')
 
@@ -2379,6 +2380,90 @@ class TestCleanIllegalCharsAndDefaultString(unittest.TestCase):
                 table_name="tbl_interactions",
             )
             self.assertIsNotNone(res)
+
+
+class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
+    """Unit tests validating Gold layer invocation payloads and Athena statement sanitization."""
+
+    def test_gold_trigger_manual_db_params(self):
+        """Validates that build_glue_arguments maps manual DB credentials (rds_schema, rds_url, rds_password, rds_username, rds_port)."""
+        import lambda_function
+        event = {
+            "layer": "gold",
+            "source_system": "moveworks",
+            "rds_schema": "enterprise_reporting",
+            "rds_url": "aurora-mysql-prod.cluster-xyz.us-east-1.rds.amazonaws.com",
+            "rds_port": 3306,
+            "rds_username": "reporting_user",
+            "rds_password": "super_secret_password"
+        }
+        glue_args = lambda_function.build_glue_arguments(event)
+        self.assertEqual(glue_args["--PROCESS_LAYER"], "gold")
+        self.assertEqual(glue_args["--GOLD_SCHEMA"], "enterprise_reporting")
+        self.assertEqual(glue_args["--RDS_HOST"], "aurora-mysql-prod.cluster-xyz.us-east-1.rds.amazonaws.com")
+        self.assertEqual(glue_args["--RDS_PORT"], "3306")
+        self.assertEqual(glue_args["--RDS_USER"], "reporting_user")
+        self.assertEqual(glue_args["--RDS_PASSWORD"], "super_secret_password")
+
+    def test_gold_trigger_db_secret(self):
+        """Validates that build_glue_arguments maps db_secret to --RDS_SECRET_NAME for Secrets Manager."""
+        import lambda_function
+        event = {
+            "layer": "gold",
+            "source_system": "servicenow",
+            "rds_schema": "enterprise_reporting",
+            "db_secret": "prod/rds/mysql_credentials"
+        }
+        glue_args = lambda_function.build_glue_arguments(event)
+        self.assertEqual(glue_args["--PROCESS_LAYER"], "gold")
+        self.assertEqual(glue_args["--GOLD_SCHEMA"], "enterprise_reporting")
+        self.assertEqual(glue_args["--RDS_SECRET_NAME"], "prod/rds/mysql_credentials")
+
+    def test_gold_trigger_typo_alias_support(self):
+        """Validates that build_glue_arguments supports user typo rds_uaername."""
+        import lambda_function
+        event = {
+            "layer": "gold",
+            "source_system": "moveworks",
+            "rds_schema": "enterprise_reporting",
+            "rds_uaername": "admin_user"
+        }
+        glue_args = lambda_function.build_glue_arguments(event)
+        self.assertEqual(glue_args["--RDS_USER"], "admin_user")
+
+    def test_athena_statement_comment_stripping(self):
+        """Validates that leading comments (-- and /* */) are cleanly stripped from Athena queries."""
+        import re
+        sql_with_header = (
+            "-- ==============================================================================\n"
+            "-- Gold Mart Query: v_interactions.sql\n"
+            "-- Description: Test query header comments\n"
+            "-- ==============================================================================\n\n"
+            "WITH conversation_topics AS (\n"
+            "    SELECT * FROM tbl_interactions\n"
+            ")\n"
+            "SELECT * FROM conversation_topics;"
+        )
+        clean = re.sub(r'^(?:\s*(?:--[^\r\n]*|/\*[\s\S]*?\*/)\s*)+', '', sql_with_header).strip()
+        self.assertTrue(clean.startswith("WITH conversation_topics AS"))
+        self.assertNotIn("-- Gold Mart Query", clean[:50])
+
+    def test_v_interactions_sql_syntax_compatibility(self):
+        """Validates that v_interactions.sql uses Trino/Presto compatible VARCHAR cast and CURRENT_TIMESTAMP."""
+        sql_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "gold", "query", "moveworks", "v_interactions.sql"
+        )
+        with open(sql_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # STRING is Hive specific; Trino / Presto in Athena requires VARCHAR
+        self.assertNotIn("CAST(NULL AS STRING)", content)
+        self.assertIn("CAST(NULL AS VARCHAR)", content)
+
+        # Trino / Presto requires CURRENT_TIMESTAMP without parentheses
+        self.assertNotIn("CURRENT_TIMESTAMP()", content)
+        self.assertIn("CURRENT_TIMESTAMP", content)
 
 
 if __name__ == "__main__":

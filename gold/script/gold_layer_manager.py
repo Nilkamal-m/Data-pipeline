@@ -921,7 +921,12 @@ class GoldLayerManager:
           3. AWS Glue Connection: CLI parameter --CONNECTION_NAME
         If no password is provided, raises an explicit ValueError guiding the error.
         """
-        gold_schema = params.get('GOLD_SCHEMA')
+        gold_schema = (
+            params.get('GOLD_SCHEMA')
+            or params.get('gold_schema')
+            or params.get('RDS_SCHEMA')
+            or params.get('rds_schema')
+        )
         if not gold_schema or not str(gold_schema).strip():
             raise ValueError(
                 "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_SCHEMA'.\n"
@@ -930,15 +935,41 @@ class GoldLayerManager:
             )
         gold_schema = str(gold_schema).strip()
 
-        host = params.get('RDS_HOST', os.environ.get('RDS_HOST', 'localhost'))
-        port = str(params.get('RDS_PORT', os.environ.get('RDS_PORT', '3306')))
-        user = params.get('RDS_USER', os.environ.get('RDS_USER', 'pipeline_user'))
-        pwd = params.get('RDS_PASSWORD') or os.environ.get('RDS_PASSWORD')
+        host = (
+            params.get('RDS_HOST')
+            or params.get('rds_host')
+            or params.get('RDS_URL')
+            or params.get('rds_url')
+            or os.environ.get('RDS_HOST', 'localhost')
+        )
+        port = str(
+            params.get('RDS_PORT')
+            or params.get('rds_port')
+            or os.environ.get('RDS_PORT', '3306')
+        )
+        user = (
+            params.get('RDS_USER')
+            or params.get('rds_user')
+            or params.get('RDS_USERNAME')
+            or params.get('rds_username')
+            or params.get('rds_uaername')
+            or os.environ.get('RDS_USER', 'pipeline_user')
+        )
+        pwd = (
+            params.get('RDS_PASSWORD')
+            or params.get('rds_password')
+            or os.environ.get('RDS_PASSWORD')
+        )
 
         secret_name = (
             params.get('RDS_SECRET_NAME')
+            or params.get('rds_secret_name')
             or params.get('SECRET_NAME')
+            or params.get('secret_name')
             or params.get('DB_SECRET_NAME')
+            or params.get('db_secret_name')
+            or params.get('DB_SECRET')
+            or params.get('db_secret')
             or os.environ.get('RDS_SECRET_NAME')
         )
         conn_name = params.get('CONNECTION_NAME') or params.get('GLUE_CONNECTION_NAME')

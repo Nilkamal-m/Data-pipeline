@@ -202,12 +202,16 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         # Gold Serving Layer parameters
         'gold_schema': '--GOLD_SCHEMA',
         'GOLD_SCHEMA': '--GOLD_SCHEMA',
+        'rds_schema': '--GOLD_SCHEMA',
+        'RDS_SCHEMA': '--GOLD_SCHEMA',
         'schema_name': '--GOLD_SCHEMA',
         'SCHEMA_NAME': '--GOLD_SCHEMA',
         'schema': '--GOLD_SCHEMA',
         'SCHEMA': '--GOLD_SCHEMA',
         'gold_target': '--GOLD_TARGET',
         'GOLD_TARGET': '--GOLD_TARGET',
+        'gold_targets': '--GOLD_TARGETS',
+        'GOLD_TARGETS': '--GOLD_TARGETS',
         'gold_query_s3_path': '--GOLD_QUERY_S3_PATH',
         'GOLD_QUERY_S3_PATH': '--GOLD_QUERY_S3_PATH',
         'gold_data_s3_path': '--GOLD_DATA_S3_PATH',
@@ -216,14 +220,28 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         'RDS_SECRET_NAME': '--RDS_SECRET_NAME',
         'db_secret_name': '--RDS_SECRET_NAME',
         'DB_SECRET_NAME': '--RDS_SECRET_NAME',
+        'db_secret': '--RDS_SECRET_NAME',
+        'DB_SECRET': '--RDS_SECRET_NAME',
         'rds_password': '--RDS_PASSWORD',
         'RDS_PASSWORD': '--RDS_PASSWORD',
         'rds_host': '--RDS_HOST',
         'RDS_HOST': '--RDS_HOST',
+        'rds_url': '--RDS_HOST',
+        'RDS_URL': '--RDS_HOST',
+        'host': '--RDS_HOST',
+        'HOST': '--RDS_HOST',
         'rds_port': '--RDS_PORT',
         'RDS_PORT': '--RDS_PORT',
+        'port': '--RDS_PORT',
+        'PORT': '--RDS_PORT',
         'rds_user': '--RDS_USER',
         'RDS_USER': '--RDS_USER',
+        'rds_username': '--RDS_USER',
+        'RDS_USERNAME': '--RDS_USER',
+        'rds_uaername': '--RDS_USER',
+        'RDS_UAERNAME': '--RDS_USER',
+        'user': '--RDS_USER',
+        'USER': '--RDS_USER',
         'connection_name': '--CONNECTION_NAME',
         'CONNECTION_NAME': '--CONNECTION_NAME',
         'glue_connection_name': '--CONNECTION_NAME',
@@ -255,7 +273,8 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
     elif layer == 'gold':
         glue_args['--PROCESS_LAYER'] = 'gold'
     elif not glue_args.get('--PROCESS_LAYER'):
-        if 'gold_schema' in event or 'GOLD_SCHEMA' in event or event.get('action') == 'gold':
+        gold_identifiers = ('gold_schema', 'GOLD_SCHEMA', 'rds_schema', 'RDS_SCHEMA', 'schema_name', 'SCHEMA_NAME', 'db_secret', 'DB_SECRET', 'rds_secret_name')
+        if any(k in event for k in gold_identifiers) or event.get('action') == 'gold':
             glue_args['--PROCESS_LAYER'] = 'gold'
         else:
             glue_args['--PROCESS_LAYER'] = 'silver'
@@ -265,9 +284,9 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         gold_schema = glue_args.get('--GOLD_SCHEMA')
         if not gold_schema or not str(gold_schema).strip():
             raise ValueError(
-                "CRITICAL CONFIG ERROR: Missing required parameter 'gold_schema' (or 'GOLD_SCHEMA') in event payload for Gold layer.\n"
+                "CRITICAL CONFIG ERROR: Missing required parameter 'gold_schema' (or 'rds_schema' / 'GOLD_SCHEMA') in event payload for Gold layer.\n"
                 "In accordance with enterprise shared database policy, no fallback schema is permitted.\n"
-                "Example: {'layer': 'gold', 'source_system': 'servicenow', 'gold_schema': 'enterprise_reporting'}"
+                "Example: {'layer': 'gold', 'source_system': 'servicenow', 'rds_schema': 'enterprise_reporting'}"
             )
 
     # Allow custom arbitrary arguments passed via 'arguments' dictionary
@@ -1087,17 +1106,26 @@ def execute_athena_query(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     final_query_execution = None
 
     for stmt_idx, stmt in enumerate(statements, 1):
-        line_count = len(stmt.splitlines())
+        # Sanitize query string: strip leading comments and trailing semicolons/whitespace so Athena's API
+        # parser reliably detects the statement type (SELECT, WITH, CREATE, SHOW) and does NOT throw:
+        # InvalidRequestException: Query of this type are not supported.
+        clean_stmt = stmt.strip().rstrip(';').strip()
+        clean_stmt = re.sub(r'^(?:\s*(?:--[^\r\n]*|/\*[\s\S]*?\*/)\s*)+', '', clean_stmt).strip()
+        if not clean_stmt:
+            logger.info(f"Skipping empty or comment-only statement chunk {stmt_idx}.")
+            continue
+
+        line_count = len(clean_stmt.splitlines())
         logger.info(f"--- [Statement {stmt_idx}/{len(statements)}] ({line_count} lines) ---")
         if line_count <= 20:
-            logger.info(f"SQL:\n{stmt}")
+            logger.info(f"SQL:\n{clean_stmt}")
         else:
-            first_5 = "\n".join(stmt.splitlines()[:5])
-            last_5 = "\n".join(stmt.splitlines()[-5:])
+            first_5 = "\n".join(clean_stmt.splitlines()[:5])
+            last_5 = "\n".join(clean_stmt.splitlines()[-5:])
             logger.info(f"SQL (showing preview of {line_count} lines):\n{first_5}\n...\n{last_5}")
 
         start_params: Dict[str, Any] = {
-            'QueryString': stmt,
+            'QueryString': clean_stmt,
             'WorkGroup': workgroup
         }
         if database:
@@ -1535,9 +1563,20 @@ def lambda_handler(event: Any, context: Any) -> Dict[str, Any]:
             return trigger_and_monitor_crawler(event, context)
 
         # Route 2: Multi-Stage Pipeline Execution ("all", "pipeline", "e2e", or layers list)
-        layer = str(event.get('layer', 'bronze')).strip().lower()
+        layer = str(event.get('layer') or event.get('process_layer') or '').strip().lower()
         if event.get('action') in ('run_all', 'pipeline', 'e2e', 'all'):
             layer = 'all'
+        elif event.get('action') in ('gold', 'silver', 'bronze'):
+            layer = event['action'].strip().lower()
+
+        if not layer or layer not in ('bronze', 'silver', 'gold', 'all', 'pipeline', 'e2e', 'full'):
+            gold_identifiers = ('gold_schema', 'GOLD_SCHEMA', 'rds_schema', 'RDS_SCHEMA', 'schema_name', 'SCHEMA_NAME', 'db_secret', 'DB_SECRET', 'rds_secret_name', 'gold_target')
+            if any(k in event for k in gold_identifiers):
+                layer = 'gold'
+            elif any(k in event for k in ('silver_config_s3_path', 'scd_type', 'deduplication_order_by')):
+                layer = 'silver'
+            else:
+                layer = 'bronze'
 
         if layer in ('all', 'pipeline', 'e2e', 'full') or isinstance(event.get('layers'), list):
             logger.info("Multi-stage pipeline request detected. Routing to execute_pipeline_stages...")
