@@ -248,7 +248,7 @@
           "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
-          "custom_transform_script": "custom_transforms/moveworks_interactions.py"
+          "custom_transform_script": ""
         },
         "tbl_conversations": {
           "source_table_name": "raw_tbl_conversations",
@@ -275,7 +275,7 @@
           "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
-          "custom_transform_script": "custom_transforms/moveworks_conversations.py"
+          "custom_transform_script": ""
         },
         "tbl_plugin_calls": {
           "source_table_name": "raw_tbl_plugin_calls",
@@ -301,7 +301,7 @@
           "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
-          "custom_transform_script": "custom_transforms/moveworks_plugin_calls.py"
+          "custom_transform_script": ""
         },
         "tbl_plugin_resources": {
           "source_table_name": "raw_tbl_plugin_resources",
@@ -327,7 +327,7 @@
           "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
-          "custom_transform_script": "custom_transforms/moveworks_plugin_resources.py"
+          "custom_transform_script": ""
         },
         "tbl_users": {
           "source_table_name": "raw_tbl_users",
@@ -354,7 +354,7 @@
           "clean_illegal_chars_expression": "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\ufffd]",
           "filter_expression": "",
           "custom_expressions": {},
-          "custom_transform_script": "custom_transforms/moveworks_users.py"
+          "custom_transform_script": ""
         },
         "tbl_tickets": {
           "source_table_name": "raw_tbl_tickets",

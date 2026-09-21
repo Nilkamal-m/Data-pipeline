@@ -2355,6 +2355,30 @@ class TestCleanIllegalCharsAndDefaultString(unittest.TestCase):
             )
             mock_clean.assert_called_once_with(mock_df, pattern=mw_pattern)
 
+    def test_silver_transformer_execute_custom_script_compatibility(self):
+        """Verifies _execute_custom_script compatibility method exists and delegates to _apply_custom_script without AttributeError."""
+        mock_df = MagicMock()
+        mock_df.columns = ["id", "val"]
+        mock_df.drop.return_value = mock_df
+        mock_df.withColumn.return_value = mock_df
+
+        # Ensure calling _execute_custom_script does not raise AttributeError
+        with patch.object(SilverTransformer, '_apply_custom_script', return_value=mock_df) as mock_apply:
+            res = SilverTransformer._execute_custom_script(mock_df, "dummy_script.py")
+            mock_apply.assert_called_once_with(mock_df, "dummy_script.py", spark=None)
+            self.assertEqual(res, mock_df)
+
+        # Ensure apply_transformations works with custom_transform_script configured without raising AttributeError
+        with patch.object(SilverTransformer, '_apply_custom_script', return_value=mock_df):
+            table_cfg = {"custom_transform_script": "custom_transforms/moveworks_interactions.py"}
+            res = SilverTransformer.apply_transformations(
+                df=mock_df,
+                table_cfg=table_cfg,
+                source_system="moveworks",
+                table_name="tbl_interactions",
+            )
+            self.assertIsNotNone(res)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -523,6 +523,12 @@ def serialize_chunk_to_bytes(records_chunk: list, output_format: str = "parquet"
             # Exclude _ingested_at from file payload since it is the S3 directory partition key (_ingested_at=<ts>/)
             df = df[data_cols + ordered_meta]
 
+            # Prevent all-null columns from defaulting to float64 (DOUBLE) in Parquet,
+            # which causes downstream Spark schema conversion exceptions when other parts have string
+            for col_name in df.columns:
+                if df[col_name].isna().all():
+                    df[col_name] = df[col_name].astype("string")
+
             buffer = io.BytesIO()
             df.to_parquet(buffer, compression=parquet_compression, index=False)
             return buffer.getvalue(), "application/x-parquet", ".parquet"

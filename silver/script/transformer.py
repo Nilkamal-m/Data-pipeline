@@ -144,12 +144,7 @@ class SilverTransformer:
             if cfg_order:
                 order_col_name = cfg_order[0] if isinstance(cfg_order, list) else cfg_order
 
-        # 1. Custom Transform Script (table-specific hook)
-        custom_script = table_cfg.get('custom_transform_script') or table_cfg.get('custom_transform_file')
-        if custom_script:
-            df = cls._execute_custom_script(df, custom_script, spark, source_system, table_name)
-
-        # 2. Drop Bronze System Metadata Columns
+        # 1. Drop Bronze System Metadata Columns
         drops = bronze_metadata_cols or [
             '_raw_data', '_ingest_timestamp', '_extracted_at', '_batch_id',
             '_source_system', '_source_table', '_file_name', '_file_path', '_row_num',
@@ -378,13 +373,25 @@ class SilverTransformer:
         - transform(df, spark): standard transformation with SparkSession
         - transform(df): simple DataFrame transform
         """
+        if not script_path or not str(script_path).strip():
+            return df
+
         logger.info(f"Loading custom transform script: '{script_path}'...")
 
-        # Resolve absolute path
+        # Resolve absolute path across local workspace and AWS Glue runtime environments (/tmp)
         abs_script_path = script_path
         if not os.path.isabs(script_path):
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            abs_script_path = os.path.join(current_dir, script_path)
+            candidates = [
+                os.path.join(current_dir, script_path),
+                os.path.join(os.getcwd(), script_path),
+                os.path.join('/tmp', script_path),
+                os.path.join('/tmp', os.path.basename(script_path))
+            ]
+            for cand in candidates:
+                if os.path.exists(cand):
+                    abs_script_path = cand
+                    break
 
         if not os.path.exists(abs_script_path):
             logger.warning(f"Custom transform script file not found at '{abs_script_path}'. Skipping custom file transform.")
@@ -425,6 +432,18 @@ class SilverTransformer:
             raise
 
         return df
+
+    @classmethod
+    def _execute_custom_script(
+        cls,
+        df: DataFrame,
+        script_path: str,
+        spark=None,
+        *args,
+        **kwargs
+    ) -> DataFrame:
+        """Compatibility wrapper delegating to _apply_custom_script."""
+        return cls._apply_custom_script(df, script_path, spark=spark)
 
 
 # Module-level alias for direct invocation

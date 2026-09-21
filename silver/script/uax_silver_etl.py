@@ -1200,6 +1200,11 @@ def main():
     conf.set("spark.sql.defaultCatalog", "glue_catalog")
     conf.set("spark.sql.iceberg.schema-evolution", "true")
     conf.set("spark.sql.iceberg.check-nullability", "false")
+    # Parquet reader settings: Disable Vectorized Reader to support mixed/evolving schemas across files
+    # (e.g. DOUBLE in one file and string in another file / catalog definition)
+    conf.set("spark.sql.parquet.enableVectorizedReader", "false")
+    conf.set("spark.sql.parquet.recordLevelFilter.enabled", "false")
+    conf.set("spark.sql.parquet.mergeSchema", "false")
 
     sc = SparkContext.getOrCreate(conf=conf)
     glueContext = GlueContext(sc)
@@ -1212,6 +1217,9 @@ def main():
     spark.conf.set("spark.sql.defaultCatalog", "glue_catalog")
     spark.conf.set("spark.sql.iceberg.schema-evolution", "true")
     spark.conf.set("spark.sql.iceberg.check-nullability", "false")
+    spark.conf.set("spark.sql.parquet.enableVectorizedReader", "false")
+    spark.conf.set("spark.sql.parquet.recordLevelFilter.enabled", "false")
+    spark.conf.set("spark.sql.parquet.mergeSchema", "false")
     job = Job(glueContext)
     job.init(job_name, params['ARG_DICT'])
 
@@ -1333,59 +1341,114 @@ def main():
             )
             logger.info(f"Reading raw Bronze data for '{bronze_table_name}' from Glue Catalog (`{glue_database}`.`{bronze_table_name}`) or S3 ('{bronze_path}')...")
 
-            try:
-                # 1. Primary: Read Bronze Hive/Parquet table via GlueContext native catalog reader
-                # (bypasses Iceberg SparkCatalog so it never raises 'Input Glue table is not an Iceberg table')
-                if glueContext:
+            df_bronze = None
+            batch_count = 0
+
+            # 1. Primary: Read Bronze Hive/Parquet table via GlueContext native catalog reader with resolveChoice
+            # (bypasses Iceberg SparkCatalog so it never raises 'Input Glue table is not an Iceberg table',
+            # and resolves any type conflicts across Parquet parts like DOUBLE vs String to string)
+            if glueContext:
+                try:
+                    logger.info(f"Attempting to load Bronze data from Glue Catalog table `{glue_database}`.`{bronze_table_name}` via GlueContext...")
                     dyn_frame = glueContext.create_dynamic_frame.from_catalog(
                         database=glue_database,
                         table_name=bronze_table_name
                     )
-                    df_bronze = dyn_frame.toDF()
-                    logger.info(f"Successfully loaded Bronze data from Glue Catalog table `{glue_database}`.`{bronze_table_name}` via GlueContext.")
-                else:
-                    df_bronze = spark.read.option("mergeSchema", "true").parquet(bronze_path)
-            except Exception as cat_err:
-                logger.info(f"Glue Catalog table `{glue_database}`.`{bronze_table_name}` not directly queryable via GlueContext ({cat_err}). Reading from S3: '{bronze_path}'...")
+                    dyn_frame = dyn_frame.resolveChoice(choice='cast:string')
+                    temp_df = dyn_frame.toDF()
+
+                    if last_load_date and watermark_enabled and not full_refresh and watermark_column in temp_df.columns:
+                        logger.info(f"Applying Silver Watermark filter: `{watermark_column}` > '{last_load_date}' for table '{target_table_name}'...")
+                        temp_df = temp_df.filter(col(watermark_column) > lit(last_load_date))
+
+                    batch_count = temp_df.count()
+                    df_bronze = temp_df
+                    logger.info(f"Successfully loaded {batch_count} Bronze record(s) from Glue Catalog table `{glue_database}`.`{bronze_table_name}`.")
+                except Exception as cat_err:
+                    logger.warning(
+                        f"Glue Catalog table `{glue_database}`.`{bronze_table_name}` read/count failed ({cat_err}). "
+                        f"Falling back to direct S3 DynamicFrame reader from '{bronze_path}' with resolveChoice..."
+                    )
+                    df_bronze = None
+
+            # 2. Fallback: Read directly from S3 using Glue DynamicFrame with resolveChoice(choice='cast:string')
+            # Handles heterogeneous Parquet files across partitions where types differ (e.g. DOUBLE vs String)
+            if df_bronze is None and glueContext:
                 try:
-                    df_bronze = spark.read.option("mergeSchema", "true").parquet(bronze_path)
-                except Exception as parquet_err:
-                    try:
-                        df_bronze = spark.read.option("mergeSchema", "true").json(bronze_path)
-                    except Exception as json_err:
-                        alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
+                    logger.info(f"Attempting direct S3 DynamicFrame load from '{bronze_path}' with resolveChoice...")
+                    dyn_frame = glueContext.create_dynamic_frame.from_options(
+                        connection_type="s3",
+                        connection_options={"paths": [bronze_path], "recurse": True},
+                        format="parquet"
+                    )
+                    dyn_frame = dyn_frame.resolveChoice(choice='cast:string')
+                    temp_df = dyn_frame.toDF()
+
+                    if last_load_date and watermark_enabled and not full_refresh and watermark_column in temp_df.columns:
+                        logger.info(f"Applying Silver Watermark filter: `{watermark_column}` > '{last_load_date}' for table '{target_table_name}'...")
+                        temp_df = temp_df.filter(col(watermark_column) > lit(last_load_date))
+
+                    batch_count = temp_df.count()
+                    df_bronze = temp_df
+                    logger.info(f"Successfully loaded {batch_count} Bronze record(s) from S3 via DynamicFrame.")
+                except Exception as s3_dyn_err:
+                    logger.warning(f"S3 DynamicFrame read from '{bronze_path}' failed ({s3_dyn_err}). Trying Spark DataFrame reader...")
+                    df_bronze = None
+
+            # 3. Fallback: Standard Spark DataFrame Parquet read
+            if df_bronze is None:
+                try:
+                    logger.info(f"Attempting Spark Parquet read from '{bronze_path}'...")
+                    temp_df = spark.read.option("mergeSchema", "false").parquet(bronze_path)
+                    if last_load_date and watermark_enabled and not full_refresh and watermark_column in temp_df.columns:
+                        logger.info(f"Applying Silver Watermark filter: `{watermark_column}` > '{last_load_date}' for table '{target_table_name}'...")
+                        temp_df = temp_df.filter(col(watermark_column) > lit(last_load_date))
+                    batch_count = temp_df.count()
+                    df_bronze = temp_df
+                    logger.info(f"Successfully loaded {batch_count} Bronze record(s) via Spark Parquet reader.")
+                except Exception as spark_parquet_err:
+                    logger.warning(f"Spark Parquet read from '{bronze_path}' failed ({spark_parquet_err}). Trying alternate paths / formats...")
+
+            # 4. Fallback: Alternate directory paths & JSON fallback
+            if df_bronze is None:
+                alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
+                for candidate_path in [bronze_path, alt_bronze_path]:
+                    if df_bronze is not None:
+                        break
+                    for read_fn in [
+                        lambda p: spark.read.option("mergeSchema", "true").parquet(p),
+                        lambda p: spark.read.json(p)
+                    ]:
                         try:
-                            df_bronze = spark.read.option("mergeSchema", "true").parquet(alt_bronze_path)
-                        except Exception as final_parquet_err:
-                            try:
-                                df_bronze = spark.read.option("mergeSchema", "true").json(alt_bronze_path)
-                            except Exception as final_json_err:
-                                table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
-                                table_stats.append({
-                                    "table_name": target_table_name,
-                                    "status": "SKIPPED_NO_BRONZE_DATA",
-                                    "scd_type": scd_type.upper(),
-                                    "merge_strategy": merge_strategy.upper(),
-                                    "duration_seconds": round(table_duration, 2),
-                                    "records_processed": 0,
-                                    "error_message": f"Bronze source data not found in Glue Catalog nor at S3 path '{bronze_path}'."
-                                })
-                                logger.warning(
-                                    f"[TABLE SKIPPED] Bronze data not found for '{bronze_table_name}' at '{bronze_path}'. "
-                                    f"Bronze ingestion may not have run yet or 0 records were returned by source API. "
-                                    f"Skipping Silver table creation until Bronze data is available."
-                                )
-                                continue
+                            temp_df = read_fn(candidate_path)
+                            if last_load_date and watermark_enabled and not full_refresh and watermark_column in temp_df.columns:
+                                temp_df = temp_df.filter(col(watermark_column) > lit(last_load_date))
+                            batch_count = temp_df.count()
+                            df_bronze = temp_df
+                            logger.info(f"Successfully loaded {batch_count} Bronze record(s) from '{candidate_path}'.")
+                            break
+                        except Exception:
+                            continue
 
-            # Apply Incremental High-Water Mark Filter if watermark is present
-            if last_load_date and watermark_enabled and not full_refresh:
-                if watermark_column in df_bronze.columns:
-                    logger.info(f"Applying Silver Watermark filter: `{watermark_column}` > '{last_load_date}' for table '{target_table_name}'...")
-                    df_bronze = df_bronze.filter(col(watermark_column) > lit(last_load_date))
-                else:
-                    logger.warning(f"Watermark column '{watermark_column}' not found in Bronze table '{bronze_table_name}'. Reading all available records.")
+            # If all readers fail or directory is empty, skip table
+            if df_bronze is None:
+                table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
+                table_stats.append({
+                    "table_name": target_table_name,
+                    "status": "SKIPPED_NO_BRONZE_DATA",
+                    "scd_type": scd_type.upper(),
+                    "merge_strategy": merge_strategy.upper(),
+                    "duration_seconds": round(table_duration, 2),
+                    "records_processed": 0,
+                    "error_message": f"Bronze source data not found or unreadable from Glue Catalog nor S3 path '{bronze_path}'."
+                })
+                logger.warning(
+                    f"[TABLE SKIPPED] Bronze data not found for '{bronze_table_name}' at '{bronze_path}'. "
+                    f"Bronze ingestion may not have run yet or 0 records were returned by source API. "
+                    f"Skipping Silver table creation until Bronze data is available."
+                )
+                continue
 
-            batch_count = df_bronze.count()
             logger.info(f"Incoming Bronze records to process for '{target_table_name}': {batch_count}")
 
             if batch_count == 0:
