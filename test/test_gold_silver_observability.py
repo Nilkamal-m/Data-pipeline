@@ -2278,27 +2278,16 @@ class TestCleanIllegalCharsAndDefaultString(unittest.TestCase):
         self.assertEqual(mock_df.withColumn.call_count, 0)
 
     def test_moveworks_custom_transforms_export(self):
-        from custom_transforms.moveworks_plugin_resources import clean_illegal_chars as pr_clean
-        from custom_transforms.moveworks_users import clean_illegal_chars as u_clean
-        pattern = r'[\x00-\x08\x0B\x0C\x0E-\x1F\ufffd]'
+        from custom_transforms.moveworks_plugin_resources import transform as pr_transform
+        from custom_transforms.moveworks_users import transform as u_transform
 
-        class MockDF:
-            def __init__(self, data):
-                self.data = data
-            def applymap(self, fn):
-                return MockDF({k: [fn(v) for v in vals] for k, vals in self.data.items()})
+        mock_df = MagicMock()
+        mock_df.columns = ["id", "detail"]
+        r1 = pr_transform(mock_df)
+        self.assertIs(r1, mock_df)
 
-        df1 = MockDF({'text': ['Hello\x00World\x1f!']})
-        r1 = pr_clean(df1, pattern=pattern)
-        self.assertEqual(r1.data['text'][0], 'HelloWorld!')
-
-        # If no pattern is provided, ignore
-        r1_no_pat = pr_clean(df1, pattern=None)
-        self.assertEqual(r1_no_pat.data['text'][0], 'Hello\x00World\x1f!')
-
-        df2 = MockDF({'name': ['User\x0b\x0cName\ufffd']})
-        r2 = u_clean(df2, pattern=pattern)
-        self.assertEqual(r2.data['name'][0], 'UserName')
+        r2 = u_transform(mock_df)
+        self.assertIs(r2, mock_df)
 
 
     def test_silver_config_isolation(self):

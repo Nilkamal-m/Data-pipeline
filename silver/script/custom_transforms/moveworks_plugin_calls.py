@@ -1,73 +1,54 @@
 """
 Custom Transformation Script for Moveworks Plugin Calls Table.
+
+Note:
+Default column string casting and illegal character cleaning are handled directly
+and declaratively by SilverTransformer in transformer.py via silver_config.json.
+This script serves as an extensible hook for table-specific transformations or external API calls.
 """
 
 import logging
-import re
-from pyspark.sql.functions import col, regexp_replace, current_timestamp
+from pyspark.sql import DataFrame
+# import requests
+# from pyspark.sql.functions import col, udf, lit
+# from pyspark.sql.types import StringType
 
 logger = logging.getLogger(__name__)
 
 
-def clean_illegal_chars(df, pattern=None):
-    """
-    Cleans illegal characters from DataFrame using the expression provided from configuration.
-    If no expression/pattern is provided, ignores and returns DataFrame unchanged.
-    Supports both pandas (applymap/map) and PySpark (regexp_replace).
-    """
-    if not pattern or not isinstance(pattern, str) or not pattern.strip():
-        return df
-
-    def remove_illegal_chars(value):
-        if isinstance(value, str):
-            return re.sub(pattern, '', value)
-        return value
-
-    # Pandas DataFrame support (via applymap or map)
-    if hasattr(df, 'applymap'):
-        try:
-            return df.applymap(remove_illegal_chars)
-        except Exception:
-            pass
-    if hasattr(df, 'map') and not hasattr(df, '_jdf'):
-        try:
-            return df.map(remove_illegal_chars)
-        except Exception:
-            pass
-
-    # PySpark DataFrame support:
-    # 1. Cast all columns to string by default
-    # 2. Apply regexp_replace to strip illegal characters using pattern from config
-    if hasattr(df, 'columns') and hasattr(df, 'withColumn'):
-        for col_name in df.columns:
-            df = df.withColumn(
-                col_name,
-                regexp_replace(col(col_name).cast("string"), pattern, '')
-            )
-        return df
-
-    return df
-
-
-def transform(df, spark=None, context: dict = None):
+def transform(df: DataFrame, spark=None, context: dict = None) -> DataFrame:
     """
     Custom transformation entry point invoked by Silver Iceberg ETL engine.
-    Casts all columns to string by default, cleans illegal control characters using
-    the expression configured in silver_config.json, and appends technical audit metadata.
+
+    Args:
+        df (DataFrame): PySpark DataFrame after deduplication and declarative transforms.
+        spark (SparkSession, optional): Active SparkSession with Glue / Iceberg catalog connectivity.
+        context (dict, optional): Runtime execution metadata containing table_cfg, glue_database, etc.
+
+    Returns:
+        DataFrame: Transformed PySpark DataFrame.
     """
-    logger.info("[CUSTOM TRANSFORM] Casting columns to string for Moveworks plugin_calls...")
-    if hasattr(df, 'columns') and hasattr(df, 'withColumn'):
-        for c in df.columns:
-            df = df.withColumn(c, col(c).cast("string"))
+    logger.info("[CUSTOM TRANSFORM] Custom transform hook invoked for Moveworks tbl_plugin_calls.")
 
-    # Resolve illegal char expression dynamically from table configuration
-    table_cfg = context.get('table_cfg', {}) if isinstance(context, dict) else {}
-    illegal_expr = table_cfg.get('clean_illegal_chars_expression') or table_cfg.get('clean_illegal_chars_pattern')
-    if illegal_expr:
-        logger.info(f"[CUSTOM TRANSFORM] Applying illegal char expression from config: {illegal_expr}")
-        df = clean_illegal_chars(df, pattern=illegal_expr)
-
-    if hasattr(df, 'withColumn') and "_transformed_at" not in getattr(df, 'columns', []):
-        df = df.withColumn("_transformed_at", current_timestamp())
+    # --------------------------------------------------------------------------
+    # Optional Example: External API Call / Enrichment Pattern
+    # --------------------------------------------------------------------------
+    # def fetch_external_enrichment(entity_id):
+    #     try:
+    #         response = requests.get(
+    #             f"https://api.external-service.com/v1/enrichment/{entity_id}",
+    #             headers={"Authorization": "Bearer <TOKEN>"},
+    #             timeout=5
+    #         )
+    #         if response.status_code == 200:
+    #             return response.json().get("enriched_attribute")
+    #     except Exception as exc:
+    #         logger.warning(f"External API call failed for entity '{entity_id}': {exc}")
+    #     return None
+    #
+    # enrichment_udf = udf(fetch_external_enrichment, StringType())
+    # if "id" in df.columns:
+    #     df = df.withColumn("external_enrichment_field", enrichment_udf(col("id")))
+    # --------------------------------------------------------------------------
 
     return df
