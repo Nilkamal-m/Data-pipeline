@@ -287,7 +287,9 @@ def parse_spark_arguments() -> dict:
     if cli_trigger_crawler is not None:
         trigger_crawler = str(cli_trigger_crawler).strip().lower() in ('true', '1', 'yes')
     else:
-        trigger_crawler = None
+        # Defaults to False for Silver Iceberg: Spark natively updates the Glue Data Catalog.
+        glue_cat_cfg = defaults_cfg.get('glue_catalog', {})
+        trigger_crawler = bool(glue_cat_cfg.get('trigger_crawler', False))
 
     # Gold Serving Layer Parameters
     gold_targets_raw = get_cli_arg('GOLD_TARGETS', 'gold_targets', 'GOLD_TARGET', 'gold_target', default='aurora')
@@ -665,7 +667,26 @@ def check_iceberg_table_exists(spark, glue_client, database_name: str, table_nam
             table_found_in_glue = True
             params = table_meta.get('Parameters', {})
             metadata_location = params.get('metadata_location')
+            table_type = params.get('table_type', '').upper()
+            glue_table_type = table_meta.get('TableType', '').upper()
             table_location = table_meta.get('StorageDescriptor', {}).get('Location') or silver_location
+
+            # If the Glue Catalog table was created by a Crawler or legacy job as a standard Hive table
+            # (not an Iceberg table, or missing metadata_location), Iceberg SparkCatalog cannot operate on it.
+            # Drop the stale non-Iceberg registration so Iceberg can create the real table cleanly.
+            if table_type != 'ICEBERG' or not metadata_location:
+                logger.warning(
+                    f"[NON-ICEBERG CATALOG TABLE DETECTED] Glue Catalog table `{database_name}`.`{table_name}` "
+                    f"is registered as a standard Hive table ({glue_table_type}, table_type='{table_type}', metadata_location={metadata_location}). "
+                    f"This was likely created by an AWS Glue Crawler. Automatically dropping stale catalog registration "
+                    f"so Iceberg can create the table cleanly..."
+                )
+                try:
+                    glue_client.delete_table(DatabaseName=database_name, Name=table_name)
+                    logger.info(f"Successfully dropped non-Iceberg catalog table `{database_name}`.`{table_name}`.")
+                except Exception as del_err:
+                    logger.warning(f"Failed to delete stale table `{database_name}`.`{table_name}` from Glue Catalog: {del_err}")
+                return False
 
             # Validate whether the metadata_location file actually exists in S3
             if metadata_location and s3_client and metadata_location.startswith('s3://'):
@@ -707,11 +728,11 @@ def check_iceberg_table_exists(spark, glue_client, database_name: str, table_nam
         return True
     except Exception as probe_err:
         err_str = str(probe_err)
-        if any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "NotFoundException", "404", "NoSuchTableException", "Table or view not found", "Path does not exist")):
-            if table_found_in_glue and any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404", "NotFoundException")):
+        if any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "NotFoundException", "404", "NoSuchTableException", "Table or view not found", "Path does not exist", "not an Iceberg table", "ValidationException")):
+            if table_found_in_glue:
                 logger.warning(
-                    f"[CORRUPTED TABLE DETECTED] Spark probe for Iceberg table '{quoted}' failed with S3 key error: {probe_err}. "
-                    f"Underlying S3 metadata is missing. Automatically dropping stale catalog registration..."
+                    f"[CORRUPTED/NON-ICEBERG TABLE DETECTED] Spark probe for Iceberg table '{quoted}' failed ({probe_err}). "
+                    f"Automatically dropping stale catalog registration to allow clean Iceberg creation..."
                 )
                 if glue_client:
                     try:
@@ -719,7 +740,7 @@ def check_iceberg_table_exists(spark, glue_client, database_name: str, table_nam
                         logger.info(f"Successfully dropped stale Glue Catalog table `{database_name}`.`{table_name}`.")
                     except Exception as del_err:
                         logger.warning(f"Failed to delete stale table from Glue Catalog: {del_err}")
-                if table_location and s3_client:
+                if table_location and s3_client and any(x in err_str for x in ("NoSuchKey", "NotFound", "404")):
                     purge_s3_table_location(s3_client, table_location)
             return False
         return False
@@ -1313,30 +1334,48 @@ def main():
             logger.info(f"Reading raw Bronze data for '{bronze_table_name}' from Glue Catalog (`{glue_database}`.`{bronze_table_name}`) or S3 ('{bronze_path}')...")
 
             try:
-                # 1. Primary: Read directly from Bronze Glue Catalog external table
-                try:
-                    if hasattr(spark, "catalog") and hasattr(spark.catalog, "refreshTable"):
-                        spark.catalog.refreshTable(f"`{glue_database}`.`{bronze_table_name}`")
-                except Exception as ref_err:
-                    logger.debug(f"Catalog cache refresh skipped: {ref_err}")
-
-                df_bronze = spark.read.table(f"`{glue_database}`.`{bronze_table_name}`")
-                logger.info(f"Successfully loaded Bronze data from Glue Catalog table `{glue_database}`.`{bronze_table_name}`")
+                # 1. Primary: Read Bronze Hive/Parquet table via GlueContext native catalog reader
+                # (bypasses Iceberg SparkCatalog so it never raises 'Input Glue table is not an Iceberg table')
+                if glueContext:
+                    dyn_frame = glueContext.create_dynamic_frame.from_catalog(
+                        database=glue_database,
+                        table_name=bronze_table_name
+                    )
+                    df_bronze = dyn_frame.toDF()
+                    logger.info(f"Successfully loaded Bronze data from Glue Catalog table `{glue_database}`.`{bronze_table_name}` via GlueContext.")
+                else:
+                    df_bronze = spark.read.option("mergeSchema", "true").parquet(bronze_path)
             except Exception as cat_err:
-                logger.info(f"Glue Catalog table `{glue_database}`.`{bronze_table_name}` not directly queryable ({cat_err}). Reading from S3: '{bronze_path}'...")
+                logger.info(f"Glue Catalog table `{glue_database}`.`{bronze_table_name}` not directly queryable via GlueContext ({cat_err}). Reading from S3: '{bronze_path}'...")
                 try:
                     df_bronze = spark.read.option("mergeSchema", "true").parquet(bronze_path)
-                except Exception as read_err:
-                    alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
+                except Exception as parquet_err:
                     try:
-                        df_bronze = spark.read.option("mergeSchema", "true").parquet(alt_bronze_path)
-                    except Exception as final_read_err:
-                        raise FileNotFoundError(
-                            f"Bronze source data for '{bronze_table_name}' was not found in Glue Catalog "
-                            f"(`{glue_database}`.`{bronze_table_name}`) nor at S3 location '{bronze_path}'. "
-                            f"Please ensure the Bronze ingestion job has run for source system '{source_system}' "
-                            f"and table '{base_table_name}'. (Underlying error: {final_read_err})"
-                        )
+                        df_bronze = spark.read.option("mergeSchema", "true").json(bronze_path)
+                    except Exception as json_err:
+                        alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
+                        try:
+                            df_bronze = spark.read.option("mergeSchema", "true").parquet(alt_bronze_path)
+                        except Exception as final_parquet_err:
+                            try:
+                                df_bronze = spark.read.option("mergeSchema", "true").json(alt_bronze_path)
+                            except Exception as final_json_err:
+                                table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
+                                table_stats.append({
+                                    "table_name": target_table_name,
+                                    "status": "SKIPPED_NO_BRONZE_DATA",
+                                    "scd_type": scd_type.upper(),
+                                    "merge_strategy": merge_strategy.upper(),
+                                    "duration_seconds": round(table_duration, 2),
+                                    "records_processed": 0,
+                                    "error_message": f"Bronze source data not found in Glue Catalog nor at S3 path '{bronze_path}'."
+                                })
+                                logger.warning(
+                                    f"[TABLE SKIPPED] Bronze data not found for '{bronze_table_name}' at '{bronze_path}'. "
+                                    f"Bronze ingestion may not have run yet or 0 records were returned by source API. "
+                                    f"Skipping Silver table creation until Bronze data is available."
+                                )
+                                continue
 
             # Apply Incremental High-Water Mark Filter if watermark is present
             if last_load_date and watermark_enabled and not full_refresh:
@@ -1751,16 +1790,15 @@ def main():
     # 2. Explicitly provided --CRAWLER_NAME parameter (and TRIGGER_CRAWLER is not explicitly false)
     # 3. Any new Iceberg table was created for the first time (tables_created > 0)
     # 4. Any table schema was evolved with new columns (schemas_evolved > 0)
+    # Silver Iceberg tables natively register and evolve schemas in Glue Catalog via Spark SQL.
+    # Crawlers should ONLY trigger if explicitly enabled (TRIGGER_CRAWLER = True) to prevent
+    # standard crawlers from traversing /data and /metadata and creating duplicate junk tables.
     cli_trigger_crawler = params.get('TRIGGER_CRAWLER')
     cli_crawler_name = params.get('CRAWLER_NAME') or params.get('ARG_DICT', {}).get('CRAWLER_NAME') or params.get('ARG_DICT', {}).get('SILVER_CRAWLER_NAME')
 
-    should_trigger_crawler = False
-    if cli_trigger_crawler is not None:
-        should_trigger_crawler = cli_trigger_crawler
-    elif cli_crawler_name:
-        should_trigger_crawler = True
-    elif tables_created > 0 or schemas_evolved > 0:
-        should_trigger_crawler = True
+    should_trigger_crawler = bool(cli_trigger_crawler) if cli_trigger_crawler is not None else False
+    if not should_trigger_crawler:
+        logger.info("Silver Iceberg Crawler trigger skipped (trigger_crawler is false/disabled; Iceberg tables commit directly to Glue Catalog).")
 
     if should_trigger_crawler:
         crawler_name = (

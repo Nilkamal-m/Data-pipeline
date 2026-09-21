@@ -51,7 +51,8 @@
       "enabled": true,
       "database_name": "uax_datalake_db_{env}",
       "crawler_name": "uax-datalake-silver-crawler-{env}",
-      "trigger_crawler": true,
+      "trigger_crawler": false,
+      "_note_crawler": "Disabled by default for Silver Iceberg tables. Spark SQL natively commits Iceberg metadata and schema evolution directly to the Glue Data Catalog. Standard crawlers crawl /data and /metadata as separate junk tables.",
       "sync_watermark_table": true,
       "watermark_table_name": "tbl_watermarks"
     },

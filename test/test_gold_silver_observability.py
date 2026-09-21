@@ -39,6 +39,16 @@ sys.modules['pyspark.conf'].SparkConf = MagicMock
 sys.modules['awsglue.context'].GlueContext = MagicMock
 sys.modules['awsglue.job'].Job = MagicMock
 
+
+class MockClientError(Exception):
+    def __init__(self, error_response=None, operation_name=None):
+        super().__init__(str(error_response))
+        self.response = error_response or {}
+        self.operation_name = operation_name
+
+
+sys.modules['botocore.exceptions'].ClientError = MockClientError
+
 # Ensure directories are on sys.path
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 bronze_dir = os.path.join(repo_root, "bronze", "script")
@@ -2106,6 +2116,115 @@ class TestMultipleNaturalKeysHandling(unittest.TestCase):
         nkey_set = set(composite_keys)
         business_update_cols = [c for c in all_cols if c not in silver_tech and c not in nkey_set]
         self.assertEqual(business_update_cols, ["attr1", "attr2"])
+
+
+class TestCheckIcebergTableExists(unittest.TestCase):
+    """Verifies that check_iceberg_table_exists automatically detects and cleans up stale/crawler-created catalog tables."""
+
+    def test_drops_stale_crawler_hive_table(self):
+        from uax_silver_etl import check_iceberg_table_exists
+        mock_spark = MagicMock()
+        mock_glue = MagicMock()
+        mock_s3 = MagicMock()
+
+        # Simulate crawler created standard Hive table (no ICEBERG table_type or metadata_location)
+        mock_glue.get_table.return_value = {
+            'Table': {
+                'Name': 'tbl_plugin_resources',
+                'TableType': 'EXTERNAL_TABLE',
+                'Parameters': {
+                    'classification': 'parquet',
+                    'EXTERNAL': 'TRUE'
+                },
+                'StorageDescriptor': {'Location': 's3://test-bucket/silver/data/moveworks/tbl_plugin_resources/'}
+            }
+        }
+
+        exists = check_iceberg_table_exists(
+            spark=mock_spark,
+            glue_client=mock_glue,
+            database_name='uax_datalake_db_dev',
+            table_name='tbl_plugin_resources',
+            silver_location='s3://test-bucket/silver/data/moveworks/tbl_plugin_resources/',
+            s3_client=mock_s3
+        )
+
+        self.assertFalse(exists)
+        mock_glue.delete_table.assert_called_once_with(
+            DatabaseName='uax_datalake_db_dev',
+            Name='tbl_plugin_resources'
+        )
+
+    def test_drops_ghost_table_on_missing_s3_metadata(self):
+        from uax_silver_etl import check_iceberg_table_exists
+        from botocore.exceptions import ClientError
+        mock_spark = MagicMock()
+        mock_glue = MagicMock()
+        mock_s3 = MagicMock()
+
+        mock_glue.get_table.return_value = {
+            'Table': {
+                'Name': 'tbl_users',
+                'TableType': 'EXTERNAL_TABLE',
+                'Parameters': {
+                    'table_type': 'ICEBERG',
+                    'metadata_location': 's3://test-bucket/silver/data/moveworks/tbl_users/metadata/missing.json'
+                },
+                'StorageDescriptor': {'Location': 's3://test-bucket/silver/data/moveworks/tbl_users/'}
+            }
+        }
+
+        err = ClientError({'Error': {'Code': '404', 'Message': 'Not Found'}}, 'HeadObject')
+        err.response = {'Error': {'Code': '404', 'Message': 'Not Found'}}
+        mock_s3.head_object.side_effect = err
+
+        exists = check_iceberg_table_exists(
+            spark=mock_spark,
+            glue_client=mock_glue,
+            database_name='uax_datalake_db_dev',
+            table_name='tbl_users',
+            silver_location='s3://test-bucket/silver/data/moveworks/tbl_users/',
+            s3_client=mock_s3
+        )
+
+        self.assertFalse(exists)
+        mock_glue.delete_table.assert_called_once_with(
+            DatabaseName='uax_datalake_db_dev',
+            Name='tbl_users'
+        )
+
+    def test_valid_iceberg_table_returns_true(self):
+        from uax_silver_etl import check_iceberg_table_exists
+        mock_spark = MagicMock()
+        mock_glue = MagicMock()
+        mock_s3 = MagicMock()
+
+        mock_glue.get_table.return_value = {
+            'Table': {
+                'Name': 'tbl_interactions',
+                'TableType': 'EXTERNAL_TABLE',
+                'Parameters': {
+                    'table_type': 'ICEBERG',
+                    'metadata_location': 's3://test-bucket/silver/data/moveworks/tbl_interactions/metadata/v1.metadata.json'
+                },
+                'StorageDescriptor': {'Location': 's3://test-bucket/silver/data/moveworks/tbl_interactions/'}
+            }
+        }
+
+        mock_s3.head_object.return_value = {'ContentLength': 1024}
+        mock_spark.sql.return_value = MagicMock()
+
+        exists = check_iceberg_table_exists(
+            spark=mock_spark,
+            glue_client=mock_glue,
+            database_name='uax_datalake_db_dev',
+            table_name='tbl_interactions',
+            silver_location='s3://test-bucket/silver/data/moveworks/tbl_interactions/',
+            s3_client=mock_s3
+        )
+
+        self.assertTrue(exists)
+        mock_glue.delete_table.assert_not_called()
 
 
 if __name__ == "__main__":
