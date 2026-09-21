@@ -316,7 +316,16 @@ def parse_spark_arguments() -> dict:
     rds_host = get_cli_arg('RDS_HOST', 'rds_host', 'RDS_URL', 'rds_url', 'HOST', 'host')
     rds_port = get_cli_arg('RDS_PORT', 'rds_port', 'PORT', 'port', default='3306')
     rds_user = get_cli_arg('RDS_USER', 'rds_user', 'RDS_USERNAME', 'rds_username', 'USER', 'user')
-    rds_password = get_cli_arg('RDS_PASSWORD', 'rds_password', 'PASSWORD', 'password')
+    rds_password = get_cli_arg(
+        'RDS_PASSWORD', 'rds_password',
+        'RDS_PASSWORDS', 'rds_passwords',
+        'PASSWORD', 'password',
+        'PASSWORDS', 'passwords',
+        'DB_PASSWORD', 'db_password',
+        'DB_PASSWORDS', 'db_passwords',
+        'RDS_PWD', 'rds_pwd',
+        'PWD', 'pwd'
+    )
 
     # Athena Workgroup: CLI > Env > Default (uax-datalake-workgroup-{env})
     env = 'dev'

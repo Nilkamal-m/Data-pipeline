@@ -1098,6 +1098,41 @@ class TestSilverUniformConfigAndGoldMandatoryAthenaView(unittest.TestCase):
         glue_args_custom = build_glue_arguments(event_custom)
         self.assertEqual(glue_args_custom.get('--ATHENA_WORKGROUP'), 'custom-athena-wg')
 
+    def test_lambda_and_gold_manager_handle_rds_passwords_plural_alias(self):
+        from lambda_helper.lambda_function import build_glue_arguments
+        event = {
+            'layer': 'gold',
+            'source_system': 'moveworks',
+            'athena_workgroup': 'uax-datalake-workgroup-dev',
+            'rds_schema': 'enterprise_reporting',
+            'rds_url': 'aamsql.us-east-2.rds.amazonaws.com',
+            'rds_username': 'SLVR_WRITE',
+            'rds_passwords': 'SecretPassword123!',
+            'rds_port': '3306'
+        }
+        glue_args = build_glue_arguments(event)
+        self.assertEqual(glue_args.get('--RDS_PASSWORD'), 'SecretPassword123!')
+        self.assertEqual(glue_args.get('--RDS_HOST'), 'aamsql.us-east-2.rds.amazonaws.com')
+        self.assertEqual(glue_args.get('--RDS_USER'), 'SLVR_WRITE')
+
+        # Test GoldLayerManager._resolve_mysql_connection_info handles rds_passwords directly
+        params = {
+            'rds_schema': 'enterprise_reporting',
+            'rds_url': 'aamsql.us-east-2.rds.amazonaws.com',
+            'rds_username': 'SLVR_WRITE',
+            'rds_passwords': 'SecretPassword123!',
+            'rds_port': '3306'
+        }
+        conn_info = GoldLayerManager._resolve_mysql_connection_info(
+            params=params,
+            glue_client=None,
+            secrets_client=None
+        )
+        self.assertEqual(conn_info['password'], 'SecretPassword123!')
+        self.assertEqual(conn_info['user'], 'SLVR_WRITE')
+        self.assertEqual(conn_info['host'], 'aamsql.us-east-2.rds.amazonaws.com')
+        self.assertEqual(conn_info['port'], 3306)
+
     def test_gold_query_discovery_strips_v_prefix(self):
         # When discovery finds v_interactions.sql, the mart name should be interactions and view v_interactions
         mock_s3 = MagicMock()
