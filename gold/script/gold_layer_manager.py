@@ -164,6 +164,10 @@ class GoldLayerManager:
 
         logger.info(f"[GOLD STEP 1] Discovered {len(queries)} mart query file(s) to process: {list(queries.keys())}")
 
+        # Ensure dependency ordering: marts referenced in other marts (e.g. v_interactions for v_feedbacks) run first
+        queries = cls._sort_queries_by_dependency(queries)
+        logger.info(f"[GOLD STEP 1] Query execution order resolved (dependencies first): {list(queries.keys())}")
+
         # Set Spark active database to GLUE_DATABASE so queries can use direct table names (e.g. tbl_incident)
         if glue_database and spark:
             try:
@@ -497,6 +501,15 @@ class GoldLayerManager:
                 row_count = df_mart.count()
                 logger.info(f"Query executed successfully. Computed {row_count:,} records.")
                 cls._log_schema_introspection(df_mart, f"Gold Query Output Schema: '{clean_base_name}'")
+
+                # Register in-session Spark views so downstream dependent marts (e.g. feedbacks querying v_interactions) resolve seamlessly
+                try:
+                    df_mart.createOrReplaceTempView(f"v_{clean_base_name}")
+                    df_mart.createOrReplaceTempView(f"gold_tbl_{clean_base_name}")
+                    df_mart.createOrReplaceTempView(clean_base_name)
+                    logger.info(f"[SPARK VIEW] Registered in-session temporary views: 'v_{clean_base_name}', 'gold_tbl_{clean_base_name}'")
+                except Exception as temp_err:
+                    logger.debug(f"[SPARK VIEW] Note on temporary view registration: {temp_err}")
 
                 # 2. S3 Materialization
                 mart_s3_dest = f"{data_s3_path.rstrip('/')}/{clean_base_name}"
@@ -1141,6 +1154,30 @@ class GoldLayerManager:
                         logger.info(f"[QUERY DISCOVERY] Loaded local query for '{clean_name}' from '{file_path}'")
 
         return queries
+
+    @classmethod
+    def _sort_queries_by_dependency(cls, query_dict: Dict[str, str]) -> Dict[str, str]:
+        """
+        Sorts queries so that dependency views (e.g. v_interactions) are executed
+        and registered before dependent views (e.g. v_feedbacks).
+        """
+        ordered = {}
+        remaining = dict(query_dict)
+        while remaining:
+            ready = []
+            for name, sql in remaining.items():
+                deps = [
+                    other for other in remaining
+                    if other != name and re.search(rf'\b(?:v_{other}|gold_tbl_{other}|tbl_{other}|{other})\b', sql, re.IGNORECASE)
+                ]
+                if not deps:
+                    ready.append(name)
+            if not ready:
+                # Break any circular dependency or cycle gracefully by picking the first remaining
+                ready.append(next(iter(remaining.keys())))
+            for r in ready:
+                ordered[r] = remaining.pop(r)
+        return ordered
 
     # --------------------------------------------------------------------------
     # Connection Resolution

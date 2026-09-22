@@ -2740,6 +2740,52 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         self.assertNotIn("CURRENT_TIMESTAMP()", content)
         self.assertIn("CURRENT_TIMESTAMP", content)
 
+    def test_v_feedbacks_sql_exists_and_conforms_to_spec(self):
+        """Validates that gold/query/moveworks/v_feedbacks.sql exists and adheres strictly to specification."""
+        sql_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "gold", "query", "moveworks", "v_feedbacks.sql"
+        )
+        self.assertTrue(os.path.exists(sql_path), f"File not found: {sql_path}")
+        with open(sql_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Must be built directly from v_interactions
+        self.assertIn("FROM v_interactions", content)
+
+        # Grain & identification logic: link_click with helpful / not helpful
+        self.assertIn("link_click", content.lower())
+        self.assertIn("helpful", content.lower())
+        self.assertIn("not helpful", content.lower())
+
+        # Expected output columns matching Word doc specification
+        expected_cols = [
+            "conversation_id",
+            "timestamp",
+            "what_user_said",
+            "what_bot_said",
+            "rating",
+            "feedback_text",
+            "_data_as_of"
+        ]
+        for col in expected_cols:
+            self.assertIn(col, content, f"Expected output column '{col}' missing from v_feedbacks.sql")
+
+    def test_sort_queries_by_dependency(self):
+        """Validates that queries are ordered so dependencies (v_interactions) run before dependent marts (v_feedbacks)."""
+        input_queries = {
+            "feedbacks": "SELECT * FROM v_interactions WHERE is_feedback = 1",
+            "interactions": "SELECT * FROM tbl_interactions",
+            "summary_kpi": "SELECT count(*) FROM v_feedbacks"
+        }
+        ordered = GoldLayerManager._sort_queries_by_dependency(input_queries)
+        keys = list(ordered.keys())
+
+        # interactions must precede feedbacks
+        self.assertLess(keys.index("interactions"), keys.index("feedbacks"))
+        # feedbacks must precede summary_kpi
+        self.assertLess(keys.index("feedbacks"), keys.index("summary_kpi"))
+
 
 if __name__ == "__main__":
     unittest.main()
