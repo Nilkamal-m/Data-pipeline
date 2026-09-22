@@ -19,67 +19,50 @@
 -- ==============================================================================
 
 WITH
-    base_interactions AS (
-        SELECT
-            conversation_id,
-            timestamp,
-            interaction_id,
-            interaction_content,
-            bot_response,
-            plugin_used,
-            ROW_NUMBER() OVER (
-                PARTITION BY conversation_id
-                ORDER BY timestamp ASC, interaction_id ASC
-            ) AS overall_seq
-        FROM v_interactions
-        WHERE conversation_id IS NOT NULL AND trim(conversation_id) != ''
-    ),
-    prompts_numbered AS (
-        SELECT
-            conversation_id,
-            interaction_content,
-            ROW_NUMBER() OVER (
-                PARTITION BY conversation_id
-                ORDER BY timestamp ASC, interaction_id ASC
-            ) AS prompt_seq
-        FROM base_interactions
-        WHERE interaction_content IS NOT NULL AND trim(interaction_content) != ''
-    ),
-    prompts_formatted AS (
-        SELECT
-            conversation_id,
-            concat('Prompt ', cast(prompt_seq as varchar(20)), ': ', trim(interaction_content)) AS formatted_prompt
-        FROM prompts_numbered
-    ),
     prompts_aggregated AS (
         SELECT
             conversation_id,
-            array_join(array_agg(formatted_prompt), '; ') AS interaction_content
-        FROM prompts_formatted
+            array_join(
+                array_agg(concat('Prompt ', cast(prompt_seq as varchar(20)), ': ', trim(interaction_content))),
+                '; '
+            ) AS interaction_content
+        FROM (
+            SELECT
+                conversation_id,
+                interaction_content,
+                ROW_NUMBER() OVER (
+                    PARTITION BY conversation_id
+                    ORDER BY timestamp ASC, interaction_id ASC
+                ) AS prompt_seq
+            FROM v_interactions
+            WHERE conversation_id IS NOT NULL
+              AND trim(conversation_id) != ''
+              AND interaction_content IS NOT NULL
+              AND trim(interaction_content) != ''
+        )
         GROUP BY conversation_id
-    ),
-    responses_numbered AS (
-        SELECT
-            conversation_id,
-            bot_response,
-            ROW_NUMBER() OVER (
-                PARTITION BY conversation_id
-                ORDER BY timestamp ASC, interaction_id ASC
-            ) AS response_seq
-        FROM base_interactions
-        WHERE bot_response IS NOT NULL AND trim(bot_response) != ''
-    ),
-    responses_formatted AS (
-        SELECT
-            conversation_id,
-            concat('Response ', cast(response_seq as varchar(20)), ': ', trim(bot_response)) AS formatted_response
-        FROM responses_numbered
     ),
     responses_aggregated AS (
         SELECT
             conversation_id,
-            array_join(array_agg(formatted_response), '; ') AS bot_response
-        FROM responses_formatted
+            array_join(
+                array_agg(concat('Response ', cast(response_seq as varchar(20)), ': ', trim(bot_response))),
+                '; '
+            ) AS bot_response
+        FROM (
+            SELECT
+                conversation_id,
+                bot_response,
+                ROW_NUMBER() OVER (
+                    PARTITION BY conversation_id
+                    ORDER BY timestamp ASC, interaction_id ASC
+                ) AS response_seq
+            FROM v_interactions
+            WHERE conversation_id IS NOT NULL
+              AND trim(conversation_id) != ''
+              AND bot_response IS NOT NULL
+              AND trim(bot_response) != ''
+        )
         GROUP BY conversation_id
     ),
     conversation_bounds AS (
@@ -93,7 +76,8 @@ WITH
                     ELSE 0
                 END
             ) AS escalated
-        FROM base_interactions
+        FROM v_interactions
+        WHERE conversation_id IS NOT NULL AND trim(conversation_id) != ''
         GROUP BY conversation_id
     )
 SELECT
