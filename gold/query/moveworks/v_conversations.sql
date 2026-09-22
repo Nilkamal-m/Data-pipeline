@@ -82,27 +82,17 @@ WITH
         FROM responses_formatted
         GROUP BY conversation_id
     ),
-    escalations AS (
-        SELECT
-            conversation_id,
-            CASE
-                WHEN lower(coalesce(bot_response, '')) LIKE '%hr%' THEN 'HR'
-                WHEN lower(coalesce(bot_response, '')) LIKE '%live%' THEN 'IT'
-                WHEN lower(coalesce(interaction_content, '')) LIKE '%it%' THEN 'IT'
-                ELSE 'HR'
-            END AS hr_vs_it_agent,
-            ROW_NUMBER() OVER (
-                PARTITION BY conversation_id
-                ORDER BY timestamp ASC, interaction_id ASC
-            ) AS rnk
-        FROM base_interactions
-        WHERE lower(coalesce(plugin_used, '')) LIKE '%start live agent chat%'
-    ),
     conversation_bounds AS (
         SELECT
             conversation_id,
             min(timestamp) AS conversation_start,
-            max(timestamp) AS conversation_end
+            max(timestamp) AS conversation_end,
+            max(
+                CASE
+                    WHEN lower(coalesce(plugin_used, '')) LIKE '%start live agent chat%' THEN 1
+                    ELSE 0
+                END
+            ) AS escalated
         FROM base_interactions
         GROUP BY conversation_id
     )
@@ -113,10 +103,18 @@ SELECT
     cb.conversation_end AS conversation_end,
     COALESCE(pa.interaction_content, '') AS interaction_content,
     COALESCE(ra.bot_response, '') AS bot_response,
-    CASE WHEN esc.conversation_id IS NOT NULL THEN 1 ELSE 0 END AS escalated,
-    COALESCE(esc.hr_vs_it_agent, '') AS hr_vs_it_agent,
+    cb.escalated AS escalated,
+    CASE
+        WHEN cb.escalated = 1 THEN
+            CASE
+                WHEN lower(coalesce(ra.bot_response, '')) LIKE '%hr%' THEN 'HR'
+                WHEN lower(coalesce(ra.bot_response, '')) LIKE '%live%' THEN 'IT'
+                WHEN lower(coalesce(pa.interaction_content, '')) LIKE '%it%' THEN 'IT'
+                ELSE 'HR'
+            END
+        ELSE ''
+    END AS hr_vs_it_agent,
     CURRENT_TIMESTAMP AS _data_as_of
 FROM conversation_bounds cb
 LEFT JOIN prompts_aggregated pa ON cb.conversation_id = pa.conversation_id
 LEFT JOIN responses_aggregated ra ON cb.conversation_id = ra.conversation_id
-LEFT JOIN escalations esc ON cb.conversation_id = esc.conversation_id AND esc.rnk = 1
