@@ -34,50 +34,52 @@ WITH
         FROM v_interactions
         WHERE conversation_id IS NOT NULL AND trim(conversation_id) != ''
     ),
-    prompts_sequenced AS (
+    prompts_numbered AS (
         SELECT
             conversation_id,
-            overall_seq,
-            concat(
-                'Prompt ',
-                cast(ROW_NUMBER() OVER (
-                    PARTITION BY conversation_id
-                    ORDER BY timestamp ASC, interaction_id ASC
-                ) as varchar(20)),
-                ': ',
-                trim(interaction_content)
-            ) AS formatted_prompt
+            interaction_content,
+            ROW_NUMBER() OVER (
+                PARTITION BY conversation_id
+                ORDER BY timestamp ASC, interaction_id ASC
+            ) AS prompt_seq
         FROM base_interactions
         WHERE interaction_content IS NOT NULL AND trim(interaction_content) != ''
+    ),
+    prompts_formatted AS (
+        SELECT
+            conversation_id,
+            concat('Prompt ', cast(prompt_seq as varchar(20)), ': ', trim(interaction_content)) AS formatted_prompt
+        FROM prompts_numbered
     ),
     prompts_aggregated AS (
         SELECT
             conversation_id,
             array_join(array_agg(formatted_prompt), '; ') AS interaction_content
-        FROM prompts_sequenced
+        FROM prompts_formatted
         GROUP BY conversation_id
     ),
-    responses_sequenced AS (
+    responses_numbered AS (
         SELECT
             conversation_id,
-            overall_seq,
-            concat(
-                'Response ',
-                cast(ROW_NUMBER() OVER (
-                    PARTITION BY conversation_id
-                    ORDER BY timestamp ASC, interaction_id ASC
-                ) as varchar(20)),
-                ': ',
-                trim(bot_response)
-            ) AS formatted_response
+            bot_response,
+            ROW_NUMBER() OVER (
+                PARTITION BY conversation_id
+                ORDER BY timestamp ASC, interaction_id ASC
+            ) AS response_seq
         FROM base_interactions
         WHERE bot_response IS NOT NULL AND trim(bot_response) != ''
+    ),
+    responses_formatted AS (
+        SELECT
+            conversation_id,
+            concat('Response ', cast(response_seq as varchar(20)), ': ', trim(bot_response)) AS formatted_response
+        FROM responses_numbered
     ),
     responses_aggregated AS (
         SELECT
             conversation_id,
             array_join(array_agg(formatted_response), '; ') AS bot_response
-        FROM responses_sequenced
+        FROM responses_formatted
         GROUP BY conversation_id
     ),
     escalations AS (
