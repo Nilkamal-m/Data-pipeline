@@ -2786,6 +2786,40 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         # feedbacks must precede summary_kpi
         self.assertLess(keys.index("feedbacks"), keys.index("summary_kpi"))
 
+    def test_v_conversations_sql_exists_and_conforms_to_spec(self):
+        """Validates that gold/query/moveworks/v_conversations.sql exists and conforms to specifications."""
+        sql_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "gold", "query", "moveworks", "v_conversations.sql"
+        )
+        self.assertTrue(os.path.exists(sql_path), f"File not found: {sql_path}")
+        with open(sql_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Must be built directly from v_interactions
+        self.assertIn("FROM v_interactions", content)
+
+        # Expected output columns matching Word doc specification
+        expected_cols = [
+            "conversation_id",
+            "conversation_start",
+            "conversation_end",
+            "interaction_content",
+            "bot_response",
+            "escalated",
+            "hr_vs_it_agent",
+            "_data_as_of"
+        ]
+        for col in expected_cols:
+            self.assertIn(col, content, f"Expected output column '{col}' missing from v_conversations.sql")
+
+        # Escalation and agent classification logic checks
+        self.assertIn("start live agent chat", content.lower())
+        self.assertIn("hr", content.lower())
+        self.assertIn("it", content.lower())
+        self.assertIn("prompt ", content.lower())
+        self.assertIn("response ", content.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
