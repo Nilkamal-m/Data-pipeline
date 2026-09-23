@@ -113,6 +113,26 @@ class TestGoldConfigLoader(unittest.TestCase):
         self.assertIsNotNone(path)
         self.assertTrue(path.endswith("genesys_conversations.py"))
 
+    def test_get_initial_load_config(self):
+        # 1. Directly from gold_config.json for genesys conversations
+        init_cfg = GoldConfigLoader.get_initial_load_config("genesys", "conversations")
+        self.assertIn("conversations.csv", init_cfg.get("path", ""))
+        self.assertEqual(init_cfg.get("delimiter"), ",")
+        self.assertTrue(init_cfg.get("has_header"))
+
+        # 2. Custom dict with initial_load_path string
+        custom = {
+            "source_systems": {
+                "custom_src": {
+                    "tables": {
+                        "tbl": {"initial_load_path": "s3://bucket/custom.csv"}
+                    }
+                }
+            }
+        }
+        res = GoldConfigLoader.get_initial_load_config("custom_src", "tbl", custom)
+        self.assertEqual(res.get("path"), "s3://bucket/custom.csv")
+
 
 class TestGoldLayerManagerExtensions(unittest.TestCase):
     """Tests for GoldLayerManager upsert and transform capabilities."""

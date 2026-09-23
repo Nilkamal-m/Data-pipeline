@@ -241,12 +241,7 @@ class GoldInitialLoader:
         if not source_system or not table_name:
             raise ValueError(
                 "CRITICAL ERROR: '--SOURCE_SYSTEM' and '--TABLE_NAME' are required for Gold initial load.\n"
-                "Example: --SOURCE_SYSTEM genesys --TABLE_NAME conversations --CSV_PATH s3://bucket/landing/genesys/history.csv"
-            )
-
-        if not csv_path:
-            raise ValueError(
-                f"CRITICAL ERROR: Missing '--CSV_PATH' for initial load of '{source_system}.{table_name}'."
+                "Example: --SOURCE_SYSTEM genesys --TABLE_NAME conversations"
             )
 
         # Clean table name
@@ -257,6 +252,26 @@ class GoldInitialLoader:
 
         # Load gold_config.json
         gold_cfg = GoldConfigLoader.load_config() if GoldConfigLoader else {}
+
+        # Resolve initial export/load CSV path: CLI > gold_config.json > S3 template/convention
+        csv_path = params.get('CSV_PATH') or params.get('INITIAL_LOAD_PATH') or params.get('INPUT_FILE')
+        if not csv_path and GoldConfigLoader:
+            init_cfg = GoldConfigLoader.get_initial_load_config(source_system, table_name, gold_cfg)
+            csv_path = init_cfg.get('path')
+            if not params.get('DELIMITER') and init_cfg.get('delimiter'):
+                params['DELIMITER'] = init_cfg.get('delimiter')
+            if not params.get('HAS_HEADER') and 'has_header' in init_cfg:
+                params['HAS_HEADER'] = init_cfg.get('has_header')
+
+        # Template variable replacement (e.g. {bucket}, {env})
+        if csv_path and isinstance(csv_path, str):
+            env_name = params.get('ENVIRONMENT', 'dev')
+            csv_path = csv_path.replace("{bucket}", bucket_name).replace("{env}", env_name).replace("{source}", source_system).replace("{table}", table_name)
+
+        # Fallback to default S3 convention if not explicitly passed
+        if not csv_path:
+            csv_path = f"s3://{bucket_name}/gold/initial_exports/{source_system}/{table_name}.csv"
+            logger.info(f"[INITIAL LOAD CONVENTION] No explicit path passed. Using default S3 export path: '{csv_path}'")
 
         # Resolve Target Table Name (Default: gold_<source>_<tablename>)
         if GoldConfigLoader:

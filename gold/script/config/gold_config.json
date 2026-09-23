@@ -17,7 +17,14 @@
     },
     "default_target_engines": [
       "athena"
-    ]
+    ],
+    "initial_load": {
+      "template": "s3://{bucket}/gold/initial_exports/{source}/{table}.csv",
+      "format": "csv",
+      "delimiter": ",",
+      "has_header": true,
+      "_comment": "Default S3 path convention for historical report exports. Can be overridden per table."
+    }
   },
   "source_systems": {
     "genesys": {
@@ -31,6 +38,12 @@
             "conversation_id"
           ],
           "incremental": true,
+          "initial_load": {
+            "path": "s3://{bucket}/gold/initial_exports/genesys/conversations.csv",
+            "format": "csv",
+            "delimiter": ",",
+            "has_header": true
+          },
           "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
           "api_secret_name": "dev/data-pipeline/genesys-llm-api",
           "aurora": {

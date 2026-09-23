@@ -252,6 +252,52 @@ class GoldConfigLoader:
         return ["athena"]
 
     @classmethod
+    def get_initial_load_config(
+        cls,
+        source_system: str,
+        table_name: str,
+        config_dict: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Resolves initial report/export file configuration from gold_config.json.
+        Supports:
+          1. tables.<table>.initial_load: {"path": "...", "format": "csv", "delimiter": ",", "has_header": true}
+          2. tables.<table>.initial_load_path: "s3://..."
+          3. tables.<table>.initial_export_path: "s3://..."
+          4. pipeline_defaults.initial_load.template: "s3://{bucket}/gold/initial_exports/{source}/{table}.csv"
+        """
+        tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
+        init_cfg = tbl_cfg.get("initial_load") or tbl_cfg.get("initial_export") or {}
+        if isinstance(init_cfg, str):
+            init_cfg = {"path": init_cfg}
+        elif isinstance(init_cfg, dict):
+            init_cfg = dict(init_cfg)
+        else:
+            init_cfg = {}
+
+        if not init_cfg.get("path"):
+            path = (
+                tbl_cfg.get("initial_load_path")
+                or tbl_cfg.get("initial_export_path")
+                or tbl_cfg.get("historical_export_path")
+                or tbl_cfg.get("csv_path")
+            )
+            if path:
+                init_cfg["path"] = path
+
+        defaults = cls.get_defaults(config_dict)
+        default_init = defaults.get("initial_load", {})
+        if isinstance(default_init, dict):
+            if "delimiter" not in init_cfg and "delimiter" in default_init:
+                init_cfg["delimiter"] = default_init["delimiter"]
+            if "has_header" not in init_cfg and "has_header" in default_init:
+                init_cfg["has_header"] = default_init["has_header"]
+            if not init_cfg.get("path") and default_init.get("template"):
+                init_cfg["path"] = default_init["template"]
+
+        return init_cfg
+
+    @classmethod
     def get_custom_transform_path(
         cls,
         source_system: str,
