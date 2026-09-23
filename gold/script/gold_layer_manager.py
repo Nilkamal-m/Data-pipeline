@@ -1763,6 +1763,17 @@ class GoldLayerManager:
             # 1. Dynamically evolve Iceberg schema if new columns are present
             cls._sync_iceberg_schema(spark, full_table, df_mart)
 
+            # 2. Dynamically pad any target columns missing in df_mart with NULL and align column order
+            try:
+                target_df = spark.table(f"{glue_database}.{target_table_name}")
+                incoming_cols_lower = {c.lower(): c for c in df_mart.columns}
+                for field in target_df.schema.fields:
+                    if field.name.lower() not in incoming_cols_lower:
+                        df_mart = df_mart.withColumn(field.name, lit(None).cast(field.dataType))
+                # Reorder columns to exactly match target table schema (safe for both MERGE and insertInto)
+                df_mart = df_mart.select([field.name for field in target_df.schema.fields])
+            except Exception as align_err:
+                logger.warning(f"[SCHEMA SYNC NOTE] Dynamic column alignment note: {align_err}")
 
         # Register temp view with fully aligned columns for Spark SQL MERGE
         temp_view = f"incoming_gold_{clean_base_name}"
