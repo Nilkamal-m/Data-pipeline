@@ -381,6 +381,36 @@ class GoldInitialLoader:
             except Exception as ice_err:
                 logger.warning(f"[INITIAL LOAD WRITE] Direct Iceberg saveAsTable fallback to Parquet: {ice_err}")
                 df_consolidated.write.mode("overwrite").format("parquet").save(s3_location)
+        # 6. Optional Downstream Extension: Aurora MySQL Serving
+        # Only created/served if requested by user/config (target_engines contains 'aurora' or --GOLD_TARGETS contains 'aurora')
+        target_engines = []
+        if params.get('GOLD_TARGETS') or params.get('TARGET_ENGINES'):
+            target_engines = [t.strip().lower() for t in str(params.get('GOLD_TARGETS') or params.get('TARGET_ENGINES')).split(',') if t.strip()]
+        elif GoldConfigLoader:
+            target_engines = GoldConfigLoader.get_target_engines(source_system, table_name, gold_cfg)
+
+        needs_aurora = any(t in target_engines for t in ('aurora', 'rds', 'mysql'))
+        if needs_aurora and GoldLayerManager:
+            logger.info(f"[AURORA EXTENSION] User requested Aurora serving for '{target_table_name}'. Reading from Athena table and serving to Aurora...")
+            try:
+                df_athena = spark.table(full_table)
+                gold_schema = params.get('GOLD_SCHEMA') or 'enterprise_reporting'
+                GoldLayerManager._serve_to_mysql(
+                    spark=spark,
+                    queries={table_name: ""},
+                    gold_schema=gold_schema,
+                    data_s3_path=s3_location,
+                    params=params,
+                    glue_client=None,
+                    secrets_client=None,
+                    mart_stats=[],
+                    source_system=source_system,
+                    materialized_dfs={table_name: df_athena},
+                    mart_keys={table_name: pks}
+                )
+                logger.info(f"[AURORA EXTENSION] Successfully served Athena table '{full_table}' to Aurora '{gold_schema}.{target_table_name}'.")
+            except Exception as aurora_err:
+                logger.error(f"[AURORA EXTENSION ERROR] Failed to serve to Aurora: {aurora_err}")
 
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         logger.info(

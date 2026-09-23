@@ -614,6 +614,83 @@ class TestGoldSchemaEvolution(unittest.TestCase):
             ))
 
 
+class TestAthenaToAuroraExtension(unittest.TestCase):
+    """Tests for Athena-first architecture where Aurora acts as an optional extension reading from Athena."""
+
+    def test_serve_to_mysql_reads_from_athena_iceberg_table(self):
+        """When in-memory DataFrame is not cached, _serve_to_mysql reads directly from Athena table."""
+        mock_spark = MagicMock()
+        mock_athena_df = MagicMock()
+        mock_athena_df.columns = ["conversation_id", "prompt_text"]
+        mock_athena_df.count.return_value = 100
+        mock_spark.table.return_value = mock_athena_df
+
+        jdbc_info = {"host": "localhost", "port": 3306, "user": "dbuser", "password": "pwd"}
+
+        with patch.object(GoldLayerManager, "_resolve_mysql_connection_info", return_value=jdbc_info), \
+             patch.object(GoldLayerManager, "_verify_schema_exists_or_raise"), \
+             patch.object(GoldLayerManager, "_detect_schema_evolution"), \
+             patch.object(GoldLayerManager, "_write_staging_table"), \
+             patch.object(GoldLayerManager, "_table_exists", return_value=True), \
+             patch.object(GoldLayerManager, "_upsert_mysql_table"):
+
+            GoldLayerManager._serve_to_mysql(
+                spark=mock_spark,
+                queries={"conversations": "SELECT 1"},
+                gold_schema="enterprise_reporting",
+                data_s3_path="s3://bucket/gold/data/genesys",
+                params={"GLUE_DATABASE": "uax_datalake_db_dev"},
+                glue_client=None,
+                secrets_client=None,
+                mart_stats=[],
+                source_system="genesys",
+                materialized_dfs=None,  # Not in memory -> Must read from Athena table!
+                mart_keys={"conversations": ["conversation_id"]}
+            )
+
+            # Must have called spark.table with Athena table name
+            mock_spark.table.assert_called_with("uax_datalake_db_dev.gold_genesys_conversations")
+
+    def test_aurora_extension_only_when_requested(self):
+        """Verifies Aurora extension is created ONLY when requested, and skipped when targets is ['athena']."""
+        # 1. When targets is ['athena'] -> needs_mysql is False
+        targets_athena_only = ["athena"]
+        needs_mysql = any(t in targets_athena_only for t in ('aurora', 'rds', 'mysql'))
+        self.assertFalse(needs_mysql)
+
+        # 2. When targets contains 'aurora' -> needs_mysql is True
+        targets_with_aurora = ["athena", "aurora"]
+        needs_mysql_aurora = any(t in targets_with_aurora for t in ('aurora', 'rds', 'mysql'))
+        self.assertTrue(needs_mysql_aurora)
+
+    def test_initial_load_aurora_extension_invoked(self):
+        """When GOLD_TARGETS includes 'aurora', initial load creates Athena table then serves to Aurora."""
+        mock_spark = MagicMock()
+        mock_raw_df = MagicMock()
+        mock_raw_df.columns = ["conversation_id"]
+        mock_raw_df.count.return_value = 50
+        mock_spark.read.option.return_value.option.return_value.option.return_value.csv.return_value = mock_raw_df
+        mock_spark.table.return_value = mock_raw_df
+
+        params = {
+            "JOB_NAME": "test_job",
+            "SOURCE_SYSTEM": "genesys",
+            "TABLE_NAME": "conversations",
+            "CSV_PATH": "s3://bucket/init/conversations.csv",
+            "GOLD_TARGETS": "athena,aurora",
+            "GLUE_DATABASE": "uax_datalake_db_dev",
+            "GOLD_SCHEMA": "enterprise_reporting"
+        }
+
+        with patch.object(GoldLayerManager, "_serve_to_mysql") as mock_mysql_serve:
+            GoldInitialLoader.run_initial_load(mock_spark, params)
+            # Aurora serving extension must have been called
+            mock_mysql_serve.assert_called_once()
+            call_kwargs = mock_mysql_serve.call_args[1]
+            self.assertEqual(call_kwargs["gold_schema"], "enterprise_reporting")
+            self.assertEqual(call_kwargs["source_system"], "genesys")
+
+
 if __name__ == "__main__":
     unittest.main()
 

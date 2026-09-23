@@ -673,16 +673,23 @@ class GoldLayerManager:
             )
 
             try:
-                # 1. Spark SQL Execution / Reuse Step 1 Materialized DF
+                # 1. Read directly from Step 1 Athena table or in-memory DataFrame
+                glue_db = params.get('GLUE_DATABASE') or 'uax_datalake_db_dev'
+                athena_tbl_name = f"`{glue_db}`.`{target_table}`"
                 if clean_base_name in materialized_dfs:
                     df_mart = materialized_dfs[clean_base_name]
                     row_count = df_mart.count()
-                    logger.info(f"Reusing Step 1 materialized DataFrame for '{clean_base_name}' ({row_count:,} records).")
+                    logger.info(f"[ATHENA -> AURORA] Reusing Step 1 materialized DataFrame from Athena for '{clean_base_name}' ({row_count:,} records).")
                 else:
-                    logger.info(f"Executing Spark SQL query for '{clean_base_name}'...")
-                    df_mart = spark.sql(sql_text)
-                    row_count = df_mart.count()
-                    logger.info(f"Query executed successfully. Computed {row_count:,} records.")
+                    try:
+                        logger.info(f"[ATHENA -> AURORA] Reading directly from Athena Iceberg table {athena_tbl_name}...")
+                        df_mart = spark.table(f"{glue_db}.{target_table}")
+                        row_count = df_mart.count()
+                        logger.info(f"[ATHENA -> AURORA] Successfully loaded {row_count:,} records directly from Athena table {athena_tbl_name}.")
+                    except Exception as athena_read_err:
+                        logger.warning(f"[ATHENA -> AURORA NOTE] Could not read directly from Athena table {athena_tbl_name} ({athena_read_err}). Falling back to SQL query.")
+                        df_mart = spark.sql(sql_text)
+                        row_count = df_mart.count()
 
                 cls._log_schema_introspection(df_mart, f"Gold Query Output Schema: '{clean_base_name}'")
 
