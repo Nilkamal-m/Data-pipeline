@@ -868,7 +868,123 @@ class TestDynamicEnvInterpolationAcrossAllLayers(unittest.TestCase):
         self.assertEqual(glue_args_upper["--ENV"], "staging")
 
 
+class TestGoldMartDependencyAndOmittedColumns(unittest.TestCase):
+    """
+    Validates:
+    1. Gold table dependency detection handles gold_<source>_<table> and db.gold_<source>_<table>.
+    2. Joining silver tables (tbl_conversations) or SQL comments does not invert dependency order.
+    3. Composite nkeys are strictly preserved without guessing single-column keys.
+    4. MySQL omitted columns (such as _data_as_of) are altered to NULL DEFAULT NULL to prevent Error 1364.
+    """
+
+    def test_dependency_ordering_moveworks_marts(self):
+        """interactions must run before conversations and feedbacks even when referencing physical gold table names."""
+        interactions_sql = """
+        -- Aggregates Moveworks conversations and interactions
+        -- Constructed from interactions and joins tbl_conversations
+        SELECT
+            ui.id AS interaction_id,
+            ui.conversation_id AS conversation_id,
+            c.primary_domain AS conversation_domain
+        FROM tbl_interactions ui
+        LEFT JOIN tbl_conversations c ON ui.conversation_id = c.id
+        """
+
+        conversations_sql = """
+        -- Constructed directly from physical gold table gold_moveworks_interactions
+        SELECT
+            conversation_id,
+            min(timestamp) AS conversation_start,
+            max(timestamp) AS conversation_end
+        FROM uax_datalake_db_dev.gold_moveworks_interactions
+        GROUP BY conversation_id
+        """
+
+        feedbacks_sql = """
+        -- Constructed from gold_moveworks_interactions
+        SELECT
+            conversation_id,
+            interaction_id,
+            interaction_content AS rating
+        FROM gold_moveworks_interactions
+        WHERE lower(interaction_type) = 'link_click'
+        """
+
+        queries = {
+            "conversations": conversations_sql,
+            "feedbacks": feedbacks_sql,
+            "interactions": interactions_sql
+        }
+
+        ordered = GoldLayerManager._sort_queries_by_dependency(
+            queries, source_system="moveworks", glue_database="uax_datalake_db_dev"
+        )
+        ordered_keys = list(ordered.keys())
+
+        # interactions MUST be the first mart executed
+        self.assertEqual(ordered_keys[0], "interactions")
+        self.assertIn("conversations", ordered_keys[1:])
+        self.assertIn("feedbacks", ordered_keys[1:])
+
+    def test_composite_nkey_preservation_no_autodetect(self):
+        """Composite nkeys are strictly preserved and not overridden by auto-detection."""
+        composite_cfg = {
+            "source_systems": {
+                "servicenow": {
+                    "tables": {
+                        "incident_kpi": {
+                            "nkey": ["priority_level", "incident_state", "incident_category"]
+                        }
+                    }
+                }
+            }
+        }
+        pks = GoldConfigLoader.get_primary_key("servicenow", "incident_kpi", composite_cfg)
+        self.assertEqual(pks, ["priority_level", "incident_state", "incident_category"])
+
+        # When no nkey is specified, it returns empty list (no single-column auto-detect guessing)
+        empty_pks = GoldConfigLoader.get_primary_key("servicenow", "unknown_table", composite_cfg)
+        self.assertEqual(empty_pks, [])
+
+    def test_mysql_omitted_columns_altered_to_null_default(self):
+        """When an incoming query omits a NOT NULL column present in target MySQL table, alter it to NULL DEFAULT NULL."""
+        mock_df = MagicMock()
+        mock_field = MagicMock()
+        mock_field.name = "conversation_id"
+        mock_field.dataType.simpleString.return_value = "string"
+        mock_df.schema.fields = [mock_field]
+        mock_df.columns = ["conversation_id"]
+
+        # Target MySQL table contains conversation_id AND _data_as_of (NOT NULL)
+        target_cols = [
+            ("conversation_id", "varchar(255)", "NO"),
+            ("_data_as_of", "timestamp", "NO")
+        ]
+
+        executed_ddls = []
+        def mock_execute_ddl(jdbc_info, sql):
+            executed_ddls.append(sql)
+
+        def mock_execute_query(jdbc_info, sql, *args):
+            return target_cols
+
+        with patch.object(GoldLayerManager, "_execute_sql_query", side_effect=mock_execute_query):
+            with patch.object(GoldLayerManager, "_execute_ddl", side_effect=mock_execute_ddl):
+                GoldLayerManager._detect_schema_evolution(
+                    jdbc_info={"host": "localhost", "port": 3306, "user": "u", "password": "p"},
+                    schema_name="enterprise_reporting",
+                    target_table="gold_moveworks_conversations",
+                    df_mart=mock_df
+                )
+
+        # Must have modified omitted _data_as_of to allow NULL DEFAULT NULL
+        modify_ddls = [d for d in executed_ddls if "MODIFY COLUMN `_data_as_of`" in d]
+        self.assertTrue(len(modify_ddls) > 0)
+        self.assertIn("NULL DEFAULT NULL", modify_ddls[0])
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 

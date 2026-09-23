@@ -95,6 +95,12 @@
           "nkey": [
             "interaction_id"
           ],
+          "initial_load": {
+            "path": "s3://{bucket}/gold/initial_exports/moveworks/interactions.csv",
+            "format": "csv",
+            "delimiter": ",",
+            "has_header": true
+          },
           "aurora": {
             "schema": "enterprise_reporting",
             "table_name": "gold_moveworks_interactions"
@@ -104,6 +110,12 @@
           "nkey": [
             "conversation_id"
           ],
+          "initial_load": {
+            "path": "s3://{bucket}/gold/initial_exports/moveworks/conversations.csv",
+            "format": "csv",
+            "delimiter": ",",
+            "has_header": true
+          },
           "aurora": {
             "schema": "enterprise_reporting",
             "table_name": "gold_moveworks_conversations"
@@ -113,6 +125,12 @@
           "nkey": [
             "feedback_id"
           ],
+          "initial_load": {
+            "path": "s3://{bucket}/gold/initial_exports/moveworks/feedbacks.csv",
+            "format": "csv",
+            "delimiter": ",",
+            "has_header": true
+          },
           "aurora": {
             "schema": "enterprise_reporting",
             "table_name": "gold_moveworks_feedbacks"

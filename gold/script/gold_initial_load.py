@@ -384,12 +384,11 @@ class GoldInitialLoader:
         if "_inserted_at" not in df_consolidated.columns:
             df_consolidated = df_consolidated.withColumn("_inserted_at", current_timestamp())
 
-        # Fallback primary key detection
-        if not pks:
-            id_cols = [c for c in df_consolidated.columns if (c.endswith('_id') or c.endswith('_key') or c == 'sys_id') and not c.startswith('_')]
-            if id_cols:
-                pks = [id_cols[0]]
-                logger.info(f"[KEY DETECTION] Auto-detected primary key for '{table_name}': {pks}")
+        # Strictly honor composite natural keys from config/CLI/annotations (no auto-detect)
+        if pks:
+            logger.info(f"[PRIMARY KEY] Natural keys resolved for '{table_name}': {pks}")
+        else:
+            logger.info(f"[PRIMARY KEY] No natural keys specified for '{table_name}'. Operating in overwrite/append mode.")
 
         # 5. Perform Idempotent UPSERT into Athena / Iceberg Table
         temp_view = f"incoming_initial_{table_name}"
@@ -494,10 +493,10 @@ def main():
     spark = glueContext.spark_session
 
     expected_args = [
-        'JOB_NAME', 'SOURCE_SYSTEM', 'TABLE_NAME', 'CSV_PATH'
+        'JOB_NAME', 'SOURCE_SYSTEM', 'TABLE_NAME'
     ]
     optional_args = [
-        'NKEY', 'PRIMARY_KEY', 'SECRET_NAME', 'RDS_SECRET_NAME',
+        'CSV_PATH', 'NKEY', 'PRIMARY_KEY', 'SECRET_NAME', 'RDS_SECRET_NAME',
         'API_SECRET_NAME', 'LLM_SECRET_NAME',
         'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'DELIMITER', 'HAS_HEADER',
         'ENV', 'ENVIRONMENT', 'INITIAL_LOAD_PATH', 'INPUT_FILE', 'MART_NAME'

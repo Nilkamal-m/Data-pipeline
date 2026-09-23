@@ -209,8 +209,8 @@ class GoldLayerManager:
 
         logger.info(f"[GOLD STEP 1] Discovered {len(queries)} mart query file(s) to process: {list(queries.keys())}")
 
-        # Ensure dependency ordering: marts referenced in other marts (e.g. v_interactions for v_feedbacks) run first
-        queries = cls._sort_queries_by_dependency(queries)
+        # Ensure dependency ordering: marts referenced in other marts (e.g. interactions for conversations/feedbacks) run first
+        queries = cls._sort_queries_by_dependency(queries, source_system=source_system, glue_database=glue_database, gold_cfg=gold_cfg)
         logger.info(f"[GOLD STEP 1] Query execution order resolved (dependencies first): {list(queries.keys())}")
 
         # Set Spark active database to GLUE_DATABASE so queries can use direct table names (e.g. tbl_incident)
@@ -256,7 +256,7 @@ class GoldLayerManager:
                 f"\n+--------------------------------------------------------------------------------+\n"
                 f"|  PROCESSING ATHENA GOLD MART: '{clean_base_name}'\n"
                 f"|  * Target Table    : {glue_database}.{target_table_name} (Physical Iceberg Table)\n"
-                f"|  * Primary Keys    : {pks or 'Auto-Detect'}\n"
+                f"|  * Primary Keys    : {pks or 'None (Overwrite/Append)'}\n"
                 f"|  * Output Model    : Physical Tables Only (No Views Created)\n"
                 f"+--------------------------------------------------------------------------------+"
             )
@@ -324,12 +324,11 @@ class GoldLayerManager:
                 if "_inserted_at" not in df_mart.columns:
                     df_mart = df_mart.withColumn("_inserted_at", current_timestamp())
 
-                # Fallback primary key auto-detection from DataFrame columns
-                if not pks:
-                    id_cols = [c for c in df_mart.columns if (c.endswith('_id') or c.endswith('_key') or c == 'sys_id') and not c.startswith('_')]
-                    if id_cols:
-                        pks = [id_cols[0]]
-                        logger.info(f"[KEY DETECTION] Auto-detected primary key for '{clean_base_name}': {pks}")
+                # Strictly honor composite natural keys from config/CLI/annotations (no auto-detect)
+                if pks:
+                    logger.info(f"[PRIMARY KEY] Natural keys resolved for '{clean_base_name}': {pks}")
+                else:
+                    logger.info(f"[PRIMARY KEY] No natural keys specified for '{clean_base_name}'. Operating in overwrite/append mode.")
 
                 mart_keys[clean_base_name] = pks
 
@@ -399,7 +398,8 @@ class GoldLayerManager:
                 mart_stats=mart_stats,
                 source_system=source_system,
                 materialized_dfs=materialized_dfs,
-                mart_keys=mart_keys
+                mart_keys=mart_keys,
+                gold_cfg=gold_cfg
             )
 
         # Target: Databricks (Delta Lake)
@@ -656,7 +656,8 @@ class GoldLayerManager:
         mart_stats: List[Dict[str, Any]],
         source_system: str = "",
         materialized_dfs: Optional[Dict[str, DataFrame]] = None,
-        mart_keys: Optional[Dict[str, List[str]]] = None
+        mart_keys: Optional[Dict[str, List[str]]] = None,
+        gold_cfg: Optional[Dict[str, Any]] = None
     ) -> None:
         """Executes zero-DDL MySQL validation, Spark SQL materialization, atomic swap / upsert, and view creation."""
         jdbc_conn_info = cls._resolve_mysql_connection_info(
@@ -678,7 +679,7 @@ class GoldLayerManager:
         for clean_base_name, sql_text in queries.items():
             mart_start = datetime.now(timezone.utc)
             if GoldConfigLoader and source_system:
-                target_table = GoldConfigLoader.get_target_table_name(source_system, clean_base_name, 'aurora')
+                target_table = GoldConfigLoader.get_target_table_name(source_system, clean_base_name, 'aurora', gold_cfg)
             else:
                 target_table = f"gold_{source_system}_{clean_base_name}" if source_system else f"gold_tbl_{clean_base_name}"
 
@@ -695,7 +696,11 @@ class GoldLayerManager:
 
             pks = mart_keys.get(clean_base_name, [])
             if not pks and GoldConfigLoader and source_system:
-                pks = GoldConfigLoader.get_primary_key(source_system, clean_base_name)
+                pks = GoldConfigLoader.get_primary_key(source_system, clean_base_name, gold_cfg)
+            if not pks and params.get("PRIMARY_KEY"):
+                pks = [k.strip() for k in str(params["PRIMARY_KEY"]).split(",") if k.strip()]
+            if not pks and params.get("NKEY"):
+                pks = [k.strip() for k in str(params["NKEY"]).split(",") if k.strip()]
 
             logger.info(
                 f"\n+--------------------------------------------------------------------------------+\n"
@@ -1379,7 +1384,8 @@ class GoldLayerManager:
                 diff_lines.append(f"+================================================================================+")
                 logger.info("\n".join(diff_lines))
 
-                # Dynamically evolve MySQL target table schema by adding new columns
+                # Dynamically evolve MySQL target table schema:
+                # 1. Add newly observed columns from incoming mart query
                 if new_columns:
                     field_by_name = {f.name.lower(): f for f in df_mart.schema.fields}
                     for col_name in new_columns:
@@ -1395,6 +1401,23 @@ class GoldLayerManager:
                                     f"[SCHEMA EVOLUTION NOTE] Note on adding column `{field_obj.name}` to `{schema_name}`.`{target_table}`: {alter_err}. "
                                     f"Shared database user may lack ALTER TABLE permissions."
                                 )
+
+                # 2. Modify omitted columns that are defined as NOT NULL to allow NULL / DEFAULT NULL to avoid MySQL Error 1364
+                if dropped_columns:
+                    for col_name in dropped_columns:
+                        col_info = target_cols.get(col_name)
+                        if col_info:
+                            col_type = col_info[0]
+                            col_null = str(col_info[1]).upper() if len(col_info) > 1 else "YES"
+                            if col_null == "NO":
+                                modify_sql = f"ALTER TABLE `{schema_name}`.`{target_table}` MODIFY COLUMN `{col_name}` {col_type} NULL DEFAULT NULL"
+                                try:
+                                    cls._execute_ddl(jdbc_info, modify_sql)
+                                    logger.info(f"[DDL AUDIT - SCHEMA EVOLUTION] Modified omitted column `{col_name}` in `{schema_name}`.`{target_table}` to allow NULL / DEFAULT NULL.")
+                                except Exception as mod_err:
+                                    logger.warning(
+                                        f"[SCHEMA EVOLUTION NOTE] Note on modifying omitted column `{col_name}` to NULL in `{schema_name}`.`{target_table}`: {mod_err}."
+                                    )
             else:
                 logger.info(f"[SCHEMA SYNC] Target table '{schema_name}.{target_table}' and incoming query have 100% identical column signatures.")
 
@@ -1952,10 +1975,81 @@ class GoldLayerManager:
         return queries
 
     @classmethod
-    def _sort_queries_by_dependency(cls, query_dict: Dict[str, str]) -> Dict[str, str]:
+    def _strip_sql_comments(cls, sql: str) -> str:
+        """Strips SQL block (/* ... */) and line (--) comments to avoid false dependency detection."""
+        if not sql:
+            return ""
+        # Remove block comments
+        sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.DOTALL)
+        # Remove line comments
+        sql = re.sub(r'--[^\r\n]*', ' ', sql)
+        return sql
+
+    @classmethod
+    def _check_mart_dependency(
+        cls,
+        sql: str,
+        other_mart: str,
+        source_system: str = '',
+        glue_database: str = '',
+        gold_cfg: Optional[Dict[str, Any]] = None
+    ) -> bool:
         """
-        Sorts queries so that dependency views (e.g. v_interactions) are executed
-        and registered before dependent views (e.g. v_feedbacks).
+        Determines whether SQL query references another gold mart table or view.
+        Supports:
+          - gold_<source>_<other> (e.g. gold_moveworks_interactions)
+          - <db>.gold_<source>_<other> (e.g. uax_datalake_db_dev.gold_moveworks_interactions)
+          - v_<other> (e.g. v_interactions)
+          - gold_tbl_<other> (e.g. gold_tbl_interactions)
+          - gold_<other> (e.g. gold_interactions)
+          - Direct table name in FROM / JOIN: FROM interactions, JOIN interactions
+          - Config target table name if configured
+        Explicitly does NOT match tbl_<other> (Silver tables like tbl_conversations, tbl_interactions).
+        """
+        clean_sql = cls._strip_sql_comments(sql)
+
+        target_tables = [
+            f"gold_{source_system}_{other_mart}" if source_system else f"gold_{other_mart}",
+            f"gold_tbl_{other_mart}",
+            f"gold_{other_mart}",
+            f"v_{other_mart}"
+        ]
+        if GoldConfigLoader and source_system:
+            athena_tbl = GoldConfigLoader.get_target_table_name(source_system, other_mart, 'athena', gold_cfg)
+            if athena_tbl:
+                target_tables.append(athena_tbl)
+            aurora_tbl = GoldConfigLoader.get_target_table_name(source_system, other_mart, 'aurora', gold_cfg)
+            if aurora_tbl:
+                target_tables.append(aurora_tbl)
+
+        unique_targets = list(dict.fromkeys(target_tables))
+
+        for target in unique_targets:
+            pat = rf'(?:[`\w]+\.)?`?{target}`?\b'
+            if re.search(pat, clean_sql, re.IGNORECASE):
+                return True
+
+        generic_gold_pat = rf'(?:[`\w]+\.)?`?gold_\w+_{other_mart}`?\b'
+        if re.search(generic_gold_pat, clean_sql, re.IGNORECASE):
+            return True
+
+        from_join_pat = rf'\b(?:FROM|JOIN)\s+(?:[`\w]+\.)?`?{other_mart}`?\b'
+        if re.search(from_join_pat, clean_sql, re.IGNORECASE):
+            return True
+
+        return False
+
+    @classmethod
+    def _sort_queries_by_dependency(
+        cls,
+        query_dict: Dict[str, str],
+        source_system: str = '',
+        glue_database: str = '',
+        gold_cfg: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, str]:
+        """
+        Sorts queries so that dependency marts (e.g. interactions) are executed
+        and registered before dependent marts (e.g. conversations, feedbacks).
         """
         ordered = {}
         remaining = dict(query_dict)
@@ -1964,12 +2058,12 @@ class GoldLayerManager:
             for name, sql in remaining.items():
                 deps = [
                     other for other in remaining
-                    if other != name and re.search(rf'\b(?:v_{other}|gold_tbl_{other}|tbl_{other}|{other})\b', sql, re.IGNORECASE)
+                    if other != name and cls._check_mart_dependency(sql, other, source_system, glue_database, gold_cfg)
                 ]
                 if not deps:
                     ready.append(name)
             if not ready:
-                # Break any circular dependency or cycle gracefully by picking the first remaining
+                # Cycle or unresolvable dependency: pick the first remaining gracefully
                 ready.append(next(iter(remaining.keys())))
             for r in ready:
                 ordered[r] = remaining.pop(r)
