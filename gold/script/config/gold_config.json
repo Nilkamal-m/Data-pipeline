@@ -1,0 +1,127 @@
+{
+  "_comment": "Gold Layer Multi-Target Transformation & Serving Configuration — UAX Data Lake Pipeline. Uniform with Bronze and Silver layers.",
+  "pipeline_defaults": {
+    "gold_bucket": "",
+    "gold_data_prefix": "gold/data",
+    "target_format": "iceberg",
+    "table_prefix": "gold_",
+    "merge_strategy": "upsert",
+    "glue_catalog": {
+      "enabled": true,
+      "database_name": "uax_datalake_db_{env}"
+    },
+    "technical_columns": {
+      "inserted_at_column": "_inserted_at",
+      "updated_at_column": "_updated_at"
+    },
+    "default_target_engines": [
+      "athena"
+    ]
+  },
+  "source_systems": {
+    "genesys": {
+      "target_engines": [
+        "athena",
+        "aurora"
+      ],
+      "tables": {
+        "conversations": {
+          "primary_key": [
+            "conversation_id"
+          ],
+          "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
+          "aurora": {
+            "schema": "enterprise_reporting",
+            "table_name": "gold_genesys_conversations"
+          },
+          "redshift": {
+            "schema": "gold_spectrum_schema",
+            "table_name": "gold_genesys_conversations"
+          },
+          "snowflake": {
+            "database": "UAX_ANALYTICS_DB",
+            "schema": "GOLD_MARTS",
+            "table_name": "gold_genesys_conversations"
+          },
+          "databricks": {
+            "catalog": "main",
+            "schema": "gold",
+            "table_name": "gold_genesys_conversations"
+          }
+        },
+        "users": {
+          "primary_key": [
+            "user_id"
+          ],
+          "aurora": {
+            "schema": "enterprise_reporting",
+            "table_name": "gold_genesys_users"
+          }
+        },
+        "queues": {
+          "primary_key": [
+            "queue_id"
+          ],
+          "aurora": {
+            "schema": "enterprise_reporting",
+            "table_name": "gold_genesys_queues"
+          }
+        }
+      }
+    },
+    "moveworks": {
+      "target_engines": [
+        "athena",
+        "aurora"
+      ],
+      "tables": {
+        "interactions": {
+          "primary_key": [
+            "interaction_id"
+          ],
+          "aurora": {
+            "schema": "enterprise_reporting",
+            "table_name": "gold_tbl_interactions"
+          }
+        },
+        "conversations": {
+          "primary_key": [
+            "conversation_id"
+          ],
+          "aurora": {
+            "schema": "enterprise_reporting",
+            "table_name": "gold_tbl_conversations"
+          }
+        },
+        "feedbacks": {
+          "primary_key": [
+            "feedback_id"
+          ],
+          "aurora": {
+            "schema": "enterprise_reporting",
+            "table_name": "gold_tbl_feedbacks"
+          }
+        }
+      }
+    },
+    "servicenow": {
+      "target_engines": [
+        "athena",
+        "aurora"
+      ],
+      "tables": {
+        "incident_kpi": {
+          "primary_key": [
+            "priority_level",
+            "incident_state",
+            "incident_category"
+          ],
+          "aurora": {
+            "schema": "enterprise_reporting",
+            "table_name": "gold_tbl_incident_kpi"
+          }
+        }
+      }
+    }
+  }
+}

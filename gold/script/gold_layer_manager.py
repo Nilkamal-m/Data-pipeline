@@ -21,13 +21,24 @@ import logging
 import time
 import traceback
 import re
+import inspect
+import importlib.util
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import ClientError
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.functions import current_timestamp, lit
+
+try:
+    from gold_config_loader import GoldConfigLoader
+except ImportError:
+    try:
+        from gold.script.gold_config_loader import GoldConfigLoader
+    except ImportError:
+        GoldConfigLoader = None
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +70,8 @@ class GoldLayerManager:
         bucket_name = params.get('DATA_LAKE_BUCKET', 'uax-datalake-dev-bucket')
         glue_database = params.get('GLUE_DATABASE') or 'uax_datalake_db_dev'
 
-        # Resolve Target Engines: CLI --GOLD_TARGETS or --GOLD_TARGET (default: athena)
-        gold_targets_raw = params.get('GOLD_TARGETS') or params.get('GOLD_TARGET') or 'athena'
-        gold_targets = [t.strip().lower() for t in str(gold_targets_raw).split(',') if t.strip()]
-        if not gold_targets:
-            gold_targets = ['athena']
+        # Load Gold Configuration via GoldConfigLoader (zero CLI config passing required)
+        gold_cfg = GoldConfigLoader.load_config(params.get('GOLD_CONFIG_S3_PATH'), s3_client=s3_client) if GoldConfigLoader else {}
 
         # Strict SOURCE_SYSTEM Enforcement
         source_system = (params.get('SOURCE_SYSTEM') or '').strip().lower()
@@ -71,20 +79,29 @@ class GoldLayerManager:
             raise ValueError(
                 "CRITICAL CONFIG ERROR: Missing required parameter '--SOURCE_SYSTEM'.\n"
                 "The Gold query path is 's3://<bucket>/gold/query/<source>/v_<table_name>.sql'.\n"
-                "Please specify the source system (e.g. --SOURCE_SYSTEM servicenow)."
+                "Please specify the source system (e.g. --SOURCE_SYSTEM genesys)."
             )
 
-        # Target MySQL Schema Enforcement only when MySQL/Aurora is in targets
+        # Resolve Target Engines: CLI --GOLD_TARGETS or gold_config.json (default: athena)
+        cli_targets = params.get('GOLD_TARGETS') or params.get('GOLD_TARGET')
+        if cli_targets:
+            gold_targets = [t.strip().lower() for t in str(cli_targets).split(',') if t.strip()]
+        elif GoldConfigLoader:
+            gold_targets = GoldConfigLoader.get_target_engines(source_system, "", config_dict=gold_cfg)
+        else:
+            gold_targets = ['athena']
+
+        if not gold_targets:
+            gold_targets = ['athena']
+
+        # Target MySQL Schema Resolution
         needs_mysql = any(t in gold_targets for t in ('aurora', 'rds', 'mysql'))
         gold_schema = params.get('GOLD_SCHEMA')
-        if needs_mysql:
-            if not gold_schema or not str(gold_schema).strip():
-                raise ValueError(
-                    "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_SCHEMA'.\n"
-                    "Downstream target includes Aurora/MySQL, where no fallback schema is permitted.\n"
-                    "Please explicitly specify the target MySQL schema name (e.g. --GOLD_SCHEMA enterprise_reporting)."
-                )
-            gold_schema = str(gold_schema).strip()
+        if needs_mysql and not gold_schema:
+            # Check gold_config.json for aurora schema
+            src_cfg = GoldConfigLoader.get_source_config(source_system, gold_cfg) if GoldConfigLoader else {}
+            first_tbl_cfg = list(src_cfg.get('tables', {}).values())[0] if src_cfg.get('tables') else {}
+            gold_schema = first_tbl_cfg.get('aurora', {}).get('schema') or 'enterprise_reporting'
 
         # Query and Data Paths
         query_s3_path = params.get('GOLD_QUERY_S3_PATH') or f"s3://{bucket_name}/gold/query/{source_system}"
@@ -97,7 +114,7 @@ class GoldLayerManager:
             f"\n+================================================================================+\n"
             f"|              STARTING GOLD SERVING ENGINE: MULTI-TARGET PIPELINE               |\n"
             f"+================================================================================+\n"
-            f"|  * Mandatory Step 1  : CREATE/REFRESH ATHENA VIEW (AWS Glue Catalog)           |\n"
+            f"|  * Mandatory Step 1  : MATERIALIZE/UPSERT ATHENA TABLE (AWS Glue Catalog)      |\n"
             f"|  * Target Engines    : {', '.join(gold_targets).upper()}\n"
             f"|  * Glue Database     : {glue_database}\n"
             f"|  * Target DB Schema  : {gold_schema or 'N/A (Athena / External DW)'}\n"
@@ -128,7 +145,7 @@ class GoldLayerManager:
         if not queries:
             raise FileNotFoundError(
                 f"CRITICAL QUERY DISCOVERY ERROR: No .sql query definitions found at '{query_s3_path}'.\n"
-                f"Expected query path: s3://{bucket_name}/gold/query/{source_system}/v_<table_name>.sql\n"
+                f"Expected query path: s3://{bucket_name}/gold/query/{source_system}/<table_name>.sql (or v_<table_name>.sql)\n"
                 f"Please ensure at least one SQL definition is present in S3 or locally in 'gold/query/{source_system}/'."
             )
 
@@ -143,7 +160,7 @@ class GoldLayerManager:
                 clean_filters.add(low)
                 clean_filters.add(low.replace('-', '_'))
                 clean_filters.add(low.replace('_', '-'))
-                for prefix in ['gold_tbl_', 'raw_tbl_', 'tbl_', 'v_']:
+                for prefix in [f"gold_{source_system}_", 'gold_tbl_', 'raw_tbl_', 'tbl_', 'v_']:
                     if low.startswith(prefix):
                         stripped = low[len(prefix):]
                         clean_filters.add(stripped)
@@ -177,27 +194,141 @@ class GoldLayerManager:
                 logger.warning(f"[GOLD PREP] Could not set Spark active database to '{glue_database}': {use_err}")
 
         # ----------------------------------------------------------------------
-        # [GOLD STEP 2 - MANDATORY] Create/Refresh Athena Views
+        # [GOLD STEP 2 - MANDATORY] Athena / Iceberg Table Materialization & UPSERT
         # ----------------------------------------------------------------------
         logger.info(
             f"\n================================================================================\n"
-            f"[GOLD STEP 2 - MANDATORY] Creating/Refreshing Athena Views in Glue Catalog\n"
+            f"[GOLD STEP 2 - MANDATORY] Materializing / Upserting Athena Tables & Views\n"
             f"--------------------------------------------------------------------------------"
         )
+        materialized_dfs: Dict[str, DataFrame] = {}
+        mart_keys: Dict[str, List[str]] = {}
+
         for clean_base_name, sql_text in queries.items():
+            mart_start = datetime.now(timezone.utc)
+            # 1. Primary key resolution (Config > SQL Header Annotation > CLI > Auto-detect)
+            pks = []
+            if GoldConfigLoader:
+                pks = GoldConfigLoader.get_primary_key(source_system, clean_base_name, gold_cfg)
+            if not pks:
+                annotations = cls._extract_sql_annotations(sql_text)
+                pks = annotations.get("primary_key", [])
+            if not pks and params.get("PRIMARY_KEY"):
+                pks = [k.strip() for k in str(params["PRIMARY_KEY"]).split(",") if k.strip()]
+
+            # 2. Target Athena Table Name (Default: gold_<source>_<tablename>)
+            if GoldConfigLoader:
+                target_table_name = GoldConfigLoader.get_target_table_name(source_system, clean_base_name, 'athena', gold_cfg)
+            else:
+                target_table_name = f"gold_{source_system}_{clean_base_name}"
+
             view_name = f"v_{clean_base_name}"
-            cls.create_athena_view(
-                spark=spark,
-                glue_database=glue_database,
-                view_name=view_name,
-                sql_text=sql_text,
-                params=params,
-                athena_client=athena_client,
-                glue_client=glue_client
+
+            logger.info(
+                f"\n+--------------------------------------------------------------------------------+\n"
+                f"|  PROCESSING ATHENA GOLD MART: '{clean_base_name}'\n"
+                f"|  * Target Table    : {glue_database}.{target_table_name}\n"
+                f"|  * Primary Keys    : {pks or 'Auto-Detect'}\n"
+                f"|  * Presentation View: {glue_database}.{view_name}\n"
+                f"+--------------------------------------------------------------------------------+"
             )
 
+            try:
+                # 3. Execute Mart SQL Query
+                logger.info(f"Executing Spark SQL query for '{clean_base_name}'...")
+                df_mart = spark.sql(sql_text)
+
+                # 4. Invoke Custom Transform Hook if exists (gold/script/custom_transforms/<source>_<table>.py)
+                custom_script_path = None
+                if GoldConfigLoader:
+                    custom_script_path = GoldConfigLoader.get_custom_transform_path(source_system, clean_base_name, gold_cfg)
+
+                if custom_script_path:
+                    context = {
+                        "source_system": source_system,
+                        "table_name": clean_base_name,
+                        "target_table": target_table_name,
+                        "glue_database": glue_database,
+                        "primary_keys": pks,
+                        "params": params
+                    }
+                    df_mart = cls._apply_custom_transform(df_mart, custom_script_path, spark=spark, context=context)
+
+                # 5. Technical audit columns (_updated_at, _inserted_at)
+                if "_updated_at" not in df_mart.columns:
+                    df_mart = df_mart.withColumn("_updated_at", current_timestamp())
+                if "_inserted_at" not in df_mart.columns:
+                    df_mart = df_mart.withColumn("_inserted_at", current_timestamp())
+
+                # Fallback primary key auto-detection from DataFrame columns
+                if not pks:
+                    id_cols = [c for c in df_mart.columns if (c.endswith('_id') or c.endswith('_key') or c == 'sys_id') and not c.startswith('_')]
+                    if id_cols:
+                        pks = [id_cols[0]]
+                        logger.info(f"[KEY DETECTION] Auto-detected primary key for '{clean_base_name}': {pks}")
+
+                mart_keys[clean_base_name] = pks
+
+                # Register in-session Spark views so downstream dependent marts resolve seamlessly
+                try:
+                    df_mart.createOrReplaceTempView(f"v_{clean_base_name}")
+                    df_mart.createOrReplaceTempView(f"gold_tbl_{clean_base_name}")
+                    df_mart.createOrReplaceTempView(target_table_name)
+                    df_mart.createOrReplaceTempView(clean_base_name)
+                except Exception as temp_err:
+                    logger.debug(f"[SPARK VIEW] Note on temporary view registration: {temp_err}")
+
+                # 6. Physical Materialization & UPSERT into Athena / Iceberg Table
+                mart_s3_dest = f"{data_s3_path.rstrip('/')}/{clean_base_name}"
+                rows_written = cls._materialize_athena_table(
+                    spark=spark,
+                    df_mart=df_mart,
+                    glue_database=glue_database,
+                    target_table_name=target_table_name,
+                    primary_keys=pks,
+                    s3_location=mart_s3_dest,
+                    clean_base_name=clean_base_name,
+                    params=params
+                )
+
+                # 7. Backward Compatibility: Create / Refresh Athena presentation view
+                cls.create_athena_view(
+                    spark=spark,
+                    glue_database=glue_database,
+                    view_name=view_name,
+                    sql_text=sql_text,
+                    params=params,
+                    athena_client=athena_client,
+                    glue_client=glue_client
+                )
+
+                materialized_dfs[clean_base_name] = df_mart
+
+                duration = (datetime.now(timezone.utc) - mart_start).total_seconds()
+                mart_stats.append({
+                    "mart_name": clean_base_name,
+                    "target_table": f"{glue_database}.{target_table_name}",
+                    "view_name": f"{glue_database}.{view_name}",
+                    "status": "SUCCESS",
+                    "rows_served": rows_written,
+                    "duration_seconds": round(duration, 2),
+                    "error_message": None
+                })
+            except Exception as err:
+                duration = (datetime.now(timezone.utc) - mart_start).total_seconds()
+                logger.error(f"[ATHENA MATERIALIZE ERROR] Failed for '{clean_base_name}': {err}\n{traceback.format_exc()}")
+                mart_stats.append({
+                    "mart_name": clean_base_name,
+                    "target_table": f"{glue_database}.{target_table_name}",
+                    "view_name": f"{glue_database}.{view_name}",
+                    "status": "FAILED",
+                    "rows_served": 0,
+                    "duration_seconds": round(duration, 2),
+                    "error_message": str(err)
+                })
+
         # ----------------------------------------------------------------------
-        # [GOLD STEP 3+] Downstream Target Serving (Aurora / Redshift / Snowflake)
+        # [GOLD STEP 3+] Downstream Target Serving (Aurora / Databricks / Redshift / Snowflake)
         # ----------------------------------------------------------------------
         # Target: Aurora MySQL
         if needs_mysql:
@@ -214,14 +345,36 @@ class GoldLayerManager:
                 params=params,
                 glue_client=glue_client,
                 secrets_client=secrets_client,
-                mart_stats=mart_stats
+                mart_stats=mart_stats,
+                source_system=source_system,
+                materialized_dfs=materialized_dfs,
+                mart_keys=mart_keys
             )
+
+        # Target: Databricks (Delta Lake)
+        if 'databricks' in gold_targets:
+            logger.info(
+                f"\n================================================================================\n"
+                f"[GOLD STEP 4] Serving Gold Marts to Databricks (Delta Lake)\n"
+                f"--------------------------------------------------------------------------------"
+            )
+            for clean_base_name, df_mart in materialized_dfs.items():
+                db_table = GoldConfigLoader.get_target_table_name(source_system, clean_base_name, 'databricks', gold_cfg) if GoldConfigLoader else f"gold_{source_system}_{clean_base_name}"
+                cls._run_databricks_serving(
+                    spark=spark,
+                    params=params,
+                    df_mart=df_mart,
+                    clean_base_name=clean_base_name,
+                    target_table_name=db_table,
+                    primary_keys=mart_keys.get(clean_base_name, []),
+                    mart_stats=mart_stats
+                )
 
         # Target: Amazon Redshift
         if 'redshift' in gold_targets:
             logger.info(
                 f"\n================================================================================\n"
-                f"[GOLD STEP 4] Serving Gold Marts to Amazon Redshift / Redshift Spectrum\n"
+                f"[GOLD STEP 5] Serving Gold Marts to Amazon Redshift / Redshift Spectrum\n"
                 f"--------------------------------------------------------------------------------"
             )
             cls._run_redshift_serving(spark, params, queries, glue_database, mart_stats)
@@ -230,23 +383,19 @@ class GoldLayerManager:
         if 'snowflake' in gold_targets:
             logger.info(
                 f"\n================================================================================\n"
-                f"[GOLD STEP 5] Serving Gold Marts to Snowflake (External Iceberg / Direct Load)\n"
+                f"[GOLD STEP 6] Serving Gold Marts to Snowflake (External Iceberg / Direct Load)\n"
                 f"--------------------------------------------------------------------------------"
             )
             cls._run_snowflake_serving(spark, params, queries, glue_database, mart_stats)
 
-        # If only Athena was targeted, record successful Athena mart stats
-        if not needs_mysql and 'redshift' not in gold_targets and 'snowflake' not in gold_targets:
-            for clean_base_name in queries.keys():
-                mart_stats.append({
-                    "mart_name": clean_base_name,
-                    "target_table": f"{glue_database}.v_{clean_base_name}",
-                    "view_name": f"v_{clean_base_name}",
-                    "status": "SUCCESS",
-                    "rows_served": None,
-                    "duration_seconds": 0.0,
-                    "error_message": None
-                })
+        # Overall Gold Execution Summary
+        cls._log_final_gold_summary(mart_stats, execution_start)
+
+        failed_marts = [m for m in mart_stats if m.get('status') == 'FAILED']
+        if failed_marts:
+            raise RuntimeError(f"Gold Serving Layer completed with failures in {len(failed_marts)} mart(s).")
+
+        return mart_stats
 
         # Overall Gold Execution Summary
         cls._log_final_gold_summary(mart_stats, execution_start)
@@ -455,9 +604,12 @@ class GoldLayerManager:
         params: Dict[str, Any],
         glue_client,
         secrets_client,
-        mart_stats: List[Dict[str, Any]]
+        mart_stats: List[Dict[str, Any]],
+        source_system: str = "",
+        materialized_dfs: Optional[Dict[str, DataFrame]] = None,
+        mart_keys: Optional[Dict[str, List[str]]] = None
     ) -> None:
-        """Executes zero-DDL MySQL validation, Spark SQL materialization, atomic swap, and view creation."""
+        """Executes zero-DDL MySQL validation, Spark SQL materialization, atomic swap / upsert, and view creation."""
         jdbc_conn_info = cls._resolve_mysql_connection_info(
             params,
             glue_client=glue_client,
@@ -471,11 +623,18 @@ class GoldLayerManager:
         cls._verify_schema_exists_or_raise(jdbc_conn_info, gold_schema)
         logger.info(f"Target MySQL schema '{gold_schema}' verified. [PASSED]")
 
+        materialized_dfs = materialized_dfs or {}
+        mart_keys = mart_keys or {}
+
         for clean_base_name, sql_text in queries.items():
             mart_start = datetime.now(timezone.utc)
-            target_table = f"gold_tbl_{clean_base_name}"
-            staging_table = f"gold_tbl_{clean_base_name}_staging"
-            old_backup_table = f"gold_tbl_{clean_base_name}_old"
+            if GoldConfigLoader and source_system:
+                target_table = GoldConfigLoader.get_target_table_name(source_system, clean_base_name, 'aurora')
+            else:
+                target_table = f"gold_{source_system}_{clean_base_name}" if source_system else f"gold_tbl_{clean_base_name}"
+
+            staging_table = f"{target_table}_staging"
+            old_backup_table = f"{target_table}_old"
             view_name = f"v_{clean_base_name}"
 
             cls._validate_gold_table_name(target_table)
@@ -485,33 +644,44 @@ class GoldLayerManager:
             assert staging_table.endswith("_staging"), f"Safety Error: Invalid staging table {staging_table}"
             assert old_backup_table.endswith("_old"), f"Safety Error: Invalid backup table {old_backup_table}"
 
+            pks = mart_keys.get(clean_base_name, [])
+            if not pks and GoldConfigLoader and source_system:
+                pks = GoldConfigLoader.get_primary_key(source_system, clean_base_name)
+
             logger.info(
                 f"\n+--------------------------------------------------------------------------------+\n"
                 f"|  PROCESSING MYSQL GOLD MART: '{clean_base_name}'\n"
                 f"|  * Target Table  : {gold_schema}.{target_table}\n"
                 f"|  * Staging Table : {gold_schema}.{staging_table}\n"
+                f"|  * Primary Keys  : {pks or 'None (Zero-Downtime Swap)'}\n"
                 f"|  * Power BI Feed : {gold_schema}.{target_table} (Zero-Downtime Physical Table)\n"
                 f"+--------------------------------------------------------------------------------+"
             )
 
             try:
-                # 1. Spark SQL Execution
-                logger.info(f"Executing Spark SQL query for '{clean_base_name}'...")
-                df_mart = spark.sql(sql_text)
-                row_count = df_mart.count()
-                logger.info(f"Query executed successfully. Computed {row_count:,} records.")
+                # 1. Spark SQL Execution / Reuse Step 1 Materialized DF
+                if clean_base_name in materialized_dfs:
+                    df_mart = materialized_dfs[clean_base_name]
+                    row_count = df_mart.count()
+                    logger.info(f"Reusing Step 1 materialized DataFrame for '{clean_base_name}' ({row_count:,} records).")
+                else:
+                    logger.info(f"Executing Spark SQL query for '{clean_base_name}'...")
+                    df_mart = spark.sql(sql_text)
+                    row_count = df_mart.count()
+                    logger.info(f"Query executed successfully. Computed {row_count:,} records.")
+
                 cls._log_schema_introspection(df_mart, f"Gold Query Output Schema: '{clean_base_name}'")
 
-                # Register in-session Spark views so downstream dependent marts (e.g. feedbacks querying v_interactions) resolve seamlessly
+                # Register in-session Spark views
                 try:
                     df_mart.createOrReplaceTempView(f"v_{clean_base_name}")
                     df_mart.createOrReplaceTempView(f"gold_tbl_{clean_base_name}")
+                    df_mart.createOrReplaceTempView(target_table)
                     df_mart.createOrReplaceTempView(clean_base_name)
-                    logger.info(f"[SPARK VIEW] Registered in-session temporary views: 'v_{clean_base_name}', 'gold_tbl_{clean_base_name}'")
                 except Exception as temp_err:
                     logger.debug(f"[SPARK VIEW] Note on temporary view registration: {temp_err}")
 
-                # 2. S3 Materialization
+                # 2. S3 Parquet Backup
                 mart_s3_dest = f"{data_s3_path.rstrip('/')}/{clean_base_name}"
                 logger.info(f"Materializing {row_count:,} records to S3 Parquet: -> {mart_s3_dest}")
                 df_mart.write.mode("overwrite").format("parquet").save(mart_s3_dest)
@@ -520,16 +690,27 @@ class GoldLayerManager:
                 cls._detect_schema_evolution(jdbc_conn_info, gold_schema, target_table, df_mart)
                 cls._write_staging_table(spark, df_mart, jdbc_conn_info, gold_schema, staging_table)
 
-                # 4. Atomic Swap & Cleanup (Zero-Downtime Table Swap for Power BI)
-                cls._execute_isolated_atomic_swap(
-                    jdbc_info=jdbc_conn_info,
-                    schema_name=gold_schema,
-                    target_table=target_table,
-                    staging_table=staging_table,
-                    old_backup_table=old_backup_table,
-                    view_name=view_name,
-                    create_view=False
-                )
+                # 4. Atomic Swap or Upsert
+                if pks and cls._table_exists(jdbc_conn_info, gold_schema, target_table):
+                    logger.info(f"[MYSQL SERVING] Executing primary-key UPSERT on '{gold_schema}.{target_table}'...")
+                    cls._upsert_mysql_table(
+                        jdbc_info=jdbc_conn_info,
+                        schema_name=gold_schema,
+                        target_table=target_table,
+                        staging_table=staging_table,
+                        primary_keys=pks,
+                        columns=df_mart.columns
+                    )
+                else:
+                    cls._execute_isolated_atomic_swap(
+                        jdbc_info=jdbc_conn_info,
+                        schema_name=gold_schema,
+                        target_table=target_table,
+                        staging_table=staging_table,
+                        old_backup_table=old_backup_table,
+                        view_name=view_name,
+                        create_view=False
+                    )
 
                 mart_duration = (datetime.now(timezone.utc) - mart_start).total_seconds()
                 mart_stats.append({
@@ -664,6 +845,148 @@ class GoldLayerManager:
                 "duration_seconds": 0.0,
                 "error_message": None
             })
+
+    # --------------------------------------------------------------------------
+    # Databricks Serving Adapter (Delta Lake / Unity Catalog)
+    # --------------------------------------------------------------------------
+    @classmethod
+    def _run_databricks_serving(
+        cls,
+        spark: SparkSession,
+        params: Dict[str, Any],
+        df_mart: DataFrame,
+        clean_base_name: str,
+        target_table_name: str,
+        primary_keys: List[str],
+        mart_stats: List[Dict[str, Any]]
+    ) -> None:
+        """
+        Databricks Delta Lake serving adapter with native MERGE INTO upsert support.
+        Supports Unity Catalog (<catalog>.<schema>.<table_name>) or legacy hive_metastore.
+        """
+        catalog = params.get('DATABRICKS_CATALOG', 'main')
+        schema = params.get('DATABRICKS_SCHEMA', 'gold')
+        full_table = f"`{catalog}`.`{schema}`.`{target_table_name}`"
+
+        card = (
+            f"\n+================================================================================+\n"
+            f"|  DATABRICKS DELTA LAKE SERVING ADAPTER ACTIVATED                               |\n"
+            f"+================================================================================+\n"
+            f"|  * Databricks Target Catalog : {catalog}\n"
+            f"|  * Databricks Target Schema  : {schema}\n"
+            f"|  * Target Table              : {full_table}\n"
+            f"|  * Primary Keys              : {primary_keys or 'None (Overwrite)'}\n"
+            f"|  * Serving Strategy          : MERGE INTO (Delta Lake)\n"
+            f"+================================================================================+\n"
+        )
+        logger.info(card)
+
+        try:
+            temp_view = f"incoming_databricks_{clean_base_name}"
+            df_mart.createOrReplaceTempView(temp_view)
+
+            table_exists = False
+            try:
+                spark.sql(f"DESCRIBE TABLE {full_table}")
+                table_exists = True
+            except Exception:
+                table_exists = False
+
+            if table_exists and primary_keys:
+                join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in primary_keys])
+                merge_sql = (
+                    f"MERGE INTO {full_table} AS target\n"
+                    f"USING {temp_view} AS source\n"
+                    f"ON {join_cond}\n"
+                    f"WHEN MATCHED THEN UPDATE SET *\n"
+                    f"WHEN NOT MATCHED THEN INSERT *"
+                )
+                logger.info(f"[DATABRICKS MERGE] Executing Delta Lake upsert:\n{merge_sql}")
+                spark.sql(merge_sql)
+            else:
+                logger.info(f"[DATABRICKS WRITE] Initializing Delta table '{full_table}'...")
+                df_mart.write.format("delta").mode("overwrite").saveAsTable(full_table)
+
+            mart_stats.append({
+                "mart_name": clean_base_name,
+                "target_table": full_table,
+                "view_name": f"{full_table}_view",
+                "status": "SUCCESS",
+                "rows_served": df_mart.count(),
+                "duration_seconds": 0.0,
+                "error_message": None
+            })
+        except Exception as err:
+            logger.error(f"[DATABRICKS ERROR] Failed to serve mart '{clean_base_name}' to Databricks: {err}")
+            mart_stats.append({
+                "mart_name": clean_base_name,
+                "target_table": full_table,
+                "view_name": f"{full_table}_view",
+                "status": "FAILED",
+                "rows_served": 0,
+                "duration_seconds": 0.0,
+                "error_message": str(err)
+            })
+
+    # --------------------------------------------------------------------------
+    # Mandatory Step 1: Athena / Iceberg Physical Table Materialization & UPSERT
+    # --------------------------------------------------------------------------
+    @classmethod
+    def _materialize_athena_table(
+        cls,
+        spark: SparkSession,
+        df_mart: DataFrame,
+        glue_database: str,
+        target_table_name: str,
+        primary_keys: List[str],
+        s3_location: str,
+        clean_base_name: str,
+        params: Dict[str, Any]
+    ) -> int:
+        """
+        Step 1: Materializes/Upserts the physical Iceberg table in AWS Athena / Glue Data Catalog.
+        Ensures idempotent loads via Spark SQL MERGE INTO when primary key exists.
+        """
+        full_table = f"`{glue_database}`.`{target_table_name}`"
+        row_count = df_mart.count()
+        temp_view = f"incoming_gold_{clean_base_name}"
+        df_mart.createOrReplaceTempView(temp_view)
+
+        table_exists = False
+        try:
+            spark.sql(f"DESCRIBE TABLE {full_table}")
+            table_exists = True
+        except Exception:
+            table_exists = False
+
+        if table_exists and primary_keys:
+            join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in primary_keys])
+            merge_sql = (
+                f"MERGE INTO {full_table} AS target\n"
+                f"USING {temp_view} AS source\n"
+                f"ON {join_cond}\n"
+                f"WHEN MATCHED THEN UPDATE SET *\n"
+                f"WHEN NOT MATCHED THEN INSERT *"
+            )
+            logger.info(f"[ATHENA/ICEBERG UPSERT] Executing Iceberg MERGE INTO on {full_table}:\n{merge_sql}")
+            try:
+                spark.sql(merge_sql)
+            except Exception as merge_err:
+                logger.warning(f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). Overwriting to {s3_location}...")
+                df_mart.write.mode("overwrite").format("parquet").save(s3_location)
+        else:
+            logger.info(f"[ATHENA/ICEBERG WRITE] Initializing Gold table {full_table} at '{s3_location}'...")
+            try:
+                df_mart.write \
+                    .format("iceberg") \
+                    .mode("overwrite") \
+                    .option("path", s3_location) \
+                    .saveAsTable(f"{glue_database}.{target_table_name}")
+            except Exception as ice_err:
+                logger.warning(f"[ATHENA/ICEBERG WRITE] Direct Iceberg saveAsTable fallback to Parquet: {ice_err}")
+                df_mart.write.mode("overwrite").format("parquet").save(s3_location)
+
+        return row_count
 
     # --------------------------------------------------------------------------
     # Database Safety & Schema Pre-existence
@@ -986,6 +1309,60 @@ class GoldLayerManager:
                 f"MySQL view creation omitted (user lacks CREATE VIEW permission; physical Gold table is authoritative)."
             )
 
+    @classmethod
+    def _upsert_mysql_table(
+        cls,
+        jdbc_info: Dict[str, Any],
+        schema_name: str,
+        target_table: str,
+        staging_table: str,
+        primary_keys: List[str],
+        columns: List[str]
+    ) -> None:
+        """
+        Executes an idempotent UPSERT into target MySQL table from staging table.
+        Prevents duplicate row inserts by updating existing records based on primary key.
+        """
+        cls._validate_gold_table_name(target_table)
+        cls._validate_gold_table_name(staging_table)
+
+        if not cls._table_exists(jdbc_info, schema_name, target_table):
+            # Target table does not exist: promote staging table to target table
+            initial_rename = f"RENAME TABLE `{schema_name}`.`{staging_table}` TO `{schema_name}`.`{target_table}`"
+            logger.info(f"[DDL AUDIT - INITIAL DEPLOY] Promoting staging to target table:\n  -> {initial_rename}")
+            cls._execute_ddl(jdbc_info, initial_rename)
+            if primary_keys:
+                pk_clause = ", ".join([f"`{k}`" for k in primary_keys])
+                try:
+                    cls._execute_ddl(jdbc_info, f"ALTER TABLE `{schema_name}`.`{target_table}` ADD PRIMARY KEY ({pk_clause})")
+                    logger.info(f"[DDL AUDIT - PRIMARY KEY] Added PRIMARY KEY ({pk_clause}) to `{schema_name}`.`{target_table}`")
+                except Exception as pk_err:
+                    logger.warning(f"Could not add primary key constraint on MySQL table: {pk_err}")
+            return
+
+        col_names = [f"`{c}`" for c in columns]
+        update_clauses = [f"`{c}` = VALUES(`{c}`)" for c in columns if c not in primary_keys]
+
+        if update_clauses:
+            upsert_sql = (
+                f"INSERT INTO `{schema_name}`.`{target_table}` ({', '.join(col_names)})\n"
+                f"SELECT {', '.join(col_names)} FROM `{schema_name}`.`{staging_table}`\n"
+                f"ON DUPLICATE KEY UPDATE {', '.join(update_clauses)}"
+            )
+        else:
+            upsert_sql = (
+                f"INSERT IGNORE INTO `{schema_name}`.`{target_table}` ({', '.join(col_names)})\n"
+                f"SELECT {', '.join(col_names)} FROM `{schema_name}`.`{staging_table}`"
+            )
+
+        logger.info(f"[DDL AUDIT - MYSQL UPSERT] Merging staging records into '{schema_name}.{target_table}'...")
+        cls._execute_ddl(jdbc_info, upsert_sql)
+
+        # Cleanup staging table after upsert
+        if cls._table_exists(jdbc_info, schema_name, staging_table):
+            logger.info(f"[DDL AUDIT - CLEANUP] Dropping staging table '{schema_name}.{staging_table}'...")
+            cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{staging_table}`")
+
     # --------------------------------------------------------------------------
     # SQL Execution Helpers with SSL / TLS Support
     # --------------------------------------------------------------------------
@@ -1081,8 +1458,89 @@ class GoldLayerManager:
             conn.close()
 
     # --------------------------------------------------------------------------
-    # Query Discovery
+    # Query Discovery & Custom Transform Invocation
     # --------------------------------------------------------------------------
+    @classmethod
+    def _extract_sql_annotations(cls, sql_text: str) -> Dict[str, Any]:
+        """
+        Parses SQL comment annotations in the header (e.g. -- PRIMARY_KEY: col1, col2).
+        """
+        annotations = {}
+        if not sql_text:
+            return annotations
+        for line in sql_text.splitlines()[:30]:
+            stripped = line.strip()
+            if stripped.startswith("--") or stripped.startswith("#"):
+                comment = stripped.lstrip("-#").strip()
+                if ":" in comment:
+                    key, val = comment.split(":", 1)
+                    key_clean = key.strip().upper()
+                    val_clean = val.strip()
+                    if key_clean in ("PRIMARY_KEY", "PRIMARY_KEYS", "NKEY", "NATURAL_KEY"):
+                        annotations["primary_key"] = [k.strip() for k in val_clean.split(",") if k.strip()]
+                    elif key_clean in ("TARGET_TABLE", "TABLE_NAME"):
+                        annotations["target_table"] = val_clean
+        return annotations
+
+    @classmethod
+    def _apply_custom_transform(
+        cls,
+        df: DataFrame,
+        script_path: str,
+        spark: Optional[SparkSession] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> DataFrame:
+        """
+        Dynamically loads and invokes transform(df, spark=None, context=None) -> DataFrame
+        from gold/script/custom_transforms/<source>_<table>.py.
+        """
+        if not script_path or not str(script_path).strip():
+            return df
+
+        resolved_path = script_path
+        if not os.path.isabs(script_path):
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(current_dir, script_path),
+                os.path.join(current_dir, "custom_transforms", os.path.basename(script_path)),
+                os.path.join(os.getcwd(), script_path),
+                os.path.join("/tmp", script_path),
+                os.path.join("/tmp", os.path.basename(script_path))
+            ]
+            for cand in candidates:
+                if os.path.exists(cand):
+                    resolved_path = cand
+                    break
+
+        if not os.path.exists(resolved_path):
+            logger.info(f"[CUSTOM TRANSFORM] No custom script found at '{resolved_path}'. Proceeding with standard DataFrame.")
+            return df
+
+        try:
+            logger.info(f"[CUSTOM TRANSFORM] Loading custom transform script: '{resolved_path}'")
+            module_name = f"gold_custom_{os.path.splitext(os.path.basename(resolved_path))[0]}"
+            spec = importlib.util.spec_from_file_location(module_name, resolved_path)
+            custom_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(custom_module)
+
+            if hasattr(custom_module, "transform"):
+                transform_func = getattr(custom_module, "transform")
+                sig = inspect.signature(transform_func)
+                param_count = len(sig.parameters)
+                logger.info(f"[CUSTOM TRANSFORM] Invoking transform() with {param_count} parameters from '{resolved_path}'...")
+                if param_count >= 3:
+                    return transform_func(df, spark, context or {})
+                elif param_count == 2:
+                    return transform_func(df, spark)
+                else:
+                    return transform_func(df)
+            else:
+                logger.warning(f"[CUSTOM TRANSFORM] Script '{resolved_path}' has no transform() function. Skipping.")
+                return df
+        except Exception as err:
+            logger.error(f"[CUSTOM TRANSFORM ERROR] Failed executing custom transform '{resolved_path}': {err}\n{traceback.format_exc()}")
+            raise
+
     @classmethod
     def _discover_queries(
         cls,
@@ -1093,7 +1551,7 @@ class GoldLayerManager:
     ) -> Dict[str, str]:
         """
         Discovers .sql query files from S3 or local directory.
-        Path pattern: bucket/gold/query/<source>/v_<table_name>.sql (or <table_name>.sql).
+        Accepts both 'v_<table_name>.sql' and '<table_name>.sql'.
         Returns a dict mapping clean_base_name -> sql_text.
         """
         queries = {}
@@ -1105,12 +1563,7 @@ class GoldLayerManager:
                 if s3_prefix.endswith('.sql'):
                     file_name = os.path.basename(s3_prefix)
                     file_base = os.path.splitext(file_name)[0].replace('-', '_')
-                    if not file_base.startswith('v_'):
-                        raise ValueError(
-                            f"CRITICAL QUERY NAMING ERROR: Query file '{file_name}' does not follow the required Gold naming standard.\n"
-                            f"All Gold query files MUST strictly be named 'v_<tablename>.sql' (e.g. 'v_{file_name}'). Non-standard query files are not permitted."
-                        )
-                    clean_name = file_base[2:]
+                    clean_name = file_base[2:] if file_base.startswith('v_') else file_base
                     resp = s3_client.get_object(Bucket=s3_bucket, Key=s3_prefix)
                     queries[clean_name] = resp['Body'].read().decode('utf-8')
                     logger.info(f"[QUERY DISCOVERY] Loaded single S3 query for '{clean_name}' from '{query_path}'")
@@ -1122,17 +1575,10 @@ class GoldLayerManager:
                             if key.endswith('.sql'):
                                 file_name = os.path.basename(key)
                                 file_base = os.path.splitext(file_name)[0].replace('-', '_')
-                                if not file_base.startswith('v_'):
-                                    raise ValueError(
-                                        f"CRITICAL QUERY NAMING ERROR: Found query file '{file_name}' at 's3://{s3_bucket}/{key}' which violates the strict Gold naming standard.\n"
-                                        f"All Gold query files MUST strictly be named 'v_<tablename>.sql' (e.g. 'v_{file_name}'). Non-standard query files are not permitted."
-                                    )
-                                clean_name = file_base[2:]
+                                clean_name = file_base[2:] if file_base.startswith('v_') else file_base
                                 resp = s3_client.get_object(Bucket=s3_bucket, Key=key)
                                 queries[clean_name] = resp['Body'].read().decode('utf-8')
                                 logger.info(f"[QUERY DISCOVERY] Loaded S3 query for '{clean_name}' from 's3://{s3_bucket}/{key}'")
-            except ValueError:
-                raise
             except Exception as e:
                 logger.warning(f"Error listing S3 query files at '{query_path}': {e}. Falling back to local directory.")
 
@@ -1142,12 +1588,7 @@ class GoldLayerManager:
             for file_path in glob.glob(f"{local_dir}/*.sql"):
                 file_name = os.path.basename(file_path)
                 file_base = os.path.splitext(file_name)[0].replace('-', '_')
-                if not file_base.startswith('v_'):
-                    raise ValueError(
-                        f"CRITICAL QUERY NAMING ERROR: Found query file '{file_name}' at '{file_path}' which violates the strict Gold naming standard.\n"
-                        f"All Gold query files MUST strictly be named 'v_<tablename>.sql' (e.g. 'v_{file_name}'). Non-standard query files are not permitted."
-                    )
-                clean_name = file_base[2:]
+                clean_name = file_base[2:] if file_base.startswith('v_') else file_base
                 if clean_name not in queries:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         queries[clean_name] = f.read()

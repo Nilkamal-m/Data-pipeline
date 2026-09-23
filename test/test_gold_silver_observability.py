@@ -1296,20 +1296,19 @@ class TestSilverUniformConfigAndGoldMandatoryAthenaView(unittest.TestCase):
         self.assertIn("interactions", queries)
         self.assertTrue(len(queries["interactions"]) > 0)
 
-    def test_gold_query_discovery_rejects_non_v_query_file(self):
+    def test_gold_query_discovery_supports_flexible_naming(self):
         mock_s3 = MagicMock()
         mock_s3.get_paginator.return_value.paginate.return_value = [
             {'Contents': [{'Key': 'gold/query/moveworks/interactions.sql'}]}
         ]
-        with self.assertRaises(ValueError) as ctx:
-            GoldLayerManager._discover_queries(
-                query_path="s3://test-bucket/gold/query/moveworks/",
-                bucket="test-bucket",
-                s3_client=mock_s3,
-                source_system="moveworks"
-            )
-        self.assertIn("violates the strict Gold naming standard", str(ctx.exception))
-        self.assertIn("v_<tablename>.sql", str(ctx.exception))
+        mock_s3.get_object.return_value = {'Body': MagicMock(read=lambda: b"SELECT 1 FROM tbl;")}
+        queries = GoldLayerManager._discover_queries(
+            query_path="s3://test-bucket/gold/query/moveworks/",
+            bucket="test-bucket",
+            s3_client=mock_s3,
+            source_system="moveworks"
+        )
+        self.assertIn("interactions", queries)
 
 
 class TestWatermarkExecutionStartTime(unittest.TestCase):
