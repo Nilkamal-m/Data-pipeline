@@ -190,6 +190,7 @@ SELECT
 -- Conversation Details
 COALESCE(c.primary_domain, '') AS conversation_domain,
 COALESCE(ct.conversation_topic, '') AS conversation_topic,
+COALESCE(ct.conversation_topic, '') AS conversation_topics,
 
 -- Content & Bot Response
 COALESCE(ui.detail_content, '') AS interaction_content,

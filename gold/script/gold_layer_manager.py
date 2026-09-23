@@ -1737,9 +1737,6 @@ class GoldLayerManager:
         if primary_keys:
             df_mart = cls._deduplicate_by_nkey(df_mart, primary_keys)
         row_count = df_mart.count()
-        temp_view = f"incoming_gold_{clean_base_name}"
-        df_mart.createOrReplaceTempView(temp_view)
-
         # Dual-check table existence and metadata health
         table_exists = False
         try:
@@ -1763,8 +1760,29 @@ class GoldLayerManager:
                 table_exists = False
 
         if table_exists:
-            # Dynamically evolve Iceberg schema if new columns are present
+            # 1. Dynamically evolve Iceberg schema if new columns are present
             cls._sync_iceberg_schema(spark, full_table, df_mart)
+
+            # 2. Align incoming df_mart with target table schema to guarantee MERGE SET * compatibility
+            try:
+                target_df = spark.table(f"{glue_database}.{target_table_name}")
+                target_cols = {f.name.lower(): f for f in target_df.schema.fields}
+                incoming_cols = {c.lower(): c for c in df_mart.columns}
+
+                for t_lower, f in target_cols.items():
+                    if t_lower not in incoming_cols:
+                        if t_lower == 'conversation_topics' and 'conversation_topic' in incoming_cols:
+                            df_mart = df_mart.withColumn(f.name, col(incoming_cols['conversation_topic']))
+                        elif t_lower == 'conversation_topic' and 'conversation_topics' in incoming_cols:
+                            df_mart = df_mart.withColumn(f.name, col(incoming_cols['conversation_topics']))
+                        else:
+                            df_mart = df_mart.withColumn(f.name, lit(None).cast(f.dataType))
+            except Exception as align_err:
+                logger.warning(f"[SCHEMA ALIGNMENT NOTE] Error aligning columns with target table: {align_err}")
+
+        # Register temp view with fully aligned columns for Spark SQL MERGE
+        temp_view = f"incoming_gold_{clean_base_name}"
+        df_mart.createOrReplaceTempView(temp_view)
 
         if table_exists and primary_keys:
             join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in primary_keys])
@@ -1781,14 +1799,10 @@ class GoldLayerManager:
             except Exception as merge_err:
                 logger.warning(
                     f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). "
-                    f"Falling back to Iceberg APPEND at '{s3_location}'..."
+                    f"Falling back to Iceberg insertInto on '{full_table}'..."
                 )
                 try:
-                    df_mart.write \
-                        .format("iceberg") \
-                        .mode("append") \
-                        .option("path", s3_location) \
-                        .save()
+                    df_mart.write.format("iceberg").mode("append").insertInto(f"{glue_database}.{target_table_name}")
                 except Exception as ice_fallback_err:
                     logger.error(f"[ATHENA/ICEBERG UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
                     raise
