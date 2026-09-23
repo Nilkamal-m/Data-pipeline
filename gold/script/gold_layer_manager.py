@@ -67,11 +67,39 @@ class GoldLayerManager:
         3. DOWNSTREAM: Materializes and serves data to configured targets (Aurora MySQL, Redshift, Snowflake).
         """
         execution_start = datetime.now(timezone.utc)
-        bucket_name = params.get('DATA_LAKE_BUCKET', 'uax-datalake-dev-bucket')
-        glue_database = params.get('GLUE_DATABASE') or 'uax_datalake_db_dev'
 
-        # Load Gold Configuration via GoldConfigLoader (zero CLI config passing required)
-        gold_cfg = GoldConfigLoader.load_config(params.get('GOLD_CONFIG_S3_PATH'), s3_client=s3_client) if GoldConfigLoader else {}
+        # Target Deployment Environment: CLI (--ENV or --ENVIRONMENT) > Env Var > Default ('dev')
+        env = (
+            params.get('ENV')
+            or params.get('env')
+            or params.get('ENVIRONMENT')
+            or params.get('environment')
+            or os.environ.get('ENV')
+            or os.environ.get('ENVIRONMENT')
+            or 'dev'
+        ).strip().lower()
+        logger.info(f"Target deployment environment resolved: '{env}'")
+
+        # Load Gold Configuration via GoldConfigLoader with dynamic {env} interpolation
+        gold_cfg = GoldConfigLoader.load_config(params.get('GOLD_CONFIG_S3_PATH'), s3_client=s3_client, env=env) if GoldConfigLoader else {}
+        if GoldConfigLoader:
+            GoldConfigLoader.set_loaded_config(gold_cfg, env=env)
+
+        defaults_cfg = GoldConfigLoader.get_defaults(gold_cfg, env=env) if GoldConfigLoader else {}
+
+        raw_bucket = (
+            params.get('DATA_LAKE_BUCKET')
+            or defaults_cfg.get('gold_bucket')
+            or f"uax-datalake-{env}-bucket"
+        )
+        bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+        raw_glue_db = (
+            params.get('GLUE_DATABASE')
+            or (GoldConfigLoader.get_glue_database(gold_cfg, env=env) if GoldConfigLoader else None)
+            or f"uax_datalake_db_{env}"
+        )
+        glue_database = str(raw_glue_db).replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
         # Strict SOURCE_SYSTEM Enforcement
         source_system = (params.get('SOURCE_SYSTEM') or '').strip().lower()
@@ -446,11 +474,18 @@ class GoldLayerManager:
 
         # 1. Resolve Target Athena Workgroup
         # Dynamically determine the dedicated data lake workgroup: uax-datalake-workgroup-{env}
-        env = 'dev'
-        if glue_database:
-            parts = glue_database.split('_')
-            if len(parts) > 1 and parts[-1] in ('dev', 'qa', 'staging', 'prod', 'test'):
-                env = parts[-1]
+        env = (
+            params.get('ENV')
+            or params.get('env')
+            or params.get('ENVIRONMENT')
+            or params.get('environment')
+            or 'dev'
+        ).strip().lower()
+        if not env or env == 'dev':
+            if glue_database:
+                parts = glue_database.split('_')
+                if len(parts) > 1 and parts[-1] in ('dev', 'qa', 'staging', 'prod', 'test'):
+                    env = parts[-1]
         default_workgroup = f"uax-datalake-workgroup-{env}"
 
         configured_wg = (
@@ -2220,10 +2255,11 @@ def main():
         'SECRET_NAME', 'RDS_SECRET_NAME', 'API_SECRET_NAME', 'LLM_SECRET_NAME',
         'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'INCREMENTAL', 'FULL_REFRESH',
         'RDS_HOST', 'RDS_PORT', 'RDS_USER', 'RDS_PASSWORD',
-        'GOLD_SCHEMA', 'GOLD_TARGETS', 'CONNECTION_NAME', 'ENV'
+        'GOLD_SCHEMA', 'GOLD_TARGETS', 'CONNECTION_NAME', 'ENV', 'ENVIRONMENT',
+        'GOLD_CONFIG_S3_PATH', 'ATHENA_WORKGROUP', 'WORKGROUP', 'MART_NAME', 'TABLE_NAME'
     ]
 
-    args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv]
+    args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv or f"--{a.lower()}" in sys.argv]
     resolved = getResolvedOptions(sys.argv, args_to_check)
 
     GoldLayerManager.run_gold_pipeline(spark, resolved)

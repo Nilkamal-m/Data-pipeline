@@ -128,12 +128,26 @@ def parse_spark_arguments() -> dict:
                     return str(v).strip()
         return default
 
-    config_s3_path = get_cli_arg('SILVER_CONFIG_S3_PATH', 'silver_config_s3_path', 'CONFIG_S3_PATH', 'config_s3_path')
+    # Target Deployment Environment: CLI (--ENV or --ENVIRONMENT) > Env Var > Default ('dev')
+    env = (
+        get_cli_arg('ENV', 'env', 'ENVIRONMENT', 'environment')
+        or os.environ.get('ENV')
+        or os.environ.get('ENVIRONMENT')
+        or 'dev'
+    ).strip().lower()
+    logger.info(f"Target deployment environment resolved: '{env}'")
 
-    # Load Silver centralized configuration file
+    config_s3_path = get_cli_arg('SILVER_CONFIG_S3_PATH', 'silver_config_s3_path', 'CONFIG_S3_PATH', 'config_s3_path')
+    if not config_s3_path:
+        bucket_hint = get_cli_arg('DATA_LAKE_BUCKET', 'data_lake_bucket', 'SILVER_BUCKET', 'silver_bucket') or f"uax-datalake-{env}-bucket"
+        clean_bucket = bucket_hint.replace('{env}', env).replace('{ENV}', env.upper())
+        config_s3_path = f"s3://{clean_bucket}/silver/script/config/silver_config.json"
+
+    # Load Silver centralized configuration file with dynamic {env} interpolation
     s3_client = boto3.client('s3') if config_s3_path else None
-    silver_full_config = SilverConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client)
-    defaults_cfg = SilverConfigLoader.get_defaults(silver_full_config)
+    silver_full_config = SilverConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client, env=env)
+    SilverConfigLoader.set_loaded_config(silver_full_config, env=env)
+    defaults_cfg = SilverConfigLoader.get_defaults(silver_full_config, env=env)
 
     # Process Layer Routing: Supports 'silver', 'gold', or 'both'
     process_layer = (get_cli_arg('PROCESS_LAYER', 'process_layer', default='silver')).lower().strip()
@@ -155,25 +169,28 @@ def parse_spark_arguments() -> dict:
     source_system_clean = source_system.strip().lower()
 
     # Data Lake Bucket: CLI > Config > Env > Default
-    data_lake_bucket = get_cli_arg(
+    raw_data_lake_bucket = get_cli_arg(
         'DATA_LAKE_BUCKET', 'data_lake_bucket',
         'BRONZE_BUCKET', 'bronze_bucket',
-        default=defaults_cfg.get('data_lake_bucket') or os.environ.get('DATA_LAKE_BUCKET', 'uax-datalake-dev-bucket')
+        'SILVER_BUCKET', 'silver_bucket',
+        default=defaults_cfg.get('data_lake_bucket') or defaults_cfg.get('silver_bucket') or os.environ.get('DATA_LAKE_BUCKET', f'uax-datalake-{env}-bucket')
     )
+    data_lake_bucket = str(raw_data_lake_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
     # Glue Database: CLI > Config (Required)
-    glue_database = (
+    raw_glue_database = (
         get_cli_arg('GLUE_DATABASE', 'glue_database', 'GLUE_DB_NAME', 'glue_db_name')
         or defaults_cfg.get('glue_database')
         or defaults_cfg.get('glue_catalog', {}).get('database_name')
+        or f"uax_datalake_db_{env}"
     )
-    if not glue_database or not str(glue_database).strip():
+    glue_database = str(raw_glue_database).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+    if not glue_database:
         raise ValueError(
             "CRITICAL CONFIG ERROR: 'glue_database' is missing or empty in silver_config.json "
             "(pipeline_defaults.glue_database or glue_catalog.database_name) and was not provided via CLI. "
-            "Please configure 'glue_database' (e.g. 'uax_datalake_db_dev')."
+            "Please configure 'glue_database' (e.g. 'uax_datalake_db_{env}')."
         )
-    glue_database = str(glue_database).strip()
 
     # Bronze Data Prefix: CLI > Config > Default ('bronze/data')
     bronze_data_prefix = (
@@ -279,9 +296,11 @@ def parse_spark_arguments() -> dict:
         get_cli_arg('CRAWLER_NAME', 'crawler_name', 'SILVER_CRAWLER_NAME', 'silver_crawler_name')
         or defaults_cfg.get('crawler_name')
         or defaults_cfg.get('silver_crawler_name')
+        or defaults_cfg.get('glue_catalog', {}).get('crawler_name')
+        or f"uax-datalake-silver-crawler-{env}"
     )
     if crawler_name:
-        crawler_name = str(crawler_name).strip()
+        crawler_name = str(crawler_name).replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
     cli_trigger_crawler = get_cli_arg('TRIGGER_CRAWLER', 'trigger_crawler')
     if cli_trigger_crawler is not None:
@@ -328,11 +347,6 @@ def parse_spark_arguments() -> dict:
     )
 
     # Athena Workgroup: CLI > Env > Default (uax-datalake-workgroup-{env})
-    env = 'dev'
-    if glue_database:
-        parts = glue_database.split('_')
-        if len(parts) > 1 and parts[-1] in ('dev', 'qa', 'staging', 'prod', 'test'):
-            env = parts[-1]
     default_athena_wg = os.environ.get('ATHENA_WORKGROUP') or f"uax-datalake-workgroup-{env}"
     athena_workgroup = get_cli_arg(
         'ATHENA_WORKGROUP', 'athena_workgroup',
@@ -352,6 +366,7 @@ def parse_spark_arguments() -> dict:
     snowflake_secret_name = get_cli_arg('SNOWFLAKE_SECRET_NAME', 'snowflake_secret_name')
 
     return {
+        'ENV': env,
         'PROCESS_LAYER': process_layer,
         'JOB_NAME': job_name,
         'SOURCE_SYSTEM': source_system_clean,

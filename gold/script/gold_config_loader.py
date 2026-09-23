@@ -19,64 +19,144 @@ class GoldConfigLoader:
     """
     Centralized Configuration Loader for Gold Layer Multi-Target Serving Engine.
     """
-    _config_cache: Optional[Dict[str, Any]] = None
-
-    @classmethod
-    def load_config(cls, config_s3_path: Optional[str] = None, s3_client: Optional[Any] = None) -> Dict[str, Any]:
-        """
-        Loads the Gold configuration JSON file from S3 or local disk.
-        Cached in memory after first load.
-        """
-        if cls._config_cache is not None:
-            return cls._config_cache
-
-        # 1. Try S3 path if provided
-        if config_s3_path and config_s3_path.startswith("s3://") and s3_client:
-            try:
-                path_parts = config_s3_path.replace("s3://", "").split("/", 1)
-                bucket_name, object_key = path_parts[0], path_parts[1]
-                logger.info(f"Loading Gold configuration from S3: '{config_s3_path}'")
-                response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
-                content = response['Body'].read().decode('utf-8')
-                cls._config_cache = json.loads(content)
-                return cls._config_cache
-            except Exception as err:
-                logger.warning(f"Failed to load Gold config from S3 path '{config_s3_path}': {err}. Falling back to local search.")
-
-        # 2. Local search candidates (handles local repo, AWS Glue /tmp, and relative execution paths)
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        possible_paths = [
-            os.path.join(current_dir, "config", "gold_config.json"),
-            "gold/script/config/gold_config.json",
-            "scripts/gold/config/gold_config.json",
-            "/tmp/gold_config.json"
-        ]
-
-        for path in possible_paths:
-            if os.path.exists(path):
-                logger.info(f"Loading Gold configuration from local file: '{path}'")
-                with open(path, "r", encoding="utf-8") as f:
-                    cls._config_cache = json.load(f)
-                    return cls._config_cache
-
-        logger.warning("Gold configuration file 'gold_config.json' not found. Using empty defaults.")
-        return {}
+    _config_cache: Dict[str, Dict[str, Any]] = {}
+    _latest_config: Optional[Dict[str, Any]] = None
+    _cached_s3_path: Optional[str] = None
+    _cached_s3_client: Optional[Any] = None
 
     @classmethod
     def clear_cache(cls) -> None:
         """Clears the cached configuration."""
-        cls._config_cache = None
+        if isinstance(cls._config_cache, dict):
+            cls._config_cache.clear()
+        else:
+            cls._config_cache = {}
+        cls._latest_config = None
+        cls._cached_s3_path = None
+        cls._cached_s3_client = None
 
     @classmethod
-    def get_defaults(cls, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def set_loaded_config(cls, config_dict: Dict[str, Any], env: Optional[str] = None) -> None:
+        """Explicitly registers a loaded config into the cache to guarantee all subsequent calls reuse it."""
+        if cls._config_cache is None or not isinstance(cls._config_cache, dict):
+            cls._config_cache = {}
+        effective_env = (env or os.environ.get('ENV') or os.environ.get('ENVIRONMENT') or 'dev').strip().lower()
+        cls._config_cache[effective_env] = config_dict
+        cls._latest_config = config_dict
+
+    @classmethod
+    def interpolate_env(cls, obj: Any, env: str) -> Any:
+        """
+        Recursively replaces '{env}' and '{ENV}' placeholders in strings, dictionaries (keys & values), and lists.
+        """
+        if not env:
+            return obj
+        env_lower = str(env).strip().lower()
+        env_upper = str(env).strip().upper()
+
+        if isinstance(obj, str):
+            return obj.replace("{env}", env_lower).replace("{ENV}", env_upper)
+        elif isinstance(obj, dict):
+            return {
+                cls.interpolate_env(k, env): cls.interpolate_env(v, env)
+                for k, v in obj.items()
+            }
+        elif isinstance(obj, list):
+            return [cls.interpolate_env(item, env) for item in obj]
+        return obj
+
+    @classmethod
+    def load_config(
+        cls,
+        config_s3_path: Optional[str] = None,
+        s3_client: Optional[Any] = None,
+        env: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Loads the Gold configuration JSON file from S3 or local disk.
+        Dynamically interpolates all {env} placeholders according to effective_env.
+        Cached in memory per environment after first load.
+        """
+        if cls._config_cache is None or not isinstance(cls._config_cache, dict):
+            cls._config_cache = {}
+        effective_env = (env or os.environ.get('ENV') or os.environ.get('ENVIRONMENT') or 'dev').strip().lower()
+        if effective_env in cls._config_cache:
+            return cls._config_cache[effective_env]
+
+        raw_config = None
+
+        if config_s3_path and str(config_s3_path).strip():
+            cls._cached_s3_path = str(config_s3_path).strip()
+        if s3_client is not None:
+            cls._cached_s3_client = s3_client
+
+        active_s3_path = config_s3_path or cls._cached_s3_path
+        active_s3_client = s3_client or cls._cached_s3_client
+
+        # 1. Try S3 path if provided
+        if active_s3_path and active_s3_path.startswith("s3://") and active_s3_client:
+            try:
+                path_parts = active_s3_path.replace("s3://", "").split("/", 1)
+                bucket_name, object_key = path_parts[0], path_parts[1]
+                logger.info(f"Loading Gold configuration from S3: '{active_s3_path}'")
+                response = active_s3_client.get_object(Bucket=bucket_name, Key=object_key)
+                content = response['Body'].read().decode('utf-8')
+                raw_config = json.loads(content)
+            except Exception as err:
+                logger.warning(f"Failed to load Gold config from S3 path '{active_s3_path}': {err}. Falling back to local search.")
+
+        # 2. Local search candidates (handles local repo, AWS Glue /tmp, and relative execution paths)
+        if raw_config is None:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            possible_paths = [
+                os.path.join(current_dir, "config", "gold_config.json"),
+                "gold/script/config/gold_config.json",
+                "scripts/gold/config/gold_config.json",
+                "/tmp/gold_config.json"
+            ]
+
+            for path in possible_paths:
+                if os.path.exists(path):
+                    logger.info(f"Loading Gold configuration from local file: '{path}'")
+                    with open(path, "r", encoding="utf-8") as f:
+                        raw_config = json.load(f)
+                        break
+
+        if raw_config is None:
+            logger.warning("Gold configuration file 'gold_config.json' not found. Using empty defaults.")
+            raw_config = {}
+
+        interpolated = cls.interpolate_env(raw_config, effective_env)
+        cls._config_cache[effective_env] = interpolated
+        cls._latest_config = interpolated
+        return interpolated
+
+    @classmethod
+    def get_defaults(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> Dict[str, Any]:
         """Retrieves pipeline defaults block."""
-        config = config_dict if config_dict is not None else (cls._config_cache or cls.load_config())
+        config = config_dict if config_dict is not None else ((cls._config_cache.get(env) if env else cls._latest_config) or cls.load_config(env=env))
         return config.get("pipeline_defaults", {})
 
     @classmethod
-    def get_source_config(cls, source_system: str, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def get_glue_database(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> str:
+        """
+        Retrieves glue_database for Gold layer tables from centralized defaults.
+        Dynamically interpolates {env} if present.
+        """
+        effective_env = (env or os.environ.get('ENV') or os.environ.get('ENVIRONMENT') or 'dev').strip().lower()
+        defaults = cls.get_defaults(config_dict, env=effective_env)
+        db = defaults.get("glue_database") or defaults.get("glue_catalog", {}).get("database_name")
+        if not db or not str(db).strip():
+            return f"uax_datalake_db_{effective_env}"
+        db_str = str(db).strip()
+        if "{env}" in db_str or "{ENV}" in db_str:
+            db_str = db_str.replace("{env}", effective_env).replace("{ENV}", effective_env.upper())
+        return db_str
+
+    @classmethod
+    def get_source_config(cls, source_system: str, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> Dict[str, Any]:
         """Retrieves configuration for a specific source system in Gold layer."""
-        config = config_dict if config_dict is not None else (cls._config_cache or cls.load_config())
+        config = config_dict if config_dict is not None else ((cls._config_cache.get(env) if env else cls._latest_config) or cls.load_config(env=env))
         sources = config.get("source_systems", {})
         return sources.get(source_system.strip().lower(), {})
 

@@ -711,6 +711,164 @@ class TestAthenaToAuroraExtension(unittest.TestCase):
             self.assertEqual(call_kwargs["source_system"], "genesys")
 
 
+class TestDynamicEnvInterpolationAcrossAllLayers(unittest.TestCase):
+    """
+    Comprehensive verification that all layers (Bronze, Silver, Gold, and Initial Load)
+    dynamically replace '{env}' and '{ENV}' placeholders with the exact values passed from
+    Glue job arguments (--ENV or --ENVIRONMENT) triggered from Lambda or Step Functions.
+    """
+
+    def setUp(self):
+        GoldConfigLoader.clear_cache()
+        try:
+            from silver.script.silver_config_loader import SilverConfigLoader
+            SilverConfigLoader.clear_cache()
+        except ImportError:
+            pass
+
+    def tearDown(self):
+        GoldConfigLoader.clear_cache()
+        try:
+            from silver.script.silver_config_loader import SilverConfigLoader
+            SilverConfigLoader.clear_cache()
+        except ImportError:
+            pass
+
+    def test_gold_config_loader_interpolate_env(self):
+        sample = {
+            "db": "uax_datalake_db_{env}",
+            "upper": "BUCKET_{ENV}",
+            "nested": {
+                "prefix": "gold/data/{env}",
+                "tables": ["tbl_{env}_conversations", 99]
+            }
+        }
+        res = GoldConfigLoader.interpolate_env(sample, "prod")
+        self.assertEqual(res["db"], "uax_datalake_db_prod")
+        self.assertEqual(res["upper"], "BUCKET_PROD")
+        self.assertEqual(res["nested"]["prefix"], "gold/data/prod")
+        self.assertEqual(res["nested"]["tables"][0], "tbl_prod_conversations")
+
+    def test_gold_config_loader_load_config_with_custom_env(self):
+        prod_cfg = GoldConfigLoader.load_config(env="prod")
+        self.assertEqual(prod_cfg["pipeline_defaults"]["glue_catalog"]["database_name"], "uax_datalake_db_prod")
+
+        qa_db = GoldConfigLoader.get_glue_database(env="qa")
+        self.assertEqual(qa_db, "uax_datalake_db_qa")
+
+    def test_silver_config_loader_interpolate_env_and_caching(self):
+        from silver.script.silver_config_loader import SilverConfigLoader
+        SilverConfigLoader.clear_cache()
+
+        sample = {
+            "catalog": {
+                "db": "uax_datalake_db_{env}",
+                "crawler": "uax-datalake-silver-crawler-{env}"
+            }
+        }
+        res = SilverConfigLoader.interpolate_env(sample, "staging")
+        self.assertEqual(res["catalog"]["db"], "uax_datalake_db_staging")
+        self.assertEqual(res["catalog"]["crawler"], "uax-datalake-silver-crawler-staging")
+
+        prod_cfg = SilverConfigLoader.load_config(env="prod")
+        self.assertEqual(prod_cfg["pipeline_defaults"]["glue_catalog"]["database_name"], "uax_datalake_db_prod")
+        self.assertEqual(prod_cfg["pipeline_defaults"]["glue_catalog"]["crawler_name"], "uax-datalake-silver-crawler-prod")
+
+        db_prod = SilverConfigLoader.get_glue_database(env="prod")
+        self.assertEqual(db_prod, "uax_datalake_db_prod")
+        crawler_prod = SilverConfigLoader.get_crawler_name(env="prod")
+        self.assertEqual(crawler_prod, "uax-datalake-silver-crawler-prod")
+
+    def test_silver_etl_parse_spark_arguments_resolves_env(self):
+        from silver.script.uax_silver_etl import parse_spark_arguments
+
+        cli_args = [
+            'uax_silver_etl.py',
+            '--SOURCE_SYSTEM', 'genesys',
+            '--ENV', 'prod',
+            '--DATA_LAKE_BUCKET', 'my-bucket-{env}',
+            '--GLUE_DATABASE', 'uax_datalake_db_{env}'
+        ]
+        with patch('sys.argv', cli_args):
+            parsed = parse_spark_arguments()
+            self.assertEqual(parsed['ENV'], 'prod')
+            self.assertEqual(parsed['DATA_LAKE_BUCKET'], 'my-bucket-prod')
+            self.assertEqual(parsed['GLUE_DATABASE'], 'uax_datalake_db_prod')
+            self.assertEqual(parsed['CRAWLER_NAME'], 'uax-datalake-silver-crawler-prod')
+
+    def test_gold_layer_manager_resolves_env_dynamically(self):
+        mock_spark = MagicMock()
+        mock_df = MagicMock()
+        mock_df.count.return_value = 10
+        mock_df.columns = ["conversation_id"]
+        mock_spark.sql.return_value = mock_df
+
+        params = {
+            "JOB_NAME": "gold_job",
+            "SOURCE_SYSTEM": "genesys",
+            "ENV": "qa",
+            "DATA_LAKE_BUCKET": "uax-datalake-{env}-bucket",
+            "GOLD_TARGETS": "athena"
+        }
+
+        mock_s3 = MagicMock()
+        mock_s3.get_object.return_value = {'Body': MagicMock(read=MagicMock(return_value=b"SELECT 1"))}
+
+        with patch.object(GoldLayerManager, "_discover_queries", return_value={"conversations": "SELECT 1 AS conversation_id"}):
+            with patch.object(GoldLayerManager, "_materialize_athena_table", return_value=10) as mock_mat:
+                results = GoldLayerManager.run_gold_pipeline(mock_spark, params, s3_client=mock_s3)
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["status"], "SUCCESS")
+                self.assertEqual(results[0]["target_table"], "uax_datalake_db_qa.gold_genesys_conversations")
+                mock_mat.assert_called_once()
+                self.assertEqual(mock_mat.call_args[1]["glue_database"], "uax_datalake_db_qa")
+
+    def test_gold_initial_load_resolves_env_dynamically(self):
+        mock_spark = MagicMock()
+        mock_raw_df = MagicMock()
+        mock_raw_df.columns = ["conversation_id"]
+        mock_raw_df.count.return_value = 25
+        mock_spark.read.option.return_value.option.return_value.option.return_value.csv.return_value = mock_raw_df
+        mock_spark.table.return_value = mock_raw_df
+
+        params = {
+            "JOB_NAME": "test_init_job",
+            "SOURCE_SYSTEM": "genesys",
+            "TABLE_NAME": "conversations",
+            "ENV": "prod",
+            "CSV_PATH": "s3://{bucket}/gold/initial_exports/{source}/{table}.csv",
+            "DATA_LAKE_BUCKET": "uax-datalake-{env}-bucket",
+            "GOLD_TARGETS": "athena"
+        }
+
+        res = GoldInitialLoader.run_initial_load(mock_spark, params)
+        self.assertEqual(res["target_table"], "uax_datalake_db_prod.gold_genesys_conversations")
+        self.assertEqual(res["records_loaded"], 25)
+
+    def test_lambda_build_glue_arguments_maps_env(self):
+        from lambda_helper.lambda_function import build_glue_arguments
+
+        # Test lowercase 'env'
+        event_lower = {
+            "source_system": "genesys",
+            "layer": "silver",
+            "env": "prod"
+        }
+        glue_args_lower = build_glue_arguments(event_lower)
+        self.assertEqual(glue_args_lower["--ENV"], "prod")
+
+        # Test uppercase 'ENVIRONMENT'
+        event_upper = {
+            "source_system": "genesys",
+            "layer": "gold",
+            "gold_schema": "enterprise_reporting",
+            "ENVIRONMENT": "staging"
+        }
+        glue_args_upper = build_glue_arguments(event_upper)
+        self.assertEqual(glue_args_upper["--ENV"], "staging")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -232,11 +232,21 @@ class GoldInitialLoader:
         Executes initial CSV load and upserts into Gold table.
         """
         start_time = datetime.now(timezone.utc)
+
+        # Target Deployment Environment: CLI (--ENV or --ENVIRONMENT) > Env Var > Default ('dev')
+        env = (
+            params.get('ENV')
+            or params.get('env')
+            or params.get('ENVIRONMENT')
+            or params.get('environment')
+            or os.environ.get('ENV')
+            or os.environ.get('ENVIRONMENT')
+            or 'dev'
+        ).strip().lower()
+        logger.info(f"Target deployment environment resolved: '{env}'")
+
         source_system = (params.get('SOURCE_SYSTEM') or '').strip().lower()
         table_name = (params.get('TABLE_NAME') or params.get('MART_NAME') or '').strip().lower()
-        csv_path = params.get('CSV_PATH') or params.get('INITIAL_LOAD_PATH') or params.get('INPUT_FILE')
-        glue_database = params.get('GLUE_DATABASE') or 'uax_datalake_db_dev'
-        bucket_name = params.get('DATA_LAKE_BUCKET') or 'uax-datalake-dev-bucket'
 
         if not source_system or not table_name:
             raise ValueError(
@@ -250,8 +260,25 @@ class GoldInitialLoader:
                 table_name = table_name[len(prefix):]
                 break
 
-        # Load gold_config.json
-        gold_cfg = GoldConfigLoader.load_config() if GoldConfigLoader else {}
+        # Load gold_config.json with dynamic {env} interpolation
+        gold_cfg = GoldConfigLoader.load_config(env=env) if GoldConfigLoader else {}
+        if GoldConfigLoader:
+            GoldConfigLoader.set_loaded_config(gold_cfg, env=env)
+        defaults_cfg = GoldConfigLoader.get_defaults(gold_cfg, env=env) if GoldConfigLoader else {}
+
+        raw_bucket = (
+            params.get('DATA_LAKE_BUCKET')
+            or defaults_cfg.get('gold_bucket')
+            or f"uax-datalake-{env}-bucket"
+        )
+        bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+        raw_glue_db = (
+            params.get('GLUE_DATABASE')
+            or (GoldConfigLoader.get_glue_database(gold_cfg, env=env) if GoldConfigLoader else None)
+            or f"uax_datalake_db_{env}"
+        )
+        glue_database = str(raw_glue_db).replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
         # Resolve initial export/load CSV path: CLI > gold_config.json > S3 template/convention
         csv_path = params.get('CSV_PATH') or params.get('INITIAL_LOAD_PATH') or params.get('INPUT_FILE')
@@ -265,8 +292,14 @@ class GoldInitialLoader:
 
         # Template variable replacement (e.g. {bucket}, {env})
         if csv_path and isinstance(csv_path, str):
-            env_name = params.get('ENVIRONMENT', 'dev')
-            csv_path = csv_path.replace("{bucket}", bucket_name).replace("{env}", env_name).replace("{source}", source_system).replace("{table}", table_name)
+            csv_path = (
+                csv_path
+                .replace("{bucket}", bucket_name)
+                .replace("{env}", env)
+                .replace("{ENV}", env.upper())
+                .replace("{source}", source_system)
+                .replace("{table}", table_name)
+            )
 
         # Fallback to default S3 convention if not explicitly passed
         if not csv_path:
@@ -466,10 +499,11 @@ def main():
     optional_args = [
         'NKEY', 'PRIMARY_KEY', 'SECRET_NAME', 'RDS_SECRET_NAME',
         'API_SECRET_NAME', 'LLM_SECRET_NAME',
-        'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'DELIMITER', 'HAS_HEADER'
+        'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'DELIMITER', 'HAS_HEADER',
+        'ENV', 'ENVIRONMENT', 'INITIAL_LOAD_PATH', 'INPUT_FILE', 'MART_NAME'
     ]
 
-    args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv]
+    args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv or f"--{a.lower()}" in sys.argv]
     resolved = getResolvedOptions(sys.argv, args_to_check)
 
     GoldInitialLoader.run_initial_load(spark, resolved)
