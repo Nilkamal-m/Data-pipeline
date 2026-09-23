@@ -671,10 +671,16 @@ class GoldLayerManager:
                 logger.info(f"Executing Spark SQL query for '{clean_base_name}'...")
                 df_mart = spark.sql(sql_text)
 
-                # Incremental Delta Check: Isolates new/modified records so LLM transforms never process entire dataset
-                is_incremental = False
+                # Incremental Delta Check: Default True — only new/changed records processed.
+                # On Run 1, filter_incremental_delta() detects no Gold table exists and returns
+                # the full dataset automatically. Override via --FULL_REFRESH=true or
+                # gold_config.json "incremental": false for explicit full-refresh behaviour.
+                is_incremental = True
                 if GoldConfigLoader:
-                    is_incremental = GoldConfigLoader.is_incremental(source_system, clean_base_name, gold_cfg)
+                    cfg_incremental = GoldConfigLoader.is_incremental(source_system, clean_base_name, gold_cfg)
+                    # Only override the True default if config explicitly sets it to False
+                    if cfg_incremental is False:
+                        is_incremental = False
                 if 'INCREMENTAL' in params:
                     is_incremental = str(params['INCREMENTAL']).strip().lower() in ('true', '1', 'yes')
                 if 'FULL_REFRESH' in params and str(params['FULL_REFRESH']).strip().lower() in ('true', '1', 'yes'):
@@ -1652,6 +1658,37 @@ class GoldLayerManager:
 
             res = loader_cls.run_initial_load(spark, load_params)
             logger.info(f"[INITIAL LOAD] Successfully completed initial historical export load for '{table_name}'. Details: {res}")
+
+            # Archive the source CSV/Parquet so it never re-triggers on subsequent runs.
+            # Moves: s3://<bucket>/gold/initial_exports/<source>/<file>
+            #     -> s3://<bucket>/gold/initial_exports/<source>/_archived/<file>
+            try:
+                if found_path and found_path.startswith('s3://'):
+                    import re as _re
+                    m = _re.match(r'^s3://([^/]+)/(.+)$', found_path)
+                    if m:
+                        _bkt = m.group(1)
+                        _key = m.group(2)
+                        _key_parts = _key.rsplit('/', 1)
+                        _archived_key = f"{_key_parts[0]}/_archived/{_key_parts[1]}" if len(_key_parts) == 2 else f"_archived/{_key}"
+                        _s3 = s3_client or boto3.client('s3')
+                        _s3.copy_object(
+                            Bucket=_bkt,
+                            CopySource={'Bucket': _bkt, 'Key': _key},
+                            Key=_archived_key
+                        )
+                        _s3.delete_object(Bucket=_bkt, Key=_key)
+                        logger.info(
+                            f"[INITIAL LOAD] Archived source file to prevent re-trigger on next run:\n"
+                            f"  s3://{_bkt}/{_key}\n"
+                            f"  -> s3://{_bkt}/{_archived_key}"
+                        )
+            except Exception as arch_err:
+                logger.warning(
+                    f"[INITIAL LOAD] Could not archive source file '{found_path}' (non-fatal): {arch_err}. "
+                    f"Pass --SKIP_INITIAL_LOAD=true on next run to avoid re-processing."
+                )
+
             return True
         except Exception as err:
             logger.error(
