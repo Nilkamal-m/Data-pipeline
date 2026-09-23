@@ -216,6 +216,8 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         'GOLD_TARGET': '--GOLD_TARGET',
         'gold_targets': '--GOLD_TARGETS',
         'GOLD_TARGETS': '--GOLD_TARGETS',
+        'gold_config_s3_path': '--GOLD_CONFIG_S3_PATH',
+        'GOLD_CONFIG_S3_PATH': '--GOLD_CONFIG_S3_PATH',
         'gold_query_s3_path': '--GOLD_QUERY_S3_PATH',
         'GOLD_QUERY_S3_PATH': '--GOLD_QUERY_S3_PATH',
         'gold_data_s3_path': '--GOLD_DATA_S3_PATH',
@@ -318,6 +320,12 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
                 "In accordance with enterprise shared database policy, no fallback schema is permitted.\n"
                 "Example: {'layer': 'gold', 'source_system': 'servicenow', 'rds_schema': 'enterprise_reporting'}"
             )
+
+    # Auto-default --GOLD_CONFIG_S3_PATH for Gold layer if data lake bucket is known
+    if glue_args.get('--PROCESS_LAYER') in ('gold', 'both') or layer == 'gold':
+        if not glue_args.get('--GOLD_CONFIG_S3_PATH') and glue_args.get('--DATA_LAKE_BUCKET'):
+            bucket = glue_args.get('--DATA_LAKE_BUCKET')
+            glue_args['--GOLD_CONFIG_S3_PATH'] = f"s3://{bucket}/gold/script/config/gold_config.json"
 
     # Allow custom arbitrary arguments passed via 'arguments' dictionary
     if 'arguments' in event and isinstance(event['arguments'], dict):
