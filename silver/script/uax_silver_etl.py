@@ -143,6 +143,12 @@ def parse_spark_arguments() -> dict:
         clean_bucket = bucket_hint.replace('{env}', env).replace('{ENV}', env.upper())
         config_s3_path = f"s3://{clean_bucket}/silver/script/config/silver_config.json"
 
+    gold_config_s3_path = get_cli_arg('GOLD_CONFIG_S3_PATH', 'gold_config_s3_path')
+    if not gold_config_s3_path:
+        bucket_hint = get_cli_arg('DATA_LAKE_BUCKET', 'data_lake_bucket', 'GOLD_BUCKET', 'gold_bucket') or f"uax-datalake-{env}-bucket"
+        clean_bucket = bucket_hint.replace('{env}', env).replace('{ENV}', env.upper())
+        gold_config_s3_path = f"s3://{clean_bucket}/gold/script/config/gold_config.json"
+
     # Load Silver centralized configuration file with dynamic {env} interpolation
     s3_client = boto3.client('s3') if config_s3_path else None
     silver_full_config = SilverConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client, env=env)
@@ -388,6 +394,7 @@ def parse_spark_arguments() -> dict:
         'GOLD_SCHEMA': gold_schema,
         'GOLD_TARGET': gold_target,
         'GOLD_TARGETS': ','.join(gold_targets),
+        'GOLD_CONFIG_S3_PATH': gold_config_s3_path,
         'GOLD_QUERY_S3_PATH': gold_query_s3_path,
         'GOLD_DATA_S3_PATH': gold_data_s3_path,
         'CONNECTION_NAME': connection_name,
@@ -405,6 +412,8 @@ def parse_spark_arguments() -> dict:
         'SNOWFLAKE_SCHEMA': snowflake_schema,
         'SNOWFLAKE_EXTERNAL_VOLUME': snowflake_external_volume,
         'SNOWFLAKE_SECRET_NAME': snowflake_secret_name,
+        'NKEY': get_cli_arg('NKEY', 'nkey', 'PRIMARY_KEY', 'primary_key'),
+        'PRIMARY_KEY': get_cli_arg('PRIMARY_KEY', 'primary_key', 'NKEY', 'nkey'),
         'ARG_DICT': arg_dict
     }
 

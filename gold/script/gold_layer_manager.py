@@ -102,11 +102,17 @@ class GoldLayerManager:
         bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
         # Auto-discover gold_config.json in S3 if not explicitly passed
-        config_s3_path = params.get('GOLD_CONFIG_S3_PATH')
+        config_s3_path = (
+            params.get('GOLD_CONFIG_S3_PATH')
+            or (params.get('ARG_DICT', {}).get('GOLD_CONFIG_S3_PATH') if isinstance(params.get('ARG_DICT'), dict) else None)
+        )
         if not config_s3_path and s3_client:
             candidate_cfg_paths = [
                 f"s3://{bucket_name}/gold/script/config/gold_config.json",
-                f"s3://{bucket_name}/gold/config/gold_config.json"
+                f"s3://{bucket_name}/gold/config/gold_config.json",
+                f"s3://{bucket_name}/scripts/gold/config/gold_config.json",
+                f"s3://{bucket_name}/silver/script/config/gold_config.json",
+                f"s3://{bucket_name}/config/gold_config.json"
             ]
             for c_path in candidate_cfg_paths:
                 if cls._s3_path_exists(c_path, s3_client):
@@ -114,10 +120,26 @@ class GoldLayerManager:
                     logger.info(f"Auto-discovered Gold configuration in S3 at '{config_s3_path}'")
                     break
 
+        if not config_s3_path:
+            config_s3_path = f"s3://{bucket_name}/gold/script/config/gold_config.json"
+
         # Load Gold Configuration via GoldConfigLoader with dynamic {env} interpolation
         gold_cfg = GoldConfigLoader.load_config(config_s3_path, s3_client=s3_client, env=env) if GoldConfigLoader else {}
         if GoldConfigLoader:
             GoldConfigLoader.set_loaded_config(gold_cfg, env=env)
+
+        if not gold_cfg or not gold_cfg.get("source_systems"):
+            logger.warning(
+                f"\n+================================================================================+\n"
+                f"|  [WARNING: GOLD CONFIG EMPTY] Could not load gold_config.json from S3/local!   |\n"
+                f"+================================================================================+\n"
+                f"|  * Attempted S3 Path   : {config_s3_path}\n"
+                f"|  * Target Bucket       : {bucket_name}\n"
+                f"|  * Target Environment  : {env}\n"
+                f"|  * Action Required     : Upload gold_config.json to your S3 bucket:\n"
+                f"|    aws s3 cp gold/script/config/gold_config.json s3://{bucket_name}/gold/script/config/gold_config.json\n"
+                f"+================================================================================+"
+            )
 
         defaults_cfg = GoldConfigLoader.get_defaults(gold_cfg, env=env) if GoldConfigLoader else {}
         if defaults_cfg.get('gold_bucket') and not params.get('DATA_LAKE_BUCKET'):

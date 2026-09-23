@@ -110,6 +110,9 @@ class GoldConfigLoader:
             current_dir = os.path.dirname(os.path.abspath(__file__))
             possible_paths = [
                 os.path.join(current_dir, "config", "gold_config.json"),
+                os.path.join(os.getcwd(), "gold_config.json"),
+                os.path.join(os.getcwd(), "gold", "script", "config", "gold_config.json"),
+                "gold_config.json",
                 "gold/script/config/gold_config.json",
                 "scripts/gold/config/gold_config.json",
                 "/tmp/gold_config.json"
