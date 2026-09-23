@@ -75,17 +75,45 @@ class S3FileConnector:
         tables_dict = config.get('tables', {})
         table_cfg = tables_dict.get(table_name, {}) if isinstance(tables_dict, dict) else {}
         table_paths = config.get('table_paths', {})
-        file_prefix = table_cfg.get('file_path') or table_paths.get(table_name) or config.get('file_prefix', f'raw/{table_name}/')
+        raw_path = table_cfg.get('file_path') or table_paths.get(table_name) or config.get('file_prefix', f'raw/{table_name}/')
+
+        # If file_path contains wildcards (e.g. "raw_feed/genesys/conversations_*.csv"), split into prefix and pattern
+        file_pattern = table_cfg.get('file_pattern') or config.get('file_pattern')
+        raw_path_str = str(raw_path).strip().rstrip('/')
+        if any(char in raw_path_str for char in ('*', '?', '[')):
+            if '/' in raw_path_str:
+                prefix_part, pattern_part = raw_path_str.rsplit('/', 1)
+                file_prefix = prefix_part + '/'
+                if any(char in pattern_part for char in ('*', '?', '[')):
+                    file_pattern = pattern_part
+                else:
+                    file_prefix = raw_path_str + '/'
+            else:
+                file_prefix = ''
+                file_pattern = raw_path_str
+        else:
+            file_prefix = raw_path if raw_path.endswith('/') else raw_path + '/'
 
         # Per-table fetch_mode override: tables.<table_name>.fetch_mode > table_fetch_modes > global fetch_mode
         table_modes = config.get('table_fetch_modes', {})
         raw_mode = table_cfg.get('fetch_mode') or table_modes.get(table_name) or config.get('fetch_mode', 'all')
+        
+        # Check CLI args for dynamic override
+        import sys
+        for arg in sys.argv[1:]:
+            if arg.startswith('--FETCH_MODE=') or arg.startswith('--fetch_mode='):
+                raw_mode = arg.split('=', 1)[1]
+            elif arg in ('--FETCH_MODE', '--fetch_mode'):
+                idx = sys.argv.index(arg)
+                if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith('--'):
+                    raw_mode = sys.argv[idx + 1]
+
         fetch_mode = str(raw_mode).strip().lower()
         if fetch_mode not in _VALID_FETCH_MODES:
             raise ValueError(
                 f"S3FileConnector for '{table_name}': invalid 'fetch_mode' = '{fetch_mode}'. "
                 f"Allowed: {_VALID_FETCH_MODES}. "
-                "Set 'fetch_mode' in bronze_config.json (source_systems.<name>.fetch_mode)."
+                "Set 'fetch_mode' in bronze_config.json (source_systems.<name>.fetch_mode) or via --FETCH_MODE."
             )
 
         file_format = (config.get('file_format') or 'csv').lower()
@@ -97,6 +125,7 @@ class S3FileConnector:
         delimiter  = config.get('delimiter', ',')
         has_header = bool(config.get('has_header', True))
         encoding   = config.get('encoding', 'utf-8')
+        file_pattern = config.get('file_pattern')
 
         # Build S3 client (cross-account if explicit credentials provided)
         if secret_dict.get('aws_access_key_id') and secret_dict.get('aws_secret_access_key'):
@@ -149,6 +178,17 @@ class S3FileConnector:
                 key = obj['Key']
                 if key.endswith('/'):
                     continue
+                # If file pattern configured or matching table_name in filename
+                filename = key.split('/')[-1]
+                if file_pattern:
+                    import fnmatch
+                    if not fnmatch.fnmatch(filename, file_pattern):
+                        continue
+                elif not file_prefix.rstrip('/').endswith(table_name):
+                    # If prefix is a shared parent directory, ensure filename starts with table_name
+                    if not (filename.startswith(f"{table_name}_") or filename.startswith(f"{table_name}.")):
+                        continue
+
                 mtime = obj['LastModified']
                 within_ub = (ub_dt is None) or (mtime <= ub_dt)
                 if (fetch_mode == 'latest' or mtime > hwm) and within_ub:

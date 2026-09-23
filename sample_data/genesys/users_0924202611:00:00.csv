@@ -1,0 +1,4 @@
+id,name,email,department,title,division_id,state,date_modified
+usr_004,Sarah Connor,sarah.connor@company.com,Operations,Operations Lead,div_01,active,2026-09-24T09:30:00Z
+usr_005,Kyle Reese,kyle.reese@company.com,Customer Support,Tier 1 Agent,div_02,active,2026-09-24T10:00:00Z
+usr_006,Ellen Ripley,ellen.ripley@company.com,Executive,Director of CX,div_03,active,2026-09-24T10:15:00Z

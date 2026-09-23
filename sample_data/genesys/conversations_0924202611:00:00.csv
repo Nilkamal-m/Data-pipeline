@@ -1,0 +1,4 @@
+id,conversation_start,conversation_end,division_ids,media_types,originating_direction,customer_name,sentiment_score
+conv_004,2026-09-24T10:05:00Z,2026-09-24T10:18:22Z,div_01,voice,inbound,Diana Prince,0.95
+conv_005,2026-09-24T10:20:00Z,2026-09-24T10:35:45Z,div_02,chat,inbound,Evan Wright,0.48
+conv_006,2026-09-24T10:40:00Z,2026-09-24T10:55:10Z,div_03,message,outbound,Fiona Gallagher,0.78

@@ -312,6 +312,31 @@ def parse_arguments() -> dict:
     if cli_assistant:
         source_config['assistant_name'] = cli_assistant
 
+    # S3 File connector CLI overrides (allowing dynamic testing / runtime configuration)
+    cli_fetch_mode = get_cli_arg('FETCH_MODE')
+    if cli_fetch_mode:
+        source_config['fetch_mode'] = cli_fetch_mode.strip().lower()
+
+    cli_source_bucket = get_cli_arg('SOURCE_BUCKET')
+    if cli_source_bucket:
+        source_config['source_bucket'] = cli_source_bucket.strip()
+
+    cli_file_prefix = get_cli_arg('FILE_PREFIX')
+    if cli_file_prefix:
+        source_config['file_prefix'] = cli_file_prefix.strip()
+
+    cli_file_format = get_cli_arg('FILE_FORMAT')
+    if cli_file_format:
+        source_config['file_format'] = cli_file_format.strip().lower()
+
+    cli_file_pattern = get_cli_arg('FILE_PATTERN')
+    if cli_file_pattern:
+        source_config['file_pattern'] = cli_file_pattern.strip()
+
+    cli_delimiter = get_cli_arg('DELIMITER')
+    if cli_delimiter:
+        source_config['delimiter'] = cli_delimiter
+
     job_name = get_cli_arg('JOB_NAME', default=f"glue-bronze-{source_system_clean}-{env}").replace('{env}', env).replace('{ENV}', env.upper())
 
     bronze_data_prefix = (

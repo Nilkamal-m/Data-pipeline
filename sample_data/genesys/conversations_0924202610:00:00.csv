@@ -1,0 +1,4 @@
+id,conversation_start,conversation_end,division_ids,media_types,originating_direction,customer_name,sentiment_score
+conv_001,2026-09-24T09:00:00Z,2026-09-24T09:12:30Z,div_01,voice,inbound,Alice Smith,0.85
+conv_002,2026-09-24T09:15:00Z,2026-09-24T09:28:10Z,div_01,chat,inbound,Bob Jones,0.62
+conv_003,2026-09-24T09:30:00Z,2026-09-24T09:45:00Z,div_02,email,outbound,Charlie Brown,0.91

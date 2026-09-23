@@ -1,0 +1,4 @@
+id,name,email,department,title,division_id,state,date_modified
+usr_001,John Doe,john.doe@company.com,Customer Support,Tier 1 Agent,div_01,active,2026-09-24T08:30:00Z
+usr_002,Jane Smith,jane.smith@company.com,Technical Support,Tier 2 Specialist,div_01,active,2026-09-24T08:45:00Z
+usr_003,Mark Spencer,mark.spencer@company.com,Sales,Account Executive,div_02,active,2026-09-24T09:00:00Z
