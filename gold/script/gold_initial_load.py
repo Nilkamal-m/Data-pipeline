@@ -413,6 +413,7 @@ def main():
     ]
     optional_args = [
         'NKEY', 'PRIMARY_KEY', 'SECRET_NAME', 'RDS_SECRET_NAME',
+        'API_SECRET_NAME', 'LLM_SECRET_NAME',
         'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'DELIMITER', 'HAS_HEADER'
     ]
 

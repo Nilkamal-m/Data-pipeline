@@ -182,6 +182,37 @@ class GoldConfigLoader:
         return defaults.get("secret_name")
 
     @classmethod
+    def get_api_secret_name(
+        cls,
+        source_system: Optional[str] = None,
+        table_name: Optional[str] = None,
+        config_dict: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """
+        Retrieves external API / LLM secret_name from gold_config.json:
+        1. source_systems.<source>.tables.<table>.api_secret_name (or llm_secret_name)
+        2. source_systems.<source>.api_secret_name (or llm_secret_name)
+        3. pipeline_defaults.api_secret_name (or llm_secret_name)
+        """
+        cfg = config_dict or cls.load_config()
+        if source_system and table_name:
+            tbl_cfg = cls.get_table_config(source_system, table_name, cfg)
+            if tbl_cfg.get("api_secret_name"):
+                return tbl_cfg.get("api_secret_name")
+            if tbl_cfg.get("llm_secret_name"):
+                return tbl_cfg.get("llm_secret_name")
+
+        if source_system:
+            src_cfg = cls.get_source_config(source_system, cfg)
+            if src_cfg.get("api_secret_name"):
+                return src_cfg.get("api_secret_name")
+            if src_cfg.get("llm_secret_name"):
+                return src_cfg.get("llm_secret_name")
+
+        defaults = cls.get_defaults(cfg)
+        return defaults.get("api_secret_name") or defaults.get("llm_secret_name")
+
+    @classmethod
     def get_target_engines(
         cls,
         source_system: str,

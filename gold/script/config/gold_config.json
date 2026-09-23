@@ -31,6 +31,7 @@
           ],
           "incremental": true,
           "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
+          "api_secret_name": "dev/data-pipeline/genesys-llm-api",
           "aurora": {
             "schema": "enterprise_reporting",
             "table_name": "gold_genesys_conversations"

@@ -265,6 +265,16 @@ class GoldLayerManager:
                 if GoldConfigLoader:
                     custom_script_path = GoldConfigLoader.get_custom_transform_path(source_system, clean_base_name, gold_cfg)
 
+                # Resolve API / LLM secret name for external APIs, Bedrock, OpenAI, etc.
+                api_secret_name = (
+                    params.get('API_SECRET_NAME')
+                    or params.get('api_secret_name')
+                    or params.get('LLM_SECRET_NAME')
+                    or params.get('llm_secret_name')
+                )
+                if not api_secret_name and GoldConfigLoader:
+                    api_secret_name = GoldConfigLoader.get_api_secret_name(source_system, clean_base_name, gold_cfg)
+
                 if custom_script_path:
                     context = {
                         "source_system": source_system,
@@ -274,6 +284,8 @@ class GoldLayerManager:
                         "primary_keys": pks,
                         "is_incremental": is_incremental,
                         "llm_column": llm_col,
+                        "api_secret_name": api_secret_name,
+                        "llm_secret_name": api_secret_name,
                         "params": params
                     }
                     df_mart = cls._apply_custom_transform(df_mart, custom_script_path, spark=spark, context=context)
@@ -2056,8 +2068,9 @@ def main():
 
     expected_args = ['JOB_NAME', 'SOURCE_SYSTEM']
     optional_args = [
-        'SECRET_NAME', 'RDS_SECRET_NAME', 'GLUE_DATABASE', 'DATA_LAKE_BUCKET',
-        'INCREMENTAL', 'FULL_REFRESH', 'RDS_HOST', 'RDS_PORT', 'RDS_USER', 'RDS_PASSWORD',
+        'SECRET_NAME', 'RDS_SECRET_NAME', 'API_SECRET_NAME', 'LLM_SECRET_NAME',
+        'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'INCREMENTAL', 'FULL_REFRESH',
+        'RDS_HOST', 'RDS_PORT', 'RDS_USER', 'RDS_PASSWORD',
         'GOLD_SCHEMA', 'GOLD_TARGETS', 'CONNECTION_NAME', 'ENV'
     ]
 

@@ -402,6 +402,50 @@ class TestGoldIncrementalDelta(unittest.TestCase):
             mock_secrets_client.get_secret_value.assert_called_with(SecretId="rds/config-secret")
             self.assertEqual(conn_info_fallback["password"], "resolved_pwd")
 
+    def test_get_api_secret_name_resolution(self):
+        # 1. Direct from gold_config.json for genesys conversations
+        api_secret = GoldConfigLoader.get_api_secret_name("genesys", "conversations")
+        self.assertEqual(api_secret, "dev/data-pipeline/genesys-llm-api")
+
+        # 2. Table-level override in custom dict
+        custom_cfg = {
+            "source_systems": {
+                "custom_src": {
+                    "tables": {
+                        "tbl": {"api_secret_name": "secrets/table-api-key"}
+                    }
+                }
+            },
+            "pipeline_defaults": {"api_secret_name": "secrets/default-api-key"}
+        }
+        self.assertEqual(
+            GoldConfigLoader.get_api_secret_name("custom_src", "tbl", custom_cfg),
+            "secrets/table-api-key"
+        )
+        # 3. Source without table config falls back to default
+        self.assertEqual(
+            GoldConfigLoader.get_api_secret_name("other_src", "tbl", custom_cfg),
+            "secrets/default-api-key"
+        )
+
+    def test_genesys_transform_with_api_secret_name(self):
+        mock_df = MagicMock()
+        mock_df.columns = ["conversation_id"]
+        mock_df.withColumn.return_value = mock_df
+
+        transform_path = os.path.join(gold_script_dir, "custom_transforms", "genesys_conversations.py")
+        context = {
+            "source_system": "genesys",
+            "table_name": "conversations",
+            "api_secret_name": "dev/data-pipeline/genesys-llm-api",
+            "is_incremental": True
+        }
+        result_df = GoldLayerManager._apply_custom_transform(
+            mock_df, transform_path, spark=MagicMock(), context=context
+        )
+        self.assertIsNotNone(result_df)
+        mock_df.withColumn.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()
