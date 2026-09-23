@@ -92,9 +92,11 @@ class TestGoldConfigLoader(unittest.TestCase):
         tbl_name = GoldConfigLoader.get_target_table_name("genesys", "conversations", "athena")
         self.assertEqual(tbl_name, "gold_genesys_conversations")
 
-        # Configured aurora table name for moveworks interactions
+        # Configured aurora table name for moveworks interactions matches athena table name
         aurora_tbl = GoldConfigLoader.get_target_table_name("moveworks", "interactions", "aurora")
-        self.assertEqual(aurora_tbl, "gold_tbl_interactions")
+        athena_tbl = GoldConfigLoader.get_target_table_name("moveworks", "interactions", "athena")
+        self.assertEqual(aurora_tbl, "gold_moveworks_interactions")
+        self.assertEqual(athena_tbl, aurora_tbl)
 
     def test_get_target_engines(self):
         # From config

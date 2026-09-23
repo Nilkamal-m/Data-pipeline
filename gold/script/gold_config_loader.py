@@ -300,7 +300,8 @@ class GoldConfigLoader:
     ) -> str:
         """
         Determines the target table name for the specified engine.
-        Default standard convention: gold_<source>_<tablename>
+        Standard enterprise convention: gold_<source>_<tablename>
+        Identical across Athena, Aurora, Redshift, Snowflake, and Databricks.
         Can be overridden in table config under engine specific section (e.g. aurora.table_name).
         """
         tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
@@ -316,5 +317,14 @@ class GoldConfigLoader:
         if isinstance(engine_cfg, dict) and engine_cfg.get("table_name"):
             return engine_cfg["table_name"]
 
-        # Default standard: gold_<source>_<tablename>
-        return f"gold_{clean_source}_{clean_table}"
+        if tbl_cfg.get("table_name"):
+            return tbl_cfg["table_name"]
+
+        defaults = cls.get_defaults(config_dict)
+        prefix = defaults.get("table_prefix", "gold_{source}_")
+        if "{source}" in prefix or "{source_system}" in prefix:
+            prefix = prefix.replace("{source}", clean_source).replace("{source_system}", clean_source)
+        elif prefix == "gold_":
+            prefix = f"gold_{clean_source}_"
+
+        return f"{prefix}{clean_table}"

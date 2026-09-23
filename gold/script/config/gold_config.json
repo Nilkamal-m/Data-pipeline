@@ -4,7 +4,8 @@
     "gold_bucket": "",
     "gold_data_prefix": "gold/data",
     "target_format": "iceberg",
-    "table_prefix": "gold_",
+    "table_prefix": "gold_{source}_",
+    "_note_table_prefix": "Uniform table naming standard: 'gold_{source}_{table_name}'. Identical physical table names across Athena, Aurora, Redshift, Snowflake, and Databricks. Physical tables only (no views).",
     "merge_strategy": "upsert",
     "glue_catalog": {
       "enabled": true,
@@ -83,7 +84,7 @@
           ],
           "aurora": {
             "schema": "enterprise_reporting",
-            "table_name": "gold_tbl_interactions"
+            "table_name": "gold_moveworks_interactions"
           }
         },
         "conversations": {
@@ -92,7 +93,7 @@
           ],
           "aurora": {
             "schema": "enterprise_reporting",
-            "table_name": "gold_tbl_conversations"
+            "table_name": "gold_moveworks_conversations"
           }
         },
         "feedbacks": {
@@ -101,7 +102,7 @@
           ],
           "aurora": {
             "schema": "enterprise_reporting",
-            "table_name": "gold_tbl_feedbacks"
+            "table_name": "gold_moveworks_feedbacks"
           }
         }
       }
@@ -120,7 +121,7 @@
           ],
           "aurora": {
             "schema": "enterprise_reporting",
-            "table_name": "gold_tbl_incident_kpi"
+            "table_name": "gold_servicenow_incident_kpi"
           }
         }
       }

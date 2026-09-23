@@ -227,9 +227,9 @@ class GoldLayerManager:
             logger.info(
                 f"\n+--------------------------------------------------------------------------------+\n"
                 f"|  PROCESSING ATHENA GOLD MART: '{clean_base_name}'\n"
-                f"|  * Target Table    : {glue_database}.{target_table_name}\n"
+                f"|  * Target Table    : {glue_database}.{target_table_name} (Physical Iceberg Table)\n"
                 f"|  * Primary Keys    : {pks or 'Auto-Detect'}\n"
-                f"|  * Presentation View: {glue_database}.{view_name}\n"
+                f"|  * Output Model    : Physical Tables Only (No Views Created)\n"
                 f"+--------------------------------------------------------------------------------+"
             )
 
@@ -327,24 +327,12 @@ class GoldLayerManager:
                     params=params
                 )
 
-                # 7. Backward Compatibility: Create / Refresh Athena presentation view
-                cls.create_athena_view(
-                    spark=spark,
-                    glue_database=glue_database,
-                    view_name=view_name,
-                    sql_text=sql_text,
-                    params=params,
-                    athena_client=athena_client,
-                    glue_client=glue_client
-                )
-
                 materialized_dfs[clean_base_name] = df_mart
 
                 duration = (datetime.now(timezone.utc) - mart_start).total_seconds()
                 mart_stats.append({
                     "mart_name": clean_base_name,
                     "target_table": f"{glue_database}.{target_table_name}",
-                    "view_name": f"{glue_database}.{view_name}",
                     "status": "SUCCESS",
                     "rows_served": rows_written,
                     "duration_seconds": round(duration, 2),
@@ -356,7 +344,6 @@ class GoldLayerManager:
                 mart_stats.append({
                     "mart_name": clean_base_name,
                     "target_table": f"{glue_database}.{target_table_name}",
-                    "view_name": f"{glue_database}.{view_name}",
                     "status": "FAILED",
                     "rows_served": 0,
                     "duration_seconds": round(duration, 2),
