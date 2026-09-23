@@ -118,6 +118,9 @@ class GoldConfigLoader:
             return [str(k).strip() for k in pk.split(',') if str(k).strip()]
         return []
 
+    # get_nkey alias for seamless compatibility with Silver layer naming
+    get_nkey = get_primary_key
+
     @classmethod
     def get_target_engines(
         cls,

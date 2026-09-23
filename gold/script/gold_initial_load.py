@@ -11,6 +11,7 @@ Imports historical exports (CSV/Parquet) into Gold tables with flexible schema c
 
 import sys
 import os
+import re
 import logging
 import traceback
 from datetime import datetime, timezone
@@ -49,6 +50,30 @@ class GoldInitialLoader:
     """
 
     @classmethod
+    def sanitize_column_name(cls, col_name: str) -> str:
+        """
+        Cleanses and standardizes column names for SQL, Parquet, Iceberg, and Athena compatibility:
+        - Converts spaces (' ') and periods ('.') into underscores ('_').
+        - Converts hyphens ('-'), slashes ('/'), colons (':'), brackets into underscores ('_').
+        - Strips illegal/non-alphanumeric characters.
+        - Collapses duplicate underscores and converts to lowercase snake_case.
+        """
+        if not col_name:
+            return "unnamed_column"
+        # 1. Replace spaces, dots, hyphens, slashes, brackets, colons, hashes with underscore
+        clean = re.sub(r'[\s\.\-\/\:\(\)\[\]\{\}\<\>#]+', '_', str(col_name).strip())
+        # 2. Strip non-alphanumeric characters except underscore
+        clean = re.sub(r'[^a-zA-Z0-9_]', '', clean)
+        # 3. Collapse multiple underscores and trim leading/trailing underscores
+        clean = re.sub(r'_+', '_', clean).strip('_')
+        # 4. Handle leading digits or empty
+        if not clean:
+            clean = "col"
+        elif clean[0].isdigit():
+            clean = f"col_{clean}"
+        return clean.lower()
+
+    @classmethod
     def reconcile_schema(
         cls,
         df_source: DataFrame,
@@ -56,30 +81,146 @@ class GoldInitialLoader:
     ) -> DataFrame:
         """
         Consolidates source DataFrame columns against target table schema fields:
-        - Columns in target but not in source are added with NULL (cast to target data type).
-        - Columns in source but not in target are preserved for schema evolution.
-        - Returns aligned DataFrame.
+        1. Cleanses and sanitizes all source column names (converting ' ' and '.' to '_').
+        2. Matches source columns against target schema fields (case-insensitively).
+        3. Missing in source -> padded with NULL (cast to target data type).
+        4. Extra in source -> retained for schema evolution.
+        Returns the cleansed and reconciled DataFrame.
         """
+        # 1. Cleanse source column names (spaces -> _, dots -> _, hyphens -> _)
+        for orig_col in list(df_source.columns):
+            clean_col = cls.sanitize_column_name(orig_col)
+            if clean_col != orig_col:
+                logger.info(f"[COLUMN CLEANSING] Renaming '{orig_col}' -> '{clean_col}'")
+                df_source = df_source.withColumnRenamed(orig_col, clean_col)
+
         if not target_schema_fields:
             return df_source
 
-        target_field_map = {f.name: f.dataType for f in target_schema_fields}
-        source_cols = set(df_source.columns)
+        # 2. Build target field map: normalized_name -> (canonical_target_name, dataType)
+        target_field_map = {}
+        for f in target_schema_fields:
+            norm_name = cls.sanitize_column_name(f.name)
+            target_field_map[norm_name] = (f.name, f.dataType)
 
-        # 1. Pad missing columns with NULL cast to target type
-        missing_in_source = [f_name for f_name in target_field_map if f_name not in source_cols]
+        source_cols = {cls.sanitize_column_name(c): c for c in df_source.columns}
+
+        # 3. Pad missing columns with NULL cast to target type
+        missing_in_source = []
+        for norm_name, (target_name, data_type) in target_field_map.items():
+            if norm_name not in source_cols:
+                missing_in_source.append(target_name)
+                df_source = df_source.withColumn(target_name, lit(None).cast(data_type))
+            else:
+                actual_col = source_cols[norm_name]
+                if actual_col != target_name:
+                    df_source = df_source.withColumnRenamed(actual_col, target_name)
+
         if missing_in_source:
             logger.info(f"[SCHEMA CONSOLIDATION] Padding {len(missing_in_source)} missing column(s) with NULL: {missing_in_source}")
-            for col_name in missing_in_source:
-                data_type = target_field_map[col_name]
-                df_source = df_source.withColumn(col_name, lit(None).cast(data_type))
 
-        # 2. Log newly introduced columns present in source
-        extra_in_source = [c for c in source_cols if c not in target_field_map]
+        # 4. Retain extra columns from source for schema evolution
+        extra_in_source = [source_cols[norm_name] for norm_name in source_cols if norm_name not in target_field_map]
         if extra_in_source:
             logger.info(f"[SCHEMA CONSOLIDATION] Preserving {len(extra_in_source)} extra column(s) from CSV for schema evolution: {extra_in_source}")
 
         return df_source
+
+    @classmethod
+    def _probe_target_schema_from_query(
+        cls,
+        spark: SparkSession,
+        source_system: str,
+        table_name: str,
+        params: Dict[str, Any]
+    ) -> Optional[List[Any]]:
+        """
+        Automatically extracts the target schema from the Gold SQL select query:
+        1. Checks custom query parameter override (--QUERY_PATH or --GOLD_SQL).
+        2. Automatically discovers local or S3 SQL files (e.g. gold/query/<source>/<table>.sql).
+        3. Executes a zero-record probe query (SELECT * FROM (<sql>) WHERE 1=0) via Spark SQL.
+        4. Extracts schema fields and data types in milliseconds without reading data.
+        """
+        # 1. Direct SQL override via params
+        sql_text = params.get('GOLD_SQL') or params.get('QUERY_SQL')
+
+        # 2. Query file path override
+        query_path = params.get('QUERY_PATH')
+        if not sql_text and query_path:
+            if query_path.startswith('s3://'):
+                try:
+                    import boto3
+                    from urllib.parse import urlparse
+                    parsed = urlparse(query_path)
+                    s3 = boto3.client('s3')
+                    resp = s3.get_object(Bucket=parsed.netloc, Key=parsed.path.lstrip('/'))
+                    sql_text = resp['Body'].read().decode('utf-8')
+                    logger.info(f"[QUERY DISCOVERY] Loaded Gold query from '{query_path}'")
+                except Exception as s3_err:
+                    logger.warning(f"Could not load Gold query from S3 '{query_path}': {s3_err}")
+            elif os.path.exists(query_path):
+                with open(query_path, 'r', encoding='utf-8') as f:
+                    sql_text = f.read()
+                logger.info(f"[QUERY DISCOVERY] Loaded Gold query from local path '{query_path}'")
+
+        # 3. Automatic Discovery in local repository
+        if not sql_text:
+            candidate_local_paths = [
+                os.path.join(script_dir, "..", "query", source_system, f"{table_name}.sql"),
+                os.path.join(script_dir, "..", "query", source_system, f"v_{table_name}.sql"),
+                os.path.join(script_dir, "..", "query", f"{table_name}.sql"),
+                os.path.join("gold", "query", source_system, f"{table_name}.sql"),
+                os.path.join("gold", "query", source_system, f"v_{table_name}.sql"),
+            ]
+            for c_path in candidate_local_paths:
+                norm_c = os.path.abspath(c_path)
+                if os.path.exists(norm_c):
+                    try:
+                        with open(norm_c, 'r', encoding='utf-8') as f:
+                            sql_text = f.read()
+                        logger.info(f"[QUERY AUTO-DISCOVERY] Found local Gold query file at '{norm_c}'")
+                        break
+                    except Exception as f_err:
+                        logger.debug(f"Error reading candidate query path '{norm_c}': {f_err}")
+
+        # 4. S3 discovery under default convention: s3://<bucket>/gold/query/<source>/<table>.sql
+        if not sql_text and params.get('DATA_LAKE_BUCKET'):
+            bucket_name = params.get('DATA_LAKE_BUCKET')
+            for q_name in [f"{table_name}.sql", f"v_{table_name}.sql"]:
+                s3_key = f"gold/query/{source_system}/{q_name}"
+                try:
+                    import boto3
+                    s3 = boto3.client('s3')
+                    resp = s3.get_object(Bucket=bucket_name, Key=s3_key)
+                    sql_text = resp['Body'].read().decode('utf-8')
+                    logger.info(f"[QUERY AUTO-DISCOVERY] Found S3 Gold query file at 's3://{bucket_name}/{s3_key}'")
+                    break
+                except Exception:
+                    pass
+
+        if not sql_text:
+            logger.info(f"[QUERY AUTO-DISCOVERY] No query found for '{source_system}.{table_name}'. Initial load will use input file schema.")
+            return None
+
+        # Clean SQL comments and annotations
+        clean_sql = re.sub(r'--[^\r\n]*', '', sql_text).strip().rstrip(';')
+        if not clean_sql:
+            return None
+
+        # Execute ultra-fast zero-data probe query
+        probe_sql = f"SELECT * FROM (\n{clean_sql}\n) AS probe_q WHERE 1=0"
+        logger.info(f"[QUERY SCHEMA PROBE] Probing target schema from Gold query via zero-record probe (WHERE 1=0)...")
+        try:
+            probe_df = spark.sql(probe_sql)
+            target_fields = probe_df.schema.fields
+            logger.info(f"[QUERY SCHEMA PROBE] Successfully probed schema: found {len(target_fields)} column(s) from Gold query.")
+            return target_fields
+        except Exception as probe_err:
+            logger.warning(
+                f"[QUERY SCHEMA PROBE NOTE] Spark SQL zero-record probe note: {probe_err}. "
+                f"(Underlying Silver tables may not be registered in session; proceeding with input file schema)."
+            )
+            return None
 
     @classmethod
     def run_initial_load(
@@ -123,12 +264,14 @@ class GoldInitialLoader:
         else:
             target_table_name = f"gold_{source_system}_{table_name}"
 
-        # Resolve Primary Keys
+        # Resolve Natural Keys (nkey) / Primary Keys
         pks = []
-        if params.get('PRIMARY_KEY'):
+        if params.get('NKEY'):
+            pks = [k.strip() for k in str(params['NKEY']).split(',') if k.strip()]
+        elif params.get('PRIMARY_KEY'):
             pks = [k.strip() for k in str(params['PRIMARY_KEY']).split(',') if k.strip()]
         elif GoldConfigLoader:
-            pks = GoldConfigLoader.get_primary_key(source_system, table_name, gold_cfg)
+            pks = GoldConfigLoader.get_nkey(source_system, table_name, gold_cfg)
 
         full_table = f"`{glue_database}`.`{target_table_name}`"
 
@@ -139,7 +282,7 @@ class GoldInitialLoader:
             f"|  * Source System     : {source_system.upper()}\n"
             f"|  * Table Name        : {table_name}\n"
             f"|  * Target Table      : {full_table}\n"
-            f"|  * Primary Keys      : {pks or 'None (Overwrite)'}\n"
+            f"|  * Natural Keys      : {pks or 'None (Overwrite)'}\n"
             f"|  * Input File Path   : {csv_path}\n"
             f"|  * Glue Database     : {glue_database}\n"
             f"|  * Execution Time    : {start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
@@ -160,12 +303,6 @@ class GoldInitialLoader:
                 .option("inferSchema", "false") \
                 .csv(csv_path)
 
-        # Clean column names (strip whitespace)
-        for col_name in df_raw.columns:
-            cleaned_col = col_name.strip()
-            if cleaned_col != col_name:
-                df_raw = df_raw.withColumnRenamed(col_name, cleaned_col)
-
         raw_count = df_raw.count()
         logger.info(f"Loaded {raw_count:,} records from input file.")
 
@@ -179,7 +316,16 @@ class GoldInitialLoader:
             logger.info(f"Found existing Gold table '{full_table}' with {len(target_fields)} column(s).")
         except Exception:
             table_exists = False
-            logger.info(f"Gold table '{full_table}' does not exist yet. Initial load will create it.")
+            logger.info(f"Gold table '{full_table}' not found in catalog. Attempting automatic Gold query extraction...")
+
+        # If table not yet in catalog, probe target schema from Gold SQL query
+        if not target_fields:
+            target_fields = cls._probe_target_schema_from_query(
+                spark=spark,
+                source_system=source_system,
+                table_name=table_name,
+                params=params
+            )
 
         # 3. Reconcile Schemas
         df_consolidated = cls.reconcile_schema(df_raw, target_fields)

@@ -397,15 +397,6 @@ class GoldLayerManager:
 
         return mart_stats
 
-        # Overall Gold Execution Summary
-        cls._log_final_gold_summary(mart_stats, execution_start)
-
-        failed_marts = [m for m in mart_stats if m.get('status') == 'FAILED']
-        if failed_marts:
-            raise RuntimeError(f"Gold Serving Layer completed with failures in {len(failed_marts)} mart(s).")
-
-        return mart_stats
-
     # --------------------------------------------------------------------------
     # Mandatory Athena View Creation
     # --------------------------------------------------------------------------
@@ -709,7 +700,8 @@ class GoldLayerManager:
                         staging_table=staging_table,
                         old_backup_table=old_backup_table,
                         view_name=view_name,
-                        create_view=False
+                        create_view=False,
+                        primary_keys=pks
                     )
 
                 mart_duration = (datetime.now(timezone.utc) - mart_start).total_seconds()
@@ -1213,7 +1205,8 @@ class GoldLayerManager:
         staging_table: str,
         old_backup_table: str,
         view_name: Optional[str] = None,
-        create_view: bool = False
+        create_view: bool = False,
+        primary_keys: Optional[List[str]] = None
     ) -> None:
         """
         Executes zero-downtime RENAME TABLE atomic swap in MySQL.
@@ -1223,6 +1216,7 @@ class GoldLayerManager:
           - Drops old backup table and any leftover staging tables.
           - View creation in MySQL is disabled by default because database users lack CREATE VIEW privileges;
             Power BI connects directly to the physical Gold table (gold_tbl_<mart>).
+          - Ensures performance index on natural key (nkey) is created on target table.
         """
         # Guardrail: validate naming conventions
         cls._validate_gold_table_name(target_table)
@@ -1277,6 +1271,10 @@ class GoldLayerManager:
             logger.info(f"[DDL AUDIT - CLEANUP] Dropping leftover staging table '{schema_name}.{staging_table}'...")
             cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{staging_table}`")
 
+        # Ensure performance index on natural key (nkey) for query performance boost
+        if primary_keys:
+            cls._ensure_mysql_index(jdbc_info, schema_name, target_table, primary_keys)
+
         # Optional Presentation View Creation (Skipped by default for MySQL shared DB)
         if create_view and view_name:
             cls._validate_view_name(view_name)
@@ -1310,6 +1308,42 @@ class GoldLayerManager:
             )
 
     @classmethod
+    def _ensure_mysql_index(
+        cls,
+        jdbc_info: Dict[str, Any],
+        schema_name: str,
+        target_table: str,
+        nkeys: Optional[List[str]]
+    ) -> None:
+        """
+        Ensures a performance index exists on natural keys (nkey) in Aurora MySQL.
+        Significantly boosts query performance for downstream BI (Power BI, Tableau) and upsert operations.
+        Handles duplicate index, nullable columns, and existing index gracefully.
+        """
+        if not nkeys:
+            return
+        cls._validate_gold_table_name(target_table)
+        idx_cols = ", ".join([f"`{k}`" for k in nkeys])
+        clean_tbl = target_table.replace("gold_tbl_", "").replace("gold_", "")
+        # Short unique index name within MySQL 64-char identifier limit
+        idx_name = f"idx_nkey_{clean_tbl[:20]}_{'_'.join(nkeys)[:20]}"
+        try:
+            check_sql = f"SHOW INDEX FROM `{schema_name}`.`{target_table}` WHERE Key_name = %s"
+            existing = cls._execute_sql_query(jdbc_info, check_sql, (idx_name,))
+            if not existing:
+                ddl = f"ALTER TABLE `{schema_name}`.`{target_table}` ADD INDEX `{idx_name}` ({idx_cols})"
+                cls._execute_ddl(jdbc_info, ddl)
+                logger.info(f"[DDL AUDIT - PERFORMANCE INDEX] Created query performance index `{idx_name}` on ({idx_cols}) in `{schema_name}`.`{target_table}`.")
+            else:
+                logger.debug(f"[DDL AUDIT - INDEX] Performance index `{idx_name}` already exists on `{schema_name}`.`{target_table}`.")
+        except Exception as e:
+            err_msg = str(e)
+            if "Duplicate key name" in err_msg or "1061" in err_msg:
+                logger.debug(f"[DDL AUDIT - INDEX] Index `{idx_name}` already exists on `{schema_name}`.`{target_table}`.")
+            else:
+                logger.warning(f"[DDL AUDIT - INDEX NOTE] Note on index creation for `{idx_name}` on `{schema_name}`.`{target_table}`: {e}")
+
+    @classmethod
     def _upsert_mysql_table(
         cls,
         jdbc_info: Dict[str, Any],
@@ -1321,7 +1355,8 @@ class GoldLayerManager:
     ) -> None:
         """
         Executes an idempotent UPSERT into target MySQL table from staging table.
-        Prevents duplicate row inserts by updating existing records based on primary key.
+        Prevents duplicate row inserts by updating existing records based on natural key (nkey).
+        Creates / ensures a performance index on nkeys to maximize upsert and query throughput.
         """
         cls._validate_gold_table_name(target_table)
         cls._validate_gold_table_name(staging_table)
@@ -1338,7 +1373,12 @@ class GoldLayerManager:
                     logger.info(f"[DDL AUDIT - PRIMARY KEY] Added PRIMARY KEY ({pk_clause}) to `{schema_name}`.`{target_table}`")
                 except Exception as pk_err:
                     logger.warning(f"Could not add primary key constraint on MySQL table: {pk_err}")
+                cls._ensure_mysql_index(jdbc_info, schema_name, target_table, primary_keys)
             return
+
+        # Ensure performance index exists on existing target table
+        if primary_keys:
+            cls._ensure_mysql_index(jdbc_info, schema_name, target_table, primary_keys)
 
         col_names = [f"`{c}`" for c in columns]
         update_clauses = [f"`{c}` = VALUES(`{c}`)" for c in columns if c not in primary_keys]

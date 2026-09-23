@@ -154,6 +154,112 @@ class TestGoldInitialLoader(unittest.TestCase):
         self.assertIn("bot_response", calls)
         self.assertIn("sentiment", calls)
 
+    def test_sanitize_column_name_spaces_and_dots(self):
+        """Verify spaces, dots, hyphens, and illegal characters are cleansed into valid snake_case."""
+        self.assertEqual(GoldInitialLoader.sanitize_column_name("Customer Name"), "customer_name")
+        self.assertEqual(GoldInitialLoader.sanitize_column_name("caller_id.name"), "caller_id_name")
+        self.assertEqual(GoldInitialLoader.sanitize_column_name("user-id"), "user_id")
+        self.assertEqual(GoldInitialLoader.sanitize_column_name("incident.category #1"), "incident_category_1")
+        self.assertEqual(GoldInitialLoader.sanitize_column_name("  nested.field.name  "), "nested_field_name")
+        self.assertEqual(GoldInitialLoader.sanitize_column_name("123_number"), "col_123_number")
+        self.assertEqual(GoldInitialLoader.sanitize_column_name(""), "unnamed_column")
+
+    def test_reconcile_schema_cleanses_spaces_and_dots_and_pads_missing(self):
+        """Verify CSV column cleansing, target schema alignment, and evolution retention."""
+        mock_df = MagicMock()
+        mock_df.columns = ["Customer Name", "caller_id.name", "Extra Notes"]
+        mock_df.withColumnRenamed.return_value = mock_df
+        mock_df.withColumn.return_value = mock_df
+
+        target_field_cust = MagicMock()
+        target_field_cust.name = "customer_name"
+        target_field_cust.dataType = "string"
+
+        target_field_caller = MagicMock()
+        target_field_caller.name = "caller_id_name"
+        target_field_caller.dataType = "string"
+
+        target_field_kpi = MagicMock()
+        target_field_kpi.name = "sentiment_score"
+        target_field_kpi.dataType = "double"
+
+        target_schema = [target_field_cust, target_field_caller, target_field_kpi]
+
+        reconciled = GoldInitialLoader.reconcile_schema(mock_df, target_schema)
+
+        # withColumnRenamed should be called to cleanse spaces and dots
+        renamed_calls = [c[0] for c in mock_df.withColumnRenamed.call_args_list]
+        self.assertTrue(any(c[0] == "Customer Name" and c[1] == "customer_name" for c in renamed_calls))
+        self.assertTrue(any(c[0] == "caller_id.name" and c[1] == "caller_id_name" for c in renamed_calls))
+
+        # withColumn should be called to pad missing 'sentiment_score'
+        added_calls = [c[0][0] for c in mock_df.withColumn.call_args_list]
+        self.assertIn("sentiment_score", added_calls)
+
+
+class TestAuroraMySQLIndexing(unittest.TestCase):
+    """Tests for Aurora MySQL performance index creation based on nkey."""
+
+    def test_ensure_mysql_index_creation(self):
+        jdbc_info = {"host": "localhost", "port": 3306, "user": "uax_user", "password": "pwd"}
+        with patch.object(GoldLayerManager, "_execute_sql_query", return_value=[]), \
+             patch.object(GoldLayerManager, "_execute_ddl") as mock_ddl:
+
+            GoldLayerManager._ensure_mysql_index(
+                jdbc_info=jdbc_info,
+                schema_name="enterprise_reporting",
+                target_table="gold_genesys_conversations",
+                nkeys=["conversation_id"]
+            )
+
+            mock_ddl.assert_called_once()
+            called_ddl = mock_ddl.call_args[0][1]
+            self.assertIn("ALTER TABLE `enterprise_reporting`.`gold_genesys_conversations` ADD INDEX", called_ddl)
+            self.assertIn("`conversation_id`", called_ddl)
+
+    def test_ensure_mysql_index_skips_when_already_exists(self):
+        jdbc_info = {"host": "localhost", "port": 3306, "user": "uax_user", "password": "pwd"}
+        with patch.object(GoldLayerManager, "_execute_sql_query", return_value=[{"Key_name": "idx_nkey_conversations"}]), \
+             patch.object(GoldLayerManager, "_execute_ddl") as mock_ddl:
+
+            GoldLayerManager._ensure_mysql_index(
+                jdbc_info=jdbc_info,
+                schema_name="enterprise_reporting",
+                target_table="gold_genesys_conversations",
+                nkeys=["conversation_id"]
+            )
+
+            # DDL should not be called since index already exists
+            mock_ddl.assert_not_called()
+
+
+class TestGoldQuerySchemaProbe(unittest.TestCase):
+    """Tests for zero-record schema extraction via SELECT * FROM (<query>) WHERE 1=0."""
+
+    def test_probe_target_schema_from_sql_text(self):
+        mock_spark = MagicMock()
+        mock_probe_df = MagicMock()
+        mock_field = MagicMock()
+        mock_field.name = "conversation_id"
+        mock_probe_df.schema.fields = [mock_field]
+        mock_spark.sql.return_value = mock_probe_df
+
+        params = {
+            "GOLD_SQL": "SELECT conversation_id, user_id FROM tbl_conversations"
+        }
+        fields = GoldInitialLoader._probe_target_schema_from_query(
+            spark=mock_spark,
+            source_system="genesys",
+            table_name="conversations",
+            params=params
+        )
+
+        self.assertIsNotNone(fields)
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].name, "conversation_id")
+        called_sql = mock_spark.sql.call_args[0][0]
+        self.assertIn("WHERE 1=0", called_sql)
+
 
 if __name__ == "__main__":
     unittest.main()

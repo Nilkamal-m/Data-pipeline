@@ -26,7 +26,7 @@
       ],
       "tables": {
         "conversations": {
-          "primary_key": [
+          "nkey": [
             "conversation_id"
           ],
           "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
@@ -50,7 +50,7 @@
           }
         },
         "users": {
-          "primary_key": [
+          "nkey": [
             "user_id"
           ],
           "aurora": {
@@ -59,7 +59,7 @@
           }
         },
         "queues": {
-          "primary_key": [
+          "nkey": [
             "queue_id"
           ],
           "aurora": {
@@ -76,7 +76,7 @@
       ],
       "tables": {
         "interactions": {
-          "primary_key": [
+          "nkey": [
             "interaction_id"
           ],
           "aurora": {
@@ -85,7 +85,7 @@
           }
         },
         "conversations": {
-          "primary_key": [
+          "nkey": [
             "conversation_id"
           ],
           "aurora": {
@@ -94,7 +94,7 @@
           }
         },
         "feedbacks": {
-          "primary_key": [
+          "nkey": [
             "feedback_id"
           ],
           "aurora": {
@@ -111,7 +111,7 @@
       ],
       "tables": {
         "incident_kpi": {
-          "primary_key": [
+          "nkey": [
             "priority_level",
             "incident_state",
             "incident_category"
