@@ -357,7 +357,9 @@ class GoldInitialLoader:
 
         # Resolve Natural Keys (nkey) / Primary Keys
         pks = []
-        if GoldConfigLoader:
+        if GoldLayerManager:
+            pks = GoldLayerManager._resolve_natural_keys(source_system, table_name, gold_cfg, params)
+        elif GoldConfigLoader:
             pks = GoldConfigLoader.get_nkey(source_system, table_name, gold_cfg)
         if not pks and params.get('NKEY'):
             pks = [k.strip() for k in str(params['NKEY']).split(',') if k.strip()]

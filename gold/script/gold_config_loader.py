@@ -24,23 +24,6 @@ class GoldConfigLoader:
     _cached_s3_path: Optional[str] = None
     _cached_s3_client: Optional[Any] = None
 
-    KNOWN_ENTITY_KEYS: Dict[str, Dict[str, List[str]]] = {
-        "moveworks": {
-            "interactions": ["interaction_id"],
-            "conversations": ["conversation_id"],
-            "feedbacks": ["feedback_id"]
-        },
-        "genesys": {
-            "conversations": ["conversation_id"],
-            "users": ["user_id"],
-            "queues": ["queue_id"]
-        },
-        "servicenow": {
-            "incident": ["sys_id"],
-            "incident_kpi": ["priority_level", "incident_state", "incident_category"]
-        }
-    }
-
     @classmethod
     def _clean_table_name(cls, table_name: str, source_system: str) -> str:
         clean = (table_name or '').strip().lower()
@@ -97,29 +80,77 @@ class GoldConfigLoader:
         cls,
         config_s3_path: Optional[str] = None,
         s3_client: Optional[Any] = None,
-        env: Optional[str] = None
+        env: Optional[str] = None,
+        bucket_hint: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Loads the Gold configuration JSON file from S3 or local disk.
+        Loads the Gold configuration JSON file from S3, CLI arguments, or local disk.
         Dynamically interpolates all {env} placeholders according to effective_env.
         Cached in memory per environment after first load.
         """
+        import sys
+        import zipfile
+
         if cls._config_cache is None or not isinstance(cls._config_cache, dict):
             cls._config_cache = {}
         effective_env = (env or os.environ.get('ENV') or os.environ.get('ENVIRONMENT') or 'dev').strip().lower()
-        if effective_env in cls._config_cache:
+        if effective_env in cls._config_cache and cls._config_cache[effective_env]:
             return cls._config_cache[effective_env]
 
         raw_config = None
 
-        if not config_s3_path:
-            import sys
+        # Tier 0: Direct JSON string passed via CLI parameter or environment variable
+        for i, a in enumerate(sys.argv):
+            for flag in ('--GOLD_CONFIG_JSON', '--gold_config_json', '--GOLD_CONFIG', '--gold_config'):
+                if a == flag and i + 1 < len(sys.argv):
+                    val = sys.argv[i + 1].strip()
+                    if val.startswith('{') and val.endswith('}'):
+                        try:
+                            raw_config = json.loads(val)
+                            logger.info("[GOLD CONFIG] Loaded Gold configuration directly from CLI raw JSON argument.")
+                            break
+                        except Exception:
+                            pass
+                elif a.startswith(f"{flag}="):
+                    val = a.split('=', 1)[1].strip()
+                    if val.startswith('{') and val.endswith('}'):
+                        try:
+                            raw_config = json.loads(val)
+                            logger.info("[GOLD CONFIG] Loaded Gold configuration directly from CLI raw JSON argument.")
+                            break
+                        except Exception:
+                            pass
+            if raw_config is not None:
+                break
+
+        if raw_config is None:
+            raw_env_json = os.environ.get('GOLD_CONFIG_JSON') or os.environ.get('GOLD_CONFIG')
+            if raw_env_json and raw_env_json.strip().startswith('{') and raw_env_json.strip().endswith('}'):
+                try:
+                    raw_config = json.loads(raw_env_json.strip())
+                    logger.info("[GOLD CONFIG] Loaded Gold configuration from GOLD_CONFIG_JSON environment variable.")
+                except Exception:
+                    pass
+
+        # Tier 1: Explicit CLI / sys.argv path resolution
+        if raw_config is None and not config_s3_path:
             for i, a in enumerate(sys.argv):
-                if a in ('--GOLD_CONFIG_S3_PATH', '--gold_config_s3_path') and i + 1 < len(sys.argv):
-                    config_s3_path = sys.argv[i + 1].strip()
-                    break
-                elif a.startswith('--GOLD_CONFIG_S3_PATH=') or a.startswith('--gold_config_s3_path='):
-                    config_s3_path = a.split('=', 1)[1].strip()
+                for flag in (
+                    '--GOLD_CONFIG_S3_PATH', '--gold_config_s3_path', '--gold-config-s3-path',
+                    '--GOLD_CONFIG_PATH', '--gold_config_path', '--gold-config-path',
+                    '--GOLD_CONFIG', '--gold_config', '--CONFIG_S3_PATH', '--config_s3_path'
+                ):
+                    if a == flag and i + 1 < len(sys.argv):
+                        val = sys.argv[i + 1].strip()
+                        if not (val.startswith('{') and val.endswith('}')):
+                            config_s3_path = val
+                            break
+                    elif a.startswith(f"{flag}="):
+                        val = a.split('=', 1)[1].strip()
+                        if not (val.startswith('{') and val.endswith('}')):
+                            config_s3_path = val
+                            break
+                if config_s3_path:
                     break
 
         if config_s3_path and str(config_s3_path).strip():
@@ -130,60 +161,139 @@ class GoldConfigLoader:
         active_s3_path = config_s3_path or cls._cached_s3_path
         active_s3_client = s3_client or cls._cached_s3_client
 
-        # 1. Try S3 path if provided
-        if active_s3_path and active_s3_path.startswith("s3://"):
-            if not active_s3_client:
-                try:
-                    import boto3
-                    active_s3_client = boto3.client('s3')
-                    cls._cached_s3_client = active_s3_client
-                except Exception as err:
-                    logger.warning(f"Failed to auto-initialize S3 client in GoldConfigLoader: {err}")
-            if active_s3_client:
-                try:
-                    path_parts = active_s3_path.replace("s3://", "").split("/", 1)
-                    bucket_name, object_key = path_parts[0], path_parts[1]
-                    logger.info(f"Loading Gold configuration from S3: '{active_s3_path}'")
-                    response = active_s3_client.get_object(Bucket=bucket_name, Key=object_key)
-                    content = response['Body'].read().decode('utf-8')
-                    raw_config = json.loads(content)
-                except Exception as err:
-                    logger.warning(f"Failed to load Gold config from S3 path '{active_s3_path}': {err}. Falling back to local search.")
+        if (not active_s3_client) and (active_s3_path and active_s3_path.startswith("s3://") or bucket_hint):
+            try:
+                import boto3
+                active_s3_client = boto3.client('s3')
+                cls._cached_s3_client = active_s3_client
+            except Exception as err:
+                logger.warning(f"Could not auto-initialize S3 client in GoldConfigLoader: {err}")
 
-        # 2. Local search candidates (handles local repo, AWS Glue /tmp, and relative execution paths)
-        if raw_config is None:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            possible_paths = [
-                os.path.join(current_dir, "config", "gold_config.json"),
-                os.path.join(os.getcwd(), "gold_config.json"),
-                os.path.join(os.getcwd(), "gold", "script", "config", "gold_config.json"),
-                "gold_config.json",
+        # Tier 2: Try explicit S3 path if provided
+        if raw_config is None and active_s3_path and active_s3_path.startswith("s3://") and active_s3_client:
+            try:
+                path_parts = active_s3_path.replace("s3://", "").split("/", 1)
+                bucket_name, object_key = path_parts[0], path_parts[1]
+                logger.info(f"[GOLD CONFIG] Attempting to load Gold configuration from explicit S3 path: '{active_s3_path}'")
+                response = active_s3_client.get_object(Bucket=bucket_name, Key=object_key)
+                content = response['Body'].read().decode('utf-8')
+                raw_config = json.loads(content)
+                logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from explicit S3 path: '{active_s3_path}'")
+            except Exception as err:
+                logger.warning(f"[GOLD CONFIG] Could not load from '{active_s3_path}': {err}. Probing alternative S3 locations...")
+
+        # Tier 3: Probe candidate S3 paths across buckets
+        if raw_config is None and active_s3_client:
+            candidate_buckets = []
+            if active_s3_path and active_s3_path.startswith("s3://"):
+                candidate_buckets.append(active_s3_path.replace("s3://", "").split("/", 1)[0])
+            if bucket_hint:
+                clean_b = str(bucket_hint).replace('{env}', effective_env).replace('{ENV}', effective_env.upper()).strip()
+                if clean_b and clean_b not in candidate_buckets:
+                    candidate_buckets.append(clean_b)
+            for b_candidate in [
+                os.environ.get('DATA_LAKE_BUCKET'),
+                os.environ.get('GOLD_BUCKET'),
+                os.environ.get('SILVER_BUCKET'),
+                f"uax-datalake-{effective_env}-bucket",
+                f"uax-datalake-dev-bucket"
+            ]:
+                if b_candidate:
+                    clean_b = str(b_candidate).replace('{env}', effective_env).replace('{ENV}', effective_env.upper()).strip()
+                    if clean_b and clean_b not in candidate_buckets:
+                        candidate_buckets.append(clean_b)
+
+            relative_keys = [
                 "gold/script/config/gold_config.json",
+                "gold/config/gold_config.json",
                 "scripts/gold/config/gold_config.json",
-                "/tmp/gold_config.json"
+                "scripts/config/gold_config.json",
+                "silver/script/config/gold_config.json",
+                "silver/config/gold_config.json",
+                "config/gold_config.json",
+                "gold_config.json"
             ]
 
-            for path in possible_paths:
-                if os.path.exists(path):
-                    logger.info(f"Loading Gold configuration from local file: '{path}'")
-                    with open(path, "r", encoding="utf-8") as f:
-                        raw_config = json.load(f)
+            for b in candidate_buckets:
+                if raw_config is not None:
+                    break
+                for k in relative_keys:
+                    candidate_s3_url = f"s3://{b}/{k}"
+                    if candidate_s3_url == active_s3_path:
+                        continue
+                    try:
+                        resp = active_s3_client.get_object(Bucket=b, Key=k)
+                        raw_config = json.loads(resp['Body'].read().decode('utf-8'))
+                        logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from probed S3 path: '{candidate_s3_url}'")
                         break
+                    except Exception:
+                        pass
+
+        # Tier 4: Local filesystem search candidates (handles local repo, Glue /tmp, working directory, and sys.path)
+        if raw_config is None:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            possible_local_paths = [
+                os.path.join(current_dir, "config", "gold_config.json"),
+                os.path.join(current_dir, "gold_config.json"),
+                os.path.join(os.getcwd(), "gold_config.json"),
+                os.path.join(os.getcwd(), "config", "gold_config.json"),
+                os.path.join(os.getcwd(), "gold", "script", "config", "gold_config.json"),
+                "/tmp/gold_config.json",
+                "/tmp/config/gold_config.json",
+                "/tmp/gold/script/config/gold_config.json",
+                "gold_config.json",
+                "gold/script/config/gold_config.json",
+                "scripts/gold/config/gold_config.json"
+            ]
+
+            for path in possible_local_paths:
+                if os.path.exists(path) and os.path.isfile(path):
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            raw_config = json.load(f)
+                            logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from local file: '{path}'")
+                            break
+                    except Exception as err:
+                        logger.warning(f"Error reading local config file '{path}': {err}")
+
+        # Tier 5: Scan sys.path archives (.zip/.egg)
+        if raw_config is None:
+            for p in sys.path:
+                if p.endswith(('.zip', '.egg')) and os.path.exists(p):
+                    try:
+                        with zipfile.ZipFile(p, 'r') as zf:
+                            for zinfo in zf.namelist():
+                                if zinfo.endswith("gold_config.json"):
+                                    with zf.open(zinfo) as f:
+                                        raw_config = json.load(f)
+                                        logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from archive '{p}!/{zinfo}'")
+                                        break
+                    except Exception:
+                        pass
+                if raw_config is not None:
+                    break
 
         if raw_config is None:
-            logger.warning("Gold configuration file 'gold_config.json' not found on S3 or locally.")
+            logger.warning("[GOLD CONFIG] Gold configuration file 'gold_config.json' could not be loaded from S3, CLI, or local paths.")
             raw_config = {}
 
         interpolated = cls.interpolate_env(raw_config, effective_env)
         cls._config_cache[effective_env] = interpolated
         cls._latest_config = interpolated
+
+        sources_detected = list(
+            (interpolated.get("source_systems") or interpolated.get("sources") or {}).keys()
+        ) if isinstance(interpolated, dict) else []
+        if sources_detected:
+            logger.info(f"[GOLD CONFIG] Configuration ready for environment '{effective_env}'. Sources: {sources_detected}")
+
         return interpolated
 
     @classmethod
     def get_defaults(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> Dict[str, Any]:
         """Retrieves pipeline defaults block."""
         config = config_dict if config_dict is not None else ((cls._config_cache.get(env) if env else cls._latest_config) or cls.load_config(env=env))
-        return config.get("pipeline_defaults", {})
+        return config.get("pipeline_defaults", {}) if isinstance(config, dict) else {}
 
     @classmethod
     def get_glue_database(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> str:
@@ -205,8 +315,17 @@ class GoldConfigLoader:
     def get_source_config(cls, source_system: str, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> Dict[str, Any]:
         """Retrieves configuration for a specific source system in Gold layer."""
         config = config_dict if config_dict is not None else ((cls._config_cache.get(env) if env else cls._latest_config) or cls.load_config(env=env))
-        sources = config.get("source_systems", {})
-        return sources.get(source_system.strip().lower(), {})
+        if not isinstance(config, dict):
+            return {}
+        sources = config.get("source_systems") or config.get("sources") or {}
+        clean_src = (source_system or '').strip().lower()
+        if isinstance(sources, dict):
+            for k, v in sources.items():
+                if k.strip().lower() == clean_src and isinstance(v, dict):
+                    return v
+        if clean_src in config and isinstance(config[clean_src], dict):
+            return config[clean_src]
+        return {}
 
     @classmethod
     def get_table_config(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -215,48 +334,46 @@ class GoldConfigLoader:
         Supports lookup by clean table name, 'v_<name>', or 'gold_<source>_<name>'.
         """
         source_cfg = cls.get_source_config(source_system, config_dict)
-        table_configs = source_cfg.get("tables", {})
-        clean = table_name.strip().lower()
+        if not isinstance(source_cfg, dict):
+            return {}
+        table_configs = source_cfg.get("tables") if isinstance(source_cfg.get("tables"), dict) else source_cfg
+        if not isinstance(table_configs, dict):
+            return {}
 
+        clean = (table_name or '').strip().lower()
         base = clean
         # Strip known prefixes
-        for prefix in [f"gold_{source_system}_", "gold_tbl_", "gold_", "v_"]:
+        for prefix in [f"gold_{source_system.lower()}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]:
             if base.startswith(prefix):
                 base = base[len(prefix):]
                 break
 
         candidates = [clean, base, base.replace('-', '_'), base.replace('_', '-')]
         for cand in candidates:
-            if cand in table_configs:
-                return dict(table_configs[cand])
+            for tbl_k, tbl_v in table_configs.items():
+                if tbl_k.strip().lower() == cand and isinstance(tbl_v, dict):
+                    return dict(tbl_v)
 
         return {}
 
     @classmethod
     def get_primary_key(cls, source_system: str, table_name: str, config_dict: Optional[Dict[str, Any]] = None) -> List[str]:
         """
-        Retrieves primary key list for table upsert / merge.
+        Retrieves primary key / natural key list for table upsert / merge from gold_config.json.
         Returns empty list if not specified.
         """
         tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
-        pk = tbl_cfg.get("primary_key") or tbl_cfg.get("natural_key") or tbl_cfg.get("nkey")
-        if isinstance(pk, list) and pk:
-            return [str(k).strip() for k in pk if str(k).strip()]
-        elif isinstance(pk, str) and pk.strip():
-            return [str(k).strip() for k in pk.split(',') if str(k).strip()]
-
-        # Built-in platform fallback registry for standard entity natural keys
-        clean_src = (source_system or '').strip().lower()
-        clean_tbl = cls._clean_table_name(table_name, source_system)
-        if clean_src in cls.KNOWN_ENTITY_KEYS and clean_tbl in cls.KNOWN_ENTITY_KEYS[clean_src]:
-            fallback_keys = cls.KNOWN_ENTITY_KEYS[clean_src][clean_tbl]
-            logger.info(
-                f"[NATURAL KEY RESOLUTION] Resolved natural key for '{source_system}.{table_name}' to "
-                f"{fallback_keys} via platform schema registry."
-            )
-            return list(fallback_keys)
+        for key_name in ("nkey", "primary_key", "natural_key", "pk", "natural_keys", "primary_keys"):
+            pk = tbl_cfg.get(key_name)
+            if isinstance(pk, list) and pk:
+                return [str(k).strip() for k in pk if str(k).strip()]
+            elif isinstance(pk, str) and pk.strip():
+                return [str(k).strip() for k in pk.split(',') if str(k).strip()]
 
         return []
+
+    # get_nkey alias for seamless compatibility with Silver layer naming
+    get_nkey = get_primary_key
 
     # get_nkey alias for seamless compatibility with Silver layer naming
     get_nkey = get_primary_key

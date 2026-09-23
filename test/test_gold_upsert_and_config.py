@@ -1128,6 +1128,76 @@ class TestGoldInitialLoadIntegration(unittest.TestCase):
         mock_df.dropDuplicates.assert_called_once_with(subset=["interaction_id"])
         self.assertEqual(result, "deduped_df")
 
+    def test_resolve_natural_keys_strictly_from_config(self):
+        """Natural keys must come from gold_config.json, with zero hardcoding."""
+        sample_cfg = {
+            "source_systems": {
+                "moveworks": {
+                    "tables": {
+                        "interactions": {"nkey": ["interaction_id"]},
+                        "conversations": {"primary_key": ["conversation_id"]}
+                    }
+                }
+            }
+        }
+        # 1. Matches configured table
+        pks = GoldLayerManager._resolve_natural_keys("moveworks", "interactions", sample_cfg)
+        self.assertEqual(pks, ["interaction_id"])
+
+        # 2. Matches prefixed name (v_interactions)
+        pks_v = GoldLayerManager._resolve_natural_keys("moveworks", "v_interactions", sample_cfg)
+        self.assertEqual(pks_v, ["interaction_id"])
+
+        # 3. Unconfigured table returns [] (no hardcoded fallback)
+        pks_unknown = GoldLayerManager._resolve_natural_keys("moveworks", "unknown_tbl", sample_cfg)
+        self.assertEqual(pks_unknown, [])
+
+        # 4. CLI parameter override takes effect if not in config
+        pks_cli = GoldLayerManager._resolve_natural_keys("moveworks", "unknown_tbl", sample_cfg, params={"NKEY": "custom_id"})
+        self.assertEqual(pks_cli, ["custom_id"])
+
+    def test_load_gold_config_from_s3_path_containing_raw_json(self):
+        """GoldLayerManager._load_gold_config parses raw JSON even if passed via config_s3_path."""
+        import json
+        raw_json = json.dumps({
+            "source_systems": {
+                "inline_src": {
+                    "tables": {
+                        "records": {"nkey": ["rec_id"]}
+                    }
+                }
+            }
+        })
+        loaded = GoldLayerManager._load_gold_config(config_s3_path=raw_json)
+        self.assertIn("inline_src", loaded.get("source_systems", {}))
+        pks = GoldLayerManager._resolve_natural_keys("inline_src", "records", loaded)
+        self.assertEqual(pks, ["rec_id"])
+
+    def test_resolve_natural_keys_table_specific_override(self):
+        """Table-specific overrides like --interactions_nkey work seamlessly."""
+        cfg = {"source_systems": {}}
+        pks = GoldLayerManager._resolve_natural_keys(
+            "moveworks", "interactions", cfg,
+            params={"interactions_nkey": "interaction_id"}
+        )
+        self.assertEqual(pks, ["interaction_id"])
+
+    def test_lambda_build_glue_arguments_auto_defaults_gold_config(self):
+        """Lambda helper auto-defaults --GOLD_CONFIG_S3_PATH when running Gold layer."""
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda_helper"))
+        from lambda_function import build_glue_arguments
+        event = {
+            "source_system": "moveworks",
+            "layer": "gold",
+            "gold_schema": "enterprise_reporting"
+        }
+        args = build_glue_arguments(event)
+        self.assertEqual(args.get("--PROCESS_LAYER"), "gold")
+        self.assertEqual(args.get("--GOLD_SCHEMA"), "enterprise_reporting")
+        self.assertIn("--GOLD_CONFIG_S3_PATH", args)
+        self.assertTrue(args["--GOLD_CONFIG_S3_PATH"].endswith("gold/script/config/gold_config.json"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,357 @@ class GoldLayerManager:
     """
 
     @classmethod
+    def _load_gold_config(
+        cls,
+        config_s3_path: Optional[str] = None,
+        s3_client=None,
+        env: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Loads Gold configuration dictionary using GoldConfigLoader if available,
+        or a self-contained fallback loader that probes CLI arguments (including raw JSON),
+        S3 candidate paths, local files, and sys.path zip archives.
+        """
+        effective_env = (env or (params.get('ENV') if params else None) or os.environ.get('ENV') or 'dev').strip().lower()
+
+        import zipfile
+        raw_config = None
+
+        # Tier 0: Direct JSON string or dict in params or sys.argv
+        if params:
+            for k in ('GOLD_CONFIG_JSON', 'gold_config_json', 'GOLD_CONFIG', 'gold_config'):
+                val = params.get(k)
+                if isinstance(val, dict):
+                    raw_config = val
+                    break
+                elif isinstance(val, str) and val.strip().startswith('{') and val.strip().endswith('}'):
+                    try:
+                        raw_config = json.loads(val.strip())
+                        break
+                    except Exception:
+                        pass
+        if raw_config is None and params and isinstance(params.get('ARG_DICT'), dict):
+            for k in ('GOLD_CONFIG_JSON', 'gold_config_json', 'GOLD_CONFIG', 'gold_config'):
+                val = params['ARG_DICT'].get(k)
+                if isinstance(val, dict):
+                    raw_config = val
+                    break
+                elif isinstance(val, str) and val.strip().startswith('{') and val.strip().endswith('}'):
+                    try:
+                        raw_config = json.loads(val.strip())
+                        break
+                    except Exception:
+                        pass
+
+        if raw_config is None:
+            for i, a in enumerate(sys.argv):
+                for flag in ('--GOLD_CONFIG_JSON', '--gold_config_json', '--GOLD_CONFIG', '--gold_config'):
+                    if a == flag and i + 1 < len(sys.argv):
+                        val = sys.argv[i + 1].strip()
+                        if val.startswith('{') and val.endswith('}'):
+                            try:
+                                raw_config = json.loads(val)
+                                break
+                            except Exception:
+                                pass
+                    elif a.startswith(f"{flag}="):
+                        val = a.split('=', 1)[1].strip()
+                        if val.startswith('{') and val.endswith('}'):
+                            try:
+                                raw_config = json.loads(val)
+                                break
+                            except Exception:
+                                pass
+                if raw_config is not None:
+                    break
+
+        # Tier 0b: config_s3_path itself might be a direct JSON string
+        if raw_config is None and config_s3_path and isinstance(config_s3_path, str):
+            clean_p = config_s3_path.strip()
+            if clean_p.startswith('{') and clean_p.endswith('}'):
+                try:
+                    raw_config = json.loads(clean_p)
+                except Exception:
+                    pass
+
+        # Tier 1: Try GoldConfigLoader if imported and no direct JSON was provided
+        if raw_config is None and GoldConfigLoader:
+            try:
+                cfg = GoldConfigLoader.load_config(
+                    config_s3_path=config_s3_path,
+                    s3_client=s3_client,
+                    env=effective_env,
+                    bucket_hint=bucket_name
+                )
+                if cfg and isinstance(cfg, dict) and (cfg.get("source_systems") or cfg.get("sources")):
+                    return cfg
+            except Exception as e:
+                logger.warning(f"[GOLD CONFIG] GoldConfigLoader.load_config encountered error: {e}. Trying direct load...")
+
+        # Tier 1: Check CLI argument for path
+        if raw_config is None and not config_s3_path:
+            for i, a in enumerate(sys.argv):
+                for flag in (
+                    '--GOLD_CONFIG_S3_PATH', '--gold_config_s3_path', '--gold-config-s3-path',
+                    '--GOLD_CONFIG_PATH', '--gold_config_path', '--gold-config-path',
+                    '--GOLD_CONFIG', '--gold_config', '--CONFIG_S3_PATH', '--config_s3_path'
+                ):
+                    if a == flag and i + 1 < len(sys.argv):
+                        val = sys.argv[i + 1].strip()
+                        if not (val.startswith('{') and val.endswith('}')):
+                            config_s3_path = val
+                            break
+                    elif a.startswith(f"{flag}="):
+                        val = a.split('=', 1)[1].strip()
+                        if not (val.startswith('{') and val.endswith('}')):
+                            config_s3_path = val
+                            break
+                if config_s3_path:
+                    break
+
+        if not s3_client and ((config_s3_path and config_s3_path.startswith("s3://")) or bucket_name):
+            try:
+                s3_client = boto3.client('s3')
+            except Exception:
+                pass
+
+        # Tier 2: Load from explicit S3 path
+        if raw_config is None and config_s3_path and config_s3_path.startswith("s3://") and s3_client:
+            try:
+                path_parts = config_s3_path.replace("s3://", "").split("/", 1)
+                b_name, o_key = path_parts[0], path_parts[1]
+                resp = s3_client.get_object(Bucket=b_name, Key=o_key)
+                raw_config = json.loads(resp['Body'].read().decode('utf-8'))
+                logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from '{config_s3_path}'")
+            except Exception as err:
+                logger.warning(f"[GOLD CONFIG] Failed to load from '{config_s3_path}': {err}. Probing alternative S3 locations...")
+
+        # Tier 3: Probe candidate S3 locations
+        if raw_config is None and s3_client:
+            candidate_buckets = []
+            if bucket_name:
+                clean_b = str(bucket_name).replace('{env}', effective_env).replace('{ENV}', effective_env.upper()).strip()
+                if clean_b and clean_b not in candidate_buckets:
+                    candidate_buckets.append(clean_b)
+            for b_env in [
+                os.environ.get('DATA_LAKE_BUCKET'),
+                os.environ.get('GOLD_BUCKET'),
+                os.environ.get('SILVER_BUCKET'),
+                f"uax-datalake-{effective_env}-bucket",
+                f"uax-datalake-dev-bucket"
+            ]:
+                if b_env:
+                    cb = str(b_env).replace('{env}', effective_env).replace('{ENV}', effective_env.upper()).strip()
+                    if cb and cb not in candidate_buckets:
+                        candidate_buckets.append(cb)
+
+            relative_keys = [
+                "gold/script/config/gold_config.json",
+                "gold/config/gold_config.json",
+                "scripts/gold/config/gold_config.json",
+                "scripts/config/gold_config.json",
+                "silver/script/config/gold_config.json",
+                "silver/config/gold_config.json",
+                "config/gold_config.json",
+                "gold_config.json"
+            ]
+
+            for b in candidate_buckets:
+                if raw_config is not None:
+                    break
+                for k in relative_keys:
+                    candidate_url = f"s3://{b}/{k}"
+                    if candidate_url == config_s3_path:
+                        continue
+                    try:
+                        resp = s3_client.get_object(Bucket=b, Key=k)
+                        raw_config = json.loads(resp['Body'].read().decode('utf-8'))
+                        logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from probed S3 path: '{candidate_url}'")
+                        break
+                    except Exception:
+                        pass
+
+        # Tier 4: Local filesystem search
+        if raw_config is None:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            local_paths = [
+                os.path.join(current_dir, "config", "gold_config.json"),
+                os.path.join(current_dir, "gold_config.json"),
+                os.path.join(os.getcwd(), "gold_config.json"),
+                os.path.join(os.getcwd(), "config", "gold_config.json"),
+                os.path.join(os.getcwd(), "gold", "script", "config", "gold_config.json"),
+                "/tmp/gold_config.json",
+                "/tmp/config/gold_config.json",
+                "/tmp/gold/script/config/gold_config.json",
+                "gold_config.json",
+                "gold/script/config/gold_config.json",
+                "scripts/gold/config/gold_config.json"
+            ]
+            for p in local_paths:
+                if os.path.exists(p) and os.path.isfile(p):
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            raw_config = json.load(f)
+                            logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from local file: '{p}'")
+                            break
+                    except Exception as err:
+                        logger.warning(f"Error reading local file '{p}': {err}")
+
+        # Tier 5: Scan sys.path archives (.zip/.egg)
+        if raw_config is None:
+            for p in sys.path:
+                if p.endswith(('.zip', '.egg')) and os.path.exists(p):
+                    try:
+                        with zipfile.ZipFile(p, 'r') as zf:
+                            for zinfo in zf.namelist():
+                                if zinfo.endswith("gold_config.json"):
+                                    with zf.open(zinfo) as f:
+                                        raw_config = json.load(f)
+                                        logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from archive '{p}!/{zinfo}'")
+                                        break
+                    except Exception:
+                        pass
+                if raw_config is not None:
+                    break
+
+        if raw_config is None:
+            logger.warning("[GOLD CONFIG] Gold configuration file 'gold_config.json' could not be loaded from S3, CLI, or local paths.")
+            raw_config = {}
+
+        # Interpolate {env}
+        def _interp(val):
+            if isinstance(val, str):
+                return val.replace('{env}', effective_env).replace('{ENV}', effective_env.upper())
+            elif isinstance(val, dict):
+                return {_interp(k): _interp(v) for k, v in val.items()}
+            elif isinstance(val, list):
+                return [_interp(x) for x in val]
+            return val
+
+        interpolated = _interp(raw_config)
+        if GoldConfigLoader:
+            try:
+                GoldConfigLoader.set_loaded_config(interpolated, env=effective_env)
+            except Exception:
+                pass
+        return interpolated
+
+    @classmethod
+    def _resolve_natural_keys(
+        cls,
+        source_system: str,
+        table_name: str,
+        gold_cfg: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
+        """
+        Resolves natural key / primary key list for table upsert / merge:
+        1. From gold_config.json table definition (source_systems.<source>.tables.<table_name>.nkey)
+        2. From CLI override parameters (--NKEY, --PRIMARY_KEY)
+        Returns empty list if not specified (NO HARDCODED VALUES).
+        """
+        pks = []
+
+        # 1. Config lookup via GoldConfigLoader
+        if GoldConfigLoader and gold_cfg:
+            try:
+                pks = GoldConfigLoader.get_primary_key(source_system, table_name, gold_cfg)
+            except Exception:
+                pks = []
+
+        # 1b. Direct config dictionary traversal if GoldConfigLoader is absent or didn't find key
+        if not pks and isinstance(gold_cfg, dict):
+            sources = gold_cfg.get("source_systems") or gold_cfg.get("sources") or {}
+            clean_src = (source_system or '').strip().lower()
+            source_cfg = {}
+            if isinstance(sources, dict):
+                for k, v in sources.items():
+                    if k.strip().lower() == clean_src and isinstance(v, dict):
+                        source_cfg = v
+                        break
+            if not source_cfg and clean_src in gold_cfg and isinstance(gold_cfg[clean_src], dict):
+                source_cfg = gold_cfg[clean_src]
+
+            table_configs = source_cfg.get("tables") if isinstance(source_cfg.get("tables"), dict) else source_cfg
+            if isinstance(table_configs, dict):
+                clean_tbl = (table_name or '').strip().lower()
+                base_tbl = clean_tbl
+                for prefix in [f"gold_{clean_src}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]:
+                    if base_tbl.startswith(prefix):
+                        base_tbl = base_tbl[len(prefix):]
+                        break
+                candidates = [clean_tbl, base_tbl, base_tbl.replace('-', '_'), base_tbl.replace('_', '-')]
+
+                matched_tbl_cfg = {}
+                for cand in candidates:
+                    for tbl_k, tbl_v in table_configs.items():
+                        if tbl_k.strip().lower() == cand and isinstance(tbl_v, dict):
+                            matched_tbl_cfg = tbl_v
+                            break
+                    if matched_tbl_cfg:
+                        break
+
+                if matched_tbl_cfg:
+                    for key_name in ("nkey", "primary_key", "natural_key", "pk", "natural_keys", "primary_keys"):
+                        pk_val = matched_tbl_cfg.get(key_name)
+                        if isinstance(pk_val, list) and pk_val:
+                            pks = [str(k).strip() for k in pk_val if str(k).strip()]
+                            break
+                        elif isinstance(pk_val, str) and pk_val.strip():
+                            pks = [str(k).strip() for k in pk_val.split(',') if str(k).strip()]
+                            break
+
+        # 2. CLI / Lambda override parameters
+        if not pks and params:
+            clean_tbl = (table_name or '').strip().lower()
+            base_tbl = clean_tbl
+            for prefix in [f"gold_{clean_src}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]:
+                if base_tbl.startswith(prefix):
+                    base_tbl = base_tbl[len(prefix):]
+                    break
+
+            cand_param_keys = [
+                "NKEY", "nkey", "NKEYS", "nkeys",
+                "PRIMARY_KEY", "primary_key", "PRIMARY_KEYS", "primary_keys",
+                "NATURAL_KEY", "natural_key", "NATURAL_KEYS", "natural_keys",
+                "PK", "pk",
+                f"{clean_tbl}_nkey", f"{clean_tbl}_primary_key",
+                f"{base_tbl}_nkey", f"{base_tbl}_primary_key"
+            ]
+            for pk_key in cand_param_keys:
+                val = params.get(pk_key)
+                if val:
+                    pks = [k.strip() for k in str(val).split(",") if k.strip()]
+                    break
+                if isinstance(params.get("ARG_DICT"), dict):
+                    val = params["ARG_DICT"].get(pk_key)
+                    if val:
+                        pks = [k.strip() for k in str(val).split(",") if k.strip()]
+                        break
+
+        if not pks:
+            import sys
+            clean_tbl = (table_name or '').strip().lower()
+            flags = (
+                '--NKEY', '--nkey', '--NKEYS', '--nkeys',
+                '--PRIMARY_KEY', '--primary_key', '--PRIMARY_KEYS', '--primary_keys',
+                '--NATURAL_KEY', '--natural_key', '--NATURAL_KEYS', '--natural_keys',
+                '--PK', '--pk',
+                f'--{clean_tbl}_nkey', f'--{clean_tbl}_primary_key'
+            )
+            for i, a in enumerate(sys.argv):
+                if a in flags and i + 1 < len(sys.argv):
+                    pks = [k.strip() for k in sys.argv[i + 1].split(',') if k.strip()]
+                    break
+                elif any(a.startswith(f"{f}=") for f in flags):
+                    pks = [k.strip() for k in a.split('=', 1)[1].split(',') if k.strip()]
+                    break
+
+        return pks
+
+    @classmethod
     def run_gold_pipeline(
         cls,
         spark: SparkSession,
@@ -101,48 +452,24 @@ class GoldLayerManager:
         )
         bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
-        # Auto-discover gold_config.json in S3 if not explicitly passed
+        # Auto-discover and load Gold configuration with robust multi-path probing
         config_s3_path = (
             params.get('GOLD_CONFIG_S3_PATH')
             or (params.get('ARG_DICT', {}).get('GOLD_CONFIG_S3_PATH') if isinstance(params.get('ARG_DICT'), dict) else None)
         )
-        if not config_s3_path:
-            import sys
-            for i, a in enumerate(sys.argv):
-                if a in ('--GOLD_CONFIG_S3_PATH', '--gold_config_s3_path') and i + 1 < len(sys.argv):
-                    config_s3_path = sys.argv[i + 1].strip()
-                    break
-                elif a.startswith('--GOLD_CONFIG_S3_PATH=') or a.startswith('--gold_config_s3_path='):
-                    config_s3_path = a.split('=', 1)[1].strip()
-                    break
-        if not config_s3_path and s3_client:
-            candidate_cfg_paths = [
-                f"s3://{bucket_name}/gold/script/config/gold_config.json",
-                f"s3://{bucket_name}/gold/config/gold_config.json",
-                f"s3://{bucket_name}/scripts/gold/config/gold_config.json",
-                f"s3://{bucket_name}/silver/script/config/gold_config.json",
-                f"s3://{bucket_name}/config/gold_config.json"
-            ]
-            for c_path in candidate_cfg_paths:
-                if cls._s3_path_exists(c_path, s3_client):
-                    config_s3_path = c_path
-                    logger.info(f"Auto-discovered Gold configuration in S3 at '{config_s3_path}'")
-                    break
+        gold_cfg = cls._load_gold_config(
+            config_s3_path=config_s3_path,
+            s3_client=s3_client,
+            env=env,
+            bucket_name=bucket_name,
+            params=params
+        )
 
-        if not config_s3_path:
-            config_s3_path = f"s3://{bucket_name}/gold/script/config/gold_config.json"
-
-        # Load Gold Configuration via GoldConfigLoader with dynamic {env} interpolation
-        gold_cfg = GoldConfigLoader.load_config(config_s3_path, s3_client=s3_client, env=env) if GoldConfigLoader else {}
-        if GoldConfigLoader:
-            GoldConfigLoader.set_loaded_config(gold_cfg, env=env)
-
-        if not gold_cfg or not gold_cfg.get("source_systems"):
+        if not gold_cfg or not (gold_cfg.get("source_systems") or gold_cfg.get("sources")):
             logger.warning(
                 f"\n+================================================================================+\n"
                 f"|  [WARNING: GOLD CONFIG EMPTY] Could not load gold_config.json from S3/local!   |\n"
                 f"+================================================================================+\n"
-                f"|  * Attempted S3 Path   : {config_s3_path}\n"
                 f"|  * Target Bucket       : {bucket_name}\n"
                 f"|  * Target Environment  : {env}\n"
                 f"|  * Action Required     : Upload gold_config.json to your S3 bucket:\n"
@@ -295,26 +622,7 @@ class GoldLayerManager:
         for clean_base_name, sql_text in queries.items():
             mart_start = datetime.now(timezone.utc)
             # 1. Natural key (nkey) resolution strictly from Gold config (or CLI override params)
-            pks = []
-            if GoldConfigLoader:
-                pks = GoldConfigLoader.get_primary_key(source_system, clean_base_name, gold_cfg)
-            if not pks and params.get("NKEY"):
-                pks = [k.strip() for k in str(params["NKEY"]).split(",") if k.strip()]
-            if not pks and params.get("PRIMARY_KEY"):
-                pks = [k.strip() for k in str(params["PRIMARY_KEY"]).split(",") if k.strip()]
-            if not pks and isinstance(params.get("ARG_DICT"), dict):
-                arg_n = params["ARG_DICT"].get("NKEY") or params["ARG_DICT"].get("nkey") or params["ARG_DICT"].get("PRIMARY_KEY")
-                if arg_n:
-                    pks = [k.strip() for k in str(arg_n).split(",") if k.strip()]
-            if not pks:
-                import sys
-                for i, a in enumerate(sys.argv):
-                    if a in ('--NKEY', '--nkey', '--PRIMARY_KEY', '--primary_key') and i + 1 < len(sys.argv):
-                        pks = [k.strip() for k in sys.argv[i + 1].split(',') if k.strip()]
-                        break
-                    elif any(a.startswith(p) for p in ('--NKEY=', '--nkey=', '--PRIMARY_KEY=', '--primary_key=')):
-                        pks = [k.strip() for k in a.split('=', 1)[1].split(',') if k.strip()]
-                        break
+            pks = cls._resolve_natural_keys(source_system, clean_base_name, gold_cfg, params)
 
             # Strictly require nkey from gold config — no hardcoded or default keys allowed
             if not pks:
@@ -478,13 +786,15 @@ class GoldLayerManager:
                 })
 
         # Check for any configured tables in gold_config.json with initial_load that lacked a .sql file
-        if GoldConfigLoader and gold_cfg:
-            src_tables = gold_cfg.get('sources', {}).get(source_system, {}).get('tables', {})
+        # Check for any configured tables in gold_config.json with initial_load that lacked a .sql file
+        if gold_cfg:
+            all_sources = gold_cfg.get('source_systems') or gold_cfg.get('sources') or {}
+            src_tables = all_sources.get(source_system, {}).get('tables', {}) if isinstance(all_sources, dict) else {}
             for tbl_name, tbl_cfg in src_tables.items():
                 if tbl_name not in materialized_dfs and 'initial_load' in tbl_cfg:
                     clean_tbl = tbl_name
-                    target_tbl_name = GoldConfigLoader.get_target_table_name(source_system, clean_tbl, 'athena', gold_cfg)
-                    tbl_pks = GoldConfigLoader.get_primary_key(source_system, clean_tbl, gold_cfg)
+                    target_tbl_name = GoldConfigLoader.get_target_table_name(source_system, clean_tbl, 'athena', gold_cfg) if GoldConfigLoader else f"gold_{source_system}_{clean_tbl}"
+                    tbl_pks = cls._resolve_natural_keys(source_system, clean_tbl, gold_cfg, params)
                     logger.info(f"[INITIAL LOAD] Found configured table '{clean_tbl}' without SQL query file. Evaluating initial load...")
                     init_done = cls._check_and_run_initial_load(
                         spark=spark,
@@ -834,25 +1144,8 @@ class GoldLayerManager:
             assert old_backup_table.endswith("_old"), f"Safety Error: Invalid backup table {old_backup_table}"
 
             pks = mart_keys.get(clean_base_name, [])
-            if not pks and GoldConfigLoader and source_system:
-                pks = GoldConfigLoader.get_primary_key(source_system, clean_base_name, gold_cfg)
-            if not pks and params.get("NKEY"):
-                pks = [k.strip() for k in str(params["NKEY"]).split(",") if k.strip()]
-            if not pks and params.get("PRIMARY_KEY"):
-                pks = [k.strip() for k in str(params["PRIMARY_KEY"]).split(",") if k.strip()]
-            if not pks and isinstance(params.get("ARG_DICT"), dict):
-                arg_n = params["ARG_DICT"].get("NKEY") or params["ARG_DICT"].get("nkey") or params["ARG_DICT"].get("PRIMARY_KEY")
-                if arg_n:
-                    pks = [k.strip() for k in str(arg_n).split(",") if k.strip()]
             if not pks:
-                import sys
-                for i, a in enumerate(sys.argv):
-                    if a in ('--NKEY', '--nkey', '--PRIMARY_KEY', '--primary_key') and i + 1 < len(sys.argv):
-                        pks = [k.strip() for k in sys.argv[i + 1].split(',') if k.strip()]
-                        break
-                    elif any(a.startswith(p) for p in ('--NKEY=', '--nkey=', '--PRIMARY_KEY=', '--primary_key=')):
-                        pks = [k.strip() for k in a.split('=', 1)[1].split(',') if k.strip()]
-                        break
+                pks = cls._resolve_natural_keys(source_system, clean_base_name, gold_cfg, params)
             if not pks:
                 raise ValueError(
                     f"CRITICAL CONFIG ERROR: Missing 'nkey' in gold configuration for table '{clean_base_name}' "
@@ -2903,14 +3196,7 @@ class GoldInitialLoader:
         else:
             target_table_name = f"gold_{source_system}_{table_name}"
 
-        pks = []
-        if GoldConfigLoader:
-            pks = GoldConfigLoader.get_nkey(source_system, table_name, gold_cfg)
-        if not pks and params.get('NKEY'):
-            pks = [k.strip() for k in str(params['NKEY']).split(',') if k.strip()]
-        if not pks and params.get('PRIMARY_KEY'):
-            pks = [k.strip() for k in str(params['PRIMARY_KEY']).split(',') if k.strip()]
-
+        pks = cls._resolve_natural_keys(source_system, table_name, gold_cfg, params)
         if not pks:
             raise ValueError(
                 f"CRITICAL CONFIG ERROR: Missing 'nkey' in gold configuration for table '{table_name}' "

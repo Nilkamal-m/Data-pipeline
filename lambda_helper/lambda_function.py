@@ -218,6 +218,20 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         'GOLD_TARGETS': '--GOLD_TARGETS',
         'gold_config_s3_path': '--GOLD_CONFIG_S3_PATH',
         'GOLD_CONFIG_S3_PATH': '--GOLD_CONFIG_S3_PATH',
+        'gold_config_path': '--GOLD_CONFIG_S3_PATH',
+        'GOLD_CONFIG_PATH': '--GOLD_CONFIG_S3_PATH',
+        'gold_config': '--GOLD_CONFIG_S3_PATH',
+        'GOLD_CONFIG': '--GOLD_CONFIG_S3_PATH',
+        'gold_config_json': '--GOLD_CONFIG_JSON',
+        'GOLD_CONFIG_JSON': '--GOLD_CONFIG_JSON',
+        'primary_key': '--PRIMARY_KEY',
+        'PRIMARY_KEY': '--PRIMARY_KEY',
+        'primary_keys': '--PRIMARY_KEY',
+        'PRIMARY_KEYS': '--PRIMARY_KEY',
+        'natural_key': '--NKEY',
+        'NATURAL_KEY': '--NKEY',
+        'natural_keys': '--NKEY',
+        'NATURAL_KEYS': '--NKEY',
         'gold_query_s3_path': '--GOLD_QUERY_S3_PATH',
         'GOLD_QUERY_S3_PATH': '--GOLD_QUERY_S3_PATH',
         'gold_data_s3_path': '--GOLD_DATA_S3_PATH',
@@ -321,10 +335,15 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
                 "Example: {'layer': 'gold', 'source_system': 'servicenow', 'rds_schema': 'enterprise_reporting'}"
             )
 
-    # Auto-default --GOLD_CONFIG_S3_PATH for Gold layer if data lake bucket is known
+    # Auto-default --GOLD_CONFIG_S3_PATH for Gold layer if not explicitly specified
     if glue_args.get('--PROCESS_LAYER') in ('gold', 'both') or layer == 'gold':
-        if not glue_args.get('--GOLD_CONFIG_S3_PATH') and glue_args.get('--DATA_LAKE_BUCKET'):
-            bucket = glue_args.get('--DATA_LAKE_BUCKET')
+        if not glue_args.get('--GOLD_CONFIG_S3_PATH') and not glue_args.get('--GOLD_CONFIG_JSON'):
+            bucket = (
+                glue_args.get('--DATA_LAKE_BUCKET')
+                or os.environ.get('DATA_LAKE_BUCKET')
+                or os.environ.get('DEFAULT_DATA_LAKE_BUCKET')
+                or f"uax-datalake-{glue_args.get('--ENV', 'dev')}-bucket"
+            )
             glue_args['--GOLD_CONFIG_S3_PATH'] = f"s3://{bucket}/gold/script/config/gold_config.json"
 
     # Allow custom arbitrary arguments passed via 'arguments' dictionary

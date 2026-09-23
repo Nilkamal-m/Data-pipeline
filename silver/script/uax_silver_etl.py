@@ -121,10 +121,9 @@ def parse_spark_arguments() -> dict:
 
     def get_cli_arg(*names, default=None):
         for name in names:
-            if name in arg_dict and arg_dict[name] is not None and str(arg_dict[name]).strip() != '':
-                return str(arg_dict[name]).strip()
+            norm_name = str(name).lower().replace('-', '_')
             for k, v in arg_dict.items():
-                if k.lower() == name.lower() and v is not None and str(v).strip() != '':
+                if str(k).lower().replace('-', '_') == norm_name and v is not None and str(v).strip() != '':
                     return str(v).strip()
         return default
 
@@ -143,8 +142,17 @@ def parse_spark_arguments() -> dict:
         clean_bucket = bucket_hint.replace('{env}', env).replace('{ENV}', env.upper())
         config_s3_path = f"s3://{clean_bucket}/silver/script/config/silver_config.json"
 
-    gold_config_s3_path = get_cli_arg('GOLD_CONFIG_S3_PATH', 'gold_config_s3_path')
-    if not gold_config_s3_path:
+    gold_config_json = get_cli_arg('GOLD_CONFIG_JSON', 'gold_config_json')
+    gold_config_s3_path = get_cli_arg(
+        'GOLD_CONFIG_S3_PATH', 'gold_config_s3_path',
+        'GOLD_CONFIG_PATH', 'gold_config_path',
+        'GOLD_CONFIG', 'gold_config'
+    )
+    if gold_config_s3_path and gold_config_s3_path.strip().startswith('{') and gold_config_s3_path.strip().endswith('}'):
+        gold_config_json = gold_config_s3_path.strip()
+        gold_config_s3_path = None
+
+    if not gold_config_s3_path and not gold_config_json:
         bucket_hint = get_cli_arg('DATA_LAKE_BUCKET', 'data_lake_bucket', 'GOLD_BUCKET', 'gold_bucket') or f"uax-datalake-{env}-bucket"
         clean_bucket = bucket_hint.replace('{env}', env).replace('{ENV}', env.upper())
         gold_config_s3_path = f"s3://{clean_bucket}/gold/script/config/gold_config.json"
@@ -395,6 +403,7 @@ def parse_spark_arguments() -> dict:
         'GOLD_TARGET': gold_target,
         'GOLD_TARGETS': ','.join(gold_targets),
         'GOLD_CONFIG_S3_PATH': gold_config_s3_path,
+        'GOLD_CONFIG_JSON': gold_config_json,
         'GOLD_QUERY_S3_PATH': gold_query_s3_path,
         'GOLD_DATA_S3_PATH': gold_data_s3_path,
         'CONNECTION_NAME': connection_name,
@@ -412,8 +421,8 @@ def parse_spark_arguments() -> dict:
         'SNOWFLAKE_SCHEMA': snowflake_schema,
         'SNOWFLAKE_EXTERNAL_VOLUME': snowflake_external_volume,
         'SNOWFLAKE_SECRET_NAME': snowflake_secret_name,
-        'NKEY': get_cli_arg('NKEY', 'nkey', 'PRIMARY_KEY', 'primary_key'),
-        'PRIMARY_KEY': get_cli_arg('PRIMARY_KEY', 'primary_key', 'NKEY', 'nkey'),
+        'NKEY': get_cli_arg('NKEY', 'nkey', 'NKEYS', 'nkeys', 'PRIMARY_KEY', 'primary_key', 'NATURAL_KEY', 'natural_key', 'PK', 'pk'),
+        'PRIMARY_KEY': get_cli_arg('PRIMARY_KEY', 'primary_key', 'PRIMARY_KEYS', 'primary_keys', 'NKEY', 'nkey', 'NATURAL_KEY', 'natural_key', 'PK', 'pk'),
         'ARG_DICT': arg_dict
     }
 
