@@ -1686,12 +1686,20 @@ class GoldLayerManager:
         temp_view = f"incoming_gold_{clean_base_name}"
         df_mart.createOrReplaceTempView(temp_view)
 
+        # Dual-check table existence: DESCRIBE TABLE (catches Iceberg catalog registration)
+        # and spark.catalog.tableExists (catches cases where DESCRIBE TABLE raises transiently)
         table_exists = False
         try:
             spark.sql(f"DESCRIBE TABLE {full_table}")
             table_exists = True
         except Exception:
-            table_exists = False
+            pass
+
+        if not table_exists:
+            try:
+                table_exists = spark.catalog.tableExists(f"{glue_database}.{target_table_name}")
+            except Exception:
+                pass
 
         if table_exists:
             # Dynamically evolve Iceberg schema if new columns are present
@@ -1710,8 +1718,26 @@ class GoldLayerManager:
             try:
                 spark.sql(merge_sql)
             except Exception as merge_err:
-                logger.warning(f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). Overwriting to {s3_location}...")
-                df_mart.write.mode("overwrite").format("parquet").save(s3_location)
+                # Fallback: Iceberg APPEND (NOT overwrite) — table already exists, we only have
+                # new/changed records at this point. Using overwrite would rewrite the entire table
+                # on every run (expensive I/O) and Parquet overwrite on an Iceberg path causes
+                # format corruption → NoSuchKeyException on the next run.
+                logger.warning(
+                    f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). "
+                    f"Falling back to Iceberg APPEND at '{s3_location}'..."
+                )
+                try:
+                    df_mart.write \
+                        .format("iceberg") \
+                        .mode("append") \
+                        .option("path", s3_location) \
+                        .save()
+                except Exception as ice_fallback_err:
+                    logger.warning(
+                        f"[ATHENA/ICEBERG UPSERT] Iceberg append fallback also failed ({ice_fallback_err}). "
+                        f"Appending raw Parquet as last resort to '{s3_location}'."
+                    )
+                    df_mart.write.mode("append").format("parquet").save(s3_location)
         else:
             logger.info(f"[ATHENA/ICEBERG WRITE] Initializing Gold table {full_table} at '{s3_location}'...")
             try:
