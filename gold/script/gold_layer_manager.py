@@ -1593,7 +1593,7 @@ class GoldLayerManager:
         except Exception:
             table_has_data = False
 
-        if not table_has_data or str(params.get('RELOAD_INITIAL', 'false')).strip().lower() in ('true', '1', 'yes'):
+        if not table_has_data or str(params.get('RELOAD_INITIAL', 'false')).strip().lower() in ('true', '1', 'yes') or str(params.get('FULL_REFRESH', 'false')).strip().lower() in ('true', '1', 'yes'):
             archived_base = f"s3://{bucket_name}/gold/initial_exports/{source_system}/_archived/{table_name}"
             candidate_paths.extend([
                 f"{archived_base}.csv",
@@ -3327,6 +3327,9 @@ class GoldInitialLoader:
             df_raw = spark.read \
                 .option("header", str(has_header).lower()) \
                 .option("delimiter", delimiter) \
+                .option("quote", '"') \
+                .option("escape", '"') \
+                .option("multiLine", "true") \
                 .option("inferSchema", "false") \
                 .csv(csv_path)
 
@@ -3361,7 +3364,8 @@ class GoldInitialLoader:
 
         # Ensure row uniqueness by natural keys (nkey) from gold config
         df_consolidated = GoldLayerManager._deduplicate_by_nkey(df_consolidated, pks)
-        logger.info(f"[PRIMARY KEY] Natural keys resolved for '{table_name}': {pks}")
+        dedup_count = df_consolidated.count()
+        logger.info(f"[PRIMARY KEY] Natural keys resolved for '{table_name}': {pks} (Records after deduplication: {dedup_count:,}, raw: {raw_count:,})")
 
         temp_view = f"incoming_initial_{table_name}"
         df_consolidated.createOrReplaceTempView(temp_view)
@@ -3470,7 +3474,7 @@ def main():
         'RDS_HOST', 'RDS_PORT', 'RDS_USER', 'RDS_PASSWORD',
         'GOLD_SCHEMA', 'GOLD_TARGETS', 'CONNECTION_NAME', 'ENV', 'ENVIRONMENT',
         'GOLD_CONFIG_S3_PATH', 'ATHENA_WORKGROUP', 'WORKGROUP', 'MART_NAME', 'TABLE_NAME',
-        'CSV_PATH', 'INITIAL_LOAD_PATH', 'INPUT_FILE', 'SKIP_INITIAL_LOAD', 'DELIMITER', 'HAS_HEADER'
+        'CSV_PATH', 'INITIAL_LOAD_PATH', 'INPUT_FILE', 'SKIP_INITIAL_LOAD', 'RELOAD_INITIAL', 'DELIMITER', 'HAS_HEADER'
     ]
 
     args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv or f"--{a.lower()}" in sys.argv]

@@ -399,6 +399,9 @@ class GoldInitialLoader:
             df_raw = spark.read \
                 .option("header", str(has_header).lower()) \
                 .option("delimiter", delimiter) \
+                .option("quote", '"') \
+                .option("escape", '"') \
+                .option("multiLine", "true") \
                 .option("inferSchema", "false") \
                 .csv(csv_path)
 
