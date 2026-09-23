@@ -29,6 +29,7 @@
           "nkey": [
             "conversation_id"
           ],
+          "incremental": true,
           "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
           "aurora": {
             "schema": "enterprise_reporting",

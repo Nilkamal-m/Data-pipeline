@@ -122,6 +122,38 @@ class GoldConfigLoader:
     get_nkey = get_primary_key
 
     @classmethod
+    def is_incremental(
+        cls,
+        source_system: str,
+        table_name: str,
+        config_dict: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Checks if incremental delta processing is enabled for the table.
+        When enabled, only new and modified records (the delta) are passed to custom transforms
+        and LLM enrichments, preventing exponential API costs.
+        """
+        tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
+        if "incremental" in tbl_cfg:
+            return bool(tbl_cfg["incremental"])
+        defaults = cls.get_defaults(config_dict)
+        return bool(defaults.get("incremental", False))
+
+    @classmethod
+    def get_llm_column(
+        cls,
+        source_system: str,
+        table_name: str,
+        config_dict: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """
+        Retrieves configured LLM / enrichment column (e.g. 'sentiment_score', 'llm_summary')
+        used to identify unenriched historical records for backfilling.
+        """
+        tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
+        return tbl_cfg.get("llm_column") or tbl_cfg.get("enrichment_column")
+
+    @classmethod
     def get_target_engines(
         cls,
         source_system: str,

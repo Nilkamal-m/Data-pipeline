@@ -25,6 +25,33 @@ for mod in [
 sys.modules['pyspark.sql'].SparkSession = MagicMock
 sys.modules['pyspark.sql'].DataFrame = MagicMock
 
+class MockColumn(MagicMock):
+    def __gt__(self, other):
+        return MockColumn()
+    def __lt__(self, other):
+        return MockColumn()
+    def __ge__(self, other):
+        return MockColumn()
+    def __le__(self, other):
+        return MockColumn()
+    def __eq__(self, other):
+        return MockColumn()
+    def __ne__(self, other):
+        return MockColumn()
+    def __or__(self, other):
+        return MockColumn()
+    def __and__(self, other):
+        return MockColumn()
+    def isNull(self):
+        return MockColumn()
+    def isNotNull(self):
+        return MockColumn()
+    def alias(self, name):
+        return MockColumn()
+
+sys.modules['pyspark.sql.functions'].col = lambda name: MockColumn()
+sys.modules['pyspark.sql.functions'].lit = lambda val: MockColumn()
+
 # Ensure repository root and gold scripts are in sys.path
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 gold_script_dir = os.path.join(repo_root, "gold", "script")
@@ -259,6 +286,62 @@ class TestGoldQuerySchemaProbe(unittest.TestCase):
         self.assertEqual(fields[0].name, "conversation_id")
         called_sql = mock_spark.sql.call_args[0][0]
         self.assertIn("WHERE 1=0", called_sql)
+
+
+class TestGoldIncrementalDelta(unittest.TestCase):
+    """Tests for incremental delta filtering to protect LLM calls from exponential cost growth."""
+
+    def test_config_loader_is_incremental(self):
+        # conversations was configured with "incremental": true
+        is_inc = GoldConfigLoader.is_incremental("genesys", "conversations")
+        self.assertTrue(is_inc)
+
+        # users has no incremental flag, should default to False
+        is_inc_users = GoldConfigLoader.is_incremental("genesys", "users")
+        self.assertFalse(is_inc_users)
+
+    def test_filter_incremental_delta_target_table_not_found(self):
+        mock_spark = MagicMock()
+        mock_spark.table.side_effect = Exception("Table not found in catalog")
+        mock_incoming_df = MagicMock()
+
+        # Should return full incoming df on initial run when target table doesn't exist
+        result = GoldLayerManager.filter_incremental_delta(
+            spark=mock_spark,
+            df_incoming=mock_incoming_df,
+            glue_database="uax_datalake_db_dev",
+            target_table_name="gold_genesys_conversations",
+            nkeys=["conversation_id"]
+        )
+        self.assertEqual(result, mock_incoming_df)
+
+    def test_filter_incremental_delta_when_target_exists(self):
+        mock_spark = MagicMock()
+        mock_target_df = MagicMock()
+        mock_target_df.columns = ["conversation_id", "_updated_at", "sentiment_score"]
+        mock_spark.table.return_value = mock_target_df
+
+        mock_incoming_df = MagicMock()
+        mock_incoming_df.columns = ["conversation_id", "_updated_at"]
+        mock_joined_df = MagicMock()
+        mock_incoming_df.join.return_value = mock_joined_df
+        mock_filtered_df = MagicMock()
+        mock_joined_df.filter.return_value = mock_filtered_df
+        mock_filtered_df.columns = ["conversation_id", "_updated_at", "_target_conversation_id", "_target_updated_at", "_target_sentiment_score"]
+        mock_filtered_df.drop.return_value = mock_filtered_df
+        mock_filtered_df.count.return_value = 5
+
+        delta_result = GoldLayerManager.filter_incremental_delta(
+            spark=mock_spark,
+            df_incoming=mock_incoming_df,
+            glue_database="uax_datalake_db_dev",
+            target_table_name="gold_genesys_conversations",
+            nkeys=["conversation_id"],
+            enrichment_column="sentiment_score"
+        )
+        # Verify join and filter were invoked to isolate delta
+        mock_incoming_df.join.assert_called_once()
+        mock_joined_df.filter.assert_called_once()
 
 
 if __name__ == "__main__":

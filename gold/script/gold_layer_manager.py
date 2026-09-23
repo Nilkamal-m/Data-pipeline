@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 import boto3
 from botocore.exceptions import ClientError
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import current_timestamp, lit
+from pyspark.sql.functions import current_timestamp, lit, col
 
 try:
     from gold_config_loader import GoldConfigLoader
@@ -238,6 +238,28 @@ class GoldLayerManager:
                 logger.info(f"Executing Spark SQL query for '{clean_base_name}'...")
                 df_mart = spark.sql(sql_text)
 
+                # Incremental Delta Check: Isolates new/modified records so LLM transforms never process entire dataset
+                is_incremental = False
+                if GoldConfigLoader:
+                    is_incremental = GoldConfigLoader.is_incremental(source_system, clean_base_name, gold_cfg)
+                if 'INCREMENTAL' in params:
+                    is_incremental = str(params['INCREMENTAL']).strip().lower() in ('true', '1', 'yes')
+                if 'FULL_REFRESH' in params and str(params['FULL_REFRESH']).strip().lower() in ('true', '1', 'yes'):
+                    is_incremental = False
+
+                llm_col = GoldConfigLoader.get_llm_column(source_system, clean_base_name, gold_cfg) if GoldConfigLoader else None
+
+                if is_incremental and pks:
+                    logger.info(f"[INCREMENTAL FILTER] Isolating new/changed delta for '{clean_base_name}' against '{glue_database}.{target_table_name}'...")
+                    df_mart = cls.filter_incremental_delta(
+                        spark=spark,
+                        df_incoming=df_mart,
+                        glue_database=glue_database,
+                        target_table_name=target_table_name,
+                        nkeys=pks,
+                        enrichment_column=llm_col
+                    )
+
                 # 4. Invoke Custom Transform Hook if exists (gold/script/custom_transforms/<source>_<table>.py)
                 custom_script_path = None
                 if GoldConfigLoader:
@@ -250,6 +272,8 @@ class GoldLayerManager:
                         "target_table": target_table_name,
                         "glue_database": glue_database,
                         "primary_keys": pks,
+                        "is_incremental": is_incremental,
+                        "llm_column": llm_col,
                         "params": params
                     }
                     df_mart = cls._apply_custom_transform(df_mart, custom_script_path, spark=spark, context=context)
@@ -979,6 +1003,101 @@ class GoldLayerManager:
                 df_mart.write.mode("overwrite").format("parquet").save(s3_location)
 
         return row_count
+
+    # --------------------------------------------------------------------------
+    # Incremental Delta Isolation (Anti-Join & Change Detection for LLM Cost Protection)
+    # --------------------------------------------------------------------------
+    @classmethod
+    def filter_incremental_delta(
+        cls,
+        spark: SparkSession,
+        df_incoming: DataFrame,
+        glue_database: str,
+        target_table_name: str,
+        nkeys: List[str],
+        enrichment_column: Optional[str] = None
+    ) -> DataFrame:
+        """
+        Filters incoming DataFrame to ONLY new or modified records (the Delta):
+        1. Brand new records (nkey not present in existing Gold target table).
+        2. Modified records (source._updated_at > target._updated_at).
+        3. Unenriched records (target.<enrichment_column> is NULL, e.g. sentiment_score or llm_summary).
+
+        Guarantees that downstream LLM calls in custom transforms only process delta records,
+        preventing exponential LLM API cost increases and rate limit exhaustion.
+        If target Gold table does not exist yet (initial load), returns the full DataFrame.
+        """
+        if not nkeys or df_incoming is None:
+            return df_incoming
+
+        try:
+            target_df = spark.table(f"{glue_database}.{target_table_name}")
+        except Exception:
+            logger.info(f"[INCREMENTAL DELTA] Target table '{glue_database}.{target_table_name}' does not exist yet. Processing initial full dataset.")
+            return df_incoming
+
+        target_cols = set(target_df.columns)
+        if not all(k in target_cols for k in nkeys) or not all(k in df_incoming.columns for k in nkeys):
+            return df_incoming
+
+        # Build alias columns for join to avoid ambiguous column name resolution
+        target_select = [col(k).alias(f"_target_{k}") for k in nkeys]
+        has_updated_at = "_updated_at" in target_cols and "_updated_at" in df_incoming.columns
+        if has_updated_at:
+            target_select.append(col("_updated_at").alias("_target_updated_at"))
+
+        has_llm_col = bool(enrichment_column and enrichment_column in target_cols)
+        if has_llm_col:
+            target_select.append(col(enrichment_column).alias(f"_target_{enrichment_column}"))
+
+        target_sub = target_df.select(target_select)
+
+        # Left join incoming with target
+        join_cond = [df_incoming[k] == target_sub[f"_target_{k}"] for k in nkeys]
+        joined = df_incoming.join(target_sub, on=join_cond, how="left")
+
+        # Condition 1: Brand new record
+        cond_new = col(f"_target_{nkeys[0]}").isNull()
+
+        # Condition 2: Updated / changed record
+        if has_updated_at:
+            try:
+                cond_updated = col("_updated_at") > col("_target_updated_at")
+            except TypeError:
+                cond_updated = col("_updated_at")
+        else:
+            cond_updated = lit(False)
+
+        # Condition 3: Unenriched record (target LLM output was null)
+        if has_llm_col:
+            cond_unenriched = col(f"_target_{enrichment_column}").isNull()
+        else:
+            cond_unenriched = lit(False)
+
+        try:
+            delta_filter = cond_new | cond_updated | cond_unenriched
+        except Exception:
+            delta_filter = cond_new
+        df_delta = joined.filter(delta_filter)
+
+        # Drop temporary target columns
+        cols_to_drop = [f"_target_{k}" for k in nkeys]
+        if has_updated_at:
+            cols_to_drop.append("_target_updated_at")
+        if has_llm_col:
+            cols_to_drop.append(f"_target_{enrichment_column}")
+
+        for c in cols_to_drop:
+            if c in df_delta.columns:
+                df_delta = df_delta.drop(c)
+
+        try:
+            delta_count = df_delta.count()
+            logger.info(f"[INCREMENTAL DELTA] Isolated {delta_count:,} new/modified delta records for custom transform / LLM processing.")
+        except Exception:
+            pass
+
+        return df_delta
 
     # --------------------------------------------------------------------------
     # Database Safety & Schema Pre-existence
