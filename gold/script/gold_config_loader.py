@@ -123,7 +123,7 @@ class GoldConfigLoader:
                         break
 
         if raw_config is None:
-            logger.warning("Gold configuration file 'gold_config.json' not found. Using empty defaults.")
+            logger.warning("Gold configuration file 'gold_config.json' not found on S3 or locally.")
             raw_config = {}
 
         interpolated = cls.interpolate_env(raw_config, effective_env)

@@ -223,6 +223,33 @@ class GoldInitialLoader:
             return None
 
     @classmethod
+    def _deduplicate_by_nkey(cls, df: DataFrame, nkeys: List[str]) -> DataFrame:
+        """
+        Ensures row uniqueness by natural key(s) (nkey) from gold config.
+        If timestamp/updated_at columns are present, retains the most recent record per natural key.
+        Otherwise applies dropDuplicates on the natural key subset.
+        """
+        if not nkeys or df is None:
+            return df
+        valid_nkeys = [k for k in nkeys if k in df.columns]
+        if not valid_nkeys:
+            return df
+        order_col = None
+        for candidate in ["_updated_at", "updated_at", "_inserted_at", "created_at", "timestamp", "start_time"]:
+            if candidate in df.columns:
+                order_col = candidate
+                break
+        if order_col:
+            try:
+                from pyspark.sql.window import Window
+                from pyspark.sql.functions import row_number, col
+                window_spec = Window.partitionBy(*[col(k) for k in valid_nkeys]).orderBy(col(order_col).desc())
+                return df.withColumn("__rn", row_number().over(window_spec)).filter(col("__rn") == 1).drop("__rn")
+            except Exception:
+                pass
+        return df.dropDuplicates(subset=valid_nkeys)
+
+    @classmethod
     def _get_gold_layer_manager(cls):
         """Lazily imports GoldLayerManager to prevent circular import locks."""
         global GoldLayerManager
@@ -330,12 +357,18 @@ class GoldInitialLoader:
 
         # Resolve Natural Keys (nkey) / Primary Keys
         pks = []
-        if params.get('NKEY'):
-            pks = [k.strip() for k in str(params['NKEY']).split(',') if k.strip()]
-        elif params.get('PRIMARY_KEY'):
-            pks = [k.strip() for k in str(params['PRIMARY_KEY']).split(',') if k.strip()]
-        elif GoldConfigLoader:
+        if GoldConfigLoader:
             pks = GoldConfigLoader.get_nkey(source_system, table_name, gold_cfg)
+        if not pks and params.get('NKEY'):
+            pks = [k.strip() for k in str(params['NKEY']).split(',') if k.strip()]
+        if not pks and params.get('PRIMARY_KEY'):
+            pks = [k.strip() for k in str(params['PRIMARY_KEY']).split(',') if k.strip()]
+
+        if not pks:
+            raise ValueError(
+                f"CRITICAL CONFIG ERROR: Missing 'nkey' in gold configuration for table '{table_name}' "
+                f"under source system '{source_system}'. A natural key is mandatory for initial load."
+            )
 
         full_table = f"`{glue_database}`.`{target_table_name}`"
 
@@ -400,11 +433,9 @@ class GoldInitialLoader:
         if "_inserted_at" not in df_consolidated.columns:
             df_consolidated = df_consolidated.withColumn("_inserted_at", current_timestamp())
 
-        # Strictly honor composite natural keys from config/CLI/annotations (no auto-detect)
-        if pks:
-            logger.info(f"[PRIMARY KEY] Natural keys resolved for '{table_name}': {pks}")
-        else:
-            logger.info(f"[PRIMARY KEY] No natural keys specified for '{table_name}'. Operating in overwrite/append mode.")
+        # Ensure row uniqueness by natural keys (nkey) from gold config
+        df_consolidated = cls._deduplicate_by_nkey(df_consolidated, pks)
+        logger.info(f"[PRIMARY KEY] Natural keys resolved for '{table_name}': {pks}")
 
         # 5. Perform Idempotent UPSERT into Athena / Iceberg Table
         temp_view = f"incoming_initial_{table_name}"

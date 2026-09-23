@@ -70,6 +70,9 @@ class TestGoldConfigLoader(unittest.TestCase):
     def setUp(self):
         GoldConfigLoader.clear_cache()
 
+    def tearDown(self):
+        GoldConfigLoader.clear_cache()
+
     def test_auto_load_local_config(self):
         cfg = GoldConfigLoader.load_config()
         self.assertIsInstance(cfg, dict)
@@ -132,6 +135,14 @@ class TestGoldConfigLoader(unittest.TestCase):
         }
         res = GoldConfigLoader.get_initial_load_config("custom_src", "tbl", custom)
         self.assertEqual(res.get("path"), "s3://bucket/custom.csv")
+
+    def test_load_config_when_file_not_found_returns_empty_dict(self):
+        GoldConfigLoader.clear_cache()
+        with patch("os.path.exists", return_value=False):
+            cfg = GoldConfigLoader.load_config()
+            self.assertEqual(cfg, {})
+            self.assertFalse(hasattr(GoldConfigLoader, "DEFAULT_CONFIG"))
+            self.assertFalse(hasattr(GoldLayerManager, "DEFAULT_CONFIG"))
 
 
 class TestGoldLayerManagerExtensions(unittest.TestCase):
@@ -1075,6 +1086,47 @@ class TestGoldInitialLoadIntegration(unittest.TestCase):
         # 3. Both fail
         mock_s3.list_objects_v2.return_value = {"Contents": []}
         self.assertFalse(GoldLayerManager._s3_path_exists("s3://bucket/missing.csv", mock_s3))
+
+    def test_missing_nkey_in_config_raises_value_error_in_pipeline(self):
+        """When nkey is missing from gold_config.json for a table, run_gold_pipeline raises ValueError."""
+        mock_spark = MagicMock()
+        mock_df = MagicMock()
+        mock_df.count.return_value = 1
+        mock_df.columns = ["val"]
+        mock_spark.sql.return_value = mock_df
+
+        params = {
+            "JOB_NAME": "test_missing_nkey",
+            "SOURCE_SYSTEM": "unknown_system",
+            "DATA_LAKE_BUCKET": "test-bucket"
+        }
+        with patch.object(GoldLayerManager, "_discover_queries", return_value={"test_table": "SELECT 1"}):
+            with self.assertRaises(ValueError) as ctx:
+                GoldLayerManager.run_gold_pipeline(mock_spark, params)
+            self.assertIn("Missing 'nkey' in gold configuration", str(ctx.exception))
+
+    def test_missing_nkey_in_config_raises_value_error_in_initial_load(self):
+        """When nkey is missing from gold_config.json for a table, run_initial_load raises ValueError."""
+        mock_spark = MagicMock()
+        params = {
+            "JOB_NAME": "test_init_missing_nkey",
+            "SOURCE_SYSTEM": "unknown_system",
+            "TABLE_NAME": "test_table",
+            "DATA_LAKE_BUCKET": "test-bucket"
+        }
+        with self.assertRaises(ValueError) as ctx:
+            GoldInitialLoader.run_initial_load(mock_spark, params)
+        self.assertIn("Missing 'nkey' in gold configuration", str(ctx.exception))
+
+    def test_deduplicate_by_nkey_drops_duplicates(self):
+        """_deduplicate_by_nkey enforces row uniqueness on the given natural key columns."""
+        mock_df = MagicMock()
+        mock_df.columns = ["interaction_id", "content"]
+        mock_df.dropDuplicates.return_value = "deduped_df"
+
+        result = GoldLayerManager._deduplicate_by_nkey(mock_df, ["interaction_id"])
+        mock_df.dropDuplicates.assert_called_once_with(subset=["interaction_id"])
+        self.assertEqual(result, "deduped_df")
 
 
 if __name__ == "__main__":

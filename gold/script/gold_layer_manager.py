@@ -32,6 +32,11 @@ from botocore.exceptions import ClientError
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import current_timestamp, lit, col
 
+# Ensure gold script directory is in sys.path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
 try:
     from gold_config_loader import GoldConfigLoader
 except ImportError:
@@ -80,19 +85,43 @@ class GoldLayerManager:
         ).strip().lower()
         logger.info(f"Target deployment environment resolved: '{env}'")
 
+        # Initialize S3 client early if not provided
+        if not s3_client:
+            try:
+                import boto3
+                s3_client = boto3.client('s3')
+            except Exception as e:
+                logger.warning(f"Could not initialize S3 client: {e}")
+
+        # Resolve Data Lake Bucket
+        raw_bucket = (
+            params.get('DATA_LAKE_BUCKET')
+            or os.environ.get('DATA_LAKE_BUCKET')
+            or f"uax-datalake-{env}-bucket"
+        )
+        bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+        # Auto-discover gold_config.json in S3 if not explicitly passed
+        config_s3_path = params.get('GOLD_CONFIG_S3_PATH')
+        if not config_s3_path and s3_client:
+            candidate_cfg_paths = [
+                f"s3://{bucket_name}/gold/script/config/gold_config.json",
+                f"s3://{bucket_name}/gold/config/gold_config.json"
+            ]
+            for c_path in candidate_cfg_paths:
+                if cls._s3_path_exists(c_path, s3_client):
+                    config_s3_path = c_path
+                    logger.info(f"Auto-discovered Gold configuration in S3 at '{config_s3_path}'")
+                    break
+
         # Load Gold Configuration via GoldConfigLoader with dynamic {env} interpolation
-        gold_cfg = GoldConfigLoader.load_config(params.get('GOLD_CONFIG_S3_PATH'), s3_client=s3_client, env=env) if GoldConfigLoader else {}
+        gold_cfg = GoldConfigLoader.load_config(config_s3_path, s3_client=s3_client, env=env) if GoldConfigLoader else {}
         if GoldConfigLoader:
             GoldConfigLoader.set_loaded_config(gold_cfg, env=env)
 
         defaults_cfg = GoldConfigLoader.get_defaults(gold_cfg, env=env) if GoldConfigLoader else {}
-
-        raw_bucket = (
-            params.get('DATA_LAKE_BUCKET')
-            or defaults_cfg.get('gold_bucket')
-            or f"uax-datalake-{env}-bucket"
-        )
-        bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+        if defaults_cfg.get('gold_bucket') and not params.get('DATA_LAKE_BUCKET'):
+            bucket_name = str(defaults_cfg['gold_bucket']).replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
         raw_glue_db = (
             params.get('GLUE_DATABASE')
@@ -234,15 +263,23 @@ class GoldLayerManager:
 
         for clean_base_name, sql_text in queries.items():
             mart_start = datetime.now(timezone.utc)
-            # 1. Primary key resolution (Config > SQL Header Annotation > CLI > Auto-detect)
+            # 1. Natural key (nkey) resolution strictly from Gold config (or CLI override params)
             pks = []
             if GoldConfigLoader:
                 pks = GoldConfigLoader.get_primary_key(source_system, clean_base_name, gold_cfg)
-            if not pks:
-                annotations = cls._extract_sql_annotations(sql_text)
-                pks = annotations.get("primary_key", [])
+            if not pks and params.get("NKEY"):
+                pks = [k.strip() for k in str(params["NKEY"]).split(",") if k.strip()]
             if not pks and params.get("PRIMARY_KEY"):
                 pks = [k.strip() for k in str(params["PRIMARY_KEY"]).split(",") if k.strip()]
+
+            # Strictly require nkey from gold config — no hardcoded or default keys allowed
+            if not pks:
+                raise ValueError(
+                    f"CRITICAL CONFIG ERROR: Missing 'nkey' in gold configuration for table '{clean_base_name}' "
+                    f"under source system '{source_system}'. A natural key is mandatory to ensure row uniqueness "
+                    f"and enable idempotent Iceberg/Aurora upserts. Please configure 'nkey' in gold_config.json under "
+                    f"source_systems.{source_system}.tables.{clean_base_name}."
+                )
 
             # 2. Target Athena Table Name (Default: gold_<source>_<tablename>)
             if GoldConfigLoader:
@@ -340,12 +377,9 @@ class GoldLayerManager:
                 if "_inserted_at" not in df_mart.columns:
                     df_mart = df_mart.withColumn("_inserted_at", current_timestamp())
 
-                # Strictly honor composite natural keys from config/CLI/annotations (no auto-detect)
-                if pks:
-                    logger.info(f"[PRIMARY KEY] Natural keys resolved for '{clean_base_name}': {pks}")
-                else:
-                    logger.info(f"[PRIMARY KEY] No natural keys specified for '{clean_base_name}'. Operating in overwrite/append mode.")
-
+                # Ensure row uniqueness by natural keys (nkey) from gold config
+                df_mart = cls._deduplicate_by_nkey(df_mart, pks)
+                logger.info(f"[PRIMARY KEY] Natural keys resolved for '{clean_base_name}': {pks}")
                 mart_keys[clean_base_name] = pks
 
                 # Register in-session Spark views so downstream dependent marts resolve seamlessly
@@ -758,17 +792,22 @@ class GoldLayerManager:
             pks = mart_keys.get(clean_base_name, [])
             if not pks and GoldConfigLoader and source_system:
                 pks = GoldConfigLoader.get_primary_key(source_system, clean_base_name, gold_cfg)
-            if not pks and params.get("PRIMARY_KEY"):
-                pks = [k.strip() for k in str(params["PRIMARY_KEY"]).split(",") if k.strip()]
             if not pks and params.get("NKEY"):
                 pks = [k.strip() for k in str(params["NKEY"]).split(",") if k.strip()]
+            if not pks and params.get("PRIMARY_KEY"):
+                pks = [k.strip() for k in str(params["PRIMARY_KEY"]).split(",") if k.strip()]
+            if not pks:
+                raise ValueError(
+                    f"CRITICAL CONFIG ERROR: Missing 'nkey' in gold configuration for table '{clean_base_name}' "
+                    f"under source system '{source_system}'."
+                )
 
             logger.info(
                 f"\n+--------------------------------------------------------------------------------+\n"
                 f"|  PROCESSING MYSQL GOLD MART: '{clean_base_name}'\n"
                 f"|  * Target Table  : {gold_schema}.{target_table}\n"
                 f"|  * Staging Table : {gold_schema}.{staging_table}\n"
-                f"|  * Primary Keys  : {pks or 'None (Zero-Downtime Swap)'}\n"
+                f"|  * Primary Keys  : {pks}\n"
                 f"|  * Power BI Feed : {gold_schema}.{target_table} (Zero-Downtime Physical Table)\n"
                 f"+--------------------------------------------------------------------------------+"
             )
@@ -779,18 +818,19 @@ class GoldLayerManager:
                 athena_tbl_name = f"`{glue_db}`.`{target_table}`"
                 if clean_base_name in materialized_dfs:
                     df_mart = materialized_dfs[clean_base_name]
-                    row_count = df_mart.count()
-                    logger.info(f"[ATHENA -> AURORA] Reusing Step 1 materialized DataFrame from Athena for '{clean_base_name}' ({row_count:,} records).")
+                    logger.info(f"[ATHENA -> AURORA] Reusing Step 1 materialized DataFrame from Athena for '{clean_base_name}'.")
                 else:
                     try:
                         logger.info(f"[ATHENA -> AURORA] Reading directly from Athena Iceberg table {athena_tbl_name}...")
                         df_mart = spark.table(f"{glue_db}.{target_table}")
-                        row_count = df_mart.count()
-                        logger.info(f"[ATHENA -> AURORA] Successfully loaded {row_count:,} records directly from Athena table {athena_tbl_name}.")
+                        logger.info(f"[ATHENA -> AURORA] Successfully loaded records directly from Athena table {athena_tbl_name}.")
                     except Exception as athena_read_err:
                         logger.warning(f"[ATHENA -> AURORA NOTE] Could not read directly from Athena table {athena_tbl_name} ({athena_read_err}). Falling back to SQL query.")
                         df_mart = spark.sql(sql_text)
-                        row_count = df_mart.count()
+
+                # Ensure row uniqueness by natural keys (nkey) from gold config
+                df_mart = cls._deduplicate_by_nkey(df_mart, pks)
+                row_count = df_mart.count()
 
                 cls._log_schema_introspection(df_mart, f"Gold Query Output Schema: '{clean_base_name}'")
 
@@ -1090,17 +1130,14 @@ class GoldLayerManager:
 
     @classmethod
     def _get_gold_initial_loader(cls):
-        """Lazily imports GoldInitialLoader to avoid circular import issues."""
+        """Returns GoldInitialLoader class, either local or imported."""
+        if 'GoldInitialLoader' in globals():
+            return globals()['GoldInitialLoader']
         try:
             from gold_initial_load import GoldInitialLoader
             return GoldInitialLoader
-        except ImportError:
-            try:
-                from gold.script.gold_initial_load import GoldInitialLoader
-                return GoldInitialLoader
-            except ImportError as e:
-                logger.error(f"[INITIAL LOAD] Failed to import GoldInitialLoader: {e}")
-                return None
+        except Exception:
+            return None
 
     @classmethod
     def _s3_path_exists(cls, s3_path: str, s3_client=None) -> bool:
@@ -1293,6 +1330,8 @@ class GoldLayerManager:
         Ensures idempotent loads via Spark SQL MERGE INTO when primary key exists.
         """
         full_table = f"`{glue_database}`.`{target_table_name}`"
+        if primary_keys:
+            df_mart = cls._deduplicate_by_nkey(df_mart, primary_keys)
         row_count = df_mart.count()
         temp_view = f"incoming_gold_{clean_base_name}"
         df_mart.createOrReplaceTempView(temp_view)
@@ -1336,6 +1375,45 @@ class GoldLayerManager:
                 df_mart.write.mode("overwrite").format("parquet").save(s3_location)
 
         return row_count
+
+    # --------------------------------------------------------------------------
+    # Natural Key Deduplication & Row Uniqueness
+    # --------------------------------------------------------------------------
+    @classmethod
+    def _deduplicate_by_nkey(cls, df: DataFrame, nkeys: List[str]) -> DataFrame:
+        """
+        Ensures row uniqueness by natural key(s) (nkey) from gold config.
+        If timestamp/updated_at columns are present, retains the most recent record per natural key.
+        Otherwise applies dropDuplicates on the natural key subset.
+        """
+        if not nkeys or df is None:
+            return df
+        valid_nkeys = [k for k in nkeys if k in df.columns]
+        if not valid_nkeys:
+            logger.warning(
+                f"[ROW DEDUPLICATION] Natural keys {nkeys} not present in DataFrame columns: {df.columns}. "
+                f"Skipping deduplication."
+            )
+            return df
+
+        logger.info(f"[ROW DEDUPLICATION] Enforcing row uniqueness on natural keys: {valid_nkeys}")
+
+        order_col = None
+        for candidate in ["_updated_at", "updated_at", "_inserted_at", "created_at", "timestamp", "start_time"]:
+            if candidate in df.columns:
+                order_col = candidate
+                break
+
+        if order_col:
+            try:
+                from pyspark.sql.window import Window
+                from pyspark.sql.functions import row_number, col
+                window_spec = Window.partitionBy(*[col(k) for k in valid_nkeys]).orderBy(col(order_col).desc())
+                return df.withColumn("__rn", row_number().over(window_spec)).filter(col("__rn") == 1).drop("__rn")
+            except Exception as win_err:
+                logger.debug(f"[ROW DEDUPLICATION] Window deduplication fallback: {win_err}")
+
+        return df.dropDuplicates(subset=valid_nkeys)
 
     # --------------------------------------------------------------------------
     # Incremental Delta Isolation (Anti-Join & Change Detection for LLM Cost Protection)
@@ -2576,6 +2654,360 @@ class GoldLayerManager:
             f"+================================================================================+"
         )
         logger.info(summary_card)
+
+
+class GoldInitialLoader:
+    """
+    Handles initial historical data ingestion and column consolidation for Gold tables.
+    Self-contained within gold_layer_manager to guarantee standalone execution in AWS Glue.
+    """
+
+    @classmethod
+    def sanitize_column_name(cls, col_name: str) -> str:
+        if not col_name:
+            return "unnamed_column"
+        clean = re.sub(r'[\s\.\-\/\:\(\)\[\]\{\}\<\>#]+', '_', str(col_name).strip())
+        clean = re.sub(r'[^a-zA-Z0-9_]', '', clean)
+        clean = re.sub(r'_+', '_', clean).strip('_')
+        if not clean:
+            clean = "col"
+        elif clean[0].isdigit():
+            clean = f"col_{clean}"
+        return clean.lower()
+
+    @classmethod
+    def reconcile_schema(
+        cls,
+        df_source: DataFrame,
+        target_schema_fields: Optional[List[Any]] = None
+    ) -> DataFrame:
+        for orig_col in list(df_source.columns):
+            clean_col = cls.sanitize_column_name(orig_col)
+            if clean_col != orig_col:
+                logger.info(f"[COLUMN CLEANSING] Renaming '{orig_col}' -> '{clean_col}'")
+                df_source = df_source.withColumnRenamed(orig_col, clean_col)
+
+        if not target_schema_fields:
+            return df_source
+
+        target_field_map = {}
+        for f in target_schema_fields:
+            norm_name = cls.sanitize_column_name(f.name)
+            target_field_map[norm_name] = (f.name, f.dataType)
+
+        source_cols = {cls.sanitize_column_name(c): c for c in df_source.columns}
+
+        missing_in_source = []
+        for norm_name, (target_name, data_type) in target_field_map.items():
+            if norm_name not in source_cols:
+                missing_in_source.append(target_name)
+                df_source = df_source.withColumn(target_name, lit(None).cast(data_type))
+            else:
+                actual_col = source_cols[norm_name]
+                if actual_col != target_name:
+                    df_source = df_source.withColumnRenamed(actual_col, target_name)
+
+        if missing_in_source:
+            logger.info(f"[SCHEMA CONSOLIDATION] Padding {len(missing_in_source)} missing column(s) with NULL: {missing_in_source}")
+
+        extra_in_source = [source_cols[norm_name] for norm_name in source_cols if norm_name not in target_field_map]
+        if extra_in_source:
+            logger.info(f"[SCHEMA CONSOLIDATION] Preserving {len(extra_in_source)} extra column(s) from CSV for schema evolution: {extra_in_source}")
+
+        return df_source
+
+    @classmethod
+    def _probe_target_schema_from_query(
+        cls,
+        spark: SparkSession,
+        source_system: str,
+        table_name: str,
+        params: Dict[str, Any]
+    ) -> Optional[List[Any]]:
+        sql_text = params.get('GOLD_SQL') or params.get('QUERY_SQL')
+        query_path = params.get('QUERY_PATH')
+        if not sql_text and query_path:
+            if query_path.startswith('s3://'):
+                try:
+                    import boto3
+                    from urllib.parse import urlparse
+                    parsed = urlparse(query_path)
+                    s3 = boto3.client('s3')
+                    resp = s3.get_object(Bucket=parsed.netloc, Key=parsed.path.lstrip('/'))
+                    sql_text = resp['Body'].read().decode('utf-8')
+                    logger.info(f"[QUERY DISCOVERY] Loaded Gold query from '{query_path}'")
+                except Exception as s3_err:
+                    logger.warning(f"Could not load Gold query from S3 '{query_path}': {s3_err}")
+            elif os.path.exists(query_path):
+                with open(query_path, 'r', encoding='utf-8') as f:
+                    sql_text = f.read()
+                logger.info(f"[QUERY DISCOVERY] Loaded Gold query from local path '{query_path}'")
+
+        if not sql_text and params.get('DATA_LAKE_BUCKET'):
+            bucket_name = params.get('DATA_LAKE_BUCKET')
+            for q_name in [f"{table_name}.sql", f"v_{table_name}.sql"]:
+                s3_key = f"gold/query/{source_system}/{q_name}"
+                try:
+                    import boto3
+                    s3 = boto3.client('s3')
+                    resp = s3.get_object(Bucket=bucket_name, Key=s3_key)
+                    sql_text = resp['Body'].read().decode('utf-8')
+                    logger.info(f"[QUERY AUTO-DISCOVERY] Found S3 Gold query file at 's3://{bucket_name}/{s3_key}'")
+                    break
+                except Exception:
+                    pass
+
+        if not sql_text:
+            return None
+
+        clean_sql = re.sub(r'--[^\r\n]*', '', sql_text).strip().rstrip(';')
+        if not clean_sql:
+            return None
+
+        probe_sql = f"SELECT * FROM (\n{clean_sql}\n) AS probe_q WHERE 1=0"
+        try:
+            probe_df = spark.sql(probe_sql)
+            target_fields = probe_df.schema.fields
+            logger.info(f"[QUERY SCHEMA PROBE] Successfully probed schema: found {len(target_fields)} column(s) from Gold query.")
+            return target_fields
+        except Exception as probe_err:
+            logger.warning(f"[QUERY SCHEMA PROBE NOTE] Spark SQL zero-record probe note: {probe_err}. Proceeding with input file schema.")
+            return None
+
+    @classmethod
+    def run_initial_load(
+        cls,
+        spark: SparkSession,
+        params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        start_time = datetime.now(timezone.utc)
+        env = (
+            params.get('ENV')
+            or params.get('env')
+            or params.get('ENVIRONMENT')
+            or params.get('environment')
+            or os.environ.get('ENV')
+            or os.environ.get('ENVIRONMENT')
+            or 'dev'
+        ).strip().lower()
+
+        source_system = (params.get('SOURCE_SYSTEM') or '').strip().lower()
+        table_name = (params.get('TABLE_NAME') or params.get('MART_NAME') or '').strip().lower()
+
+        if not source_system or not table_name:
+            raise ValueError("CRITICAL ERROR: '--SOURCE_SYSTEM' and '--TABLE_NAME' are required for Gold initial load.")
+
+        for prefix in [f"gold_{source_system}_", "gold_tbl_", "gold_", "v_"]:
+            if table_name.startswith(prefix):
+                table_name = table_name[len(prefix):]
+                break
+
+        gold_cfg = GoldConfigLoader.load_config(env=env) if GoldConfigLoader else {}
+        defaults_cfg = GoldConfigLoader.get_defaults(gold_cfg, env=env) if GoldConfigLoader else {}
+
+        raw_bucket = (
+            params.get('DATA_LAKE_BUCKET')
+            or defaults_cfg.get('gold_bucket')
+            or f"uax-datalake-{env}-bucket"
+        )
+        bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+        raw_glue_db = (
+            params.get('GLUE_DATABASE')
+            or (GoldConfigLoader.get_glue_database(gold_cfg, env=env) if GoldConfigLoader else None)
+            or f"uax_datalake_db_{env}"
+        )
+        glue_database = str(raw_glue_db).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+        csv_path = params.get('CSV_PATH') or params.get('INITIAL_LOAD_PATH') or params.get('INPUT_FILE')
+        if not csv_path and GoldConfigLoader:
+            init_cfg = GoldConfigLoader.get_initial_load_config(source_system, table_name, gold_cfg)
+            csv_path = init_cfg.get('path')
+            if not params.get('DELIMITER') and init_cfg.get('delimiter'):
+                params['DELIMITER'] = init_cfg.get('delimiter')
+            if not params.get('HAS_HEADER') and 'has_header' in init_cfg:
+                params['HAS_HEADER'] = init_cfg.get('has_header')
+
+        if csv_path and isinstance(csv_path, str):
+            csv_path = (
+                csv_path
+                .replace("{bucket}", bucket_name)
+                .replace("{env}", env)
+                .replace("{ENV}", env.upper())
+                .replace("{source}", source_system)
+                .replace("{table}", table_name)
+            )
+
+        if not csv_path:
+            csv_path = f"s3://{bucket_name}/gold/initial_exports/{source_system}/{table_name}.csv"
+
+        if GoldConfigLoader:
+            target_table_name = GoldConfigLoader.get_target_table_name(source_system, table_name, 'athena', gold_cfg)
+        else:
+            target_table_name = f"gold_{source_system}_{table_name}"
+
+        pks = []
+        if GoldConfigLoader:
+            pks = GoldConfigLoader.get_nkey(source_system, table_name, gold_cfg)
+        if not pks and params.get('NKEY'):
+            pks = [k.strip() for k in str(params['NKEY']).split(',') if k.strip()]
+        if not pks and params.get('PRIMARY_KEY'):
+            pks = [k.strip() for k in str(params['PRIMARY_KEY']).split(',') if k.strip()]
+
+        if not pks:
+            raise ValueError(
+                f"CRITICAL CONFIG ERROR: Missing 'nkey' in gold configuration for table '{table_name}' "
+                f"under source system '{source_system}'. A natural key is mandatory for initial load."
+            )
+
+        full_table = f"`{glue_database}`.`{target_table_name}`"
+
+        logger.info(
+            f"\n+================================================================================+\n"
+            f"|                STARTING GOLD INITIAL LOAD & CONSOLIDATION                      |\n"
+            f"+================================================================================+\n"
+            f"|  * Source System     : {source_system.upper()}\n"
+            f"|  * Table Name        : {table_name}\n"
+            f"|  * Target Table      : {full_table}\n"
+            f"|  * Natural Keys      : {pks or 'None (Overwrite)'}\n"
+            f"|  * Input File Path   : {csv_path}\n"
+            f"|  * Glue Database     : {glue_database}\n"
+            f"|  * Execution Time    : {start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"+================================================================================+"
+        )
+
+        if csv_path.endswith('.parquet'):
+            logger.info(f"Reading input Parquet file from '{csv_path}'...")
+            df_raw = spark.read.parquet(csv_path)
+        else:
+            delimiter = params.get('DELIMITER', ',')
+            has_header = str(params.get('HAS_HEADER', 'true')).strip().lower() in ('true', '1', 'yes')
+            logger.info(f"Reading input CSV file from '{csv_path}' (delimiter='{delimiter}', header={has_header})...")
+            df_raw = spark.read \
+                .option("header", str(has_header).lower()) \
+                .option("delimiter", delimiter) \
+                .option("inferSchema", "false") \
+                .csv(csv_path)
+
+        raw_count = df_raw.count()
+        logger.info(f"Loaded {raw_count:,} records from input file.")
+
+        target_fields = None
+        table_exists = False
+        try:
+            target_df = spark.table(f"{glue_database}.{target_table_name}")
+            target_fields = target_df.schema.fields
+            table_exists = True
+            logger.info(f"Found existing Gold table '{full_table}' with {len(target_fields)} column(s).")
+        except Exception:
+            table_exists = False
+            logger.info(f"Gold table '{full_table}' not found in catalog. Attempting automatic Gold query extraction...")
+
+        if not target_fields:
+            target_fields = cls._probe_target_schema_from_query(
+                spark=spark,
+                source_system=source_system,
+                table_name=table_name,
+                params=params
+            )
+
+        df_consolidated = cls.reconcile_schema(df_raw, target_fields)
+
+        if "_updated_at" not in df_consolidated.columns:
+            df_consolidated = df_consolidated.withColumn("_updated_at", current_timestamp())
+        if "_inserted_at" not in df_consolidated.columns:
+            df_consolidated = df_consolidated.withColumn("_inserted_at", current_timestamp())
+
+        # Ensure row uniqueness by natural keys (nkey) from gold config
+        df_consolidated = GoldLayerManager._deduplicate_by_nkey(df_consolidated, pks)
+        logger.info(f"[PRIMARY KEY] Natural keys resolved for '{table_name}': {pks}")
+
+        temp_view = f"incoming_initial_{table_name}"
+        df_consolidated.createOrReplaceTempView(temp_view)
+        s3_location = f"s3://{bucket_name}/gold/data/{source_system}/{table_name}"
+
+        if table_exists:
+            try:
+                GoldLayerManager._sync_iceberg_schema(spark, full_table, df_consolidated)
+            except Exception as sync_err:
+                logger.debug(f"[INITIAL LOAD] Note on Iceberg schema sync: {sync_err}")
+
+        if table_exists and pks:
+            join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in pks])
+            merge_sql = (
+                f"MERGE INTO {full_table} AS target\n"
+                f"USING {temp_view} AS source\n"
+                f"ON {join_cond}\n"
+                f"WHEN MATCHED THEN UPDATE SET *\n"
+                f"WHEN NOT MATCHED THEN INSERT *"
+            )
+            logger.info(f"[INITIAL LOAD UPSERT] Executing Iceberg MERGE INTO on {full_table}:\n{merge_sql}")
+            try:
+                spark.sql(merge_sql)
+            except Exception as merge_err:
+                logger.warning(f"[INITIAL LOAD UPSERT] Spark SQL MERGE failed ({merge_err}). Overwriting to {s3_location}...")
+                df_consolidated.write.mode("overwrite").format("parquet").save(s3_location)
+        else:
+            logger.info(f"[INITIAL LOAD WRITE] Writing initial Gold table {full_table} to '{s3_location}'...")
+            try:
+                df_consolidated.write \
+                    .format("iceberg") \
+                    .mode("overwrite") \
+                    .option("path", s3_location) \
+                    .saveAsTable(f"{glue_database}.{target_table_name}")
+            except Exception as ice_err:
+                logger.warning(f"[INITIAL LOAD WRITE] Direct Iceberg saveAsTable fallback to Parquet: {ice_err}")
+                df_consolidated.write.mode("overwrite").format("parquet").save(s3_location)
+
+        target_engines = []
+        if params.get('GOLD_TARGETS') or params.get('TARGET_ENGINES'):
+            target_engines = [t.strip().lower() for t in str(params.get('GOLD_TARGETS') or params.get('TARGET_ENGINES')).split(',') if t.strip()]
+        elif GoldConfigLoader:
+            target_engines = GoldConfigLoader.get_target_engines(source_system, table_name, gold_cfg)
+
+        skip_aurora = str(params.get('SKIP_AURORA_SERVE', 'false')).strip().lower() in ('true', '1', 'yes')
+        needs_aurora = not skip_aurora and any(t in target_engines for t in ('aurora', 'rds', 'mysql'))
+        if needs_aurora:
+            logger.info(f"[AURORA EXTENSION] User requested Aurora serving for '{target_table_name}'. Reading from Athena table and serving to Aurora...")
+            try:
+                df_athena = spark.table(full_table)
+                gold_schema = params.get('GOLD_SCHEMA') or 'enterprise_reporting'
+                GoldLayerManager._serve_to_mysql(
+                    spark=spark,
+                    queries={table_name: ""},
+                    gold_schema=gold_schema,
+                    data_s3_path=s3_location,
+                    params=params,
+                    glue_client=None,
+                    secrets_client=None,
+                    mart_stats=[],
+                    source_system=source_system,
+                    materialized_dfs={table_name: df_athena},
+                    mart_keys={table_name: pks}
+                )
+                logger.info(f"[AURORA EXTENSION] Successfully served Athena table '{full_table}' to Aurora '{gold_schema}.{target_table_name}'.")
+            except Exception as aurora_err:
+                logger.error(f"[AURORA EXTENSION ERROR] Failed to serve to Aurora: {aurora_err}")
+
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+        logger.info(
+            f"\n+================================================================================+\n"
+            f"|                GOLD INITIAL LOAD COMPLETED SUCCESSFULLY                        |\n"
+            f"+================================================================================+\n"
+            f"|  * Target Table    : {full_table}\n"
+            f"|  * Records Loaded  : {raw_count:,}\n"
+            f"|  * Duration        : {duration:.2f}s\n"
+            f"+================================================================================+"
+        )
+
+        return {
+            "source_system": source_system,
+            "table_name": table_name,
+            "target_table": f"{glue_database}.{target_table_name}",
+            "records_loaded": raw_count,
+            "duration_seconds": round(duration, 2),
+            "status": "SUCCESS"
+        }
 
 
 def main():
