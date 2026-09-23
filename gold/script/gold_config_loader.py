@@ -154,6 +154,34 @@ class GoldConfigLoader:
         return tbl_cfg.get("llm_column") or tbl_cfg.get("enrichment_column")
 
     @classmethod
+    def get_secret_name(
+        cls,
+        source_system: Optional[str] = None,
+        config_dict: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """
+        Retrieves database secret_name from gold_config.json:
+        1. source_systems.<source>.aurora.secret_name
+        2. source_systems.<source>.secret_name
+        3. pipeline_defaults.aurora.secret_name
+        4. pipeline_defaults.secret_name
+        """
+        cfg = config_dict or cls.load_config()
+        if source_system:
+            src_cfg = cls.get_source_config(source_system, cfg)
+            aurora_cfg = src_cfg.get("aurora", {})
+            if isinstance(aurora_cfg, dict) and aurora_cfg.get("secret_name"):
+                return aurora_cfg.get("secret_name")
+            if src_cfg.get("secret_name"):
+                return src_cfg.get("secret_name")
+
+        defaults = cls.get_defaults(cfg)
+        aurora_def = defaults.get("aurora", {})
+        if isinstance(aurora_def, dict) and aurora_def.get("secret_name"):
+            return aurora_def.get("secret_name")
+        return defaults.get("secret_name")
+
+    @classmethod
     def get_target_engines(
         cls,
         source_system: str,

@@ -343,6 +343,65 @@ class TestGoldIncrementalDelta(unittest.TestCase):
         mock_incoming_df.join.assert_called_once()
         mock_joined_df.filter.assert_called_once()
 
+    def test_get_secret_name_resolution(self):
+        # 1. Custom config with source-level secret
+        cfg_source = {
+            "source_systems": {
+                "genesys": {
+                    "aurora": {"secret_name": "rds/genesys-secret"}
+                }
+            },
+            "pipeline_defaults": {
+                "aurora": {"secret_name": "rds/default-secret"}
+            }
+        }
+        self.assertEqual(
+            GoldConfigLoader.get_secret_name("genesys", cfg_source),
+            "rds/genesys-secret"
+        )
+        # 2. Source without aurora secret falls back to pipeline_defaults
+        self.assertEqual(
+            GoldConfigLoader.get_secret_name("other_source", cfg_source),
+            "rds/default-secret"
+        )
+        # 3. Direct config level secret
+        cfg_root = {
+            "pipeline_defaults": {"secret_name": "rds/pipeline-secret"}
+        }
+        self.assertEqual(
+            GoldConfigLoader.get_secret_name(None, cfg_root),
+            "rds/pipeline-secret"
+        )
+
+    def test_resolve_mysql_connection_info_with_secret_name(self):
+        # Test CLI param takes precedence, else falls back to config
+        with patch("gold.script.gold_layer_manager.GoldConfigLoader.get_secret_name") as mock_cfg_secret:
+            mock_cfg_secret.return_value = "rds/config-secret"
+            mock_secrets_client = MagicMock()
+            mock_secrets_client.get_secret_value.return_value = {
+                "SecretString": json.dumps({"password": "resolved_pwd", "username": "dbuser"})
+            }
+
+            # 1. When CLI SECRET_NAME is provided
+            conn_info_cli = GoldLayerManager._resolve_mysql_connection_info({
+                "SECRET_NAME": "rds/cli-secret",
+                "GOLD_SCHEMA": "enterprise_reporting",
+                "RDS_HOST": "aurora.cluster.test",
+                "SOURCE_SYSTEM": "genesys"
+            }, secrets_client=mock_secrets_client)
+            mock_secrets_client.get_secret_value.assert_called_with(SecretId="rds/cli-secret")
+            self.assertEqual(conn_info_cli["password"], "resolved_pwd")
+
+            # 2. When CLI SECRET_NAME is omitted, falls back to config secret
+            mock_secrets_client.reset_mock()
+            conn_info_fallback = GoldLayerManager._resolve_mysql_connection_info({
+                "GOLD_SCHEMA": "enterprise_reporting",
+                "RDS_HOST": "aurora.cluster.test",
+                "SOURCE_SYSTEM": "genesys"
+            }, secrets_client=mock_secrets_client)
+            mock_secrets_client.get_secret_value.assert_called_with(SecretId="rds/config-secret")
+            self.assertEqual(conn_info_fallback["password"], "resolved_pwd")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1852,6 +1852,10 @@ class GoldLayerManager:
             or os.environ.get('RDS_PASSWORD')
         )
 
+        config_secret = None
+        if GoldConfigLoader:
+            config_secret = GoldConfigLoader.get_secret_name(params.get('SOURCE_SYSTEM'))
+
         secret_name = (
             params.get('RDS_SECRET_NAME')
             or params.get('rds_secret_name')
@@ -1861,6 +1865,7 @@ class GoldLayerManager:
             or params.get('db_secret_name')
             or params.get('DB_SECRET')
             or params.get('db_secret')
+            or config_secret
             or os.environ.get('RDS_SECRET_NAME')
         )
         conn_name = params.get('CONNECTION_NAME') or params.get('GLUE_CONNECTION_NAME')
@@ -2035,3 +2040,32 @@ class GoldLayerManager:
             f"+================================================================================+"
         )
         logger.info(summary_card)
+
+
+def main():
+    """Glue entrypoint when executed as an AWS Glue Job."""
+    from pyspark.context import SparkContext
+    from awsglue.context import GlueContext
+    from awsglue.utils import getResolvedOptions
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+    sc = SparkContext.getOrCreate()
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+
+    expected_args = ['JOB_NAME', 'SOURCE_SYSTEM']
+    optional_args = [
+        'SECRET_NAME', 'RDS_SECRET_NAME', 'GLUE_DATABASE', 'DATA_LAKE_BUCKET',
+        'INCREMENTAL', 'FULL_REFRESH', 'RDS_HOST', 'RDS_PORT', 'RDS_USER', 'RDS_PASSWORD',
+        'GOLD_SCHEMA', 'GOLD_TARGETS', 'CONNECTION_NAME', 'ENV'
+    ]
+
+    args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv]
+    resolved = getResolvedOptions(sys.argv, args_to_check)
+
+    GoldLayerManager.run_gold_pipeline(spark, resolved)
+
+
+if __name__ == "__main__":
+    main()

@@ -412,7 +412,8 @@ def main():
         'JOB_NAME', 'SOURCE_SYSTEM', 'TABLE_NAME', 'CSV_PATH'
     ]
     optional_args = [
-        'PRIMARY_KEY', 'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'DELIMITER', 'HAS_HEADER'
+        'NKEY', 'PRIMARY_KEY', 'SECRET_NAME', 'RDS_SECRET_NAME',
+        'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'DELIMITER', 'HAS_HEADER'
     ]
 
     args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv]
