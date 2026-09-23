@@ -1763,22 +1763,6 @@ class GoldLayerManager:
             # 1. Dynamically evolve Iceberg schema if new columns are present
             cls._sync_iceberg_schema(spark, full_table, df_mart)
 
-            # 2. Align incoming df_mart with target table schema to guarantee MERGE SET * compatibility
-            try:
-                target_df = spark.table(f"{glue_database}.{target_table_name}")
-                target_cols = {f.name.lower(): f for f in target_df.schema.fields}
-                incoming_cols = {c.lower(): c for c in df_mart.columns}
-
-                for t_lower, f in target_cols.items():
-                    if t_lower not in incoming_cols:
-                        if t_lower == 'conversation_topics' and 'conversation_topic' in incoming_cols:
-                            df_mart = df_mart.withColumn(f.name, col(incoming_cols['conversation_topic']))
-                        elif t_lower == 'conversation_topic' and 'conversation_topics' in incoming_cols:
-                            df_mart = df_mart.withColumn(f.name, col(incoming_cols['conversation_topics']))
-                        else:
-                            df_mart = df_mart.withColumn(f.name, lit(None).cast(f.dataType))
-            except Exception as align_err:
-                logger.warning(f"[SCHEMA ALIGNMENT NOTE] Error aligning columns with target table: {align_err}")
 
         # Register temp view with fully aligned columns for Spark SQL MERGE
         temp_view = f"incoming_gold_{clean_base_name}"
