@@ -1169,20 +1169,23 @@ class GoldLayerManager:
             )
 
             try:
-                # 1. Read directly from Step 1 Athena table or in-memory DataFrame
+                # 1. Read records for MySQL serving
                 glue_db = params.get('GLUE_DATABASE') or 'uax_datalake_db_dev'
                 athena_tbl_name = f"`{glue_db}`.`{target_table}`"
-                if clean_base_name in materialized_dfs:
+                mysql_exists = cls._table_exists(jdbc_conn_info, gold_schema, target_table)
+
+                if mysql_exists and clean_base_name in materialized_dfs:
                     df_mart = materialized_dfs[clean_base_name]
-                    logger.info(f"[ATHENA -> AURORA] Reusing Step 1 materialized DataFrame from Athena for '{clean_base_name}'.")
+                    logger.info(f"[ATHENA -> AURORA] Incremental run: reusing delta records for existing MySQL table '{gold_schema}.{target_table}'.")
                 else:
+                    # Initial creation in MySQL or full sync: read full Athena Iceberg table
                     try:
-                        logger.info(f"[ATHENA -> AURORA] Reading directly from Athena Iceberg table {athena_tbl_name}...")
+                        logger.info(f"[ATHENA -> AURORA] Target table '{gold_schema}.{target_table}' not in MySQL (or full sync). Reading full Athena table {athena_tbl_name}...")
                         df_mart = spark.table(f"{glue_db}.{target_table}")
-                        logger.info(f"[ATHENA -> AURORA] Successfully loaded records directly from Athena table {athena_tbl_name}.")
+                        logger.info(f"[ATHENA -> AURORA] Successfully loaded full dataset directly from Athena table {athena_tbl_name}.")
                     except Exception as athena_read_err:
-                        logger.warning(f"[ATHENA -> AURORA NOTE] Could not read directly from Athena table {athena_tbl_name} ({athena_read_err}). Falling back to SQL query.")
-                        df_mart = spark.sql(sql_text)
+                        logger.warning(f"[ATHENA -> AURORA NOTE] Could not read directly from Athena table {athena_tbl_name} ({athena_read_err}). Falling back to materialized DF / SQL query.")
+                        df_mart = materialized_dfs.get(clean_base_name) or spark.sql(sql_text)
 
                 # Ensure row uniqueness by natural keys (nkey) from gold config
                 df_mart = cls._deduplicate_by_nkey(df_mart, pks)
@@ -1199,12 +1202,7 @@ class GoldLayerManager:
                 except Exception as temp_err:
                     logger.debug(f"[SPARK VIEW] Note on temporary view registration: {temp_err}")
 
-                # 2. S3 Parquet Backup
-                mart_s3_dest = f"{data_s3_path.rstrip('/')}/{clean_base_name}"
-                logger.info(f"Materializing {row_count:,} records to S3 Parquet: -> {mart_s3_dest}")
-                df_mart.write.mode("overwrite").format("parquet").save(mart_s3_dest)
-
-                # 3. Schema Evolution Check & Staging Table Write
+                # 2. Schema Evolution Check & Staging Table Write
                 cls._detect_schema_evolution(jdbc_conn_info, gold_schema, target_table, df_mart)
                 cls._write_staging_table(spark, df_mart, jdbc_conn_info, gold_schema, staging_table)
 
@@ -1585,6 +1583,25 @@ class GoldLayerManager:
             default_base
         ])
 
+        # If table does not exist or has 0 rows (or RELOAD_INITIAL is set), also check _archived/ to recover historical data
+        table_has_data = False
+        try:
+            spark.sql(f"DESCRIBE TABLE `{glue_database}`.`{target_table_name}`")
+            cnt = spark.table(f"{glue_database}.{target_table_name}").count()
+            if cnt > 0:
+                table_has_data = True
+        except Exception:
+            table_has_data = False
+
+        if not table_has_data or str(params.get('RELOAD_INITIAL', 'false')).strip().lower() in ('true', '1', 'yes'):
+            archived_base = f"s3://{bucket_name}/gold/initial_exports/{source_system}/_archived/{table_name}"
+            candidate_paths.extend([
+                f"{archived_base}.csv",
+                f"{archived_base}/",
+                f"{archived_base}.parquet",
+                archived_base
+            ])
+
         # Resolve variables: {bucket}, {env}, {ENV}, {source}, {table}
         resolved_candidates = []
         for p in candidate_paths:
@@ -1663,7 +1680,7 @@ class GoldLayerManager:
             # Moves: s3://<bucket>/gold/initial_exports/<source>/<file>
             #     -> s3://<bucket>/gold/initial_exports/<source>/_archived/<file>
             try:
-                if found_path and found_path.startswith('s3://'):
+                if found_path and found_path.startswith('s3://') and '/_archived/' not in found_path:
                     import re as _re
                     m = _re.match(r'^s3://([^/]+)/(.+)$', found_path)
                     if m:
@@ -1723,20 +1740,27 @@ class GoldLayerManager:
         temp_view = f"incoming_gold_{clean_base_name}"
         df_mart.createOrReplaceTempView(temp_view)
 
-        # Dual-check table existence: DESCRIBE TABLE (catches Iceberg catalog registration)
-        # and spark.catalog.tableExists (catches cases where DESCRIBE TABLE raises transiently)
+        # Dual-check table existence and metadata health
         table_exists = False
         try:
             spark.sql(f"DESCRIBE TABLE {full_table}")
+            # Verify Iceberg metadata is intact and table is readable
+            spark.table(f"{glue_database}.{target_table_name}").limit(1).collect()
             table_exists = True
-        except Exception:
-            pass
-
-        if not table_exists:
-            try:
-                table_exists = spark.catalog.tableExists(f"{glue_database}.{target_table_name}")
-            except Exception:
-                pass
+        except Exception as table_err:
+            err_msg = str(table_err).lower()
+            if any(k in err_msg for k in ("iceberg", "nosuchkey", "metadata", "not found", "cannot find", "404")):
+                logger.warning(
+                    f"[ATHENA/ICEBERG RECOVERY] Table '{full_table}' has corrupted or missing Iceberg metadata: {table_err}. "
+                    f"Dropping broken table reference to re-initialize cleanly and fix ICEBERG_MISSING_METADATA..."
+                )
+                try:
+                    spark.sql(f"DROP TABLE IF EXISTS {full_table}")
+                except Exception as drop_err:
+                    logger.warning(f"Could not drop broken table {full_table}: {drop_err}")
+                table_exists = False
+            else:
+                table_exists = False
 
         if table_exists:
             # Dynamically evolve Iceberg schema if new columns are present
@@ -1755,10 +1779,6 @@ class GoldLayerManager:
             try:
                 spark.sql(merge_sql)
             except Exception as merge_err:
-                # Fallback: Iceberg APPEND (NOT overwrite) — table already exists, we only have
-                # new/changed records at this point. Using overwrite would rewrite the entire table
-                # on every run (expensive I/O) and Parquet overwrite on an Iceberg path causes
-                # format corruption → NoSuchKeyException on the next run.
                 logger.warning(
                     f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). "
                     f"Falling back to Iceberg APPEND at '{s3_location}'..."
@@ -1770,13 +1790,10 @@ class GoldLayerManager:
                         .option("path", s3_location) \
                         .save()
                 except Exception as ice_fallback_err:
-                    logger.warning(
-                        f"[ATHENA/ICEBERG UPSERT] Iceberg append fallback also failed ({ice_fallback_err}). "
-                        f"Appending raw Parquet as last resort to '{s3_location}'."
-                    )
-                    df_mart.write.mode("append").format("parquet").save(s3_location)
+                    logger.error(f"[ATHENA/ICEBERG UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
+                    raise
         else:
-            logger.info(f"[ATHENA/ICEBERG WRITE] Initializing Gold table {full_table} at '{s3_location}'...")
+            logger.info(f"[ATHENA/ICEBERG WRITE] Initializing clean Gold Iceberg table {full_table} at '{s3_location}'...")
             try:
                 df_mart.write \
                     .format("iceberg") \
@@ -1784,10 +1801,17 @@ class GoldLayerManager:
                     .option("path", s3_location) \
                     .saveAsTable(f"{glue_database}.{target_table_name}")
             except Exception as ice_err:
-                logger.warning(f"[ATHENA/ICEBERG WRITE] Direct Iceberg saveAsTable fallback to Parquet: {ice_err}")
-                df_mart.write.mode("overwrite").format("parquet").save(s3_location)
+                logger.warning(f"[ATHENA/ICEBERG WRITE] Direct Iceberg saveAsTable exception: {ice_err}")
+                df_mart.write.format("iceberg").mode("overwrite").saveAsTable(f"{glue_database}.{target_table_name}")
 
-        return row_count
+        total_count = row_count
+        try:
+            total_count = spark.table(f"{glue_database}.{target_table_name}").count()
+            logger.info(f"[ATHENA/ICEBERG] Current total record count in '{full_table}': {total_count:,} (delta processed this run: {row_count:,})")
+        except Exception:
+            pass
+
+        return total_count
 
     # --------------------------------------------------------------------------
     # Natural Key Deduplication & Row Uniqueness
