@@ -954,6 +954,32 @@ class GoldLayerManager:
                 "error_message": str(err)
             })
 
+    @classmethod
+    def _sync_iceberg_schema(cls, spark: SparkSession, full_table: str, incoming_df: DataFrame) -> bool:
+        """
+        Dynamically evolves Iceberg table schema if incoming mart has new columns via:
+        ALTER TABLE <full_table> ADD COLUMNS (<col> <type>, ...)
+        """
+        try:
+            target_df = spark.table(full_table)
+            target_fields = {f.name.lower() for f in target_df.schema.fields}
+            new_cols = []
+            new_col_details = []
+            for field in incoming_df.schema.fields:
+                if field.name.lower() not in target_fields:
+                    new_cols.append(f"`{field.name}` {field.dataType.simpleString()}")
+                    new_col_details.append((field.name, field.dataType.simpleString()))
+            if new_cols:
+                alter_sql = f"ALTER TABLE {full_table} ADD COLUMNS ({', '.join(new_cols)})"
+                logger.info(f"[ATHENA/ICEBERG SCHEMA EVOLUTION] Adding {len(new_cols)} column(s) to Iceberg table '{full_table}':\n  -> {alter_sql}")
+                spark.sql(alter_sql)
+                logger.info(f"[ATHENA/ICEBERG SCHEMA EVOLUTION] Successfully updated Iceberg schema for '{full_table}'.")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"[ATHENA/ICEBERG SCHEMA SYNC NOTE] Could not evolve Iceberg schema for '{full_table}': {e}")
+            return False
+
     # --------------------------------------------------------------------------
     # Mandatory Step 1: Athena / Iceberg Physical Table Materialization & UPSERT
     # --------------------------------------------------------------------------
@@ -984,6 +1010,10 @@ class GoldLayerManager:
             table_exists = True
         except Exception:
             table_exists = False
+
+        if table_exists:
+            # Dynamically evolve Iceberg schema if new columns are present
+            cls._sync_iceberg_schema(spark, full_table, df_mart)
 
         if table_exists and primary_keys:
             join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in primary_keys])
@@ -1234,6 +1264,33 @@ class GoldLayerManager:
         logger.info(banner)
 
     @classmethod
+    def _spark_type_to_mysql(cls, spark_type_str: str) -> str:
+        """Translates PySpark data type string to MySQL data type."""
+        s = (spark_type_str or "").lower()
+        if "int" in s and "big" not in s and "small" not in s and "tiny" not in s:
+            return "INT"
+        elif "bigint" in s or "long" in s:
+            return "BIGINT"
+        elif "smallint" in s or "short" in s:
+            return "SMALLINT"
+        elif "tinyint" in s:
+            return "TINYINT"
+        elif "double" in s:
+            return "DOUBLE"
+        elif "float" in s:
+            return "FLOAT"
+        elif "bool" in s:
+            return "TINYINT(1)"
+        elif "timestamp" in s:
+            return "DATETIME"
+        elif "date" in s:
+            return "DATE"
+        elif "decimal" in s:
+            return s.upper()
+        else:
+            return "TEXT"
+
+    @classmethod
     def _detect_schema_evolution(
         cls,
         jdbc_info: Dict[str, Any],
@@ -1244,7 +1301,7 @@ class GoldLayerManager:
         """
         Introspects the target MySQL table columns via SHOW COLUMNS FROM `<schema>`.`<table>`.
         Does NOT query INFORMATION_SCHEMA.COLUMNS so non-privileged shared-DB users succeed.
-        If table exists, compares incoming columns against target table and alerts on newly added columns.
+        If table exists, compares incoming columns against target table and dynamically adds newly observed columns.
         """
         cls._validate_gold_table_name(target_table)
 
@@ -1279,6 +1336,23 @@ class GoldLayerManager:
                         diff_lines.append(f"|   ├── Omitted: '{col}'")
                 diff_lines.append(f"+================================================================================+")
                 logger.info("\n".join(diff_lines))
+
+                # Dynamically evolve MySQL target table schema by adding new columns
+                if new_columns:
+                    field_by_name = {f.name.lower(): f for f in df_mart.schema.fields}
+                    for col_name in new_columns:
+                        field_obj = field_by_name.get(col_name)
+                        if field_obj:
+                            mysql_type = cls._spark_type_to_mysql(incoming_cols[col_name])
+                            alter_sql = f"ALTER TABLE `{schema_name}`.`{target_table}` ADD COLUMN `{field_obj.name}` {mysql_type} NULL"
+                            try:
+                                cls._execute_ddl(jdbc_info, alter_sql)
+                                logger.info(f"[DDL AUDIT - SCHEMA EVOLUTION] Added column `{field_obj.name}` ({mysql_type}) to MySQL table `{schema_name}`.`{target_table}`.")
+                            except Exception as alter_err:
+                                logger.warning(
+                                    f"[SCHEMA EVOLUTION NOTE] Note on adding column `{field_obj.name}` to `{schema_name}`.`{target_table}`: {alter_err}. "
+                                    f"Shared database user may lack ALTER TABLE permissions."
+                                )
             else:
                 logger.info(f"[SCHEMA SYNC] Target table '{schema_name}.{target_table}' and incoming query have 100% identical column signatures.")
 

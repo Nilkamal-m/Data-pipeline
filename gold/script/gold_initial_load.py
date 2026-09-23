@@ -348,6 +348,13 @@ class GoldInitialLoader:
         df_consolidated.createOrReplaceTempView(temp_view)
         s3_location = f"s3://{bucket_name}/gold/data/{source_system}/{table_name}"
 
+        if table_exists:
+            try:
+                if GoldLayerManager and hasattr(GoldLayerManager, "_sync_iceberg_schema"):
+                    GoldLayerManager._sync_iceberg_schema(spark, full_table, df_consolidated)
+            except Exception as sync_err:
+                logger.debug(f"[INITIAL LOAD] Note on Iceberg schema sync: {sync_err}")
+
         if table_exists and pks:
             join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in pks])
             merge_sql = (

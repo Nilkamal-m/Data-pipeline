@@ -529,6 +529,91 @@ class TestAuroraTableDropAndRecordDeleteRestrictions(unittest.TestCase):
             self.assertTrue(any("TRUNCATE TABLE `enterprise_reporting`.`gold_genesys_conversations_staging`" in s for s in executed_sqls))
 
 
+class TestGoldSchemaEvolution(unittest.TestCase):
+    """Tests for first-load schema creation and dynamic schema evolution (new columns)."""
+
+    def test_spark_type_to_mysql(self):
+        """Translates PySpark schema types into valid MySQL DDL column types."""
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("string"), "TEXT")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("int"), "INT")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("integer"), "INT")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("bigint"), "BIGINT")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("long"), "BIGINT")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("double"), "DOUBLE")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("float"), "FLOAT")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("boolean"), "TINYINT(1)")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("timestamp"), "DATETIME")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("date"), "DATE")
+        self.assertEqual(GoldLayerManager._spark_type_to_mysql("decimal(18,4)"), "DECIMAL(18,4)")
+
+    def test_sync_iceberg_schema_with_new_columns(self):
+        """Evolves Apache Iceberg table definition in Glue/Athena via ALTER TABLE ADD COLUMNS."""
+        mock_spark = MagicMock()
+        mock_target_df = MagicMock()
+        mock_f1 = MagicMock()
+        mock_f1.name = "conversation_id"
+        mock_target_df.schema.fields = [mock_f1]
+        mock_spark.table.return_value = mock_target_df
+
+        mock_incoming_df = MagicMock()
+        mock_in_f1 = MagicMock()
+        mock_in_f1.name = "conversation_id"
+        mock_in_f2 = MagicMock()
+        mock_in_f2.name = "sentiment_score"
+        mock_in_f2.dataType.simpleString.return_value = "double"
+        mock_incoming_df.schema.fields = [mock_in_f1, mock_in_f2]
+
+        evolved = GoldLayerManager._sync_iceberg_schema(
+            spark=mock_spark,
+            full_table="`uax_datalake_db_dev`.`gold_genesys_conversations`",
+            incoming_df=mock_incoming_df
+        )
+
+        self.assertTrue(evolved)
+        mock_spark.sql.assert_called_once()
+        called_sql = mock_spark.sql.call_args[0][0]
+        self.assertIn("ALTER TABLE `uax_datalake_db_dev`.`gold_genesys_conversations` ADD COLUMNS", called_sql)
+        self.assertIn("`sentiment_score` double", called_sql)
+
+    def test_detect_schema_evolution_alters_mysql_table(self):
+        """Dynamically adds new columns to existing MySQL Aurora table via ALTER TABLE ADD COLUMN."""
+        jdbc_info = {"host": "localhost", "port": 3306, "user": "dbuser", "password": "pwd"}
+
+        # Target MySQL table only has 'conversation_id'
+        existing_cols = [("conversation_id", "text", "YES")]
+
+        mock_incoming_df = MagicMock()
+        f_id = MagicMock()
+        f_id.name = "conversation_id"
+        f_id.dataType.simpleString.return_value = "string"
+
+        f_sentiment = MagicMock()
+        f_sentiment.name = "sentiment_score"
+        f_sentiment.dataType.simpleString.return_value = "double"
+
+        mock_incoming_df.schema.fields = [f_id, f_sentiment]
+
+        ddl_calls = []
+        def fake_ddl(info, sql):
+            ddl_calls.append(sql)
+
+        with patch.object(GoldLayerManager, "_execute_sql_query", return_value=existing_cols), \
+             patch.object(GoldLayerManager, "_execute_ddl", side_effect=fake_ddl):
+
+            GoldLayerManager._detect_schema_evolution(
+                jdbc_info=jdbc_info,
+                schema_name="enterprise_reporting",
+                target_table="gold_genesys_conversations",
+                df_mart=mock_incoming_df
+            )
+
+            # Must have executed ALTER TABLE ADD COLUMN for sentiment_score
+            self.assertTrue(any(
+                "ALTER TABLE `enterprise_reporting`.`gold_genesys_conversations` ADD COLUMN `sentiment_score` DOUBLE NULL" in s
+                for s in ddl_calls
+            ))
+
+
 if __name__ == "__main__":
     unittest.main()
 
