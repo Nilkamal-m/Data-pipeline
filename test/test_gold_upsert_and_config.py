@@ -449,5 +449,86 @@ class TestGoldIncrementalDelta(unittest.TestCase):
         mock_df.withColumn.assert_called()
 
 
+class TestAuroraTableDropAndRecordDeleteRestrictions(unittest.TestCase):
+    """Tests for Aurora MySQL table drop and rename restrictions (DML-only pattern)."""
+
+    def test_validate_droppable_table_name_allows_staging_and_old(self):
+        """Only tables ending in _staging or _old are permissible to drop."""
+        GoldLayerManager._validate_droppable_table_name("gold_genesys_conversations_staging")
+        GoldLayerManager._validate_droppable_table_name("gold_genesys_conversations_old")
+        GoldLayerManager._validate_droppable_table_name("gold_moveworks_interactions_staging")
+
+    def test_validate_droppable_table_name_forbids_production_tables(self):
+        """Production Gold tables must NEVER be droppable."""
+        with self.assertRaises(AssertionError) as ctx1:
+            GoldLayerManager._validate_droppable_table_name("gold_genesys_conversations")
+        self.assertIn("CRITICAL SAFETY VIOLATION", str(ctx1.exception))
+
+        with self.assertRaises(AssertionError) as ctx2:
+            GoldLayerManager._validate_droppable_table_name("gold_moveworks_interactions")
+        self.assertIn("CRITICAL SAFETY VIOLATION", str(ctx2.exception))
+
+    def test_replace_mysql_records_executes_dml_only(self):
+        """Verify record-level replacement uses DELETE + INSERT without dropping or renaming production tables."""
+        jdbc_info = {"host": "localhost", "port": 3306, "user": "dbuser", "password": "pwd"}
+        ddl_calls = []
+
+        def fake_execute_ddl(info, sql):
+            ddl_calls.append(sql)
+
+        with patch.object(GoldLayerManager, "_execute_ddl", side_effect=fake_execute_ddl), \
+             patch.object(GoldLayerManager, "_table_exists", return_value=True):
+
+            GoldLayerManager._replace_mysql_records(
+                jdbc_info=jdbc_info,
+                schema_name="enterprise_reporting",
+                target_table="gold_genesys_conversations",
+                staging_table="gold_genesys_conversations_staging",
+                columns=["conversation_id", "sentiment_score", "prompt_text"]
+            )
+
+            # 1. Must execute DELETE FROM target_table
+            self.assertTrue(any("DELETE FROM `enterprise_reporting`.`gold_genesys_conversations`" in s for s in ddl_calls))
+
+            # 2. Must execute INSERT INTO target_table SELECT ... FROM staging_table
+            self.assertTrue(any(
+                "INSERT INTO `enterprise_reporting`.`gold_genesys_conversations` (`conversation_id`, `sentiment_score`, `prompt_text`)" in s
+                and "SELECT `conversation_id`, `sentiment_score`, `prompt_text` FROM `enterprise_reporting`.`gold_genesys_conversations_staging`" in s
+                for s in ddl_calls
+            ))
+
+            # 3. Must cleanup staging table
+            self.assertTrue(any("DROP TABLE IF EXISTS `enterprise_reporting`.`gold_genesys_conversations_staging`" in s for s in ddl_calls))
+
+            # 4. Target production table must NEVER appear in a DROP TABLE or RENAME TABLE statement
+            for s in ddl_calls:
+                self.assertNotIn("DROP TABLE `enterprise_reporting`.`gold_genesys_conversations`", s)
+                self.assertNotIn("DROP TABLE IF EXISTS `enterprise_reporting`.`gold_genesys_conversations`", s)
+                self.assertNotIn("RENAME TABLE `enterprise_reporting`.`gold_genesys_conversations`", s)
+
+    def test_cleanup_staging_table_fallback_on_drop_denied_1142(self):
+        """Verify fallback to TRUNCATE/DELETE when database user lacks DROP permissions."""
+        jdbc_info = {"host": "localhost", "port": 3306, "user": "dbuser", "password": "pwd"}
+        executed_sqls = []
+
+        def fake_execute_ddl(info, sql):
+            executed_sqls.append(sql)
+            if "DROP TABLE" in sql:
+                raise RuntimeError("MySQL Error (1142): DROP command denied to user 'app'@'host' for table 'staging'")
+
+        with patch.object(GoldLayerManager, "_execute_ddl", side_effect=fake_execute_ddl):
+            GoldLayerManager._cleanup_staging_table(
+                jdbc_info=jdbc_info,
+                schema_name="enterprise_reporting",
+                staging_table="gold_genesys_conversations_staging"
+            )
+
+            # First attempted DROP
+            self.assertTrue(any("DROP TABLE" in s for s in executed_sqls))
+            # Gracefully fell back to TRUNCATE or DELETE
+            self.assertTrue(any("TRUNCATE TABLE `enterprise_reporting`.`gold_genesys_conversations_staging`" in s for s in executed_sqls))
+
+
 if __name__ == "__main__":
     unittest.main()
+

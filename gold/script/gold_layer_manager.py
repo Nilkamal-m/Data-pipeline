@@ -704,18 +704,29 @@ class GoldLayerManager:
                 cls._detect_schema_evolution(jdbc_conn_info, gold_schema, target_table, df_mart)
                 cls._write_staging_table(spark, df_mart, jdbc_conn_info, gold_schema, staging_table)
 
-                # 4. Atomic Swap or Upsert
-                if pks and cls._table_exists(jdbc_conn_info, gold_schema, target_table):
-                    logger.info(f"[MYSQL SERVING] Executing primary-key UPSERT on '{gold_schema}.{target_table}'...")
-                    cls._upsert_mysql_table(
-                        jdbc_info=jdbc_conn_info,
-                        schema_name=gold_schema,
-                        target_table=target_table,
-                        staging_table=staging_table,
-                        primary_keys=pks,
-                        columns=df_mart.columns
-                    )
+                # 4. Record-Level Upsert or Refresh (Target table is NEVER dropped or renamed once created)
+                if cls._table_exists(jdbc_conn_info, gold_schema, target_table):
+                    if pks:
+                        logger.info(f"[MYSQL SERVING] Executing primary-key UPSERT on '{gold_schema}.{target_table}' based on nkey {pks}...")
+                        cls._upsert_mysql_table(
+                            jdbc_info=jdbc_conn_info,
+                            schema_name=gold_schema,
+                            target_table=target_table,
+                            staging_table=staging_table,
+                            primary_keys=pks,
+                            columns=df_mart.columns
+                        )
+                    else:
+                        logger.info(f"[MYSQL SERVING - DML ONLY] Target table '{gold_schema}.{target_table}' exists. Performing record-level refresh (DELETE + INSERT) without dropping or renaming table...")
+                        cls._replace_mysql_records(
+                            jdbc_info=jdbc_conn_info,
+                            schema_name=gold_schema,
+                            target_table=target_table,
+                            staging_table=staging_table,
+                            columns=df_mart.columns
+                        )
                 else:
+                    # Initial table creation when target table does not exist
                     cls._execute_isolated_atomic_swap(
                         jdbc_info=jdbc_conn_info,
                         schema_name=gold_schema,
@@ -1120,6 +1131,45 @@ class GoldLayerManager:
             raise AssertionError(f"Safety Error: View name '{view_name}' must start with 'v_'")
 
     @classmethod
+    def _validate_droppable_table_name(cls, table_name: str) -> None:
+        """
+        Critical Safety Guardrail: Only allows dropping temporary tables ending in '_staging' or '_old'.
+        Prevents any production Gold table (e.g. gold_genesys_conversations) from ever being dropped!
+        """
+        cls._validate_gold_table_name(table_name)
+        if not (table_name.endswith("_staging") or table_name.endswith("_old")):
+            raise AssertionError(
+                f"CRITICAL SAFETY VIOLATION: Attempted to drop non-temporary table '{table_name}'. "
+                f"Gold layer is strictly restricted from dropping production tables. "
+                f"Only temporary staging/backup tables (*_staging, *_old) may be cleaned up."
+            )
+
+    @classmethod
+    def _cleanup_staging_table(cls, jdbc_info: Dict[str, Any], schema_name: str, staging_table: str) -> None:
+        """
+        Cleans up temporary staging table.
+        First tries DROP TABLE IF EXISTS. If the database user lacks DROP permissions,
+        gracefully falls back to TRUNCATE / DELETE so no DDL permissions are required.
+        """
+        cls._validate_droppable_table_name(staging_table)
+        try:
+            cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{staging_table}`")
+            logger.info(f"[DDL AUDIT - CLEANUP] Dropped temporary staging table '{schema_name}.{staging_table}'.")
+        except Exception as drop_err:
+            err_str = str(drop_err).lower()
+            if "1142" in err_str or "denied" in err_str or "permission" in err_str:
+                logger.warning(
+                    f"[CLEANUP NOTE] DROP TABLE denied on staging table '{staging_table}'. "
+                    f"Falling back to TRUNCATE/DELETE (record-level cleanup)..."
+                )
+                try:
+                    cls._execute_ddl(jdbc_info, f"TRUNCATE TABLE `{schema_name}`.`{staging_table}`")
+                except Exception:
+                    cls._execute_ddl(jdbc_info, f"DELETE FROM `{schema_name}`.`{staging_table}`")
+            else:
+                raise
+
+    @classmethod
     def _verify_schema_exists_or_raise(cls, jdbc_info: Dict[str, Any], schema_name: str) -> None:
         """
         Verifies that the target schema pre-exists and is accessible in MySQL without querying
@@ -1357,8 +1407,7 @@ class GoldLayerManager:
         backup_exists = cls._table_exists(jdbc_info, schema_name, old_backup_table)
         if backup_exists:
             logger.info(f"[DDL AUDIT - PRE-CHECK DROP] Leftover backup table '{schema_name}.{old_backup_table}' exists. Dropping safely...")
-            cls._validate_gold_table_name(old_backup_table)
-            cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{old_backup_table}`")
+            cls._cleanup_staging_table(jdbc_info, schema_name, old_backup_table)
 
         # Pre-check before RENAME: Check if target table already exists
         target_exists = cls._table_exists(jdbc_info, schema_name, target_table)
@@ -1377,8 +1426,7 @@ class GoldLayerManager:
             # Pre-check before DROP: Remove previous table version
             if cls._table_exists(jdbc_info, schema_name, old_backup_table):
                 logger.info(f"[DDL AUDIT - PRE-CHECK DROP] Dropping previous table version '{schema_name}.{old_backup_table}'...")
-                cls._validate_gold_table_name(old_backup_table)
-                cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{old_backup_table}`")
+                cls._cleanup_staging_table(jdbc_info, schema_name, old_backup_table)
         else:
             initial_rename = f"RENAME TABLE `{schema_name}`.`{staging_table}` TO `{schema_name}`.`{target_table}`"
             logger.info(f"[DDL AUDIT - INITIAL DEPLOY] Promoting staging to target table:\n  -> {initial_rename}")
@@ -1386,8 +1434,7 @@ class GoldLayerManager:
 
         # Post-swap cleanup: Ensure staging table is completely removed
         if cls._table_exists(jdbc_info, schema_name, staging_table):
-            logger.info(f"[DDL AUDIT - CLEANUP] Dropping leftover staging table '{schema_name}.{staging_table}'...")
-            cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{staging_table}`")
+            cls._cleanup_staging_table(jdbc_info, schema_name, staging_table)
 
         # Ensure performance index on natural key (nkey) for query performance boost
         if primary_keys:
@@ -1462,6 +1509,41 @@ class GoldLayerManager:
                 logger.warning(f"[DDL AUDIT - INDEX NOTE] Note on index creation for `{idx_name}` on `{schema_name}`.`{target_table}`: {e}")
 
     @classmethod
+    def _replace_mysql_records(
+        cls,
+        jdbc_info: Dict[str, Any],
+        schema_name: str,
+        target_table: str,
+        staging_table: str,
+        columns: List[str]
+    ) -> None:
+        """
+        Safely replaces records in target MySQL table without dropping or renaming the table.
+        Preserves all database grants, table structure, indexes, and Power BI connections.
+        Executes:
+          1. DELETE FROM target_table
+          2. INSERT INTO target_table SELECT * FROM staging_table
+          3. Cleanup staging_table
+        """
+        cls._validate_gold_table_name(target_table)
+        cls._validate_droppable_table_name(staging_table)
+
+        col_names = [f"`{c}`" for c in columns]
+        logger.info(f"[MYSQL SERVING - DML ONLY] Deleting existing records from '{schema_name}.{target_table}'...")
+        cls._execute_ddl(jdbc_info, f"DELETE FROM `{schema_name}`.`{target_table}`")
+
+        logger.info(f"[MYSQL SERVING - DML ONLY] Inserting refreshed records into '{schema_name}.{target_table}'...")
+        insert_sql = (
+            f"INSERT INTO `{schema_name}`.`{target_table}` ({', '.join(col_names)})\n"
+            f"SELECT {', '.join(col_names)} FROM `{schema_name}`.`{staging_table}`"
+        )
+        cls._execute_ddl(jdbc_info, insert_sql)
+
+        # Cleanup staging
+        if cls._table_exists(jdbc_info, schema_name, staging_table):
+            cls._cleanup_staging_table(jdbc_info, schema_name, staging_table)
+
+    @classmethod
     def _upsert_mysql_table(
         cls,
         jdbc_info: Dict[str, Any],
@@ -1518,8 +1600,7 @@ class GoldLayerManager:
 
         # Cleanup staging table after upsert
         if cls._table_exists(jdbc_info, schema_name, staging_table):
-            logger.info(f"[DDL AUDIT - CLEANUP] Dropping staging table '{schema_name}.{staging_table}'...")
-            cls._execute_ddl(jdbc_info, f"DROP TABLE IF EXISTS `{schema_name}`.`{staging_table}`")
+            cls._cleanup_staging_table(jdbc_info, schema_name, staging_table)
 
     # --------------------------------------------------------------------------
     # SQL Execution Helpers with SSL / TLS Support
