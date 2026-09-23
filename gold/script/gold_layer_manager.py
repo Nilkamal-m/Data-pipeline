@@ -3196,7 +3196,9 @@ class GoldInitialLoader:
         else:
             target_table_name = f"gold_{source_system}_{table_name}"
 
-        pks = cls._resolve_natural_keys(source_system, table_name, gold_cfg, params)
+        # Use GoldLayerManager explicitly (not cls) since this method may be called via
+        # GoldInitialLoader.run_initial_load(), which does not inherit _resolve_natural_keys.
+        pks = GoldLayerManager._resolve_natural_keys(source_system, table_name, gold_cfg, params)
         if not pks:
             raise ValueError(
                 f"CRITICAL CONFIG ERROR: Missing 'nkey' in gold configuration for table '{table_name}' "
