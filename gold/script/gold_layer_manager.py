@@ -261,6 +261,22 @@ class GoldLayerManager:
                 f"+--------------------------------------------------------------------------------+"
             )
 
+            # Check and run initial historical export load if candidate exists
+            init_loaded = cls._check_and_run_initial_load(
+                spark=spark,
+                source_system=source_system,
+                table_name=clean_base_name,
+                target_table_name=target_table_name,
+                glue_database=glue_database,
+                bucket_name=bucket_name,
+                env=env,
+                pks=pks,
+                params=params,
+                sql_text=sql_text,
+                gold_cfg=gold_cfg,
+                s3_client=s3_client
+            )
+
             try:
                 # 3. Execute Mart SQL Query
                 logger.info(f"Executing Spark SQL query for '{clean_base_name}'...")
@@ -354,7 +370,13 @@ class GoldLayerManager:
                     params=params
                 )
 
-                materialized_dfs[clean_base_name] = df_mart
+                if init_loaded:
+                    try:
+                        materialized_dfs[clean_base_name] = spark.table(f"{glue_database}.{target_table_name}")
+                    except Exception:
+                        materialized_dfs[clean_base_name] = df_mart
+                else:
+                    materialized_dfs[clean_base_name] = df_mart
 
                 duration = (datetime.now(timezone.utc) - mart_start).total_seconds()
                 mart_stats.append({
@@ -376,6 +398,45 @@ class GoldLayerManager:
                     "duration_seconds": round(duration, 2),
                     "error_message": str(err)
                 })
+
+        # Check for any configured tables in gold_config.json with initial_load that lacked a .sql file
+        if GoldConfigLoader and gold_cfg:
+            src_tables = gold_cfg.get('sources', {}).get(source_system, {}).get('tables', {})
+            for tbl_name, tbl_cfg in src_tables.items():
+                if tbl_name not in materialized_dfs and 'initial_load' in tbl_cfg:
+                    clean_tbl = tbl_name
+                    target_tbl_name = GoldConfigLoader.get_target_table_name(source_system, clean_tbl, 'athena', gold_cfg)
+                    tbl_pks = GoldConfigLoader.get_primary_key(source_system, clean_tbl, gold_cfg)
+                    logger.info(f"[INITIAL LOAD] Found configured table '{clean_tbl}' without SQL query file. Evaluating initial load...")
+                    init_done = cls._check_and_run_initial_load(
+                        spark=spark,
+                        source_system=source_system,
+                        table_name=clean_tbl,
+                        target_table_name=target_tbl_name,
+                        glue_database=glue_database,
+                        bucket_name=bucket_name,
+                        env=env,
+                        pks=tbl_pks,
+                        params=params,
+                        sql_text=None,
+                        gold_cfg=gold_cfg,
+                        s3_client=s3_client
+                    )
+                    if init_done:
+                        try:
+                            df_init = spark.table(f"{glue_database}.{target_tbl_name}")
+                            materialized_dfs[clean_tbl] = df_init
+                            mart_keys[clean_tbl] = tbl_pks
+                            mart_stats.append({
+                                "mart_name": clean_tbl,
+                                "target_table": f"{glue_database}.{target_tbl_name}",
+                                "status": "SUCCESS",
+                                "rows_served": df_init.count(),
+                                "duration_seconds": 0.0,
+                                "error_message": None
+                            })
+                        except Exception as e:
+                            logger.warning(f"Could not register initial loaded table {glue_database}.{target_tbl_name}: {e}")
 
         # ----------------------------------------------------------------------
         # [GOLD STEP 3+] Downstream Target Serving (Aurora / Databricks / Redshift / Snowflake)
@@ -1025,6 +1086,191 @@ class GoldLayerManager:
             return False
         except Exception as e:
             logger.warning(f"[ATHENA/ICEBERG SCHEMA SYNC NOTE] Could not evolve Iceberg schema for '{full_table}': {e}")
+            return False
+
+    @classmethod
+    def _get_gold_initial_loader(cls):
+        """Lazily imports GoldInitialLoader to avoid circular import issues."""
+        try:
+            from gold_initial_load import GoldInitialLoader
+            return GoldInitialLoader
+        except ImportError:
+            try:
+                from gold.script.gold_initial_load import GoldInitialLoader
+                return GoldInitialLoader
+            except ImportError as e:
+                logger.error(f"[INITIAL LOAD] Failed to import GoldInitialLoader: {e}")
+                return None
+
+    @classmethod
+    def _s3_path_exists(cls, s3_path: str, s3_client=None) -> bool:
+        """
+        Checks if an S3 path (exact file or directory prefix with objects) exists.
+        For local paths, falls back to os.path.exists().
+        """
+        if not s3_path.startswith("s3://"):
+            return os.path.exists(s3_path)
+
+        match = re.match(r"^s3://([^/]+)/(.*)$", s3_path)
+        if not match:
+            return False
+
+        bucket = match.group(1)
+        key = match.group(2)
+
+        if not s3_client:
+            try:
+                import boto3
+                s3_client = boto3.client('s3')
+            except Exception:
+                return False
+
+        # 1. Try exact object head
+        try:
+            s3_client.head_object(Bucket=bucket, Key=key)
+            return True
+        except Exception:
+            pass
+
+        # 2. Try prefix/folder listing
+        try:
+            prefix = key if key.endswith('/') else f"{key}/"
+            resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=2)
+            contents = [obj for obj in resp.get('Contents', []) if obj.get('Key') != prefix]
+            if contents:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    @classmethod
+    def _check_and_run_initial_load(
+        cls,
+        spark: SparkSession,
+        source_system: str,
+        table_name: str,
+        target_table_name: str,
+        glue_database: str,
+        bucket_name: str,
+        env: str,
+        pks: List[str],
+        params: Dict[str, Any],
+        sql_text: Optional[str] = None,
+        gold_cfg: Optional[Dict[str, Any]] = None,
+        s3_client=None
+    ) -> bool:
+        """
+        Checks for historical initial export files (CSV/Parquet) in S3 or local storage.
+        If found, executes GoldInitialLoader to consolidate schema and load into Athena/Iceberg.
+        Guarantees clear, prominent logging at INFO level for complete observability in CloudWatch.
+        """
+        skip_init = str(params.get('SKIP_INITIAL_LOAD', 'false')).strip().lower() in ('true', '1', 'yes')
+        if skip_init:
+            logger.info(f"[INITIAL LOAD] SKIP_INITIAL_LOAD flag detected. Skipping initial load check for '{table_name}'.")
+            return False
+
+        # 1. Collect candidate paths in priority order:
+        # CLI/Job param > gold_config.json initial_load.path > standard S3 conventions
+        candidate_paths = []
+        custom_path = params.get('CSV_PATH') or params.get('INITIAL_LOAD_PATH') or params.get('INPUT_FILE')
+        if custom_path:
+            candidate_paths.append(str(custom_path))
+
+        init_cfg = {}
+        if GoldConfigLoader:
+            init_cfg = GoldConfigLoader.get_initial_load_config(source_system, table_name, gold_cfg)
+            if init_cfg.get('path'):
+                candidate_paths.append(str(init_cfg.get('path')))
+
+        # Standard S3 convention candidates
+        default_base = f"s3://{bucket_name}/gold/initial_exports/{source_system}/{table_name}"
+        candidate_paths.extend([
+            f"{default_base}.csv",
+            f"{default_base}/",
+            f"{default_base}.parquet",
+            default_base
+        ])
+
+        # Resolve variables: {bucket}, {env}, {ENV}, {source}, {table}
+        resolved_candidates = []
+        for p in candidate_paths:
+            resolved = (
+                str(p)
+                .replace('{bucket}', bucket_name)
+                .replace('{env}', env)
+                .replace('{ENV}', env.upper())
+                .replace('{source}', source_system)
+                .replace('{table}', table_name)
+                .strip()
+            )
+            if resolved not in resolved_candidates:
+                resolved_candidates.append(resolved)
+
+        logger.info(
+            f"\n+--------------------------------------------------------------------------------+\n"
+            f"|  [INITIAL LOAD CHECK] Evaluating historical initial export for: '{table_name}'\n"
+            f"|  * Target Table    : {glue_database}.{target_table_name}\n"
+            f"|  * Primary Keys    : {pks or 'None (Overwrite)'}\n"
+            f"|  * Candidate Paths : {', '.join(resolved_candidates[:3])}\n"
+            f"+--------------------------------------------------------------------------------+"
+        )
+
+        found_path = None
+        for cand in resolved_candidates:
+            if cls._s3_path_exists(cand, s3_client):
+                found_path = cand
+                break
+
+        if not found_path:
+            logger.info(
+                f"[INITIAL LOAD] Note: No historical initial export found for '{table_name}' "
+                f"(checked candidate: '{resolved_candidates[0]}'). "
+                f"Proceeding with standard query materialization."
+            )
+            return False
+
+        logger.info(
+            f"\n================================================================================\n"
+            f"[INITIAL LOAD] *** FOUND HISTORICAL EXPORT AT '{found_path}'! ***\n"
+            f"[INITIAL LOAD] Initiating initial data ingestion & schema reconciliation for '{table_name}'...\n"
+            f"================================================================================"
+        )
+
+        try:
+            loader_cls = cls._get_gold_initial_loader()
+            if not loader_cls:
+                logger.error(f"[INITIAL LOAD] Could not resolve GoldInitialLoader class. Skipping initial load for '{table_name}'.")
+                return False
+
+            load_params = dict(params)
+            load_params.update({
+                'SOURCE_SYSTEM': source_system,
+                'TABLE_NAME': table_name,
+                'CSV_PATH': found_path,
+                'GLUE_DATABASE': glue_database,
+                'DATA_LAKE_BUCKET': bucket_name,
+                'ENV': env,
+                'SKIP_AURORA_SERVE': 'true',  # Downstream serving handled in Gold Step 3
+            })
+            if sql_text:
+                load_params['GOLD_SQL'] = sql_text
+            if init_cfg.get('delimiter'):
+                load_params.setdefault('DELIMITER', init_cfg.get('delimiter'))
+            if 'has_header' in init_cfg:
+                load_params.setdefault('HAS_HEADER', str(init_cfg.get('has_header')).lower())
+            if pks:
+                load_params.setdefault('PRIMARY_KEY', ','.join(pks))
+                load_params.setdefault('NKEY', ','.join(pks))
+
+            res = loader_cls.run_initial_load(spark, load_params)
+            logger.info(f"[INITIAL LOAD] Successfully completed initial historical export load for '{table_name}'. Details: {res}")
+            return True
+        except Exception as err:
+            logger.error(
+                f"[INITIAL LOAD ERROR] Failed to load historical export for '{table_name}' from '{found_path}': {err}\n"
+                f"{traceback.format_exc()}"
+            )
             return False
 
     # --------------------------------------------------------------------------
@@ -2350,7 +2596,8 @@ def main():
         'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'INCREMENTAL', 'FULL_REFRESH',
         'RDS_HOST', 'RDS_PORT', 'RDS_USER', 'RDS_PASSWORD',
         'GOLD_SCHEMA', 'GOLD_TARGETS', 'CONNECTION_NAME', 'ENV', 'ENVIRONMENT',
-        'GOLD_CONFIG_S3_PATH', 'ATHENA_WORKGROUP', 'WORKGROUP', 'MART_NAME', 'TABLE_NAME'
+        'GOLD_CONFIG_S3_PATH', 'ATHENA_WORKGROUP', 'WORKGROUP', 'MART_NAME', 'TABLE_NAME',
+        'CSV_PATH', 'INITIAL_LOAD_PATH', 'INPUT_FILE', 'SKIP_INITIAL_LOAD', 'DELIMITER', 'HAS_HEADER'
     ]
 
     args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv or f"--{a.lower()}" in sys.argv]

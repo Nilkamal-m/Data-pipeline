@@ -983,6 +983,100 @@ class TestGoldMartDependencyAndOmittedColumns(unittest.TestCase):
         self.assertIn("NULL DEFAULT NULL", modify_ddls[0])
 
 
+class TestGoldInitialLoadIntegration(unittest.TestCase):
+    """Verifies that gold_layer_manager actively checks, logs, and executes initial historical export loads."""
+
+    def test_check_and_run_initial_load_when_file_exists(self):
+        """When an initial export exists in S3, _check_and_run_initial_load invokes GoldInitialLoader and returns True."""
+        mock_spark = MagicMock()
+        mock_loader = MagicMock()
+        mock_loader.run_initial_load.return_value = {"status": "SUCCESS"}
+
+        with patch.object(GoldLayerManager, "_s3_path_exists", return_value=True):
+            with patch.object(GoldLayerManager, "_get_gold_initial_loader", return_value=mock_loader):
+                result = GoldLayerManager._check_and_run_initial_load(
+                    spark=mock_spark,
+                    source_system="moveworks",
+                    table_name="interactions",
+                    target_table_name="gold_moveworks_interactions",
+                    glue_database="uax_datalake_db_dev",
+                    bucket_name="uax-datalake-dev-bucket",
+                    env="dev",
+                    pks=["interaction_id"],
+                    params={"JOB_NAME": "test_job"},
+                    sql_text="SELECT * FROM silver_interactions",
+                    gold_cfg=None,
+                    s3_client=MagicMock()
+                )
+
+        self.assertTrue(result)
+        mock_loader.run_initial_load.assert_called_once()
+        call_args = mock_loader.run_initial_load.call_args[0]
+        params_passed = call_args[1]
+        self.assertEqual(params_passed["SOURCE_SYSTEM"], "moveworks")
+        self.assertEqual(params_passed["TABLE_NAME"], "interactions")
+        self.assertEqual(params_passed["SKIP_AURORA_SERVE"], "true")
+        self.assertEqual(params_passed["PRIMARY_KEY"], "interaction_id")
+
+    def test_check_and_run_initial_load_when_no_file_exists(self):
+        """When no initial export exists, returns False without errors so normal query materialization proceeds."""
+        mock_spark = MagicMock()
+        mock_loader = MagicMock()
+
+        with patch.object(GoldLayerManager, "_s3_path_exists", return_value=False):
+            with patch.object(GoldLayerManager, "_get_gold_initial_loader", return_value=mock_loader):
+                result = GoldLayerManager._check_and_run_initial_load(
+                    spark=mock_spark,
+                    source_system="moveworks",
+                    table_name="interactions",
+                    target_table_name="gold_moveworks_interactions",
+                    glue_database="uax_datalake_db_dev",
+                    bucket_name="uax-datalake-dev-bucket",
+                    env="dev",
+                    pks=["interaction_id"],
+                    params={"JOB_NAME": "test_job"},
+                    s3_client=MagicMock()
+                )
+
+        self.assertFalse(result)
+        mock_loader.run_initial_load.assert_not_called()
+
+    def test_check_and_run_initial_load_skip_flag(self):
+        """SKIP_INITIAL_LOAD flag causes initial load check to be skipped entirely."""
+        mock_loader = MagicMock()
+        with patch.object(GoldLayerManager, "_get_gold_initial_loader", return_value=mock_loader):
+            result = GoldLayerManager._check_and_run_initial_load(
+                spark=MagicMock(),
+                source_system="moveworks",
+                table_name="interactions",
+                target_table_name="gold_moveworks_interactions",
+                glue_database="uax_datalake_db_dev",
+                bucket_name="uax-datalake-dev-bucket",
+                env="dev",
+                pks=["interaction_id"],
+                params={"SKIP_INITIAL_LOAD": "true"}
+            )
+        self.assertFalse(result)
+        mock_loader.run_initial_load.assert_not_called()
+
+    def test_s3_path_exists_detection(self):
+        """_s3_path_exists detects files via head_object or directory prefix via list_objects_v2."""
+        mock_s3 = MagicMock()
+
+        # 1. Exact object head succeeds
+        mock_s3.head_object.return_value = {}
+        self.assertTrue(GoldLayerManager._s3_path_exists("s3://bucket/path/file.csv", mock_s3))
+
+        # 2. Exact head fails, but folder prefix contains objects
+        mock_s3.head_object.side_effect = Exception("NoSuchKey")
+        mock_s3.list_objects_v2.return_value = {"Contents": [{"Key": "path/file/part1.parquet"}]}
+        self.assertTrue(GoldLayerManager._s3_path_exists("s3://bucket/path/file/", mock_s3))
+
+        # 3. Both fail
+        mock_s3.list_objects_v2.return_value = {"Contents": []}
+        self.assertFalse(GoldLayerManager._s3_path_exists("s3://bucket/missing.csv", mock_s3))
+
+
 if __name__ == "__main__":
     unittest.main()
 

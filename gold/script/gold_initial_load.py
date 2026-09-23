@@ -223,6 +223,22 @@ class GoldInitialLoader:
             return None
 
     @classmethod
+    def _get_gold_layer_manager(cls):
+        """Lazily imports GoldLayerManager to prevent circular import locks."""
+        global GoldLayerManager
+        if GoldLayerManager is None:
+            try:
+                from gold_layer_manager import GoldLayerManager as glm
+                GoldLayerManager = glm
+            except ImportError:
+                try:
+                    from gold.script.gold_layer_manager import GoldLayerManager as glm
+                    GoldLayerManager = glm
+                except ImportError:
+                    pass
+        return GoldLayerManager
+
+    @classmethod
     def run_initial_load(
         cls,
         spark: SparkSession,
@@ -395,10 +411,11 @@ class GoldInitialLoader:
         df_consolidated.createOrReplaceTempView(temp_view)
         s3_location = f"s3://{bucket_name}/gold/data/{source_system}/{table_name}"
 
+        glm = cls._get_gold_layer_manager()
         if table_exists:
             try:
-                if GoldLayerManager and hasattr(GoldLayerManager, "_sync_iceberg_schema"):
-                    GoldLayerManager._sync_iceberg_schema(spark, full_table, df_consolidated)
+                if glm and hasattr(glm, "_sync_iceberg_schema"):
+                    glm._sync_iceberg_schema(spark, full_table, df_consolidated)
             except Exception as sync_err:
                 logger.debug(f"[INITIAL LOAD] Note on Iceberg schema sync: {sync_err}")
 
@@ -436,13 +453,14 @@ class GoldInitialLoader:
         elif GoldConfigLoader:
             target_engines = GoldConfigLoader.get_target_engines(source_system, table_name, gold_cfg)
 
-        needs_aurora = any(t in target_engines for t in ('aurora', 'rds', 'mysql'))
-        if needs_aurora and GoldLayerManager:
+        skip_aurora = str(params.get('SKIP_AURORA_SERVE', 'false')).strip().lower() in ('true', '1', 'yes')
+        needs_aurora = not skip_aurora and any(t in target_engines for t in ('aurora', 'rds', 'mysql'))
+        if needs_aurora and glm:
             logger.info(f"[AURORA EXTENSION] User requested Aurora serving for '{target_table_name}'. Reading from Athena table and serving to Aurora...")
             try:
                 df_athena = spark.table(full_table)
                 gold_schema = params.get('GOLD_SCHEMA') or 'enterprise_reporting'
-                GoldLayerManager._serve_to_mysql(
+                glm._serve_to_mysql(
                     spark=spark,
                     queries={table_name: ""},
                     gold_schema=gold_schema,
