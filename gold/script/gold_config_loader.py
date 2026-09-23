@@ -24,6 +24,33 @@ class GoldConfigLoader:
     _cached_s3_path: Optional[str] = None
     _cached_s3_client: Optional[Any] = None
 
+    KNOWN_ENTITY_KEYS: Dict[str, Dict[str, List[str]]] = {
+        "moveworks": {
+            "interactions": ["interaction_id"],
+            "conversations": ["conversation_id"],
+            "feedbacks": ["feedback_id"]
+        },
+        "genesys": {
+            "conversations": ["conversation_id"],
+            "users": ["user_id"],
+            "queues": ["queue_id"]
+        },
+        "servicenow": {
+            "incident": ["sys_id"],
+            "incident_kpi": ["priority_level", "incident_state", "incident_category"]
+        }
+    }
+
+    @classmethod
+    def _clean_table_name(cls, table_name: str, source_system: str) -> str:
+        clean = (table_name or '').strip().lower()
+        base = clean
+        for prefix in [f"gold_{source_system.lower()}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]:
+            if base.startswith(prefix):
+                base = base[len(prefix):]
+                break
+        return base
+
     @classmethod
     def clear_cache(cls) -> None:
         """Clears the cached configuration."""
@@ -85,6 +112,16 @@ class GoldConfigLoader:
 
         raw_config = None
 
+        if not config_s3_path:
+            import sys
+            for i, a in enumerate(sys.argv):
+                if a in ('--GOLD_CONFIG_S3_PATH', '--gold_config_s3_path') and i + 1 < len(sys.argv):
+                    config_s3_path = sys.argv[i + 1].strip()
+                    break
+                elif a.startswith('--GOLD_CONFIG_S3_PATH=') or a.startswith('--gold_config_s3_path='):
+                    config_s3_path = a.split('=', 1)[1].strip()
+                    break
+
         if config_s3_path and str(config_s3_path).strip():
             cls._cached_s3_path = str(config_s3_path).strip()
         if s3_client is not None:
@@ -94,16 +131,24 @@ class GoldConfigLoader:
         active_s3_client = s3_client or cls._cached_s3_client
 
         # 1. Try S3 path if provided
-        if active_s3_path and active_s3_path.startswith("s3://") and active_s3_client:
-            try:
-                path_parts = active_s3_path.replace("s3://", "").split("/", 1)
-                bucket_name, object_key = path_parts[0], path_parts[1]
-                logger.info(f"Loading Gold configuration from S3: '{active_s3_path}'")
-                response = active_s3_client.get_object(Bucket=bucket_name, Key=object_key)
-                content = response['Body'].read().decode('utf-8')
-                raw_config = json.loads(content)
-            except Exception as err:
-                logger.warning(f"Failed to load Gold config from S3 path '{active_s3_path}': {err}. Falling back to local search.")
+        if active_s3_path and active_s3_path.startswith("s3://"):
+            if not active_s3_client:
+                try:
+                    import boto3
+                    active_s3_client = boto3.client('s3')
+                    cls._cached_s3_client = active_s3_client
+                except Exception as err:
+                    logger.warning(f"Failed to auto-initialize S3 client in GoldConfigLoader: {err}")
+            if active_s3_client:
+                try:
+                    path_parts = active_s3_path.replace("s3://", "").split("/", 1)
+                    bucket_name, object_key = path_parts[0], path_parts[1]
+                    logger.info(f"Loading Gold configuration from S3: '{active_s3_path}'")
+                    response = active_s3_client.get_object(Bucket=bucket_name, Key=object_key)
+                    content = response['Body'].read().decode('utf-8')
+                    raw_config = json.loads(content)
+                except Exception as err:
+                    logger.warning(f"Failed to load Gold config from S3 path '{active_s3_path}': {err}. Falling back to local search.")
 
         # 2. Local search candidates (handles local repo, AWS Glue /tmp, and relative execution paths)
         if raw_config is None:
@@ -195,10 +240,22 @@ class GoldConfigLoader:
         """
         tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
         pk = tbl_cfg.get("primary_key") or tbl_cfg.get("natural_key") or tbl_cfg.get("nkey")
-        if isinstance(pk, list):
+        if isinstance(pk, list) and pk:
             return [str(k).strip() for k in pk if str(k).strip()]
         elif isinstance(pk, str) and pk.strip():
             return [str(k).strip() for k in pk.split(',') if str(k).strip()]
+
+        # Built-in platform fallback registry for standard entity natural keys
+        clean_src = (source_system or '').strip().lower()
+        clean_tbl = cls._clean_table_name(table_name, source_system)
+        if clean_src in cls.KNOWN_ENTITY_KEYS and clean_tbl in cls.KNOWN_ENTITY_KEYS[clean_src]:
+            fallback_keys = cls.KNOWN_ENTITY_KEYS[clean_src][clean_tbl]
+            logger.info(
+                f"[NATURAL KEY RESOLUTION] Resolved natural key for '{source_system}.{table_name}' to "
+                f"{fallback_keys} via platform schema registry."
+            )
+            return list(fallback_keys)
+
         return []
 
     # get_nkey alias for seamless compatibility with Silver layer naming

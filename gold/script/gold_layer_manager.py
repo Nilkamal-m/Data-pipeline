@@ -106,6 +106,15 @@ class GoldLayerManager:
             params.get('GOLD_CONFIG_S3_PATH')
             or (params.get('ARG_DICT', {}).get('GOLD_CONFIG_S3_PATH') if isinstance(params.get('ARG_DICT'), dict) else None)
         )
+        if not config_s3_path:
+            import sys
+            for i, a in enumerate(sys.argv):
+                if a in ('--GOLD_CONFIG_S3_PATH', '--gold_config_s3_path') and i + 1 < len(sys.argv):
+                    config_s3_path = sys.argv[i + 1].strip()
+                    break
+                elif a.startswith('--GOLD_CONFIG_S3_PATH=') or a.startswith('--gold_config_s3_path='):
+                    config_s3_path = a.split('=', 1)[1].strip()
+                    break
         if not config_s3_path and s3_client:
             candidate_cfg_paths = [
                 f"s3://{bucket_name}/gold/script/config/gold_config.json",
@@ -293,6 +302,19 @@ class GoldLayerManager:
                 pks = [k.strip() for k in str(params["NKEY"]).split(",") if k.strip()]
             if not pks and params.get("PRIMARY_KEY"):
                 pks = [k.strip() for k in str(params["PRIMARY_KEY"]).split(",") if k.strip()]
+            if not pks and isinstance(params.get("ARG_DICT"), dict):
+                arg_n = params["ARG_DICT"].get("NKEY") or params["ARG_DICT"].get("nkey") or params["ARG_DICT"].get("PRIMARY_KEY")
+                if arg_n:
+                    pks = [k.strip() for k in str(arg_n).split(",") if k.strip()]
+            if not pks:
+                import sys
+                for i, a in enumerate(sys.argv):
+                    if a in ('--NKEY', '--nkey', '--PRIMARY_KEY', '--primary_key') and i + 1 < len(sys.argv):
+                        pks = [k.strip() for k in sys.argv[i + 1].split(',') if k.strip()]
+                        break
+                    elif any(a.startswith(p) for p in ('--NKEY=', '--nkey=', '--PRIMARY_KEY=', '--primary_key=')):
+                        pks = [k.strip() for k in a.split('=', 1)[1].split(',') if k.strip()]
+                        break
 
             # Strictly require nkey from gold config — no hardcoded or default keys allowed
             if not pks:
@@ -818,6 +840,19 @@ class GoldLayerManager:
                 pks = [k.strip() for k in str(params["NKEY"]).split(",") if k.strip()]
             if not pks and params.get("PRIMARY_KEY"):
                 pks = [k.strip() for k in str(params["PRIMARY_KEY"]).split(",") if k.strip()]
+            if not pks and isinstance(params.get("ARG_DICT"), dict):
+                arg_n = params["ARG_DICT"].get("NKEY") or params["ARG_DICT"].get("nkey") or params["ARG_DICT"].get("PRIMARY_KEY")
+                if arg_n:
+                    pks = [k.strip() for k in str(arg_n).split(",") if k.strip()]
+            if not pks:
+                import sys
+                for i, a in enumerate(sys.argv):
+                    if a in ('--NKEY', '--nkey', '--PRIMARY_KEY', '--primary_key') and i + 1 < len(sys.argv):
+                        pks = [k.strip() for k in sys.argv[i + 1].split(',') if k.strip()]
+                        break
+                    elif any(a.startswith(p) for p in ('--NKEY=', '--nkey=', '--PRIMARY_KEY=', '--primary_key=')):
+                        pks = [k.strip() for k in a.split('=', 1)[1].split(',') if k.strip()]
+                        break
             if not pks:
                 raise ValueError(
                     f"CRITICAL CONFIG ERROR: Missing 'nkey' in gold configuration for table '{clean_base_name}' "
