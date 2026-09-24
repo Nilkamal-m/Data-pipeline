@@ -58,7 +58,7 @@ flowchart TD
         CreateIceberg --> RouteSCD{"Merge Strategy"}
         SyncSchema --> RouteSCD
         RouteSCD -- "SCD Type 1" --> ExecSCD1["execute_iceberg_scd1_upsert():\nSpark SQL MERGE INTO target AS t USING source AS s\nON t.nkey = s.nkey\nWHEN MATCHED THEN UPDATE SET *\nWHEN NOT MATCHED THEN INSERT *"]
-        RouteSCD -- "SCD Type 2" --> ExecSCD2["execute_iceberg_scd2():\nCompute sha2() payload hash\nExpire old versions (_valid_to, _is_current=false)\nInsert new current versions (_is_current=true)"]
+        RouteSCD -- "SCD Type 2" --> ExecSCD2["execute_iceberg_scd2():\nCompute sha2() payload hash\nExpire old versions (_valid_to, _is_current='N')\nInsert new current versions (_is_current='Y')"]
     end
 
     subgraph Finalize ["5. Watermark Commit & Catalog Sync"]
@@ -147,7 +147,7 @@ Used for auditing dimensional attributes over time (e.g., employee department ch
 * **Technical Columns Added**:
   - `_valid_from`: Timestamp when the record version became active.
   - `_valid_to`: Timestamp when the record version was superseded (defaults to `9999-01-01 00:00:00` for active records).
-  - `_is_current`: Boolean flag (`true` for active record, `false` for historical).
+  - `_is_current`: String flag — `'Y'` for the active (current) version of the record, `'N'` for historical (expired) versions.
   - `_row_hash`: SHA-256 hash across all business payload columns. If the hash hasn't changed, no new SCD2 version is generated.
 
 ---

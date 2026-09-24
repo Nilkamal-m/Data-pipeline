@@ -116,7 +116,8 @@ This document provides the definitive configuration blueprint for `gold_config.j
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
 | `nkey` | array | **Required** | *Used in `_upsert_iceberg_table` and MySQL PK upsert*: Primary / unique business key(s) identifying a distinct entity. |
-| `incremental` | boolean | Optional (Default: `true`) | *Used in SQL query builder*: If `true`, filters incoming Silver data using `WHERE _updated_at > MAX(gold._updated_at)`. |
+| `incremental` | boolean | Optional (Default: `true`) | *Used in SQL query builder*: If `true`, filters incoming Silver data using `WHERE _updated_at > MAX(gold._updated_at)`. If `false`, full-refresh: all Silver records re-materialized. |
+| `max_target_partitions` | integer | Optional (Default: none) | *Used in Spark writer before Iceberg MERGE*: Controls `coalesce(N)` applied to the mart DataFrame before writing. Limits small-file proliferation for high-volume tables. Omit to let Spark decide automatically. |
 | `custom_transform_script` | string | Optional | *Used in `GoldLayerManager`*: Relative path to Python transformation script extending business logic. |
 | `api_secret_name` | string | Optional | *Used in custom transforms*: Secrets Manager key name for third-party APIs (e.g. LLM scoring endpoints). |
 | `initial_load.path` | string | Optional | *Used in `GoldInitialLoader`*: Specific S3 URI pointing to the historical CSV file for this table. |
@@ -125,28 +126,32 @@ This document provides the definitive configuration blueprint for `gold_config.j
 
 ### 2.4 Multi-Target Serving Engine Blocks
 
+> **Implementation note:** There is no separate `adapters/` module in the codebase. All serving targets are resolved inline inside `gold_layer_manager.py` via a target-engine routing block. The config keys below tell the router **where** to write; the routing logic reads them directly from the resolved table config.
+
 #### Amazon Aurora MySQL (`aurora`)
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
-| `schema` | string | **Required** | *Used in `AuroraAdapter.upsert()`*: Target MySQL database/schema name (e.g., `enterprise_reporting`). |
-| `table_name` | string | **Required** | *Used in `AuroraAdapter.upsert()`*: Target physical MySQL table name (e.g., `gold_moveworks_interactions`). |
+| `schema` | string | **Required** | *Used in `_serve_to_mysql()`*: Target MySQL database/schema name (e.g., `enterprise_reporting`). |
+| `table_name` | string | **Required** | *Used in `_serve_to_mysql()`*: Target physical MySQL table name (e.g., `gold_moveworks_interactions`). |
+
+> **Flow:** Gold Glue job materializes the Iceberg mart first, then reads it back via `spark.table()` and writes to Aurora using a staging-swap pattern. Aurora is **downstream of Iceberg**, not a parallel write target.
 
 #### Amazon Redshift Spectrum (`redshift`)
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
-| `schema` | string | **Required** | *Used in `RedshiftAdapter.sync()`*: Redshift external schema name referencing the Glue Data Catalog. |
-| `table_name` | string | **Required** | *Used in `RedshiftAdapter.sync()`*: Physical external table name exposed to BI queries. |
+| `schema` | string | **Required** | *Used in Redshift sync routing*: Redshift external schema name referencing the Glue Data Catalog. |
+| `table_name` | string | **Required** | *Used in Redshift sync routing*: Physical external table name exposed to BI queries. |
 
 #### Snowflake (`snowflake`)
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
-| `database` | string | **Required** | *Used in `SnowflakeAdapter.sync()`*: Target Snowflake database name. |
-| `schema` | string | **Required** | *Used in `SnowflakeAdapter.sync()`*: Target Snowflake schema name. |
-| `table_name` | string | **Required** | *Used in `SnowflakeAdapter.sync()`*: Snowflake external Iceberg table identifier. |
+| `database` | string | **Required** | *Used in Snowflake sync routing*: Target Snowflake database name. |
+| `schema` | string | **Required** | *Used in Snowflake sync routing*: Target Snowflake schema name. |
+| `table_name` | string | **Required** | *Used in Snowflake sync routing*: Snowflake external Iceberg table identifier. |
 
 #### Databricks (`databricks`)
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
-| `catalog` | string | **Required** | *Used in `DatabricksAdapter.sync()`*: Databricks Unity Catalog name. |
-| `schema` | string | **Required** | *Used in `DatabricksAdapter.sync()`*: Databricks schema name. |
-| `table_name` | string | **Required** | *Used in `DatabricksAdapter.sync()`*: Unity Catalog registered table name. |
+| `catalog` | string | **Required** | *Used in Databricks sync routing*: Databricks Unity Catalog name. |
+| `schema` | string | **Required** | *Used in Databricks sync routing*: Databricks schema name. |
+| `table_name` | string | **Required** | *Used in Databricks sync routing*: Unity Catalog registered table name. |

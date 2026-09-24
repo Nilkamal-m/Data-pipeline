@@ -106,14 +106,14 @@ Technical columns added automatically:
 |---|---|
 | `_valid_from` | Timestamp when this version became active |
 | `_valid_to` | Timestamp when superseded (`9999-01-01` for the current record) |
-| `_is_current` | `true` for active record, `false` for historical |
+| `_is_current` | `'Y'` for active record, `'N'` for historical (expired) version |
 | `_row_hash` | SHA-256 across all business payload columns — no new version if hash unchanged |
 
 **Execution sequence:**
 1. Compute `_row_hash` for incoming records.
 2. Join incoming against the current Iceberg table on `nkey`.
-3. For changed records (hash differs): update existing row to set `_valid_to = now(), _is_current = false`.
-4. Insert the new version with `_valid_from = now(), _valid_to = 9999-01-01, _is_current = true`.
+3. For changed records (hash differs): update existing row to set `_valid_to = now(), _is_current = 'N'`.
+4. Insert the new version with `_valid_from = now(), _valid_to = 9999-01-01, _is_current = 'Y'`.
 
 ---
 

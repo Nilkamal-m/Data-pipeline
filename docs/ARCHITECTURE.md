@@ -68,11 +68,11 @@ flowchart TD
 
     SICEBERG --> GJ
     GJ --> GICEBERG
-    GJ --> GAURORA
 
     GICEBERG --> ATHENA
     GICEBERG --> RS
     GICEBERG --> SNO
+    GICEBERG --> GAURORA
     GAURORA --> BI
 ```
 
@@ -162,7 +162,7 @@ sequenceDiagram
     GD->>GD: Filter delta (_updated_at > max Gold _updated_at)
     GD->>S3G: MERGE INTO Gold Iceberg mart
     GD->>S3G: Read authoritative Iceberg dataset
-    GD->>AURORA: Write staging table -> atomic swap to production
+    GD->>AURORA: Sync from Iceberg — staging swap to production table
 ```
 
 ---
@@ -185,8 +185,8 @@ sequenceDiagram
 - Executes modular SQL queries (`gold/query/<source>/<table>.sql`) over Silver Iceberg.
 - For incremental tables, only processes records changed since the last Gold run (`_updated_at > max(gold._updated_at)`).
 - For full-refresh tables, re-materializes the entire mart from all Silver records.
-- Materializes results into Athena Iceberg as the **single source of truth**.
-- Syncs to Aurora MySQL using an atomic staging-swap for zero-downtime BI serving.
+- Materializes results into **Athena Iceberg as the single source of truth**.
+- After Iceberg materialization, reads back the authoritative Iceberg dataset and syncs to Aurora MySQL using an atomic staging-swap for zero-downtime BI serving.
 
 ---
 
