@@ -15,6 +15,8 @@ Required bronze_config.json keys (source_systems.<name>):
   delimiter          : Column delimiter for CSV/TSV (default: ',')
   has_header         : Whether CSV has a header row (default: true)
   encoding           : File encoding (default: 'utf-8')
+  multi_line         : Enable multi-line / multi-paragraph CSV records (default: true)
+  escape             : Escape character for quotes/text fields (default: '\\')
 
 Cross-account S3 access: if Secrets Manager contains 'aws_access_key_id' and
 'aws_secret_access_key', a cross-account S3 client is used; otherwise the
@@ -25,6 +27,7 @@ import csv
 import io
 import json
 import logging
+import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -144,9 +147,43 @@ class S3FileConnector:
                 f"S3FileConnector for '{table_name}': unsupported 'file_format' = '{file_format}'. "
                 f"Allowed: {_SUPPORTED_FORMATS}."
             )
-        delimiter  = config.get('delimiter', ',')
-        has_header = bool(config.get('has_header', True))
-        encoding   = config.get('encoding', 'utf-8')
+        delimiter  = table_cfg.get('delimiter') or config.get('delimiter', ',')
+        has_header_raw = table_cfg.get('has_header', config.get('has_header', True))
+        has_header = str(has_header_raw).strip().lower() in ('true', '1', 'yes') if isinstance(has_header_raw, str) else bool(has_header_raw)
+        encoding   = table_cfg.get('encoding') or config.get('encoding', 'utf-8')
+
+        # multiLine / multi_line option (handles multi-paragraph text fields)
+        raw_multiline = (
+            table_cfg.get('multiLine')
+            if 'multiLine' in table_cfg
+            else table_cfg.get('multi_line')
+            if 'multi_line' in table_cfg
+            else table_cfg.get('multiline')
+            if 'multiline' in table_cfg
+            else config.get('multiLine')
+            if 'multiLine' in config
+            else config.get('multi_line')
+            if 'multi_line' in config
+            else config.get('multiline', True)
+        )
+        if isinstance(raw_multiline, str):
+            multi_line = raw_multiline.strip().lower() in ('true', '1', 'yes')
+        else:
+            multi_line = bool(raw_multiline)
+
+        # escape / escapechar option (handles escaped characters/quotes e.g. \" inside CSV fields)
+        raw_escape = (
+            table_cfg.get('escape')
+            if 'escape' in table_cfg
+            else table_cfg.get('escapechar')
+            if 'escapechar' in table_cfg
+            else config.get('escape')
+            if 'escape' in config
+            else config.get('escapechar', '\\')
+        )
+        escape = str(raw_escape) if raw_escape is not None else None
+        if escape and escape.lower() in ('none', 'null', 'false', ''):
+            escape = None
 
         # Build S3 client (cross-account if explicit credentials provided)
         if secret_dict.get('aws_access_key_id') and secret_dict.get('aws_secret_access_key'):
@@ -245,7 +282,16 @@ class S3FileConnector:
             logger.info(f"[S3File/{table_name}] Reading: s3://{source_bucket}/{key} (modified: {mtime})")
             try:
                 body_bytes = s3.get_object(Bucket=source_bucket, Key=key)['Body'].read()
-                records    = cls._parse(body_bytes, file_format, delimiter, has_header, encoding, key)
+                records    = cls._parse(
+                    body_bytes,
+                    file_format,
+                    delimiter,
+                    has_header,
+                    encoding,
+                    key,
+                    multi_line=multi_line,
+                    escape=escape,
+                )
             except Exception as err:
                 logger.error(f"[S3File/{table_name}] Failed to read/parse '{key}': {err}")
                 raise
@@ -269,20 +315,47 @@ class S3FileConnector:
         has_header: bool,
         encoding: str,
         source_key: str,
+        multi_line: bool = True,
+        escape: Optional[str] = '\\',
     ) -> List[Dict[str, Any]]:
         """Parses raw file bytes into a list of record dicts."""
         text = body_bytes.decode(encoding, errors='replace')
 
         if file_format in ('csv', 'tsv'):
             sep  = '\t' if file_format == 'tsv' else delimiter
+            escapechar = escape[0] if (escape and isinstance(escape, str)) else None
+
+            # Increase CSV field size limit for large multi-paragraph text fields
+            try:
+                csv.field_size_limit(sys.maxsize)
+            except (OverflowError, AttributeError):
+                csv.field_size_limit(2147483647)
+
+            reader_kwargs: Dict[str, Any] = {'delimiter': sep}
+            if escapechar:
+                reader_kwargs['escapechar'] = escapechar
+
+            if multi_line:
+                # Use io.StringIO to preserve embedded newlines inside quoted fields
+                # (handles multi-paragraph text fields properly)
+                if not text.strip():
+                    return []
+                f = io.StringIO(text)
+                if has_header:
+                    return [dict(row) for row in csv.DictReader(f, **reader_kwargs)]
+                return [
+                    {f'col_{i}': v for i, v in enumerate(row)}
+                    for row in csv.reader(f, **reader_kwargs)
+                ]
+
             lines = text.splitlines()
             if not lines:
                 return []
             if has_header:
-                return [dict(row) for row in csv.DictReader(lines, delimiter=sep)]
+                return [dict(row) for row in csv.DictReader(lines, **reader_kwargs)]
             return [
                 {f'col_{i}': v for i, v in enumerate(row)}
-                for row in csv.reader(lines, delimiter=sep)
+                for row in csv.reader(lines, **reader_kwargs)
             ]
 
         if file_format in ('json', 'ndjson'):

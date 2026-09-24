@@ -108,6 +108,8 @@ Used when `"type": "s3_file"` is set in config. Key behaviors:
 | **fetch_mode=latest** | Returns only the single most recently modified file, ignoring watermark |
 | **{env} interpolation** | If `source_bucket` contains `{env}`, it is replaced at runtime from config or `ENV` env var |
 | **Cross-account** | If `secret_dict` contains `aws_access_key_id`, a dedicated boto3 client is built |
+| **multiLine parsing** | Default `true`: uses `io.StringIO` and dynamic field limits to handle multi-paragraph text fields with embedded newlines |
+| **escape option** | Default `\\`: handles escaped quotes (e.g. `\"`) and characters within CSV records without corrupting rows |
 
 **Per-table path resolution priority (highest to lowest):**
 1. `tables.<table_name>.file_path`

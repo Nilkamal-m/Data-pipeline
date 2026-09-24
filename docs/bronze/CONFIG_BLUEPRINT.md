@@ -180,6 +180,8 @@ This document provides the definitive configuration blueprint for `bronze_config
   - `file_format`: string (**Required**) — Input format (`csv`, `json`, `parquet`).
   - `delimiter`: string (Optional, default `,`) — Delimiter for CSV feeds.
   - `has_header`: boolean (Optional, default `true`) — Header row presence flag.
+  - `multiLine`: boolean (Optional, default `true`) — Handles multi-paragraph text fields by parsing embedded newlines inside quoted fields.
+  - `escape`: string (Optional, default `\\`) — Escape character for quotes/characters in CSV.
   - `fetch_mode`: string (Optional, default `all`) — `all` (incremental modified files) or `latest` (most recent file only).
 
 ---

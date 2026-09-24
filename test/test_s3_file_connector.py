@@ -256,7 +256,97 @@ class TestS3FileConnector(unittest.TestCase):
             Prefix="landing/genesys/"
         )
 
+    @patch("bronze.script.connectors.s3_file.boto3.client")
+    def test_csv_multiline_and_escape(self, mock_boto):
+        """
+        Verify that S3FileConnector correctly parses CSV files containing multi-paragraph
+        text fields (embedded newlines) and escaped characters (escape="\\") without corrupting records.
+        """
+        mock_s3 = MagicMock()
+        mock_boto.return_value = mock_s3
+
+        s3_files = [
+            {
+                "Key": "raw_feed/tickets/tickets_20260924.csv",
+                "LastModified": datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc),
+            }
+        ]
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [{"Contents": s3_files}]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        multiline_csv = (
+            b'id,subject,description,status\n'
+            b'101,"Login Issue","First paragraph of description.\n\nSecond paragraph with \\"quoted terms\\".\n\nThird paragraph.","open"\n'
+            b'102,"Password Reset","Simple single line description","closed"\n'
+        )
+        mock_s3.get_object.return_value = {
+            "Body": MagicMock(read=lambda: multiline_csv)
+        }
+
+        config = {
+            "source_bucket": "tickets-bucket",
+            "file_format": "csv",
+            "multiLine": True,
+            "escape": "\\",
+            "tables": {
+                "tickets": {
+                    "file_path": "raw_feed/tickets/",
+                    "fetch_mode": "all",
+                }
+            }
+        }
+
+        ingested = []
+        S3FileConnector.fetch_delta(
+            last_load_date="2026-09-24 00:00:00",
+            secret_dict={},
+            table_name="tickets",
+            source_config=config,
+            on_chunk_callback=lambda chunk, part: ingested.extend(chunk)
+        )
+
+        self.assertEqual(len(ingested), 2)
+        # Record 101 should contain the full multi-paragraph description with escaped quotes parsed
+        self.assertEqual(ingested[0]["id"], "101")
+        self.assertEqual(ingested[0]["subject"], "Login Issue")
+        expected_desc = 'First paragraph of description.\n\nSecond paragraph with "quoted terms".\n\nThird paragraph.'
+        self.assertEqual(ingested[0]["description"], expected_desc)
+        self.assertEqual(ingested[0]["status"], "open")
+
+        # Record 102
+        self.assertEqual(ingested[1]["id"], "102")
+        self.assertEqual(ingested[1]["subject"], "Password Reset")
+        self.assertEqual(ingested[1]["status"], "closed")
+
+    def test_parse_direct_multiline_and_escape(self):
+        """
+        Directly test S3FileConnector._parse with multi_line=True and escape='\\'
+        for both header and non-header formats.
+        """
+        csv_data = (
+            b'ticket_id,notes\n'
+            b'T-1,"Line 1 of note.\nLine 2 with \\"quoted text\\".\nLine 3."\n'
+            b'T-2,"Standard note"\n'
+        )
+        records = S3FileConnector._parse(
+            body_bytes=csv_data,
+            file_format="csv",
+            delimiter=",",
+            has_header=True,
+            encoding="utf-8",
+            source_key="test.csv",
+            multi_line=True,
+            escape="\\"
+        )
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["ticket_id"], "T-1")
+        self.assertIn("Line 1 of note.\nLine 2 with \"quoted text\".\nLine 3.", records[0]["notes"])
+        self.assertEqual(records[1]["ticket_id"], "T-2")
+        self.assertEqual(records[1]["notes"], "Standard note")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

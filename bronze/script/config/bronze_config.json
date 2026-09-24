@@ -200,6 +200,8 @@
       "delimiter": ",",
       "has_header": true,
       "encoding": "utf-8",
+      "multiLine": true,
+      "escape": "\\",
       "fetch_mode": "all",
       "_note_fetch_mode": "'all' = all files modified after watermark (incremental). 'latest' = only the most recently modified file (snapshot/full-refresh).",
       "tables": {
