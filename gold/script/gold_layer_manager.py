@@ -564,6 +564,8 @@ class GoldLayerManager:
                 f"Please ensure at least one SQL definition is present in S3 or locally in 'gold/query/{source_system}/'."
             )
 
+        all_discovered_queries = dict(queries)
+
         # Optional CLI table override filtering
         table_filter = params.get('TABLE_LIST') or []
         if isinstance(table_filter, str):
@@ -593,6 +595,16 @@ class GoldLayerManager:
                     f"[GOLD STEP 1] CLI table override {table_filter} did not match mart names {list(queries.keys())}. "
                     f"Processing all discovered mart queries for source '{source_system}'."
                 )
+
+        # Ensure any upstream dependencies of the requested tables are included if not yet created in Athena
+        queries = cls._resolve_query_dependencies(
+            active_queries=queries,
+            all_queries=all_discovered_queries,
+            source_system=source_system,
+            glue_database=glue_database,
+            spark=spark,
+            gold_cfg=gold_cfg
+        )
 
         logger.info(f"[GOLD STEP 1] Discovered {len(queries)} mart query file(s) to process: {list(queries.keys())}")
 
@@ -667,7 +679,16 @@ class GoldLayerManager:
             )
 
             try:
-                # 3. Execute Mart SQL Query
+                # 3. Ensure upstream dependency temporary views (e.g. v_interactions) are registered
+                cls._ensure_dependency_views_registered(
+                    spark=spark,
+                    sql_text=sql_text,
+                    source_system=source_system,
+                    glue_database=glue_database,
+                    gold_cfg=gold_cfg
+                )
+
+                # Execute Mart SQL Query
                 logger.info(f"Executing Spark SQL query for '{clean_base_name}'...")
                 df_mart = spark.sql(sql_text)
 
@@ -762,13 +783,20 @@ class GoldLayerManager:
                     params=params
                 )
 
-                if init_loaded:
-                    try:
-                        materialized_dfs[clean_base_name] = spark.table(f"{glue_database}.{target_table_name}")
-                    except Exception:
+                # Refresh in-session Spark temp views directly from the authoritative physical Iceberg table
+                # so downstream dependent marts (e.g., feedbacks reading v_interactions) see the complete dataset
+                try:
+                    full_gold_df = spark.table(f"{glue_database}.{target_table_name}")
+                    full_gold_df.createOrReplaceTempView(f"v_{clean_base_name}")
+                    full_gold_df.createOrReplaceTempView(clean_base_name)
+                    full_gold_df.createOrReplaceTempView(f"gold_tbl_{clean_base_name}")
+                    full_gold_df.createOrReplaceTempView(target_table_name)
+                    materialized_dfs[clean_base_name] = full_gold_df
+                    logger.info(f"[DEPENDENCY REGISTRY] Refreshed Spark temp views for '{clean_base_name}' from full Iceberg table '{glue_database}.{target_table_name}'")
+                except Exception as refresh_err:
+                    logger.debug(f"[DEPENDENCY REGISTRY] Note refreshing temp views for '{clean_base_name}': {refresh_err}")
+                    if clean_base_name not in materialized_dfs:
                         materialized_dfs[clean_base_name] = df_mart
-                else:
-                    materialized_dfs[clean_base_name] = df_mart
 
                 duration = (datetime.now(timezone.utc) - mart_start).total_seconds()
                 mart_stats.append({
@@ -2823,6 +2851,137 @@ class GoldLayerManager:
             for r in ready:
                 ordered[r] = remaining.pop(r)
         return ordered
+
+    @classmethod
+    def _resolve_query_dependencies(
+        cls,
+        active_queries: Dict[str, str],
+        all_queries: Dict[str, str],
+        source_system: str = '',
+        glue_database: str = '',
+        spark: Optional[SparkSession] = None,
+        gold_cfg: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, str]:
+        """
+        Detects if any query in active_queries depends on another mart in all_queries.
+        If a dependency table does not yet exist in Athena/Glue catalog, it is automatically
+        scheduled for creation and loading first. If it already exists, its view is pre-registered.
+        """
+        resolved = dict(active_queries)
+        added_deps = True
+
+        while added_deps:
+            added_deps = False
+            for name, sql in list(resolved.items()):
+                for cand_name, cand_sql in all_queries.items():
+                    if cand_name not in resolved and cls._check_mart_dependency(sql, cand_name, source_system, glue_database, gold_cfg):
+                        # Dependency detected! Check if physical Iceberg table already exists in Glue catalog
+                        target_tbl = None
+                        if GoldConfigLoader and source_system:
+                            target_tbl = GoldConfigLoader.get_target_table_name(source_system, cand_name, 'athena', gold_cfg)
+                        if not target_tbl:
+                            target_tbl = f"gold_{source_system}_{cand_name}" if source_system else f"gold_{cand_name}"
+
+                        tbl_exists = False
+                        if spark and glue_database:
+                            try:
+                                spark.sql(f"DESCRIBE TABLE `{glue_database}`.`{target_tbl}`")
+                                spark.table(f"{glue_database}.{target_tbl}").limit(1).collect()
+                                tbl_exists = True
+                            except Exception:
+                                tbl_exists = False
+
+                        if not tbl_exists:
+                            logger.info(
+                                f"[DEPENDENCY RESOLUTION] Mart '{name}' depends on '{cand_name}' which does not exist yet "
+                                f"in '{glue_database}.{target_tbl}'. Scheduling '{cand_name}' to create and load first."
+                            )
+                            resolved[cand_name] = cand_sql
+                            added_deps = True
+                        else:
+                            # Pre-load existing table into temp view
+                            if spark and glue_database:
+                                try:
+                                    dep_df = spark.table(f"{glue_database}.{target_tbl}")
+                                    dep_df.createOrReplaceTempView(f"v_{cand_name}")
+                                    dep_df.createOrReplaceTempView(cand_name)
+                                    dep_df.createOrReplaceTempView(f"gold_tbl_{cand_name}")
+                                    dep_df.createOrReplaceTempView(target_tbl)
+                                    logger.info(
+                                        f"[DEPENDENCY RESOLUTION] Pre-loaded authoritative existing table '{glue_database}.{target_tbl}' "
+                                        f"into Spark view 'v_{cand_name}' for dependent mart '{name}'."
+                                    )
+                                except Exception as pre_err:
+                                    logger.debug(f"[DEPENDENCY RESOLUTION] Note pre-loading '{cand_name}': {pre_err}")
+                                    resolved[cand_name] = cand_sql
+                                    added_deps = True
+
+        return resolved
+
+    @classmethod
+    def _ensure_dependency_views_registered(
+        cls,
+        spark: Optional[SparkSession],
+        sql_text: str,
+        source_system: str = '',
+        glue_database: str = '',
+        gold_cfg: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Inspects SQL query text for references to upstream Gold tables or views
+        (e.g., v_interactions, interactions, gold_moveworks_interactions).
+        If the view is not registered in Spark's temp views but exists in the Glue
+        Data Catalog, loads it into Spark temp views so downstream queries resolve seamlessly.
+        """
+        if not spark or not sql_text or not glue_database:
+            return
+
+        clean_sql = cls._strip_sql_comments(sql_text)
+        tokens = re.findall(r'\b(?:FROM|JOIN)\s+([`\w.]+)', clean_sql, re.IGNORECASE)
+        for token in tokens:
+            raw_name = token.replace('`', '').split('.')[-1].lower()
+            try:
+                if spark.catalog.tableExists(raw_name):
+                    continue
+            except Exception:
+                pass
+
+            base_cand = raw_name
+            if base_cand.startswith("v_"):
+                base_cand = base_cand[2:]
+            elif source_system and base_cand.startswith(f"gold_{source_system}_"):
+                base_cand = base_cand[len(f"gold_{source_system}_"):]
+            elif base_cand.startswith("gold_tbl_"):
+                base_cand = base_cand[len("gold_tbl_"):]
+            elif base_cand.startswith("gold_"):
+                base_cand = base_cand[5:]
+
+            candidates_to_try = [
+                f"{glue_database}.gold_{source_system}_{base_cand}" if source_system else f"{glue_database}.gold_{base_cand}",
+                f"{glue_database}.{raw_name}",
+                f"{glue_database}.gold_{base_cand}"
+            ]
+            if GoldConfigLoader and source_system:
+                tgt = GoldConfigLoader.get_target_table_name(source_system, base_cand, 'athena', gold_cfg)
+                if tgt:
+                    candidates_to_try.insert(0, f"{glue_database}.{tgt}")
+
+            for full_cand in candidates_to_try:
+                try:
+                    dep_df = spark.table(full_cand)
+                    dep_df.createOrReplaceTempView(raw_name)
+                    dep_df.createOrReplaceTempView(base_cand)
+                    dep_df.createOrReplaceTempView(f"v_{base_cand}")
+                    dep_df.createOrReplaceTempView(f"gold_tbl_{base_cand}")
+                    if source_system:
+                        dep_df.createOrReplaceTempView(f"gold_{source_system}_{base_cand}")
+                    logger.info(
+                        f"[DEPENDENCY RESOLUTION] Pre-loaded authoritative dependency table '{full_cand}' "
+                        f"into Spark view '{raw_name}' (aliases: 'v_{base_cand}', '{base_cand}')."
+                    )
+                    break
+                except Exception:
+                    continue
 
     # --------------------------------------------------------------------------
     # Connection Resolution

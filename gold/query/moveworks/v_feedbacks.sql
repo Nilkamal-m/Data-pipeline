@@ -93,6 +93,7 @@ WITH
     )
 SELECT
     -- Output Fields
+    fb.interaction_id AS feedback_id,
     fb.conversation_id AS conversation_id,
     fb.timestamp AS timestamp,
     COALESCE(rp.what_user_said, '') AS what_user_said,

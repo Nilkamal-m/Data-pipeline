@@ -937,6 +937,43 @@ class TestGoldMartDependencyAndOmittedColumns(unittest.TestCase):
         self.assertIn("conversations", ordered_keys[1:])
         self.assertIn("feedbacks", ordered_keys[1:])
 
+    def test_resolve_query_dependencies_schedules_uncreated_prerequisite(self):
+        """When feedbacks is filtered alone, interactions is automatically resolved and scheduled."""
+        all_queries = {
+            "interactions": "SELECT * FROM tbl_interactions",
+            "feedbacks": "SELECT * FROM v_interactions WHERE is_feedback = 1"
+        }
+        active_queries = {
+            "feedbacks": all_queries["feedbacks"]
+        }
+        resolved = GoldLayerManager._resolve_query_dependencies(
+            active_queries=active_queries,
+            all_queries=all_queries,
+            source_system="moveworks",
+            glue_database="uax_datalake_db_dev"
+        )
+        self.assertIn("interactions", resolved)
+        self.assertIn("feedbacks", resolved)
+
+        # Ordering must run interactions first
+        ordered = GoldLayerManager._sort_queries_by_dependency(
+            resolved, source_system="moveworks", glue_database="uax_datalake_db_dev"
+        )
+        keys = list(ordered.keys())
+        self.assertEqual(keys[0], "interactions")
+        self.assertEqual(keys[1], "feedbacks")
+
+    def test_v_feedbacks_sql_projects_feedback_id(self):
+        """v_feedbacks.sql projects feedback_id to match gold_config.json nkey."""
+        sql_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "gold", "query", "moveworks", "v_feedbacks.sql"
+        )
+        with open(sql_path, "r", encoding="utf-8") as f:
+            sql_text = f.read()
+        self.assertIn("feedback_id", sql_text)
+        self.assertIn("fb.interaction_id AS feedback_id", sql_text)
+
     def test_composite_nkey_preservation_no_autodetect(self):
         """Composite nkeys are strictly preserved and not overridden by auto-detection."""
         composite_cfg = {

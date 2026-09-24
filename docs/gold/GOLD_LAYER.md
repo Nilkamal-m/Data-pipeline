@@ -30,7 +30,7 @@ flowchart TD
 
     subgraph InitialLoadCheck ["2. Historical Load & S3 Archival"]
         LoadConfig --> CheckInitial{"Initial CSV Exists\nin gold/initial_exports/?"}
-        CheckInitial -- Yes --> ParseCSV["GoldInitialLoader.load():\nRead CSV (multiLine=true, escape='\"')"]
+        CheckInitial -- Yes --> ParseCSV["GoldInitialLoader.load():\nRead CSV with multiLine and escape options"]
         ParseCSV --> DedupeCSV["Deduplicate by nkey\nOrdered by _updated_at DESC"]
         DedupeCSV --> ArchiveS3["Move CSV to S3 _archived/:\ns3://.../gold/initial_exports/{source}/_archived/"]
         ArchiveS3 --> InitAthena["Write Initial Baseline to Athena Iceberg"]
@@ -45,24 +45,26 @@ flowchart TD
         ExecCustomScript --> AlignSchema
     end
 
-    subgraph TargetOne ["4. Target 1: Physical Athena Iceberg Upsert"]
+    subgraph TargetOne ["4. Target 1: Authoritative Athena Iceberg Upsert"]
         AlignSchema --> FetchIcebergSchema["Inspect Target Iceberg Schema in Glue"]
         FetchIcebergSchema --> PadColumns["Pad Missing Columns as NULL\nReorder Columns to Match Iceberg Catalog"]
         PadColumns --> IcebergMerge["Spark SQL MERGE INTO target AS t USING source AS s\nON t.nkey = s.nkey\nWHEN MATCHED THEN UPDATE SET *\nWHEN NOT MATCHED THEN INSERT *"]
+        IcebergMerge --> IcebergComplete["Iceberg Gold Table Complete & Authoritative\nRefreshes in-session temp views for downstream marts"]
     end
 
     subgraph MultiTargetServing ["5. Multi-Target Serving Synchronization"]
-        IcebergMerge --> CheckTargets{"Evaluate target_engines\n(Configured per table)"}
-        CheckTargets -- "Aurora MySQL" --> ReadIceberg["Read Authoritative Athena Iceberg Table\n(Complete conformed dataset)"]
-        ReadIceberg --> AuroraStaging["Write Full Conformed DataFrame\nto Staging Table: {table}_staging"]
+        IcebergComplete --> CheckTargets{"Evaluate target_engines\n(Configured per table)"}
+        CheckTargets -- "Aurora MySQL" --> ReadIceberg["Read Authoritative Athena Iceberg Table\n(Directly after Iceberg completion)"]
+        ReadIceberg --> AuroraStaging["Write Full Conformed DataFrame\nto Aurora Staging Table: {table}_staging"]
         AuroraStaging --> AuroraSwap["Execute Zero-Downtime Atomic Swap:\nRENAME TABLE target TO old, staging TO target\nDROP TABLE old"]
+        AuroraSwap --> AuroraComplete["Aurora Gold Table Live\n(Operational query & dashboard serving)"]
         CheckTargets -- "Redshift Spectrum" --> RedshiftSync["Update External Schema Mapping"]
         CheckTargets -- "Snowflake" --> SnowflakeSync["Refresh External Stage / Iceberg Table"]
         CheckTargets -- "Databricks" --> DatabricksSync["Sync Unity Catalog Iceberg Reference"]
     end
 
     subgraph Complete ["6. Completion"]
-        AuroraSwap --> Success(["Job Complete: Marts Updated Across All Engines"])
+        AuroraComplete --> Success(["Job Complete: Marts Updated Across All Engines"])
         RedshiftSync --> Success
         SnowflakeSync --> Success
         DatabricksSync --> Success

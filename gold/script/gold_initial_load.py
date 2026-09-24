@@ -399,14 +399,14 @@ class GoldInitialLoader:
             df_raw = spark.read \
                 .option("header", str(has_header).lower()) \
                 .option("delimiter", delimiter) \
-                .option("quote", '"') \
-                .option("escape", '"') \
-                .option("multiLine", "true") \
                 .option("inferSchema", "false") \
-                .csv(csv_path)
+                .csv(csv_path, quote='"', escape='"', multiLine=True)
 
         raw_count = df_raw.count()
-        logger.info(f"Loaded {raw_count:,} records from input file.")
+        try:
+            logger.info(f"Loaded {int(raw_count):,} records from input file.")
+        except Exception:
+            logger.info(f"Loaded {raw_count} records from input file.")
 
         # 2. Check Target Table Schema for Reconciliation
         target_fields = None
@@ -519,7 +519,7 @@ class GoldInitialLoader:
             f"|                GOLD INITIAL LOAD COMPLETED SUCCESSFULLY                        |\n"
             f"+================================================================================+\n"
             f"|  * Target Table    : {full_table}\n"
-            f"|  * Records Loaded  : {raw_count:,}\n"
+            f"|  * Records Loaded  : {f'{int(raw_count):,}' if isinstance(raw_count, (int, float)) else raw_count}\n"
             f"|  * Duration        : {duration:.2f}s\n"
             f"+================================================================================+"
         )
