@@ -52,7 +52,7 @@ This document provides the definitive configuration blueprint for `gold_config.j
             "has_header": true
           },
           "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
-          "api_secret_name": "{env}/data-pipeline/genesys-llm-api",
+          "api_secret_name": "uax-datalake/genesys-credentials-{env}",
           "aurora": {
             "schema": "enterprise_reporting",
             "table_name": "gold_genesys_conversations"

@@ -118,7 +118,7 @@ Data-pipeline/
 │       ├── gold_config_loader.py       # Gold configuration loader & cache manager
 │       ├── gold_initial_load.py        # Historical CSV parser, validator & auto-archiver
 │       └── gold_layer_manager.py       # Master Gold orchestration engine
-├── docs/                               # Enterprise Documentation Suite
+└── docs/                               # Enterprise Documentation Suite
 │   ├── ARCHITECTURE.md                 # System-wide architectural blueprint
 │   ├── ONBOARDING_GUIDE.md             # Developer setup, CLI args & onboarding recipe
 │   ├── bronze/
@@ -130,10 +130,6 @@ Data-pipeline/
 │   └── gold/
 │       ├── GOLD_LAYER.md               # Gold low-level execution & multi-target guide
 │       └── CONFIG_BLUEPRINT.md         # Gold configuration parameter reference
-└── test/                               # Automated Test Suite
-    ├── test_bronze_extraction.py       # Bronze connector & JSON flattener tests
-    ├── test_silver_transforms.py       # Silver deduplication & SCD merge tests
-    └── test_gold_upsert_and_config.py  # Gold multi-engine upsert & schema tests
 ```
 
 ---

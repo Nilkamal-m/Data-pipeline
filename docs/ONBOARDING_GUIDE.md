@@ -1,44 +1,47 @@
-# Engineering Onboarding & Developer Operations Guide
+# Engineering Onboarding & Operations Guide
 
-Welcome to the **Enterprise Medallion Data Lakehouse Platform**! This guide provides data engineers with everything required to configure local environments, understand pipeline execution parameters, manage secrets, and onboard new data sources from Bronze through Silver and Gold.
+Welcome to the **Enterprise Medallion Data Lakehouse Platform**! This guide provides data engineers with the architectural principles, automated infrastructure deployment instructions, standardized secrets schema, pipeline CLI execution parameters, and an end-to-end recipe to onboard new data sources from Bronze through Silver and Gold.
 
 ---
 
-## 1. Local Environment Setup
+## 1. Environment & Infrastructure Setup
 
-### 1.1 Prerequisites
-* **Python 3.9+** (recommended: Python 3.10)
-* **Java 8 or 11** (required for local PySpark execution)
-* **AWS CLI v2** configured with appropriate AWS IAM permissions (`s3:*`, `glue:*`, `secretsmanager:GetSecretValue`)
+The entire data pipeline infrastructure, storage, security, and execution runtime environments are fully automated using infrastructure Terraform deployment scripts.
 
-### 1.2 Virtual Environment & Dependencies
-```bash
-# Clone the repository
-git clone git@github.com:Nilkamal-m/Data-pipeline.git
-cd Data-pipeline
+> [!IMPORTANT]
+> **Local Environment Setup Is Ignored & Not Required**:
+> You do not need to configure local PySpark, Java runtimes, or local databases. Triggering the Terraform deployment scripts automatically provisions and configures all required cloud components across environments (`dev`, `stage`, `prod`):
+> * **Storage**: Amazon S3 Data Lake buckets (`bronze`, `silver`, `gold`, `state`) with lifecycle and partitioning rules.
+> * **Security & IAM**: Least-privilege IAM service roles and AWS Secrets Manager credential definitions.
+> * **Catalogs & Metastore**: AWS Glue Data Catalog databases, table definitions, and operational crawlers.
+> * **Serverless Compute**: AWS Glue Job execution environments pre-configured with Spark 3.3, PyArrow, Iceberg runtimes, and external Python library dependencies.
+> * **Query Engine**: Amazon Athena workgroups with isolated query result storage.
 
-# Create and activate Python virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install required packages
-pip install --upgrade pip
-pip install pyspark==3.3.0 pyarrow pandas boto3 requests urllib3 mysql-connector-python pytest
-```
+Once the Terraform scripts are executed for your target environment, the platform is immediately ready for job runs and table onboarding.
 
 ---
 
 ## 2. Secrets Manager Naming Convention & Schemas
 
-All connection strings, API tokens, and passwords must be provisioned in **AWS Secrets Manager**. Never commit credentials or endpoint passwords into configuration JSON files or repository source code.
+All connection strings, API tokens, and database passwords must be provisioned in **AWS Secrets Manager**. Never commit credentials or endpoint passwords into configuration JSON files or repository source code.
 
 ### 2.1 Standardized Secret Naming Structure
+Every secret follows the enterprise naming format:
 ```
-{env}/data-pipeline/{layer}/{source_system}
+{appname}/<sourcename>-credentials-{env}
 ```
-* Example (Bronze ServiceNow Dev): `dev/data-pipeline/bronze/servicenow`
-* Example (Bronze Genesys Prod): `prod/data-pipeline/bronze/genesys`
-* Example (Gold Aurora Target Dev): `dev/data-pipeline/gold/aurora`
+* **Application Name (`appname`)**: `uax-datalake`
+* **Source Name (`<sourcename>`)**: Upstream or downstream system identifier (e.g., `servicenow`, `genesys`, `moveworks`, `aurora`)
+* **Environment (`{env}`)**: `dev`, `stage`, or `prod`
+
+#### Concrete Secret Identifier Examples:
+* **Bronze ServiceNow (Dev)**: `uax-datalake/servicenow-credentials-dev`
+* **Bronze Genesys (Prod)**: `uax-datalake/genesys-credentials-prod`
+* **Bronze Moveworks (Dev)**: `uax-datalake/moveworks-credentials-dev`
+* **Bronze PostgreSQL (Stage)**: `uax-datalake/postgresql-credentials-stage`
+* **Gold Aurora MySQL (Dev)**: `uax-datalake/aurora-credentials-dev`
+
+---
 
 ### 2.2 Expected Secret JSON Schemas
 
@@ -82,7 +85,7 @@ All connection strings, API tokens, and passwords must be provisioned in **AWS S
 
 ## 3. Command-Line Interface (CLI) Reference
 
-Each layer exposes a command-line interface that can be triggered locally or via AWS Glue Job runs.
+Each pipeline layer can be triggered on-demand via Python Shell / PySpark Glue job runs.
 
 ### 3.1 Bronze Layer CLI (`uax_bronze_load.py`)
 ```bash
@@ -164,7 +167,7 @@ python3 gold/script/gold_layer_manager.py \
 Follow this recipe to onboard an entity from source extraction to business serving:
 
 ### Step 1: Bronze Ingestion
-1. Create the credential secret in AWS Secrets Manager: `{env}/data-pipeline/bronze/acme_crm`.
+1. Provision the credential secret in AWS Secrets Manager: `uax-datalake/acme_crm-credentials-{env}`.
 2. Add the table definition in `bronze/script/config/bronze_config.json`:
    ```json
    "acme_crm": {
@@ -178,9 +181,11 @@ Follow this recipe to onboard an entity from source extraction to business servi
    }
    ```
 3. Run the Bronze job to ingest raw data to S3.
+   * Data lands at: `s3://{bronze_bucket}/bronze/data/acme_crm/customers/year=YYYY/month=MM/day=DD/`
+   * Watermark state lands at: `s3://{state_bucket}/metadata/bronze/acme_crm/customers/watermark.json`
 
 ### Step 2: Silver Conformation & Iceberg Persistence
-1. Add the table conformed specification in `silver/script/config/silver_config.json`:
+1. Add the conformed table specification in `silver/script/config/silver_config.json`:
    ```json
    "acme_crm": {
      "tables": {
@@ -195,10 +200,12 @@ Follow this recipe to onboard an entity from source extraction to business servi
      }
    }
    ```
-2. Run the Silver job. Verify the table in Athena:
+2. Run the Silver job. Verify the Iceberg table in Athena:
    ```sql
    SELECT * FROM "uax_datalake_db_dev"."tbl_customers" LIMIT 10;
    ```
+   * Iceberg data lands at: `s3://{silver_bucket}/silver/data/acme_crm/tbl_customers/`
+   * Watermark state lands at: `s3://{state_bucket}/metadata/silver/acme_crm_tbl_customers_watermark.json`
 
 ### Step 3: Gold Dimensional Mart & Multi-Target Serving
 1. Create SQL transformation query `gold/query/acme_crm/customers.sql`:
@@ -230,15 +237,4 @@ Follow this recipe to onboard an entity from source extraction to business servi
      }
    }
    ```
-3. Run the Gold manager to build the Athena Iceberg mart and sync to Aurora MySQL.
-
----
-
-## 5. Automated Testing & Verification
-
-Run the test suite prior to committing any code:
-```bash
-# Execute unit and integration tests
-pytest -v test/
-```
-All tests should pass cleanly without regressions.
+3. Run the Gold manager to build the Athena Iceberg mart and sync downstream to Aurora MySQL via zero-downtime PK UPSERT.

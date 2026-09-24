@@ -28,7 +28,7 @@ flowchart TD
     subgraph StateResolution ["2. High-Water Mark Resolution"]
         FetchSecret --> CheckFullRefresh{"Full Refresh\nRequested?"}
         CheckFullRefresh -- Yes --> UseInitial["HWM = initial_load_date\n(config or CLI)"]
-        CheckFullRefresh -- No --> ReadStateFile["Read S3 State JSON\nmetadata/bronze/{source}/{source}_{table}_state.json"]
+        CheckFullRefresh -- No --> ReadStateFile["Read S3 State JSON\nmetadata/bronze/{source}/{table}/watermark.json"]
         ReadStateFile --> ValidateHWM{"State Exists\n& Valid?"}
         ValidateHWM -- Yes --> UseState["HWM = state.last_load_date"]
         ValidateHWM -- No --> UseInitial
@@ -217,7 +217,7 @@ All sensitive credentials MUST reside in AWS Secrets Manager. Secrets are format
 ## 6. High-Water Mark & State Management
 
 Incremental extraction relies on an S3-persisted JSON state file per table:
-`s3://{state_bucket}/metadata/bronze/{source}/{source}_{table_name}_state.json`
+`s3://{state_bucket}/metadata/bronze/{source}/{table}/watermark.json`
 
 ### State File Schema
 ```json
@@ -246,7 +246,7 @@ Follow this step-by-step procedure to onboard a new source or table in the Bronz
 
 ### Step 1: Create AWS Secrets Manager Entry
 Store the connection credentials under the standardized secret path:
-`{env}/data-pipeline/bronze/{source_name}` (matching the schema defined in Section 4.3).
+`uax-datalake/{source_name}-credentials-{env}` (matching the schema defined in Section 4.3).
 
 ### Step 2: Update `bronze_config.json`
 Add the new source block under `source_systems` or append a table under an existing source:
@@ -285,4 +285,4 @@ python3 bronze/script/uax_bronze_load.py \
 ```
 Verify that:
 1. Parquet files appear under `s3://uax-datalake-bronze-dev/bronze/data/new_api_source/audit_events/year=YYYY/month=MM/day=DD/`.
-2. The state file is committed at `s3://uax-datalake-state-dev/metadata/bronze/new_api_source/new_api_source_audit_events_state.json`.
+2. The state file is committed at `s3://uax-datalake-state-dev/metadata/bronze/new_api_source/audit_events/watermark.json`.
