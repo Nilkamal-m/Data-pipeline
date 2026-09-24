@@ -286,3 +286,9 @@ python3 bronze/script/uax_bronze_load.py \
 Verify that:
 1. Parquet files appear under `s3://uax-datalake-bronze-dev/bronze/data/new_api_source/audit_events/year=YYYY/month=MM/day=DD/`.
 2. The state file is committed at `s3://uax-datalake-state-dev/metadata/bronze/new_api_source/audit_events/watermark.json`.
+
+---
+
+## 8. Developer Enhancement Reference
+
+For information on how the Bronze codebase is structured for contributors — adding connectors, extending the orchestration loop, or writing unit tests — see [ENHANCEMENT_GUIDE.md](ENHANCEMENT_GUIDE.md).

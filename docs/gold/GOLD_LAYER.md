@@ -224,3 +224,9 @@ python3 gold/script/gold_layer_manager.py \
 Verify Athena and Aurora:
 * Athena: `SELECT COUNT(*) FROM uax_datalake_db_dev.gold_servicenow_incidents_summary;`
 * Aurora: `SELECT COUNT(*) FROM enterprise_reporting.gold_servicenow_incidents_summary;`
+
+---
+
+## 8. Developer Enhancement Reference
+
+For information on how the Gold codebase is structured for contributors — adding marts, custom transforms, new target adapters, or modifying incremental behavior — see [ENHANCEMENT_GUIDE.md](ENHANCEMENT_GUIDE.md).

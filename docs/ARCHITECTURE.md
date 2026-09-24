@@ -1,220 +1,245 @@
-# Enterprise Multi-Hop Lakehouse Pipeline — Architecture & Technical Specifications
+# UAX DataLake — End-to-End Architecture
 
-This repository hosts a production-grade, enterprise data lakehouse platform designed to process high-throughput batch and streaming-like micro-batch workloads. Built natively on **Apache Spark (AWS Glue)**, **Apache Iceberg**, and **AWS Glue Data Catalog**, the platform enforces strict data governance, idempotent loading, schema evolution, and multi-engine serving.
+> **Project:** UAX DataLake  
+> **Pattern:** Medallion (Multi-Hop) Architecture — Bronze → Silver → Gold  
+> **Orchestration:** Amazon EventBridge → AWS Step Functions → AWS Glue Spark Jobs
 
 ---
 
-## 1. High-Level Lakehouse Architecture
+## 1. High-Level Overview
 
-The architecture follows the **Medallion (Multi-Hop) Architecture** pattern, isolating ingestion, cleansing, and business aggregation into decoupled processing layers:
+UAX DataLake ingests operational data from multiple enterprise source systems, refines it through three isolated processing layers, and serves business-ready data marts to downstream analytics and BI tools.
+
+Each layer runs as an independent AWS Glue PySpark job. Step Functions coordinates the sequential execution order. EventBridge triggers the entire pipeline on a schedule or on an S3 arrival event.
 
 ```mermaid
 flowchart TD
-    subgraph Sources["External Source Systems"]
-        S_REST["REST APIs<br/>(ServiceNow, Genesys, Moveworks)"]
-        S_DB["Relational DBs<br/>(PostgreSQL, MySQL, Oracle)"]
-        S_S3["File Drops<br/>(S3 Parquet / CSV / JSON)"]
+    subgraph Orchestration["Pipeline Orchestration"]
+        EB["Amazon EventBridge\n(Scheduled Rule / S3 Event)"]
+        SF["AWS Step Functions\n(State Machine)"]
+        EB -->|Trigger| SF
     end
 
-    subgraph BronzeLayer["Bronze Layer (Raw Ingestion)"]
-        B_JOB["AWS Glue Spark Job<br/>(uax_bronze_load.py)"]
-        B_STATE[("S3 State Watermarks<br/>metadata/bronze/...")]
-        B_S3[("Raw Data Lake (S3)<br/>bronze/data/<source>/<table>/<br/>Partitioned: year/month/day")]
-        B_CATALOG[("Glue Data Catalog<br/>raw_tbl_<source>_<table>")]
+    subgraph Sources["Source Systems"]
+        REST["REST APIs\n(ServiceNow, Genesys, Moveworks)"]
+        DB["Relational DBs\n(PostgreSQL, MySQL)"]
+        S3SRC["S3 File Drops\n(CSV / JSON / Parquet)"]
     end
 
-    subgraph SilverLayer["Silver Layer (Conformed Iceberg)"]
-        S_JOB["AWS Glue Spark Job<br/>(uax_silver_etl.py)"]
-        S_STATE[("S3 Watermarks<br/>metadata/silver/...")]
-        S_ICEBERG[("Apache Iceberg Tables (S3)<br/>silver/data/<source>/<table>/")]
-        S_CATALOG[("Glue Data Catalog<br/>tbl_<source>_<table>")]
+    subgraph Bronze["Bronze Layer — Raw Ingestion"]
+        BJ["uax_bronze_load.py\n(AWS Glue Job)"]
+        BS3[("S3 Raw Parquet\nbronze/data/{source}/{table}/\nyear=YYYY/month=MM/day=DD")]
+        BWMK[("S3 State\nmetadata/bronze/{source}/{table}/watermark.json")]
     end
 
-    subgraph GoldLayer["Gold Layer (Marts & Multi-Engine Serving)"]
-        G_JOB["AWS Glue Spark Job<br/>(gold_layer_manager.py)"]
-        G_INIT[("Historical CSV/Parquet<br/>gold/initial_exports/...")]
-        G_SQL["Mart SQL Definitions<br/>gold/query/<source>/*.sql"]
-        G_ICEBERG[("Athena Iceberg Marts<br/>gold/data/<source>/<table>/")]
-        G_CATALOG[("Glue Data Catalog<br/>gold_<source>_<table>")]
+    subgraph Silver["Silver Layer — Conformed Iceberg"]
+        SJ["uax_silver_etl.py\n(AWS Glue Job)"]
+        SICEBERG[("Apache Iceberg Tables\nsilver/data/{source}/{table}/")]
+        SWMK[("S3 State\nmetadata/silver/{source}_{table}_watermark.json")]
     end
 
-    subgraph Downstream["Downstream Analytics & Serving"]
-        D_ATHENA["Amazon Athena<br/>(Ad-hoc SQL & BI Queries)"]
-        D_AURORA["Amazon Aurora / RDS MySQL<br/>(Zero-Downtime Power BI Feed)"]
-        D_REDSHIFT["Amazon Redshift Spectrum<br/>(External Iceberg Schema)"]
-        D_SNOWFLAKE["Snowflake<br/>(External Iceberg / Shared DB)"]
-        D_DATABRICKS["Databricks<br/>(Delta Lake Unified Catalog)"]
+    subgraph Gold["Gold Layer — Business Marts"]
+        GJ["gold_layer_manager.py\n(AWS Glue Job)"]
+        GICEBERG[("Athena Iceberg Marts\ngold/data/{source}/{table}/")]
+        GAURORA[("Amazon Aurora MySQL\nenterprise_reporting.*")]
     end
 
-    %% Flow connections
-    S_REST -->|Authenticated Ingestion| B_JOB
-    S_DB -->|JDBC Extraction| B_JOB
-    S_S3 -->|S3 Event / Batch Read| B_JOB
+    subgraph Consume["Downstream Consumers"]
+        ATHENA["Amazon Athena"]
+        BI["Power BI / Tableau"]
+        RS["Redshift Spectrum"]
+        SNO["Snowflake / Databricks"]
+    end
 
-    B_JOB <--> B_STATE
-    B_JOB -->|Append Parquet + Snappy| B_S3
-    B_JOB -->|Sync Metadata| B_CATALOG
+    SF -->|Step 1| BJ
+    SF -->|Step 2| SJ
+    SF -->|Step 3| GJ
 
-    B_S3 -->|Incremental Delta Read| S_JOB
-    S_JOB <--> S_STATE
-    S_JOB -->|ACID Upsert / SCD1 & SCD2| S_ICEBERG
-    S_JOB -->|Schema Evolution| S_CATALOG
+    REST --> BJ
+    DB --> BJ
+    S3SRC --> BJ
 
-    S_ICEBERG -->|Spark SQL Mart Query| G_JOB
-    G_INIT -.->|Run 1 Historical Load| G_JOB
-    G_SQL -->|Business Logic| G_JOB
-    G_JOB -->|Iceberg MERGE INTO| G_ICEBERG
-    G_JOB -->|Register Tables| G_CATALOG
+    BJ --> BS3
+    BJ <--> BWMK
 
-    G_ICEBERG --> D_ATHENA
-    G_JOB -->|Direct JDBC PK Upsert| D_AURORA
-    G_CATALOG --> D_REDSHIFT
-    G_ICEBERG --> D_SNOWFLAKE
-    G_ICEBERG --> D_DATABRICKS
+    BS3 --> SJ
+    SJ --> SICEBERG
+    SJ <--> SWMK
+
+    SICEBERG --> GJ
+    GJ --> GICEBERG
+    GJ --> GAURORA
+
+    GICEBERG --> ATHENA
+    GICEBERG --> RS
+    GICEBERG --> SNO
+    GAURORA --> BI
 ```
 
 ---
 
-## 2. Layer-by-Layer Responsibilities
+## 2. Orchestration: EventBridge → Step Functions
 
-| Layer | Storage Engine | Format | Commit Pattern | Primary Purpose |
-|---|---|---|---|---|
-| **Bronze** | Amazon S3 | Apache Parquet (Snappy) | Append-Only with Hive partitioning (`year=YYYY/month=MM/day=DD`) | Ingest raw payload exactly as received from source systems; preserve lineage with zero data loss. |
-| **Silver** | Amazon S3 + Apache Iceberg | Apache Iceberg v2 | ACID Upsert (`MERGE INTO`), SCD Type 1 & Type 2 | Enforce conformed types, natural key deduplication, schema evolution, and row-level updates. |
-| **Gold** | Amazon S3 + Apache Iceberg | Apache Iceberg v2 + RDBMS | Idempotent Upsert + Dual-Write Serving | Aggregate dimensional models, materializing physical tables in Athena and syncing to MySQL/Redshift/Snowflake. |
+### 2.1 Trigger
+
+An **Amazon EventBridge rule** fires on a cron schedule (e.g., `cron(0 6 * * ? *)` for daily at 06:00 UTC) or on an S3 event (new file dropped in a vendor bucket). EventBridge invokes the Step Functions state machine as its target.
+
+### 2.2 Step Functions State Machine
+
+The state machine runs the three Glue jobs **sequentially** using `GlueStartJobRun` and `GlueStartJobRunSync` task states. Each step waits for job completion before the next one starts.
+
+```
+EventBridge Trigger
+        │
+        ▼
+[State: Run Bronze Job]    ──► GlueStartJobRunSync(uax_bronze_load)
+        │ SUCCESS
+        ▼
+[State: Run Silver Job]    ──► GlueStartJobRunSync(uax_silver_etl)
+        │ SUCCESS
+        ▼
+[State: Run Gold Job]      ──► GlueStartJobRunSync(gold_layer_manager)
+        │ SUCCESS
+        ▼
+[State: Pipeline Complete] ──► SNS Notification (optional)
+        │ ANY FAILURE
+        ▼
+[State: Error Handler]     ──► SNS Alert + CloudWatch Alarm
+```
+
+### 2.3 Why Sequential, Not Parallel?
+
+| Concern | Reasoning |
+|---|---|
+| **Data dependency** | Silver reads Bronze output. Gold reads Silver Iceberg. The order enforces availability. |
+| **Watermark integrity** | Each layer commits its watermark only after a successful write. Parallel execution would break state boundaries. |
+| **Failure isolation** | Step Functions retries the failed Glue job independently before failing the pipeline. |
 
 ---
 
-## 3. End-to-End Execution Flow
+## 3. Layer Summary
+
+| Layer | Job Script | Input | Output | Storage |
+|---|---|---|---|---|
+| **Bronze** | `uax_bronze_load.py` | APIs / DBs / S3 Files | Append-only Parquet partitioned by date | S3 `bronze/data/` |
+| **Silver** | `uax_silver_etl.py` | Bronze Parquet (incremental) | Apache Iceberg v2 (ACID upsert / SCD) | S3 `silver/data/` + Glue Catalog |
+| **Gold** | `gold_layer_manager.py` | Silver Iceberg (incremental delta) | Athena Iceberg Mart + Aurora MySQL sync | S3 `gold/data/` + Aurora |
+
+---
+
+## 4. End-to-End Sequence
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant SRC as External Sources
-    participant BZ as Bronze Job (uax_bronze_load.py)
-    participant S3B as S3 Bronze Bucket
-    participant SV as Silver Job (uax_silver_etl.py)
+    participant EB as EventBridge
+    participant SF as Step Functions
+    participant BZ as Bronze Job
+    participant SV as Silver Job
+    participant GD as Gold Job
+    participant S3B as S3 Bronze
     participant S3S as S3 Silver Iceberg
-    participant GD as Gold Job (gold_layer_manager.py)
     participant S3G as S3 Gold Iceberg
-    participant RDBMS as Aurora MySQL
+    participant AURORA as Aurora MySQL
 
-    Note over BZ: Step 1: Raw Extraction
-    BZ->>BZ: Resolve watermark (S3 state file / raw_tbl_watermarks)
-    BZ->>SRC: Authenticate (OAuth2 / API Key / Basic) & fetch delta records
-    BZ->>BZ: Flatten JSON & inject audit columns (_ingested_at, _source_system, etc.)
-    BZ->>S3B: Write Snappy Parquet (partitioned by year/month/day)
-    BZ->>BZ: Commit new watermark to S3 state file
+    EB->>SF: Trigger State Machine
+    SF->>BZ: GlueStartJobRun (uax_bronze_load)
+    BZ->>BZ: Resolve watermark from S3 state file
+    BZ->>BZ: Authenticate source (OAuth2 / Basic / IAM)
+    BZ->>BZ: Extract and flatten records
+    BZ->>S3B: Write Snappy Parquet (year/month/day partitions)
+    BZ->>BZ: Commit new watermark to S3
 
-    Note over SV: Step 2: Conformed Iceberg Transformation
-    SV->>SV: Resolve lower bound watermark from metadata/silver/...
-    SV->>S3B: Read incremental Bronze batch (_ingested_at > watermark)
-    SV->>SV: Apply custom transform hook (if present) & deduplicate by nkey
-    SV->>SV: Apply SCD Type 1 or Type 2 tracking with technical columns
-    SV->>S3S: Execute Spark SQL MERGE INTO Apache Iceberg table
-    SV->>SV: Update Silver watermark state file
+    SF->>SV: GlueStartJobRun (uax_silver_etl)
+    SV->>SV: Read Silver watermark from S3
+    SV->>S3B: Scan Bronze Parquet (_ingested_at > watermark)
+    SV->>SV: Deduplicate by nkey, apply transforms
+    SV->>S3S: MERGE INTO Iceberg table (SCD1 or SCD2)
+    SV->>SV: Update Silver watermark
 
-    Note over GD: Step 3: Analytical Aggregation & Serving
-    GD->>GD: Discover and dependency-sort SQL queries (gold/query/<source>/*.sql)
-    opt First Run Historical Ingestion
-        GD->>GD: Load initial export CSV/Parquet from gold/initial_exports/...
-        GD->>S3G: Materialize initial Iceberg table & archive source CSV to _archived/
-    end
-    GD->>S3S: Execute SQL query over Silver Iceberg tables
-    GD->>GD: Filter incremental delta (WHERE _updated_at > max(gold._updated_at))
-    GD->>GD: Execute custom transform / API / LLM enrichment (if configured)
-    GD->>S3G: Upsert into Athena Iceberg table via Spark SQL MERGE INTO
-    opt MySQL Target Configured
-        GD->>S3G: Read authoritative conformed dataset from Athena Iceberg
-        GD->>RDBMS: Stream conformed dataset to staging table (gold_<table>_staging)
-        GD->>RDBMS: Execute zero-downtime atomic swap (RENAME staging TO target)
-    end
+    SF->>GD: GlueStartJobRun (gold_layer_manager)
+    GD->>GD: Execute mart SQL over Silver Iceberg
+    GD->>GD: Filter delta (_updated_at > max Gold _updated_at)
+    GD->>S3G: MERGE INTO Gold Iceberg mart
+    GD->>S3G: Read authoritative Iceberg dataset
+    GD->>AURORA: Write staging table -> atomic swap to production
 ```
 
 ---
 
-## 4. Script Architecture & Linking Rationale
+## 5. Layer Responsibilities
 
-The data pipeline code is intentionally modularized into dedicated execution scripts and config loaders per layer:
+### Bronze — Raw Ingestion
+- Connects to upstream sources via pluggable connectors (REST, JDBC, S3 file).
+- Extracts records incrementally using per-table S3 watermark state files.
+- Flattens nested JSON, injects audit columns (`_ingested_at`, `_source_system`, etc.), writes Snappy Parquet partitioned by `year/month/day`.
+- Commits the new watermark only after data is confirmed written.
 
-### Why Standalone Python Scripts?
-1. **AWS Glue Job Isolation**: Each hop runs as an independent AWS Glue Spark job (`uax_bronze_load.py`, `uax_silver_etl.py`, `gold_layer_manager.py`). Failures in Gold serving never block Bronze ingestion.
-2. **Dedicated Resource Scaling**:
-   - Bronze runs lightweight standard Python/Spark workers (`G.1X` or `Standard`).
-   - Silver runs compute-intensive Iceberg compaction and merge workers (`G.2X`).
-   - Gold runs memory-intensive multi-target broadcast and JDBC serving workers.
-3. **Decoupled Configuration**:
-   - `config_loader.py` (Bronze), `silver_config_loader.py` (Silver), and `gold_config_loader.py` (Gold) allow complete schema and parameter adjustments without changing execution code.
-4. **Custom Transform Hooks**:
-   - Complex business rules (e.g. LLM transcript summarization, entity resolution) live in `custom_transforms/` modules, loaded dynamically at runtime via Python introspection without altering the core pipeline engines.
+### Silver — Conformed Iceberg
+- Reads only new Bronze records (`_ingested_at > last_watermark`).
+- Deduplicates within each micro-batch using natural keys and ordering columns.
+- Applies SCD Type 1 (in-place upsert) or SCD Type 2 (historical version tracking).
+- Automatically evolves the Iceberg schema when new columns arrive from Bronze.
+
+### Gold — Business Marts
+- Executes modular SQL queries (`gold/query/<source>/<table>.sql`) over Silver Iceberg.
+- For incremental tables, only processes records changed since the last Gold run (`_updated_at > max(gold._updated_at)`).
+- For full-refresh tables, re-materializes the entire mart from all Silver records.
+- Materializes results into Athena Iceberg as the **single source of truth**.
+- Syncs to Aurora MySQL using an atomic staging-swap for zero-downtime BI serving.
 
 ---
 
-## 5. Security & Authentication Architecture
+## 6. Security Architecture
 
-All credentials, access tokens, and API keys are strictly forbidden from source code and JSON configuration files.
+All credentials are stored in **AWS Secrets Manager**. No secrets appear in config files or code.
 
-```mermaid
-flowchart LR
-    Job["AWS Glue Job<br/>(Spark Context)"] -->|Get Secret| SM["AWS Secrets Manager<br/>(Encrypted via KMS)"]
-    SM -->|Return JSON Payload| Job
-    Job -->|Build Auth Header| AuthLogic{"HTTP Client<br/>Auth Factory"}
+| Auth Type | Used For | Mechanics |
+|---|---|---|
+| `oauth` (client_credentials) | Genesys Cloud, Moveworks | Cached Bearer token, auto-refreshed 60s before expiry |
+| `basic` | ServiceNow (legacy instances) | Base64 header injected per request |
+| `api_key` | Internal microservices | Static header injection |
+| `iam_role` | Cross-account S3 reads | Managed by boto3 / Glue execution IAM role |
 
-    AuthLogic -->|auth_type = 'oauth'| OAuth["OAuth 2.0 Client<br/>(Token URL + Client Credentials)<br/>In-memory Cached Token"]
-    AuthLogic -->|auth_type = 'basic'| Basic["Basic Auth<br/>(Base64 username:password)"]
-    AuthLogic -->|auth_type = 'api_key'| ApiKey["API Key<br/>(Header: x-api-key)"]
+---
 
-    OAuth --> Endpoint["Target API Endpoint"]
-    Basic --> Endpoint
-    ApiKey --> Endpoint
+## 7. Repository Structure
+
 ```
-
-### Authentication Strategies:
-1. **OAuth 2.0 (`client_credentials`)**: Used for modern SaaS integrations (Genesys Cloud, Moveworks, Workday). The pipeline requests an access token from the Identity Provider token endpoint, caches it in-memory, and automatically refreshes it 60 seconds before expiration.
-2. **Basic Authentication**: Used for legacy enterprise platforms (e.g. ServiceNow service accounts) utilizing base64-encoded credentials over TLS 1.3.
-3. **API Key**: Direct header injection (e.g. `x-api-key`, `Authorization: Bearer <key>`) for cloud microservices.
-4. **RDS / JDBC Authentication**: Injects database host, port, username, and password dynamically into Spark JDBC connection strings with SSL enforced (`useSSL=true&requireSSL=true`).
-
----
-
-## 6. Directory Structure & Documentation Navigation
-
-```text
 Data-pipeline/
-├── docs/                                  # Centralized Enterprise Documentation
-│   ├── ARCHITECTURE.md                    # Platform architecture (this document)
-│   ├── ONBOARDING_GUIDE.md                # Step-by-step developer onboarding & runbook
+├── docs/
+│   ├── ARCHITECTURE.md            # This document
+│   ├── ONBOARDING_GUIDE.md        # Developer runbook
 │   ├── bronze/
-│   │   ├── BRONZE_LAYER.md                # Bronze engine architecture & low-level internals
-│   │   └── CONFIG_BLUEPRINT.md            # bronze_config.json blueprint & parameters
+│   │   ├── BRONZE_LAYER.md        # Bronze engine internals
+│   │   ├── CONFIG_BLUEPRINT.md    # bronze_config.json parameter reference
+│   │   └── ENHANCEMENT_GUIDE.md   # How the Bronze code is structured for contributors
 │   ├── silver/
-│   │   ├── SILVER_LAYER.md                # Silver Iceberg engine architecture & SCD rules
-│   │   └── CONFIG_BLUEPRINT.md            # silver_config.json blueprint & parameters
+│   │   ├── SILVER_LAYER.md        # Silver engine internals
+│   │   ├── CONFIG_BLUEPRINT.md    # silver_config.json parameter reference
+│   │   └── ENHANCEMENT_GUIDE.md   # How the Silver code is structured for contributors
 │   └── gold/
-│       ├── GOLD_LAYER.md                  # Gold multi-engine serving & mart lifecycle
-│       └── CONFIG_BLUEPRINT.md            # gold_config.json blueprint & parameters
-├── bronze/                                # Bronze Layer Implementation
-│   ├── script/
-│   │   ├── uax_bronze_load.py             # Main Bronze PySpark engine
-│   │   ├── config_loader.py               # Hierarchical config parser
-│   │   ├── config/bronze_config.json      # Bronze ingestion config
-│   │   └── connectors/                    # Ingestion connectors (REST, S3, JDBC)
-├── silver/                                # Silver Layer Implementation
-│   ├── script/
-│   │   ├── uax_silver_etl.py              # Main Silver Iceberg PySpark engine
-│   │   ├── silver_config_loader.py        # Silver config parser
-│   │   ├── transformer.py                 # Core transformation utilities
-│   │   ├── custom_transforms/             # Table-specific transformation hooks
-│   │   └── config/silver_config.json      # Silver transformation config
-├── gold/                                  # Gold Layer Implementation
-│   ├── script/
-│   │   ├── gold_layer_manager.py          # Main Gold multi-target serving engine
-│   │   ├── gold_config_loader.py          # Gold config parser
-│   │   ├── gold_initial_load.py           # Historical backfill & CSV reconciliation engine
-│   │   ├── custom_transforms/             # Table-specific transformation & API hooks
-│   │   └── config/gold_config.json        # Gold serving config
-│   └── query/                             # Mart Spark SQL query definitions
-│       ├── genesys/                       # Genesys dimensional views
-│       └── moveworks/                     # Moveworks dimensional views
-└── README.md                              # Root repository overview
+│       ├── GOLD_LAYER.md          # Gold engine internals
+│       ├── CONFIG_BLUEPRINT.md    # gold_config.json parameter reference
+│       └── ENHANCEMENT_GUIDE.md   # How the Gold code is structured for contributors
+├── bronze/script/
+│   ├── uax_bronze_load.py
+│   ├── config_loader.py
+│   ├── config/bronze_config.json
+│   └── connectors/
+├── silver/script/
+│   ├── uax_silver_etl.py
+│   ├── silver_config_loader.py
+│   ├── transformer.py
+│   ├── custom_transforms/
+│   └── config/silver_config.json
+├── gold/script/
+│   ├── gold_layer_manager.py
+│   ├── gold_config_loader.py
+│   ├── gold_initial_load.py
+│   ├── custom_transforms/
+│   └── config/gold_config.json
+└── gold/query/
+    ├── genesys/
+    └── moveworks/
 ```

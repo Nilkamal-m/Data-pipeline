@@ -216,3 +216,9 @@ Verify via Amazon Athena:
 ```sql
 SELECT * FROM "uax_datalake_db_dev"."tbl_new_entity" LIMIT 10;
 ```
+
+---
+
+## 8. Developer Enhancement Reference
+
+For information on how the Silver codebase is structured for contributors — adding tables, writing custom transforms, or extending SCD logic — see [ENHANCEMENT_GUIDE.md](ENHANCEMENT_GUIDE.md).
