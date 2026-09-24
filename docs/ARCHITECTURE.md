@@ -125,8 +125,9 @@ sequenceDiagram
     GD->>GD: Execute custom transform / API / LLM enrichment (if configured)
     GD->>S3G: Upsert into Athena Iceberg table via Spark SQL MERGE INTO
     opt MySQL Target Configured
-        GD->>RDBMS: Write delta to staging table via JDBC (gold_<table>_staging)
-        GD->>RDBMS: Execute zero-downtime primary key UPSERT into physical table
+        GD->>S3G: Read authoritative conformed dataset from Athena Iceberg
+        GD->>RDBMS: Stream conformed dataset to staging table (gold_<table>_staging)
+        GD->>RDBMS: Execute zero-downtime atomic swap (RENAME staging TO target)
     end
 ```
 

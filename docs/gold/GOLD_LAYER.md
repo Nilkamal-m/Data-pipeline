@@ -53,16 +53,16 @@ flowchart TD
 
     subgraph MultiTargetServing ["5. Multi-Target Serving Synchronization"]
         IcebergMerge --> CheckTargets{"Evaluate target_engines\n(Configured per table)"}
-        CheckTargets -- "Aurora MySQL" --> AuroraStaging["Write DataFrame to Temporary Staging Table:\n_staging_{table}_{timestamp}"]
-        AuroraStaging --> AuroraUpsert["Execute Atomic PK UPSERT:\nINSERT INTO {target} SELECT * FROM {staging}\nON DUPLICATE KEY UPDATE col=VALUES(col)..."]
-        AuroraUpsert --> AuroraDrop["DROP TABLE {staging}"]
+        CheckTargets -- "Aurora MySQL" --> ReadIceberg["Read Authoritative Athena Iceberg Table\n(Complete conformed dataset)"]
+        ReadIceberg --> AuroraStaging["Write Full Conformed DataFrame\nto Staging Table: {table}_staging"]
+        AuroraStaging --> AuroraSwap["Execute Zero-Downtime Atomic Swap:\nRENAME TABLE target TO old, staging TO target\nDROP TABLE old"]
         CheckTargets -- "Redshift Spectrum" --> RedshiftSync["Update External Schema Mapping"]
         CheckTargets -- "Snowflake" --> SnowflakeSync["Refresh External Stage / Iceberg Table"]
         CheckTargets -- "Databricks" --> DatabricksSync["Sync Unity Catalog Iceberg Reference"]
     end
 
     subgraph Complete ["6. Completion"]
-        AuroraDrop --> Success(["Job Complete: Marts Updated Across All Engines"])
+        AuroraSwap --> Success(["Job Complete: Marts Updated Across All Engines"])
         RedshiftSync --> Success
         SnowflakeSync --> Success
         DatabricksSync --> Success
@@ -124,26 +124,36 @@ In production, schema drift between source SQL queries and target Iceberg tables
 
 ## 5. Downstream Serving: Amazon Aurora MySQL Adapter
 
-The Aurora MySQL adapter serves operational web applications and real-time dashboards requiring sub-second primary key lookups.
+The Aurora MySQL adapter serves operational web applications and real-time dashboards (Power BI, Tableau) requiring sub-second query performance.
 
-### 5.1 Zero-Downtime Staging & Record-Level PK UPSERT
-To prevent dashboard query disruption, table locks, or accidental data loss, the Aurora adapter never drops or truncates the target production table.
+### 5.1 Architecture: Iceberg Gold Table $\to$ Aurora Gold Staging $\to$ Aurora Gold Table
+
+To eliminate duplicate record accumulation and maintain exact parity with the authoritative Athena Iceberg mart, the platform enforces the **Atomic Table Swap Strategy**:
 
 ```
-Step 1: Create isolated temporary staging table `_staging_{target_table}_{timestamp}`
-Step 2: Stream transformed DataFrame into staging table via JDBC
-Step 3: Execute atomic UPSERT:
-        INSERT INTO enterprise_reporting.gold_moveworks_interactions
-        SELECT * FROM enterprise_reporting._staging_interactions_1711234567
-        ON DUPLICATE KEY UPDATE
-            conversation_id = VALUES(conversation_id),
-            user_id = VALUES(user_id),
-            _updated_at = VALUES(_updated_at);
-Step 4: DROP TABLE _staging_{target_table}_{timestamp}
+[Athena Iceberg Table] (Authoritative Single Source of Truth)
+       │
+       ▼
+[Aurora Staging Table] (`{target_table}_staging`)
+       │
+       ▼ (Zero-Downtime Atomic DDL Swap)
+[Aurora Target Table]  (`{target_table}`)
 ```
 
-### 5.2 Initial Load Fallback
-If the target Aurora table does not exist at run time (e.g., initial environment spin-up), the adapter automatically extracts the full historical dataset from the primary Athena Iceberg mart, creates the production table with appropriate primary key constraints, and seeds it completely.
+#### Detailed Execution Sequence:
+1. **Authoritative Ingestion**: `GoldLayerManager` queries the fully merged, deduplicated physical Athena Iceberg table directly (`spark.table(f"{glue_db}.{target_table}")`), ensuring the complete conformed dataset (initial loads + all delta increments) is processed.
+2. **Staging Materialization**: The complete conformed dataset is streamed into an isolated staging table: `{target_table}_staging`.
+3. **Atomic Table Swap**: MySQL executes a single, microsecond DDL statement:
+   ```sql
+   RENAME TABLE
+       `enterprise_reporting`.`gold_moveworks_interactions` TO `enterprise_reporting`.`gold_moveworks_interactions_old`,
+       `enterprise_reporting`.`gold_moveworks_interactions_staging` TO `enterprise_reporting`.`gold_moveworks_interactions`;
+   ```
+4. **Instant Cleanup & Indexing**: The previous table version (`_old`) is safely dropped, and query performance indexes are verified on the natural keys (`pks`).
+
+#### Key Advantages:
+* **Zero Downtime**: Power BI and BI analysts querying `{target_table}` experience continuous availability without locking or missing-table exceptions.
+* **Guaranteed Parity**: Aurora record counts always match Athena Iceberg record counts exactly (e.g. 5,477 rows in Athena $\equiv$ 5,477 rows in Aurora), preventing runaway duplicate counts on recurring runs.
 
 ---
 
