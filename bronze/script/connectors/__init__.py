@@ -43,19 +43,20 @@ def get_connector(source_system: str, source_config: dict = None):
     Raises:
         ValueError: If the source system is not registered and 'type' is absent or unknown.
     """
-    key = source_system.strip().lower()
+    # 1. Explicit 'type' routing from source_config takes precedence
+    # Allows any system (e.g. 'genesys') to use S3 file ingestion or a custom connector
+    if source_config:
+        type_key = str(source_config.get('type', '')).strip().lower()
+        if type_key:
+            connector = CONNECTOR_MAP.get(type_key)
+            if connector is not None:
+                return connector
 
-    # 1. Exact match
+    # 2. Canonical exact match by source_system name (e.g. 'genesys', 'moveworks', 'servicenow')
+    key = source_system.strip().lower()
     connector = CONNECTOR_MAP.get(key)
     if connector is not None:
         return connector
-
-    # 2. Type-based routing for vendor/custom sources (e.g. vendor_a_s3 with type='s3_file')
-    if source_config:
-        type_key = str(source_config.get('type', '')).strip().lower()
-        connector = CONNECTOR_MAP.get(type_key)
-        if connector is not None:
-            return connector
 
     supported = ', '.join(sorted(CONNECTOR_MAP.keys()))
     raise ValueError(

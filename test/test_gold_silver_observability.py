@@ -2819,6 +2819,21 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         self.assertIn("prompt ", content.lower())
         self.assertIn("response ", content.lower())
 
+    def test_get_connector_respects_source_config_type_override(self):
+        """When source_config specifies 'type': 's3_file' for 'genesys', it routes to S3FileConnector."""
+        bronze_script_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bronze", "script")
+        if bronze_script_dir not in sys.path:
+            sys.path.insert(0, bronze_script_dir)
+        from connectors import get_connector, S3FileConnector, GenesysConnector
+
+        # Explicit type override
+        conn_cls = get_connector("genesys", {"type": "s3_file"})
+        self.assertEqual(conn_cls, S3FileConnector)
+
+        # Default fallback to GenesysConnector when no type is provided
+        conn_cls_default = get_connector("genesys", {})
+        self.assertEqual(conn_cls_default, GenesysConnector)
+
 
 if __name__ == "__main__":
     unittest.main()
