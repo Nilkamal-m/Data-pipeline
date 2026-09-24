@@ -13,12 +13,6 @@ gold/script/
 ├── gold_initial_load.py       # Historical CSV backfill logic
 ├── config/
 │   └── gold_config.json       # Mart definitions, nkeys, target engine routing
-├── adapters/
-│   ├── __init__.py            # Adapter registry
-│   ├── aurora.py              # Aurora MySQL staging-swap adapter
-│   ├── redshift.py            # Redshift Spectrum catalog adapter
-│   ├── snowflake.py           # Snowflake external Iceberg table adapter
-│   └── databricks.py         # Databricks Unity Catalog adapter
 └── custom_transforms/
     ├── genesys_conversations.py
     └── moveworks_interactions.py
@@ -50,7 +44,11 @@ parse_cli_args()
                     └─► _align_schema()        # Pad missing cols as NULL, reorder to match Iceberg catalog
                         └─► _materialize_athena_table()   # Spark SQL MERGE INTO Gold Iceberg
                             └─► for each target_engine:
-                                    adapter.sync(df)      # Aurora, Redshift, Snowflake, Databricks
+                                    # Inline routing block in GoldLayerManager.run()
+                                    # if 'aurora' in targets  → _serve_to_mysql()
+                                    # if 'databricks' in targets → _run_databricks_serving()
+                                    # if 'redshift' in targets   → _run_redshift_serving()
+                                    # if 'snowflake' in targets  → _run_snowflake_serving()
 ```
 
 ---
@@ -194,7 +192,7 @@ SELECT
 FROM
     uax_datalake_db_{env}.tbl_moveworks_interactions i
 WHERE
-    i._is_deleted = false
+    i._is_deleted = 'N'
 ```
 
 The SQL runs against Silver Iceberg tables registered in Glue. The `{env}` token is interpolated at runtime.
@@ -238,26 +236,114 @@ Both counts should match.
 
 ## 10. Adding a New Downstream Target Engine
 
-To add a new serving target (e.g., a custom data store):
+All downstream serving targets are handled via **inline routing blocks** inside `GoldLayerManager.run()` in [`gold_layer_manager.py`](../../gold/script/gold_layer_manager.py). There is no separate `adapters/` directory — each target has a dedicated private `@classmethod` on `GoldLayerManager`.
 
-1. Create `gold/script/adapters/my_target.py` and implement:
-   ```python
-   class MyTargetAdapter:
-       def sync(self, df, table_config, spark, params):
-           ...
-   ```
+To add a brand new target (e.g., `"my_target"`), follow these four steps:
 
-2. Register in `gold/script/adapters/__init__.py`:
-   ```python
-   ADAPTER_MAP["my_target"] = MyTargetAdapter
-   ```
+---
 
-3. Add `"my_target"` to `target_engines` in `gold_config.json` for the relevant table.
+### Step 1 — Add config keys to `gold_config.json`
 
-4. Add target-specific connection config in the table block:
-   ```json
-   "my_target": {
-     "host": "target.host.internal",
-     "schema": "analytics"
-   }
-   ```
+Under the relevant table, add a block named after your target engine key:
+
+```json
+"interactions": {
+  "nkey": ["interaction_id"],
+  "incremental": true,
+  "my_target": {
+    "host": "my-target.internal.host",
+    "schema": "analytics",
+    "table_name": "gold_moveworks_interactions"
+  }
+}
+```
+
+Also add `"my_target"` to the `target_engines` list at the source level (or table level):
+
+```json
+"moveworks": {
+  "target_engines": ["athena", "aurora", "my_target"],
+  ...
+}
+```
+
+---
+
+### Step 2 — Add the private serving method to `GoldLayerManager`
+
+In `gold/script/gold_layer_manager.py`, add a new `@classmethod` following the same pattern as `_run_redshift_serving` or `_run_databricks_serving`. Add it after the last existing serving method (around line 1460):
+
+```python
+# --------------------------------------------------------------------------
+# My Target Serving
+# --------------------------------------------------------------------------
+@classmethod
+def _run_my_target_serving(
+    cls,
+    spark: SparkSession,
+    params: Dict[str, Any],
+    df_mart: DataFrame,
+    clean_base_name: str,
+    target_table_name: str,
+    primary_keys: List[str],
+    mart_stats: List[Dict[str, Any]]
+) -> None:
+    """
+    My Target serving method.
+    Connects to my_target and upserts the Gold mart DataFrame.
+    """
+    host = params.get('MY_TARGET_HOST', 'my-target.internal.host')
+    schema = params.get('MY_TARGET_SCHEMA', 'analytics')
+
+    logger.info(f"[MY TARGET] Serving '{target_table_name}' to {host}/{schema}")
+
+    # TODO: implement your actual connection + write logic here
+    # Example: JDBC write, REST API push, boto3 call, etc.
+
+    mart_stats.append({
+        "mart_name": clean_base_name,
+        "target_table": f"{schema}.{target_table_name}",
+        "status": "SUCCESS",
+        "rows_served": df_mart.count(),
+        "duration_seconds": 0.0,
+        "error_message": None
+    })
+```
+
+---
+
+### Step 3 — Wire it into the routing block in `GoldLayerManager.run()`
+
+In `gold/script/gold_layer_manager.py`, find the **downstream target serving block** (look for the comment `# [GOLD STEP 3+] Downstream Target Serving`). After the last existing `if 'snowflake' in gold_targets:` block, add:
+
+```python
+# Target: My Target
+if 'my_target' in gold_targets:
+    logger.info(
+        f"\n================================================================================\n"
+        f"[GOLD STEP 7] Serving Gold Marts to My Target\n"
+        f"--------------------------------------------------------------------------------"
+    )
+    for clean_base_name, df_mart in materialized_dfs.items():
+        my_tbl = GoldConfigLoader.get_target_table_name(
+            source_system, clean_base_name, 'my_target', gold_cfg
+        ) if GoldConfigLoader else f"gold_{source_system}_{clean_base_name}"
+        cls._run_my_target_serving(
+            spark=spark,
+            params=params,
+            df_mart=df_mart,
+            clean_base_name=clean_base_name,
+            target_table_name=my_tbl,
+            primary_keys=mart_keys.get(clean_base_name, []),
+            mart_stats=mart_stats
+        )
+```
+
+> **Where exactly in the file?**  
+> Search for `# Target: Snowflake` (line ~916). Your new block goes immediately after the closing of that `if` block.
+
+---
+
+### Step 4 — Validate
+
+Add `"my_target"` to a table's `target_engines` list in `gold_config.json` and run the Gold job with `--SOURCE_SYSTEM=moveworks`. Check the logs for `[MY TARGET]` entries and confirm the mart data reaches the destination.

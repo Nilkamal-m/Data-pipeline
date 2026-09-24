@@ -126,7 +126,7 @@ This document provides the definitive configuration blueprint for `gold_config.j
 
 ### 2.4 Multi-Target Serving Engine Blocks
 
-> **Implementation note:** There is no separate `adapters/` module in the codebase. All serving targets are resolved inline inside `gold_layer_manager.py` via a target-engine routing block. The config keys below tell the router **where** to write; the routing logic reads them directly from the resolved table config.
+The config keys below tell `gold_layer_manager.py` **where** to write for each downstream engine. All serving is handled by inline routing methods inside `GoldLayerManager` — see [ENHANCEMENT_GUIDE.md § 10](ENHANCEMENT_GUIDE.md#10-adding-a-new-downstream-target-engine) for how to add a new target.
 
 #### Amazon Aurora MySQL (`aurora`)
 | Parameter | Type | Required / Optional | Code Usage & Description |

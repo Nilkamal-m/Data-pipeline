@@ -83,12 +83,6 @@ gold/
 │   ├── gold_initial_load.py            # Historical CSV loader, parser & auto-archiver
 │   ├── config/
 │   │   └── gold_config.json            # Multi-target configuration blueprint
-│   ├── adapters/                       # Downstream serving engine connectors
-│   │   ├── __init__.py                 # Adapter discovery registry
-│   │   ├── aurora.py                   # Aurora MySQL staging & zero-downtime PK upsert
-│   │   ├── redshift.py                 # Amazon Redshift Spectrum catalog adapter
-│   │   ├── snowflake.py                # Snowflake Iceberg external table adapter
-│   │   └── databricks.py               # Databricks Unity Catalog connector
 │   └── custom_transforms/              # Domain-specific PySpark transformation hooks
 │       ├── genesys_conversations.py    # Custom Genesys transcript & metric parsing
 │       └── moveworks_interactions.py   # Custom Moveworks conversation aggregations
@@ -105,7 +99,7 @@ gold/
 ```
 
 ### Why Standalone Python Modules?
-1. **Target Decoupling (`adapters/`)**: Each downstream database adapter manages its own connection pooling, dialect-specific SQL, and error handling. A connection timeout to Snowflake will not affect Athena Iceberg commits.
+1. **Inline Target Routing (`gold_layer_manager.py`)**: All downstream serving targets (Aurora MySQL, Databricks, Redshift Spectrum, Snowflake) are handled via dedicated private `@classmethod` methods on `GoldLayerManager`. Each target has its own isolated method, so a failure or timeout in one target does not affect the others.
 2. **Zero-Hardcoding Resilience**: Schema alignment dynamically queries the Glue Catalog at runtime. When upstream business queries add a column, the Gold engine automatically reconciles the schema without requiring code changes.
 3. **Dedicated Migration Mechanics (`gold_initial_load.py`)**: One-time historical ingestion logic is separated from recurring delta pipelines, keeping daily jobs lean while preserving disaster recovery reload capabilities (`--RELOAD_INITIAL=true`).
 
@@ -229,4 +223,4 @@ Verify Athena and Aurora:
 
 ## 8. Developer Enhancement Reference
 
-For information on how the Gold codebase is structured for contributors — adding marts, custom transforms, new target adapters, or modifying incremental behavior — see [ENHANCEMENT_GUIDE.md](ENHANCEMENT_GUIDE.md).
+For information on how the Gold codebase is structured for contributors — adding marts, custom transforms, new downstream target engines, or modifying incremental behavior — see [ENHANCEMENT_GUIDE.md](ENHANCEMENT_GUIDE.md).
