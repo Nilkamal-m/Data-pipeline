@@ -1,30 +1,74 @@
-# UAX Data Pipeline Engine
+# Enterprise Medallion Data Lakehouse Platform
 
-An enterprise-grade, modular, and config-driven serverless data lake pipeline built on **AWS Glue**, **Apache Iceberg**, **AWS Secrets Manager**, **Amazon Athena**, and **AWS Step Functions**, fully automated via modular **Terraform** infrastructure.
+An enterprise-grade, config-driven, multi-target Medallion Lakehouse platform built on **AWS Glue**, **Apache Iceberg (v2)**, **AWS Secrets Manager**, and **Amazon Athena**, providing high-throughput incremental ingestion, conformed dimensional transformation, and multi-engine serving across **Amazon Aurora MySQL**, **Amazon Redshift Spectrum**, **Snowflake**, and **Databricks**.
 
 ---
 
-## 🌟 Core System Features & Capabilities
+## 🏗️ Architectural Overview
 
-### 1. Multi-Source Ingestion Engine (Bronze Layer)
-*   **REST API Connector**: Native OAuth 2.0 (Client Credentials / Password Flow) and HTTP Basic Auth support with automatic token caching & 401 retry handling (ServiceNow, Moveworks, Genesys).
-*   **Database JDBC Connector**: Incremental delta extraction for PostgreSQL, MySQL, Oracle, and SQL Server databases.
-*   **S3 File Bucket Ingestion Connector**: Reads raw files directly from external S3 buckets supporting **CSV, Flat, Text, JSON, NDJSON, and Parquet** file formats.
-*   **Config-Driven Orchestration**: All extraction logic, API endpoints, delta filters, file patterns, and initial load dates are controlled centrally via `bronze_config.json`.
-*   **Strict High-Water Mark (HWM) Enforcement**: Prevents silent data corruption by throwing explicit validation errors if initial load dates are missing/null.
-*   **Memory-Safe Streaming & Atomic Staging**: Extracts data in configurable memory chunks, flushes to `_staging/` directories in S3, and atomically promotes files to Bronze partitions ONLY upon successful completion.
+The platform implements the **Medallion Lakehouse Architecture** (Bronze $\to$ Silver $\to$ Gold) to decouple raw source ingestion from conformed business modeling and downstream analytical consumption:
 
-### 2. Analytical Storage & Transformation (Silver & Athena Layer)
-*   **Apache Iceberg Table Format**: High-performance ACID transactions, time-travel queries, and schema evolution.
-*   **PySpark Iceberg ETL Engine**: Performs deduplication, custom data transformations, and SQL `MERGE INTO` (UPSERT / SCD Type 2) into AWS Glue Data Catalog tables.
-*   **Silver Master Guide**: See [SILVER_LAYER_GUIDE.md](silver/SILVER_LAYER_GUIDE.md) for end-to-end architecture, configuration details, and AWS Secrets Manager external API enrichment examples.
-*   **Automated Schema Crawling**: AWS Glue Crawlers scan Iceberg metadata to sync catalog tables dynamically.
-*   **Amazon Athena Analytics Engine**: Dedicated query workgroup enforcing isolated S3 query result storage (`s3://<bucket>/athena-results/`).
+```mermaid
+flowchart LR
+    subgraph Sources ["Upstream Operational Systems"]
+        REST["REST APIs\n(ServiceNow, Genesys, Moveworks)"]
+        DB["Relational Databases\n(PostgreSQL, MySQL)"]
+        S3F["Object Storage\n(Vendor S3 Feeds)"]
+    end
 
-### 3. Orchestration & Monitoring (Step Functions & EventBridge)
-*   **Serverless Workflow Orchestration**: Step Functions State Machines coordinate Bronze extraction, Silver PySpark ETL, Glue Crawlers, and SNS alerts.
-*   **Automated Cron Scheduling**: EventBridge rules trigger state machines on customizable cron schedules.
-*   **SNS Notifications**: Sends instant email notifications on pipeline success or failure.
+    subgraph Bronze ["Bronze Layer (Raw Lake)"]
+        BLoad["uax_bronze_load.py\n(BronzeLoadManager)"]
+        BParquet[("Raw Partitioned Parquet\ns3://{bucket}/bronze/data/...")]
+        BState[("State Watermarks\nmetadata/bronze/...")]
+    end
+
+    subgraph Silver ["Silver Layer (Conformed Lakehouse)"]
+        SETL["uax_silver_etl.py\n(SilverETLManager)"]
+        SIceberg[("Apache Iceberg v2 Tables\ns3://{bucket}/silver/data/...")]
+        SWatermark[("Silver Watermarks\nmetadata/silver/...")]
+    end
+
+    subgraph Gold ["Gold Layer (Analytics Marts & Serving)"]
+        GMgr["gold_layer_manager.py\n(GoldLayerManager)"]
+        GIceberg[("Athena Iceberg Marts\ns3://{bucket}/gold/data/...")]
+        Aurora[("Amazon Aurora MySQL\n(Zero-Downtime PK UPSERT)")]
+        Redshift[("Amazon Redshift Spectrum\n(External Catalog)")]
+        Snowflake[("Snowflake / Databricks\n(External Iceberg Tables)")]
+    end
+
+    REST --> BLoad
+    DB --> BLoad
+    S3F --> BLoad
+    BLoad --> BParquet
+    BLoad -.-> BState
+
+    BParquet --> SETL
+    SETL --> SIceberg
+    SETL -.-> SWatermark
+
+    SIceberg --> GMgr
+    GMgr --> GIceberg
+    GMgr --> Aurora
+    GMgr --> Redshift
+    GMgr --> Snowflake
+```
+
+---
+
+## 📚 Comprehensive Documentation Suite
+
+For granular engineering specifications, execution lifecycles, configuration blueprints, and developer guides, refer to the documentation suite in [`docs/`](docs/):
+
+| Layer / Topic | Documentation Link | Description |
+| :--- | :--- | :--- |
+| **System Architecture** | [Architecture Blueprint](docs/ARCHITECTURE.md) | Universal architectural specification, execution lifecycle, and cross-layer security. |
+| **Bronze Layer** | [Bronze Low-Level Guide](docs/bronze/BRONZE_LAYER.md) | Ingestion mechanics, connector protocols, OAuth2 grant types, and S3 state watermarks. |
+| **Bronze Config** | [Bronze Config Blueprint](docs/bronze/CONFIG_BLUEPRINT.md) | Line-by-line configuration parameter blueprint and source connection templates. |
+| **Silver Layer** | [Silver Low-Level Guide](docs/silver/SILVER_LAYER.md) | Apache Iceberg v2 storage, deduplication windowing, SCD1, SCD2, and schema evolution. |
+| **Silver Config** | [Silver Config Blueprint](docs/silver/CONFIG_BLUEPRINT.md) | Declarative transformation, deduplication, and Iceberg table configuration reference. |
+| **Gold Layer** | [Gold Low-Level Guide](docs/gold/GOLD_LAYER.md) | Multi-target serving, Aurora MySQL zero-downtime PK upsert, Athena Iceberg schema alignment, and initial CSV migration. |
+| **Gold Config** | [Gold Config Blueprint](docs/gold/CONFIG_BLUEPRINT.md) | Business mart definition, SQL linkage, and downstream adapter configuration reference. |
+| **Developer Onboarding** | [Onboarding & Operations Guide](docs/ONBOARDING_GUIDE.md) | Environment setup, CLI reference, Secrets Manager schemas, and step-by-step entity addition. |
 
 ---
 
@@ -32,167 +76,97 @@ An enterprise-grade, modular, and config-driven serverless data lake pipeline bu
 
 ```text
 Data-pipeline/
-├── bronze/                             # Bronze Layer Script & Configuration Artifacts
+├── bronze/                             # Bronze Ingestion Engine
 │   └── script/
 │       ├── config/
-│       │   └── bronze_config.json      # Centralized Bronze configuration (endpoints, buckets, dates)
-│       ├── connectors/                 # Modular Source Connectors
-│       │   ├── __init__.py             # Connector factory & type registry
-│       │   ├── database.py             # JDBC SQL database connector
-│       │   ├── genesys.py              # Genesys Cloud REST API connector
-│       │   ├── http_client.py          # Unified Basic Auth & OAuth HTTP client
-│       │   ├── moveworks.py            # Moveworks REST API connector
-│       │   ├── oauth.py                # OAuth 2.0 token manager with in-memory cache
-│       │   ├── s3_file.py              # S3 file connector (CSV, Flat, Text, JSON, Parquet)
-│       │   └── servicenow.py           # ServiceNow REST API connector
-│       ├── config_loader.py            # Configuration parser & S3 loader module
-│       ├── connectors.zip              # Pre-bundled connectors package for AWS Glue
-│       └── uax_bronze_load.py          # Main AWS Glue Python Shell job script
-├── silver/                             # Silver Layer Transformation Code
+│       │   └── bronze_config.json      # Ingestion configuration blueprint
+│       ├── config_loader.py            # Centralized config parser & {env} interpolator
+│       ├── connectors/                 # Modular upstream connectors
+│       │   ├── base_connector.py       # Abstract connector base class
+│       │   ├── database_connector.py   # JDBC streaming database connector
+│       │   ├── genesys_connector.py    # Genesys Cloud Analytics API connector
+│       │   ├── http_client.py          # Resilient HTTP client with retry & rate limiting
+│       │   ├── moveworks_connector.py  # Moveworks Enterprise API connector
+│       │   ├── oauth.py                # OAuth2 client (client_credentials, password, refresh)
+│       │   ├── s3_connector.py         # S3 file feed connector (CSV, JSON, Parquet)
+│       │   └── servicenow_connector.py # ServiceNow REST Table API connector
+│       └── uax_bronze_load.py          # Main Bronze execution script
+├── silver/                             # Silver Conformation & Iceberg Engine
 │   └── script/
 │       ├── config/
-│       │   └── silver_config.json      # Silver configuration, deduplication & merge settings
-│       ├── custom_transforms/          # Table-specific custom PySpark transformation scripts
-│       ├── silver_config_loader.py     # Silver configuration loader module
-│       ├── uax_silver_etl.py           # Main PySpark Iceberg ETL script
-│       └── transformer.py              # Core PySpark DataFrame transformer
-├── terraform/                          # 100% Module-based Terraform Infrastructure
-│   ├── 1_bronze/
-│   │   └── bronze.tf                   # S3 Bucket, Secrets Manager, IAM Roles, Glue Job
-│   ├── 2_silver/
-│   │   └── silver.tf                   # Glue Catalog DB, Iceberg Crawler, PySpark ETL Job
-│   ├── 3_athena/
-│   │   └── athena.tf                   # Amazon Athena Query WorkGroup
-│   └── 4_step_functions/
-│       └── step_functions.tf           # SNS Topics, State Machines, EventBridge Rules
-├── ARCHITECTURE.md                     # Universal Technical Architecture Specification
-└── README.md                           # Universal Operations & Troubleshooting Manual
+│       │   └── silver_config.json      # Silver transformation & Iceberg merge configuration
+│       ├── custom_transforms/          # Pluggable PySpark transformation scripts
+│       ├── silver_config_loader.py     # Silver config parser & cache manager
+│       ├── transformer.py              # Declarative transformation rules engine
+│       └── uax_silver_etl.py           # Main Silver PySpark Iceberg execution script
+├── gold/                               # Gold Analytics Marts & Multi-Target Serving Engine
+│   ├── initial_exports/                # Historical CSV data migration drop directory
+│   ├── query/                          # Business SQL transformation queries
+│   │   ├── genesys/
+│   │   │   └── conversations.sql       # Genesys conversation dimensional mart query
+│   │   └── moveworks/
+│   │       └── interactions.sql        # Moveworks interaction mart query
+│   └── script/
+│       ├── adapters/                   # Multi-target serving database connectors
+│       │   ├── aurora.py               # Aurora MySQL isolated staging & PK UPSERT adapter
+│       │   ├── databricks.py           # Databricks Unity Catalog Iceberg adapter
+│       │   ├── redshift.py             # Amazon Redshift Spectrum external catalog adapter
+│       │   └── snowflake.py            # Snowflake external Iceberg table adapter
+│       ├── config/
+│       │   └── gold_config.json        # Multi-target serving configuration blueprint
+│       ├── custom_transforms/          # Domain-specific PySpark transformation hooks
+│       ├── gold_config_loader.py       # Gold configuration loader & cache manager
+│       ├── gold_initial_load.py        # Historical CSV parser, validator & auto-archiver
+│       └── gold_layer_manager.py       # Master Gold orchestration engine
+├── docs/                               # Enterprise Documentation Suite
+│   ├── ARCHITECTURE.md                 # System-wide architectural blueprint
+│   ├── ONBOARDING_GUIDE.md             # Developer setup, CLI args & onboarding recipe
+│   ├── bronze/
+│   │   ├── BRONZE_LAYER.md             # Bronze low-level execution & auth guide
+│   │   └── CONFIG_BLUEPRINT.md         # Bronze configuration parameter reference
+│   ├── silver/
+│   │   ├── SILVER_LAYER.md             # Silver low-level execution & Iceberg guide
+│   │   └── CONFIG_BLUEPRINT.md         # Silver configuration parameter reference
+│   └── gold/
+│       ├── GOLD_LAYER.md               # Gold low-level execution & multi-target guide
+│       └── CONFIG_BLUEPRINT.md         # Gold configuration parameter reference
+└── test/                               # Automated Test Suite
+    ├── test_bronze_extraction.py       # Bronze connector & JSON flattener tests
+    ├── test_silver_transforms.py       # Silver deduplication & SCD merge tests
+    └── test_gold_upsert_and_config.py  # Gold multi-engine upsert & schema tests
 ```
 
 ---
 
-## 🚀 Deployment & Utilization Guide
+## 🚀 Execution Quickstart
 
-### Step 1: Deploy Terraform Infrastructure
+Each pipeline layer can be triggered independently via Python CLI or deployed as AWS Glue Jobs:
 
-All Terraform scripts use enterprise private modules (`cps-terraform.anthem.com`). Deploy layer-by-layer:
-
+### 1. Ingest Raw Data (Bronze)
 ```bash
-# 1. Deploy Bronze Infrastructure (S3 Bucket, Secrets, IAM Role, Glue Ingestion Job)
-cd terraform/1_bronze
-terraform init
-terraform apply -auto-approve
-
-# 2. Deploy Silver Infrastructure (Glue Database, Iceberg Crawler, PySpark Job)
-cd ../2_silver
-terraform init
-terraform apply -auto-approve
-
-# 3. Deploy Athena Analytics WorkGroup
-cd ../3_athena
-terraform init
-terraform apply -auto-approve
-
-# 4. Deploy Step Functions Orchestration & EventBridge Cron Rules
-cd ../4_step_functions
-terraform init
-terraform apply -auto-approve
+python3 bronze/script/uax_bronze_load.py \
+  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/bronze/config/bronze_config.json" \
+  --ENV "dev" \
+  --SOURCE_SYSTEM "servicenow" \
+  --TABLE_NAME "incident"
 ```
 
----
-
-### Step 2: Upload Script Artifacts to S3 Bucket
-
-Upload local scripts and configuration files to the newly created S3 data lake bucket (`uax-datalake-dev-bucket`):
-
+### 2. Conform & Merge to Apache Iceberg (Silver)
 ```bash
-DATA_LAKE_BUCKET="uax-datalake-dev-bucket"
-
-# Upload Bronze Scripts & Config
-aws s3 cp bronze/script/uax_bronze_load.py s3://${DATA_LAKE_BUCKET}/bronze/script/uax_bronze_load.py
-aws s3 cp bronze/script/config_loader.py s3://${DATA_LAKE_BUCKET}/bronze/script/config_loader.py
-aws s3 cp bronze/script/connectors.zip s3://${DATA_LAKE_BUCKET}/bronze/script/connectors.zip
-aws s3 cp bronze/script/config/bronze_config.json s3://${DATA_LAKE_BUCKET}/bronze/script/config/bronze_config.json
-
-# Upload Silver Scripts & Config
-aws s3 cp silver/script/uax_silver_etl.py s3://${DATA_LAKE_BUCKET}/silver/script/uax_silver_etl.py
-aws s3 cp silver/script/silver_config_loader.py s3://${DATA_LAKE_BUCKET}/silver/script/silver_config_loader.py
-aws s3 cp silver/script/transformer.py s3://${DATA_LAKE_BUCKET}/silver/script/transformer.py
-aws s3 cp silver/script/config/silver_config.json s3://${DATA_LAKE_BUCKET}/silver/script/config/silver_config.json
+python3 silver/script/uax_silver_etl.py \
+  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/silver/config/silver_config.json" \
+  --ENV "dev" \
+  --SOURCE_SYSTEM "servicenow" \
+  --TABLE_NAME "tbl_incident"
 ```
 
----
-
-### Step 3: Trigger Pipeline Execution
-
-#### Option A: Trigger Step Functions Orchestrator (Recommended)
-Step Functions requires passing **ONLY** `--SOURCE_SYSTEM`. It pulls all endpoints, tables, and settings automatically from `bronze_config.json`:
-
+### 3. Build Marts & Sync Serving Targets (Gold)
 ```bash
-aws stepfunctions start-execution \
-  --state-machine-arn "arn:aws:states:us-east-1:123456789012:stateMachine:uax-datalake-servicenow-orchestrator-dev"
+python3 gold/script/gold_layer_manager.py \
+  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/gold/config/gold_config.json" \
+  --ENV "dev" \
+  --SOURCE_SYSTEM "moveworks" \
+  --TABLE_NAME "interactions"
 ```
 
-#### Option B: Trigger Bronze Glue Job Directly
-```bash
-aws glue start-job-run \
-  --job-name uax-datalake-bronze-ingestion-dev \
-  --arguments '{
-    "--SOURCE_SYSTEM": "servicenow"
-  }'
-```
-
-#### Option C: Trigger S3 File Ingestion
-```bash
-aws glue start-job-run \
-  --job-name uax-datalake-bronze-ingestion-dev \
-  --arguments '{
-    "--SOURCE_SYSTEM": "vendor_s3_files"
-  }'
-```
-
----
-
-## 🛠️ Configuration Schema Guide (`bronze_config.json`)
-
-To add or modify source systems, update `bronze/script/config/bronze_config.json`:
-
-```json
-{
-  "source_systems": {
-    "servicenow": {
-      "base_url": "https://your-instance.service-now.com",
-      "api_endpoint_template": "/api/now/table/{table_name}",
-      "default_tables": ["incident", "change_request", "problem"],
-      "table_initial_load_dates": {
-        "incident": "2024-01-01T00:00:00Z"
-      }
-    },
-    "vendor_s3_files": {
-      "type": "s3_file",
-      "source_bucket": "external-vendor-data-bucket",
-      "file_prefix_template": "raw_feed/{table_name}/",
-      "file_format": "csv",
-      "delimiter": ",",
-      "has_header": true,
-      "default_tables": ["employee_feed", "vendor_reports"],
-      "table_initial_load_dates": {
-        "employee_feed": "2024-01-01T00:00:00Z"
-      }
-    }
-  }
-}
-```
-
----
-
-## ⚠️ Comprehensive Error Handling & Troubleshooting Guide
-
-| Issue / Error Message | Root Cause | Resolution |
-| :--- | :--- | :--- |
-| **`ValueError: Initial load date for table 'X' is null or missing`** | Strict validation rule triggered because `table_initial_load_dates` is not defined for table `X` in `bronze_config.json`. | Add table entry to `table_initial_load_dates` in `bronze_config.json` or pass `--INITIAL_LOAD_DATE "2024-01-01T00:00:00Z"`. |
-| **`401 Unauthorized / Token Resolution Failed`** | Expired OAuth 2.0 token or incorrect client credentials in AWS Secrets Manager. | Update secret value in AWS Secrets Manager (`uax-datalake/<source>-credentials-dev`). Engine will auto-retry. |
-| **`BucketAlreadyExists / AccessDenied`** | Attempting to create an existing bucket or missing IAM permissions. | Set `-var="use_existing_s3_bucket=true"` in `1_bronze/bronze.tf` to reuse existing bucket. |
-| **`S3 Staging Promotion Failure`** | Job failed mid-way before promoting files from `_staging/` to `bronze/data/`. | Automatic cleanup (`cleanup_failed_staging`) purges uncommitted staging files. Re-run job. |
-| **`No non-completed scalar values found in schema`** | Parquet serialization failed due to invalid dynamic schema or complex un-flattened dictionary. | Ensure `"flatten_nested_json": true` is set in `bronze_config.json`. |
-| **`AccessDeniedException on CloudWatch Logs`** | IAM execution policy does not allow creating log groups for Glue. | Glue IAM policy is scoped to `arn:aws:logs:*:log-group:/aws-glue/jobs/uax-datalake*`. Ensure job name starts with `uax-datalake`. |
+For detailed CLI argument definitions and onboarding instructions, consult the [Onboarding & Operations Guide](docs/ONBOARDING_GUIDE.md).
