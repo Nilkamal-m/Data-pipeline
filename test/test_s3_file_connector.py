@@ -203,6 +203,60 @@ class TestS3FileConnector(unittest.TestCase):
         self.assertEqual(len(ingested_records), 1)
         self.assertEqual(ingested_records[0]["id"], "conv_004")
 
+    @patch("bronze.script.connectors.s3_file.boto3.client")
+    def test_table_name_prefix_mismatch_with_wildcard(self, mock_boto):
+        """
+        Verify that when table_name is 'genesys_users', file_path is 'landing/genesys/users_*.csv',
+        and S3 files are 'landing/genesys/users_09242026100000.csv', records are successfully extracted.
+        """
+        mock_s3 = MagicMock()
+        mock_boto.return_value = mock_s3
+
+        s3_files = [
+            {
+                "Key": "landing/genesys/users_09242026100000.csv",
+                "LastModified": datetime(2026, 9, 24, 10, 0, 0, tzinfo=timezone.utc),
+            }
+        ]
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [{"Contents": s3_files}]
+        mock_s3.get_paginator.return_value = mock_paginator
+        mock_s3.get_object.return_value = {
+            "Body": MagicMock(read=lambda: b"user_id,username\nu1,john\n")
+        }
+
+        config = {
+            "source_bucket": "uax-datalake-{env}-bucket",
+            "env": "dev",
+            "file_format": "csv",
+            "tables": {
+                "genesys_users": {
+                    "file_path": "landing/genesys/users_*.csv",
+                    "fetch_mode": "all",
+                    "initial_load_date": "2024-01-01 00:00:00"
+                }
+            }
+        }
+
+        ingested = []
+        S3FileConnector.fetch_delta(
+            last_load_date="2024-01-01 00:00:00",
+            secret_dict={},
+            table_name="genesys_users",
+            source_config=config,
+            on_chunk_callback=lambda chunk, part: ingested.extend(chunk)
+        )
+
+        self.assertEqual(len(ingested), 1)
+        self.assertEqual(ingested[0]["user_id"], "u1")
+        self.assertEqual(ingested[0]["username"], "john")
+        # Verify {env} was interpolated
+        mock_paginator.paginate.assert_called_with(
+            Bucket="uax-datalake-dev-bucket",
+            Prefix="landing/genesys/"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+

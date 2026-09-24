@@ -71,9 +71,31 @@ class S3FileConnector:
                 f"(source_systems.<name>.source_bucket)."
             )
 
+        # Dynamic {env} interpolation fallback if not already performed by ConfigLoader
+        env_val = str(config.get('env') or '').strip().lower()
+        if not env_val:
+            import os
+            env_val = str(os.environ.get('ENV') or os.environ.get('ENVIRONMENT') or 'dev').strip().lower()
+        if '{env}' in source_bucket or '{ENV}' in source_bucket:
+            source_bucket = source_bucket.replace('{env}', env_val).replace('{ENV}', env_val.upper())
+
         # Per-table path override: tables.<table_name>.file_path > table_paths > global file_prefix
         tables_dict = config.get('tables', {})
-        table_cfg = tables_dict.get(table_name, {}) if isinstance(tables_dict, dict) else {}
+        table_cfg = tables_dict.get(table_name)
+        if not table_cfg and isinstance(tables_dict, dict):
+            # Check alternative keys: hyphens, underscores, or stripping source_system prefix (e.g. 'users' vs 'genesys_users')
+            alt_keys = [
+                table_name.replace('_', '-'),
+                table_name.replace('-', '_'),
+                table_name.split('_', 1)[-1] if '_' in table_name else '',
+            ]
+            for alt in alt_keys:
+                if alt and alt in tables_dict and isinstance(tables_dict[alt], dict):
+                    table_cfg = tables_dict[alt]
+                    break
+        if not table_cfg or not isinstance(table_cfg, dict):
+            table_cfg = {}
+
         table_paths = config.get('table_paths', {})
         raw_path = table_cfg.get('file_path') or table_paths.get(table_name) or config.get('file_prefix', f'raw/{table_name}/')
 
@@ -125,7 +147,6 @@ class S3FileConnector:
         delimiter  = config.get('delimiter', ',')
         has_header = bool(config.get('has_header', True))
         encoding   = config.get('encoding', 'utf-8')
-        file_pattern = config.get('file_pattern')
 
         # Build S3 client (cross-account if explicit credentials provided)
         if secret_dict.get('aws_access_key_id') and secret_dict.get('aws_secret_access_key'):
@@ -185,8 +206,13 @@ class S3FileConnector:
                     if not fnmatch.fnmatch(filename, file_pattern):
                         continue
                 elif not file_prefix.rstrip('/').endswith(table_name):
-                    # If prefix is a shared parent directory, ensure filename starts with table_name
-                    if not (filename.startswith(f"{table_name}_") or filename.startswith(f"{table_name}.")):
+                    # If prefix is a shared parent directory, ensure filename starts with table_name or short name
+                    short_table_name = table_name.split('_', 1)[-1] if '_' in table_name else table_name
+                    matches_name = (
+                        filename.startswith(f"{table_name}_") or filename.startswith(f"{table_name}.") or
+                        filename.startswith(f"{short_table_name}_") or filename.startswith(f"{short_table_name}.")
+                    )
+                    if not matches_name:
                         continue
 
                 mtime = obj['LastModified']
@@ -197,7 +223,7 @@ class S3FileConnector:
         if not candidates:
             logger.info(
                 f"[S3File/{table_name}] No files found in "
-                f"s3://{source_bucket}/{file_prefix} (fetch_mode={fetch_mode})."
+                f"s3://{source_bucket}/{file_prefix} (fetch_mode={fetch_mode}, pattern={file_pattern}, watermark={last_load_date})."
             )
             return
 
