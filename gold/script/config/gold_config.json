@@ -95,6 +95,7 @@
           "nkey": [
             "interaction_id"
           ],
+          "incremental": true,
           "initial_load": {
             "path": "s3://{bucket}/gold/initial_exports/moveworks/interactions.csv",
             "format": "csv",
@@ -110,6 +111,7 @@
           "nkey": [
             "conversation_id"
           ],
+          "incremental": true,
           "initial_load": {
             "path": "s3://{bucket}/gold/initial_exports/moveworks/conversations.csv",
             "format": "csv",
@@ -125,6 +127,7 @@
           "nkey": [
             "feedback_id"
           ],
+          "incremental": true,
           "initial_load": {
             "path": "s3://{bucket}/gold/initial_exports/moveworks/feedbacks.csv",
             "format": "csv",

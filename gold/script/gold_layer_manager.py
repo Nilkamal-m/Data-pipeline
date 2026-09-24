@@ -1793,27 +1793,30 @@ class GoldLayerManager:
         df_mart.createOrReplaceTempView(temp_view)
 
         if table_exists and primary_keys:
-            join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in primary_keys])
-            merge_sql = (
-                f"MERGE INTO {full_table} AS target\n"
-                f"USING {temp_view} AS source\n"
-                f"ON {join_cond}\n"
-                f"WHEN MATCHED THEN UPDATE SET *\n"
-                f"WHEN NOT MATCHED THEN INSERT *"
-            )
-            logger.info(f"[ATHENA/ICEBERG UPSERT] Executing Iceberg MERGE INTO on {full_table}:\n{merge_sql}")
-            try:
-                spark.sql(merge_sql)
-            except Exception as merge_err:
-                logger.warning(
-                    f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). "
-                    f"Falling back to Iceberg insertInto on '{full_table}'..."
+            if row_count == 0:
+                logger.info(f"[ATHENA/ICEBERG] 0 delta records to merge for '{clean_base_name}'. Iceberg table {full_table} is already up to date.")
+            else:
+                join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in primary_keys])
+                merge_sql = (
+                    f"MERGE INTO {full_table} AS target\n"
+                    f"USING {temp_view} AS source\n"
+                    f"ON {join_cond}\n"
+                    f"WHEN MATCHED THEN UPDATE SET *\n"
+                    f"WHEN NOT MATCHED THEN INSERT *"
                 )
+                logger.info(f"[ATHENA/ICEBERG UPSERT] Executing Iceberg MERGE INTO on {full_table}:\n{merge_sql}")
                 try:
-                    df_mart.write.format("iceberg").mode("append").insertInto(f"{glue_database}.{target_table_name}")
-                except Exception as ice_fallback_err:
-                    logger.error(f"[ATHENA/ICEBERG UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
-                    raise
+                    spark.sql(merge_sql)
+                except Exception as merge_err:
+                    logger.warning(
+                        f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). "
+                        f"Falling back to Iceberg insertInto on '{full_table}'..."
+                    )
+                    try:
+                        df_mart.write.format("iceberg").mode("append").insertInto(f"{glue_database}.{target_table_name}")
+                    except Exception as ice_fallback_err:
+                        logger.error(f"[ATHENA/ICEBERG UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
+                        raise
         else:
             logger.info(f"[ATHENA/ICEBERG WRITE] Initializing clean Gold Iceberg table {full_table} at '{s3_location}'...")
             try:
@@ -1833,7 +1836,7 @@ class GoldLayerManager:
         except Exception:
             pass
 
-        return total_count
+        return row_count
 
     # --------------------------------------------------------------------------
     # Natural Key Deduplication & Row Uniqueness
