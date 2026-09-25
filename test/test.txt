@@ -1,0 +1,29 @@
+Services – Key Roles in the Architecture
+
+Triggers & Orchestration
+• Amazon EventBridge: Acts as the catalyst and starting trigger for the pipeline. Uses a cron schedule to automatically start the orchestration process at scheduled execution windows.
+• AWS Step Functions: Serverless orchestration state machine coordinating the end-to-end 3-stage pipeline sequence (Bronze -> Silver -> Gold), handling state transitions, retry policies, and error isolation.
+• Amazon SNS (Simple Notification Service): Handles automated alerting. Routes real-time notifications to the engineering operations team if any Glue job fails or Step Functions times out.
+
+Security & Governance
+• AWS Secrets Manager: Securely stores and automatically rotates sensitive API credentials, OAuth2 tokens, and database connection strings, injecting them into Glue jobs at runtime without hardcoding.
+• AWS IAM (Identity and Access Management): Enforces least-privilege execution roles, ensuring Step Functions can invoke Glue jobs, and Glue jobs can access designated S3 buckets and KMS encryption keys.
+
+Compute & Data Integration
+• AWS Glue Job 1 (Bronze Ingestion / Python Shell): Lightweight extraction engine (uax_bronze_load.py). Connects to REST APIs (ServiceNow, Genesys, Moveworks), relational DBs, and S3 feeds; flattens payloads, tracks incremental state, and writes Snappy-compressed Parquet partitioned by _ingested_at=<ISO8601_TIMESTAMP>/.
+• AWS Glue Job 2 (Silver Conformation / PySpark Iceberg): Conformed ETL engine (uax_silver_etl.py). Scans incremental Bronze Parquet, deduplicates by natural key (_nkey), computes payload hash, tracks history via SCD1 or SCD2 (_is_current = 'Y'/'N', _is_deleted = 'Y'/'N'), and writes directly to Apache Iceberg v2 tables.
+• AWS Glue Job 3 (Gold Layer Manager / PySpark): Business mart engine (gold_layer_manager.py). Executes domain SQL over Silver Iceberg, materializes physical conformed Gold Iceberg tables, and orchestrates atomic syncs to downstream reporting stores.
+• AWS Glue Data Catalog Integration: Apache Iceberg v2 commits table metadata, schemas, and snapshots directly to the AWS Glue Data Catalog on every write via ACID transactions—eliminating the need for Glue Crawlers on curated tables.
+
+Storage & Metadata (The Data Lakehouse)
+• Amazon S3 – Bronze Layer: Raw landing zone storing untransformed, append-only Parquet batches partitioned strictly by execution timestamp (_ingested_at=<ISO8601_TIMESTAMP>/).
+• Amazon S3 – Silver Layer: Curated enterprise lakehouse storing conformed data in Apache Iceberg v2 format with full ACID transactional integrity, deduplication, and historical versioning.
+• Amazon S3 – Gold Layer: Authoritative business marts stored as physical Apache Iceberg tables—serving as the conformed single source of truth for all enterprise reporting.
+• Amazon S3 – State & Watermarks: Dedicated metadata bucket storing incremental high-water mark state JSON files (watermark.json) for fault tolerance and idempotent restarts.
+• AWS Glue Data Catalog: Central metastore maintaining authoritative table schemas, Iceberg snapshot manifests, and cross-engine access controls.
+
+Consumption & Downstream Serving Layer
+• Amazon Aurora MySQL (Reporting Layer): Operational serving store hosting enterprise_reporting.* tables for sub-second BI dashboards (Power BI, Tableau), populated from Gold Iceberg via isolated staging tables and zero-downtime atomic table swaps (RENAME TABLE).
+• Databricks Federated Layer: Federated directly to the AWS Glue Data Catalog, mirroring current conformed lakehouse tables for unified governance and advanced analytics without data duplication.
+• Amazon Redshift Spectrum: External catalog interface allowing high-concurrency enterprise SQL queries directly against S3 Iceberg data.
+• Amazon Athena: Serverless interactive SQL engine for ad-hoc analytical queries, operational data audits, and direct reporting across Silver and Gold Iceberg tables.
