@@ -6,7 +6,7 @@ An enterprise-grade, config-driven, multi-target Medallion Lakehouse platform bu
 
 ## 🏗️ Architectural Overview
 
-The platform implements the **Medallion Lakehouse Architecture** (Bronze $\to$ Silver $\to$ Gold) to decouple raw source ingestion from conformed business modeling and downstream analytical consumption:
+The platform implements the **Medallion Lakehouse Architecture** (`Bronze` $\to$ `Silver` $\to$ `Gold (Athena Iceberg Table)` $\to$ `Reporting Layer`):
 
 ```mermaid
 flowchart LR
@@ -18,7 +18,7 @@ flowchart LR
 
     subgraph Bronze ["Bronze Layer (Raw Lake)"]
         BLoad["uax_bronze_load.py\n(BronzeLoadManager)"]
-        BParquet[("Raw Partitioned Parquet\ns3://{bucket}/bronze/data/...")]
+        BParquet[("Raw Parquet Batches\ns3://{bucket}/bronze/data/...")]
         BState[("State Watermarks\nmetadata/bronze/...")]
     end
 
@@ -28,12 +28,16 @@ flowchart LR
         SWatermark[("Silver Watermarks\nmetadata/silver/...")]
     end
 
-    subgraph Gold ["Gold Layer (Analytics Marts & Serving)"]
+    subgraph Gold ["Gold Layer (Authoritative Marts)"]
         GMgr["gold_layer_manager.py\n(GoldLayerManager)"]
-        GIceberg[("Athena Iceberg Marts\ns3://{bucket}/gold/data/...")]
-        Aurora[("Amazon Aurora MySQL\n(Zero-Downtime PK UPSERT)")]
+        GIceberg[("Athena Iceberg Table\n(Authoritative Source of Truth)\ns3://{bucket}/gold/data/...")]
+    end
+
+    subgraph Reporting ["Reporting Layer (Downstream Serving)"]
+        Aurora[("Amazon Aurora MySQL\n(enterprise_reporting tables)")]
+        Databricks[("Databricks\n(Conformed Reporting)")]
         Redshift[("Amazon Redshift Spectrum\n(External Catalog)")]
-        Snowflake[("Snowflake / Databricks\n(External Iceberg Tables)")]
+        Snowflake[("Snowflake\n(Iceberg Tables)")]
     end
 
     REST --> BLoad
@@ -48,9 +52,11 @@ flowchart LR
 
     SIceberg --> GMgr
     GMgr --> GIceberg
-    GMgr --> Aurora
-    GMgr --> Redshift
-    GMgr --> Snowflake
+
+    GIceberg --> Aurora
+    GIceberg --> Databricks
+    GIceberg --> Redshift
+    GIceberg --> Snowflake
 ```
 
 ---

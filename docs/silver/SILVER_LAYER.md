@@ -148,6 +148,7 @@ Used for auditing dimensional attributes over time (e.g., employee department ch
   - `_valid_from`: Timestamp when the record version became active.
   - `_valid_to`: Timestamp when the record version was superseded (defaults to `9999-01-01 00:00:00` for active records).
   - `_is_current`: String flag — `'Y'` for the active (current) version of the record, `'N'` for historical (expired) versions.
+  - `_is_deleted`: String flag — `'Y'` for soft-deleted records, `'N'` for active records.
   - `_row_hash`: SHA-256 hash across all business payload columns. If the hash hasn't changed, no new SCD2 version is generated.
 
 ---

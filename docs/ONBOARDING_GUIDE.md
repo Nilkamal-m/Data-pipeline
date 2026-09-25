@@ -181,7 +181,7 @@ Follow this recipe to onboard an entity from source extraction to business servi
    }
    ```
 3. Run the Bronze job to ingest raw data to S3.
-   * Data lands at: `s3://{bronze_bucket}/bronze/data/acme_crm/customers/year=YYYY/month=MM/day=DD/`
+   * Data lands at: `s3://{bronze_bucket}/bronze/data/acme_crm/customers/_ingested_at={ISO8601_TIMESTAMP}/`
    * Watermark state lands at: `s3://{state_bucket}/metadata/bronze/acme_crm/customers/watermark.json`
 
 ### Step 2: Silver Conformation & Iceberg Persistence

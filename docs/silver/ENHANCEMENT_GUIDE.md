@@ -107,6 +107,7 @@ Technical columns added automatically:
 | `_valid_from` | Timestamp when this version became active |
 | `_valid_to` | Timestamp when superseded (`9999-01-01` for the current record) |
 | `_is_current` | `'Y'` for active record, `'N'` for historical (expired) version |
+| `_is_deleted` | `'Y'` for soft-deleted record, `'N'` for active record |
 | `_row_hash` | SHA-256 across all business payload columns — no new version if hash unchanged |
 
 **Execution sequence:**

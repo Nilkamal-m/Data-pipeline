@@ -44,7 +44,7 @@ flowchart TD
     end
 
     subgraph Consumer["Consumer Layer — Serving"]
-        AURORA[("Amazon Aurora MySQL\nenterprise_reporting.*\ngold_* tables + v_* views")]
+        AURORA[("Amazon Aurora MySQL\nenterprise_reporting.*\ngold_* reporting tables")]
         ATHENA["Amazon Athena\n(Direct Iceberg Query)"]
         BI["Power BI / Tableau\n(via Aurora MySQL)"]
         RS["Redshift Spectrum\n(External Table)"]
@@ -122,7 +122,7 @@ EventBridge Trigger
 | **Bronze** | `uax_bronze_load.py` | APIs / DBs / S3 Files | Append-only Parquet — single `_ingested_at` ISO timestamp partition per run | S3 `bronze/data/` |
 | **Silver** | `uax_silver_etl.py` | Bronze Parquet (incremental) | Apache Iceberg v2 (ACID upsert / SCD) | S3 `silver/data/` + Glue Catalog |
 | **Gold** | `gold_layer_manager.py` | Silver Iceberg (incremental delta) | Athena Iceberg Mart (source of truth) | S3 `gold/data/` |
-| **Consumer** | _(Gold job — last phase)_ | Gold Iceberg Mart | Aurora MySQL tables/views + Athena + Redshift | Aurora `enterprise_reporting.*` |
+| **Consumer** | _(Gold job — last phase)_ | Gold Iceberg Mart | Aurora MySQL reporting tables + Athena + Redshift | Aurora `enterprise_reporting.*` |
 
 ---
 
@@ -159,9 +159,8 @@ sequenceDiagram
     SF->>GD: GlueStartJobRun (gold_layer_manager)
     GD->>GD: Execute mart SQL over Silver Iceberg
     GD->>GD: Filter delta (_updated_at > max Gold _updated_at)
-    GD->>S3G: MERGE INTO Gold Iceberg mart
-    GD->>GD: Create/refresh Athena view (v_table)
-    GD->>AURORA: Read Iceberg → staging swap to production table
+    GD->>S3G: MERGE INTO Gold Iceberg mart table
+    GD->>AURORA: Read Gold Table → staging swap to reporting table
 ```
 
 ---
@@ -217,7 +216,7 @@ s3://<bronze-bucket>/bronze/data/<source>/<table>/
         delta_20240601_060000_part_0002.parquet
 ```
 
-This is intentional. One execution maps to exactly one partition folder. Silver can then filter Bronze using `_ingested_at > last_watermark`, picking up only the new folders without rescanning any historical data. The ingestion cadence is job-run-based rather than calendar-based, so a Hive-style `year=/month=/day=` hierarchy would not align with the watermark incremental model and would force Silver to scan entire day-level directories on every run.
+This is intentional. One execution maps to exactly one partition folder keyed by the run-level ISO 8601 timestamp. Silver can then filter Bronze using `_ingested_at > last_watermark`, picking up only newly arrived execution folders without rescanning any historical data. The ingestion cadence is job-run-based, aligning partition discovery directly with pipeline watermark boundaries.
 
 The timestamp is captured once at job startup and held constant for all tables in that run:
 
@@ -483,17 +482,18 @@ spark.sql(f"""
 spark.sql(f"""
     MERGE INTO glue_catalog.{glue_db}.{iceberg_table} AS target
     USING incoming AS source
-    ON {merge_condition} AND target._is_current = true
+    ON {merge_condition} AND target._is_current = 'Y'
     WHEN MATCHED THEN UPDATE SET
         _valid_to   = current_timestamp(),
-        _is_current = false
+        _is_current = 'N'
 """)
 
 # Step 2: Append incoming rows as new current versions
 new_rows = transformed_df \
     .withColumn("_valid_from", current_timestamp()) \
     .withColumn("_valid_to",   lit("9999-12-31T00:00:00Z")) \
-    .withColumn("_is_current", lit(True))
+    .withColumn("_is_current", lit("Y")) \
+    .withColumn("_is_deleted", coalesce(col("_is_deleted"), lit("N")))
 new_rows.write.format("iceberg").mode("append").save(iceberg_path)
 ```
 
@@ -564,13 +564,14 @@ update_silver_watermark(
 | `_updated_at` | ✅ | ✅ | Timestamp of the last successful merge for this row |
 | `_valid_from` | — | ✅ | When this version of the row became active |
 | `_valid_to` | — | ✅ | When this version expired (`9999-12-31` = currently active) |
-| `_is_current` | — | ✅ | `true` for the latest version of each entity |
+| `_is_current` | — | ✅ | `'Y'` for the latest version of each entity, `'N'` for expired history rows |
+| `_is_deleted` | ✅ | ✅ | `'Y'` for soft-deleted records, `'N'` for active records |
 
 ---
 
 ### 5.3 Gold — Business Marts (`gold_layer_manager.py`)
 
-The Gold layer runs as the final phase inside the Silver PySpark job (via `GoldLayerManager`) or as an independent Glue job. It reads Silver Iceberg, executes mart SQL, materialises results into Gold Iceberg tables, creates Athena presentation views, and routes the finalised data to downstream consumers.
+The Gold layer runs as the final phase inside the Silver PySpark job (via `GoldLayerManager`) or as an independent Glue job. It reads Silver Iceberg, executes mart SQL, materialises results into authoritative Gold Iceberg tables, and routes the conformed data to downstream reporting tables and consumer engines.
 
 #### 5.3.1 Mart SQL Loading — Modular, Source-Scoped Queries
 
@@ -636,16 +637,29 @@ spark.sql(f"""
 """)
 ```
 
-#### 5.3.4 Mandatory Athena View — Interface Contract
+#### 5.3.4 Mandatory Gold Table — Authoritative Mart & Reporting Table Contract
 
-Before data reaches any downstream system, the job creates or replaces a stable Athena view over the Gold table. This view is the interface contract for all SQL consumers — it abstracts the underlying table name and pre-filters to current rows:
+The Gold layer creates and maintains a physical, authoritative Iceberg table for every business mart in AWS Glue Data Catalog. Rather than relying on transient views, this physical Gold table acts as the authoritative contract and single source of truth (`spark.table(f'{glue_db}.{target_table}')`) for all conformed business metrics.
+
+From this authoritative Gold table, data is reliably routed to downstream reporting tables (such as Amazon Aurora MySQL `enterprise_reporting` tables):
 
 ```python
-spark.sql(f"""
-    CREATE OR REPLACE VIEW glue_catalog.gold_db.v_{mart_table} AS
-    SELECT * FROM glue_catalog.gold_db.{mart_table}
-    WHERE _is_current = true
-""")
+# Step 1: Query the authoritative, conformed Gold Iceberg table
+gold_df = spark.table(f"glue_catalog.{gold_db}.{mart_table}")
+
+# If sourcing from an SCD2 dimensional entity, filter strictly to current active records
+if "_is_current" in gold_df.columns:
+    reporting_df = gold_df.filter(col("_is_current") == "Y")
+else:
+    reporting_df = gold_df
+
+# Step 2: Stream into the downstream reporting staging table before zero-downtime swap
+reporting_df.write \
+    .format("jdbc") \
+    .option("url", jdbc_url) \
+    .option("dbtable", f"{reporting_schema}.{mart_table}_staging") \
+    .mode("overwrite") \
+    .save()
 ```
 
 #### 5.3.5 Schema Introspection and Evolution Alerting
@@ -665,21 +679,22 @@ if new_cols:
 
 #### 5.3.6 Naming Guardrails — Shared Database Safety
 
-All Aurora object names are validated before any DDL or DML is issued. The Gold job is strictly allowed to touch only objects that carry the `gold_` table prefix or the `v_` view prefix:
+All Aurora reporting object names are validated before any DDL or DML is issued. The Gold job is strictly allowed to operate on tables that carry the `gold_` prefix, and dropping is confined solely to temporary staging or backup tables:
 
 ```python
 ALLOWED_TABLE_PREFIX = "gold_"
-ALLOWED_VIEW_PREFIX  = "v_"
 
-def _is_safe_object(name: str) -> bool:
-    return name.startswith(ALLOWED_TABLE_PREFIX) or name.startswith(ALLOWED_VIEW_PREFIX)
+def _validate_gold_table_name(table_name: str) -> None:
+    if not isinstance(table_name, str) or not table_name.startswith(ALLOWED_TABLE_PREFIX):
+        raise AssertionError(f"Safety Error: Gold table name '{table_name}' must start with '{ALLOWED_TABLE_PREFIX}'")
 
-# Enforced before every DROP, RENAME, CREATE, or ALTER
-if not _is_safe_object(target_table):
-    raise ValueError(
-        f"Blocked: '{target_table}' does not match allowed prefixes. "
-        f"Gold job may only modify 'gold_*' tables and 'v_*' views in the shared database."
-    )
+def _validate_droppable_table_name(table_name: str) -> None:
+    _validate_gold_table_name(table_name)
+    if not (table_name.endswith("_staging") or table_name.endswith("_old")):
+        raise AssertionError(
+            f"Blocked: Non-temporary table '{table_name}' cannot be dropped. "
+            f"Gold job may only drop temporary staging/backup tables (*_staging, *_old)."
+        )
 ```
 
 ---

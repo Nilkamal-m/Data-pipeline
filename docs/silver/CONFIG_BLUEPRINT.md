@@ -158,6 +158,7 @@ This document provides the complete, production-grade configuration blueprint fo
 | `valid_from_column` | string | Optional (Default: `_valid_from`) | *Used in `execute_iceberg_scd2()`*: Column name storing the timestamp when this version became active. |
 | `valid_to_column` | string | Optional (Default: `_valid_to`) | *Used in `execute_iceberg_scd2()`*: Column name storing the timestamp when this version was superseded. Set to `9999-01-01 00:00:00` for active records. |
 | `is_current_column` | string | Optional (Default: `_is_current`) | *Used in `execute_iceberg_scd2()`*: String flag — `'Y'` if this is the current active version of the record, `'N'` if it has been superseded by a newer version. |
+| `is_deleted_column` | string | Optional (Default: `_is_deleted`) | *Used in soft-delete & CDC resolution*: String flag — `'Y'` if the record is soft-deleted, `'N'` for active records. |
 | `high_date_value` | string | Optional (Default: `9999-01-01 00:00:00`) | *Used in `execute_iceberg_scd2()`*: Infinity timestamp assigned to active records' `_valid_to`. |
 
 ---

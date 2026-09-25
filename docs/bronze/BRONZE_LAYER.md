@@ -7,7 +7,7 @@ The **Bronze Layer** is the foundation of the Medallion Data Lakehouse architect
 ### Core Architectural Principles
 * **Raw & Immutable**: Source payloads are ingested as-is without destructive business transformations. Raw structures are preserved for complete replayability and audit compliance.
 * **Schema Decoupling via Flattening**: Deeply nested JSON payloads are deterministically flattened (e.g., `user.profile.id` $\to$ `user_profile_id`) using configurable separators to optimize downstream columnar scanning without losing nested attributes.
-* **Partitioned Columnar Storage**: Raw data is stored in Apache Parquet format using Snappy compression, partitioned by ingestion date (`year=YYYY/month=MM/day=DD`) to minimize storage footprint and maximize I/O throughput.
+* **Partitioned Columnar Storage**: Raw data is stored in Apache Parquet format using Snappy compression, partitioned by run-level ingestion timestamp (`_ingested_at=<ISO8601_TIMESTAMP>/`) to guarantee deterministic incremental scans for Silver and optimize storage footprint.
 * **Audit & Lineage Enrichment**: Every ingested record is stamped with technical metadata columns (`_ingested_at`, `_source_system`, `_table_name`, `_execution_id`).
 * **Resilient Watermarking**: Per-table state files stored in Amazon S3 track incremental extraction boundaries (`last_load_date`, `upper_bound`), guaranteeing fault tolerance and idempotent restarts.
 
@@ -48,7 +48,7 @@ flowchart TD
         ExecuteJDBC --> Flatten
         ExecuteS3 --> Flatten
         Flatten --> Enrich["Add Technical Metadata Columns:\n_ingested_at, _source_system, _table_name, _execution_id"]
-        Enrich --> PartitionWrite["Write Snappy-compressed Parquet to S3:\ns3://{bronze_bucket}/bronze/data/{source}/{table}/year=YYYY/month=MM/day=DD/"]
+        Enrich --> PartitionWrite["Write Snappy-compressed Parquet to S3:\ns3://{bronze_bucket}/bronze/data/{source}/{table}/_ingested_at={ISO8601_TIMESTAMP}/"]
     end
 
     subgraph Finalization ["5. State Commit & Catalog Sync"]
@@ -284,7 +284,7 @@ python3 bronze/script/uax_bronze_load.py \
   --STATE_BUCKET "uax-datalake-state-dev"
 ```
 Verify that:
-1. Parquet files appear under `s3://uax-datalake-bronze-dev/bronze/data/new_api_source/audit_events/year=YYYY/month=MM/day=DD/`.
+1. Parquet files appear under `s3://uax-datalake-bronze-dev/bronze/data/new_api_source/audit_events/_ingested_at={ISO8601_TIMESTAMP}/`.
 2. The state file is committed at `s3://uax-datalake-state-dev/metadata/bronze/new_api_source/audit_events/watermark.json`.
 
 ---

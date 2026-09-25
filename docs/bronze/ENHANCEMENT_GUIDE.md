@@ -37,7 +37,7 @@ parse_cli_args()
                 _get_watermark()            # Read S3 state file (last_load_date)
                 └─► route_connector()       # Instantiate the right connector from CONNECTOR_MAP
                     └─► connector.fetch_delta()  # Pull records incrementally
-                        └─► _write_parquet()     # Write Snappy Parquet to S3 (year/month/day)
+                        └─► _write_parquet()     # Write Snappy Parquet to S3 (_ingested_at=<ISO8601_TIMESTAMP>/)
                             └─► _commit_watermark()   # Write updated watermark.json to S3
 ```
 
