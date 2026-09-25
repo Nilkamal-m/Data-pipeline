@@ -21,6 +21,7 @@ The Helper Lambda function provides a unified control plane and execution interf
 | **Silver Iceberg ETL** | `"layer": "silver"` | Glue PySpark 4.0 | Deduplicates Bronze raw data, applies audit columns, and merges into Iceberg tables (`tbl_<name>`). |
 | **Gold Serving Marts** | `"layer": "gold"` | Glue PySpark 4.0 | Runs source-specific SQL marts (`bucket/gold/query/<source>/v_*.sql`) and publishes to shared MySQL with atomic swap. |
 | **End-to-End Pipeline** | `"layer": "all"` or `"layers": [...]` | Multi-Stage Sequential | Sequentially executes stages (e.g. `Bronze -> Crawler -> Silver -> Gold`), failing fast if any stage fails. |
+| **Step Functions Orchestrator** | `"action": "step_function"` or `"state_machine_arn"` | AWS Step Functions | Triggers and optionally monitors full 3-stage pipeline state machine (`uax-pipeline-orchestrator-{env}`). |
 
 ---
 
@@ -88,6 +89,28 @@ If `"query"`, `"sql"`, `"athena_query"`, or `"query_file"` is provided, Lambda r
 | `wait_until_completion`| boolean | Single Jobs | `true` | If `true`, polls status until completion. If `false`, returns HTTP 202 immediately. |
 | `poll_interval_seconds`| integer | All | `10` | Polling interval in seconds. |
 | `timeout_seconds` | integer | All | `540` | Maximum wait duration before Lambda exits (Default: 9 minutes). |
+
+---
+
+### 2.4 AWS Step Functions Orchestration Parameters
+
+If `"action": "step_function"`, `"layer": "step_function"`, or `"state_machine_arn"` is provided, Lambda triggers and optionally monitors an AWS Step Functions execution:
+
+| Parameter | Type | Required | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `action` / `layer` | string | Optional* | - | Set to `"step_function"`, `"state_machine"`, or `"sfn"`. |
+| `state_machine_arn` | string | Optional* | `uax-pipeline-orchestrator-{env}` | Target State Machine ARN or name. |
+| `execution_name` | string | Optional | Auto-generated | Unique name for the execution (auto-appends timestamp & UUID). |
+| `source_system` | string | **Required** | `servicenow` | Upstream system to process (e.g. `servicenow`, `moveworks`, `genesys`). |
+| `env` | string | Optional | `dev` | Environment name (`dev`, `uat`, `prod`). |
+| `pipeline_layer` | string | Optional | `all` | Stages to run: `"all"` (Bronze $\rightarrow$ Silver $\rightarrow$ Gold), `"bronze"`, `"silver"`, or `"gold"`. |
+| `source_table_name` | string \| list | Optional | All configured | Specific table to process through the pipeline. |
+| `gold_schema` | string | Optional | `enterprise_reporting` | Target MySQL/Aurora schema when running Gold mart stages. |
+| `wait_until_completion` | boolean | Optional | `false` | When `false`, triggers async and returns HTTP 202 immediately. When `true`, polls until terminal status. |
+| `poll_interval_seconds` | integer | Optional | `10` | Polling interval in seconds when monitoring synchronously. |
+| `timeout_seconds` | integer | Optional | `540` | Maximum wait time before timeout. |
+
+*\*At least one of `"action": "step_function"`, `"layer": "step_function"`, or `"state_machine_arn"` must be provided.*
 
 ---
 
@@ -466,6 +489,61 @@ python3 lambda_helper/lambda_function.py s3://uax-datalake-bronze-bucket-dev/bro
 
 ---
 
+### G. AWS Step Functions State Machine Payloads (`"action": "stepfunction"`)
+
+#### 31. Standard Pipeline Trigger by Step Function Name
+Triggers the state machine by its name with `"action": "stepfunction"`:
+```json
+{
+  "action": "stepfunction",
+  "stepfunction_name": "uax-pipeline-orchestrator-dev",
+  "source_system": "servicenow",
+  "env": "dev"
+}
+```
+
+#### 32. Trigger Step Function for a Single Target Table
+Passes the step function name and targets a single specific table:
+```json
+{
+  "action": "stepfunction",
+  "stepfunction_name": "uax-pipeline-orchestrator-dev",
+  "source_system": "servicenow",
+  "source_table_name": "incident",
+  "env": "dev",
+  "pipeline_layer": "all"
+}
+```
+
+#### 33. Trigger Step Function with Gold / Aurora MySQL Target Settings
+Passes the step function name alongside Gold serving parameters:
+```json
+{
+  "action": "stepfunction",
+  "stepfunction_name": "uax-pipeline-orchestrator-dev",
+  "source_system": "servicenow",
+  "env": "dev",
+  "gold_schema": "enterprise_reporting",
+  "rds_secret_name": "prod/rds/mysql_credentials"
+}
+```
+
+#### 34. Synchronous Execution & Polling (Wait for Completion)
+Passes `"wait_until_completion": true` to have Lambda wait and return final status:
+```json
+{
+  "action": "stepfunction",
+  "stepfunction_name": "uax-pipeline-orchestrator-dev",
+  "source_system": "moveworks",
+  "env": "dev",
+  "wait_until_completion": true,
+  "poll_interval_seconds": 15,
+  "timeout_seconds": 540
+}
+```
+
+---
+
 ## 4. Response Payload Formats
 
 ### A. Successful Multi-Stage Pipeline Execution (HTTP 200)
@@ -592,10 +670,12 @@ DATABASE TABLE VIEW:
 1. Open **AWS Lambda Console** &rarr; Functions &rarr; Select `uax-datalake-glue-job-trigger-dev`.
 2. Navigate to the **Test** tab.
 3. Paste any test payload from **Section 3** into the Event JSON editor:
-   - For ad-hoc queries: Paste payload #13 through #18.
+   - For ad-hoc queries: Paste payload #19 through #24.
    - For Bronze ingestion: Paste payload #1 through #3.
    - For Silver ETL: Paste payload #4 through #6.
    - For Gold serving: Paste payload #7 through #9.
-   - For full pipeline execution: Paste payload #10 through #12.
+   - For sequential multi-stage pipeline: Paste payload #10 through #12.
+   - For Glue Crawler: Paste payload #16 through #18.
+   - For Step Functions State Machine: Paste payload #31 through #34.
 4. Click **Test**.
 5. Inspect the execution logs and JSON output card directly in the console.

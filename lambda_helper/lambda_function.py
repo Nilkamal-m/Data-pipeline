@@ -59,6 +59,7 @@ logger.setLevel(logging.INFO)
 glue_client = boto3.client('glue')
 athena_client = boto3.client('athena')
 s3_client = boto3.client('s3')
+sfn_client = boto3.client('stepfunctions')
 
 try:
     import pandas as pd
@@ -78,6 +79,7 @@ DEFAULT_CRAWLER_NAME = os.environ.get('DEFAULT_CRAWLER_NAME', 'uax-datalake-bron
 DEFAULT_ATHENA_DATABASE = os.environ.get('DEFAULT_ATHENA_DATABASE', 'uax_datalake_db_dev')
 DEFAULT_ATHENA_WORKGROUP = os.environ.get('DEFAULT_ATHENA_WORKGROUP', 'uax-datalake-workgroup-dev')
 DEFAULT_ATHENA_OUTPUT_LOCATION = os.environ.get('DEFAULT_ATHENA_OUTPUT_LOCATION', '')
+DEFAULT_STATE_MACHINE_ARN = os.environ.get('DEFAULT_STATE_MACHINE_ARN', '')
 
 # Root directory of workspace for local SQL file lookups
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -579,6 +581,147 @@ def trigger_and_monitor_crawler(event: Dict[str, Any], context: Any) -> Dict[str
         'statusCode': status_code,
         'body': json.dumps(response_payload, default=str)
     }
+
+
+def is_step_function_event(event: Dict[str, Any]) -> bool:
+    """
+    Detects if the incoming Lambda payload is intended for AWS Step Functions execution.
+    Recognizes:
+      - 'action': 'step_function', 'stepfunction', 'state_machine', 'sfn', 'start_execution'
+      - 'layer': 'step_function', 'stepfunction', 'state_machine', 'sfn'
+      - Presence of 'state_machine_arn' or 'STATE_MACHINE_ARN'
+    """
+    action = str(event.get('action', '')).strip().lower()
+    layer = str(event.get('layer', '')).strip().lower()
+    if action in ('step_function', 'stepfunction', 'state_machine', 'sfn', 'start_execution'):
+        return True
+    if layer in ('step_function', 'stepfunction', 'state_machine', 'sfn'):
+        return True
+    if event.get('state_machine_arn') or event.get('STATE_MACHINE_ARN'):
+        return True
+    return False
+
+
+def trigger_and_monitor_step_function(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Triggers an AWS Step Functions State Machine execution and optionally monitors it until completion.
+    """
+    state_machine_arn = (
+        event.get('state_machine_arn')
+        or event.get('STATE_MACHINE_ARN')
+        or DEFAULT_STATE_MACHINE_ARN
+    )
+    env = event.get('env') or event.get('ENV') or os.environ.get('ENVIRONMENT', 'dev')
+    source_system = event.get('source_system') or event.get('SOURCE_SYSTEM', 'servicenow')
+
+    if not state_machine_arn:
+        state_machine_name = (
+            event.get('stepfunction_name')
+            or event.get('step_function_name')
+            or event.get('state_machine_name')
+            or event.get('name')
+            or f"uax-pipeline-orchestrator-{env}"
+        )
+        if state_machine_name.startswith('arn:aws:states:'):
+            state_machine_arn = state_machine_name
+        else:
+            try:
+                region = boto3.Session().region_name or os.environ.get('AWS_REGION', 'us-east-1')
+                sts = boto3.client('sts')
+                account_id = sts.get_caller_identity().get('Account', '123456789012')
+                state_machine_arn = f"arn:aws:states:{region}:{account_id}:stateMachine:{state_machine_name}"
+            except Exception:
+                state_machine_arn = f"arn:aws:states:us-east-1:123456789012:stateMachine:{state_machine_name}"
+
+    # Extract input payload to pass to Step Function
+    control_keys = {
+        'action', 'state_machine_arn', 'STATE_MACHINE_ARN', 'state_machine_name',
+        'stepfunction_name', 'step_function_name', 'name',
+        'execution_name', 'wait_until_completion', 'poll_interval_seconds', 'timeout_seconds'
+    }
+    sfn_input = {k: v for k, v in event.items() if k not in control_keys}
+    sfn_input.setdefault('source_system', source_system)
+    sfn_input.setdefault('env', env)
+    if 'layer' not in sfn_input or sfn_input['layer'] in ('step_function', 'stepfunction', 'state_machine', 'sfn'):
+        sfn_input['layer'] = event.get('pipeline_layer', 'all')
+
+    # Generate unique execution name
+    execution_name = event.get('execution_name')
+    if not execution_name:
+        import uuid
+        ts = int(time.time())
+        rnd = uuid.uuid4().hex[:6]
+        clean_source = re.sub(r'[^a-zA-Z0-9-_]', '', str(source_system))
+        execution_name = f"{clean_source}-{env}-{ts}-{rnd}"
+
+    logger.info(f"Triggering Step Function: {state_machine_arn}")
+    logger.info(f"Execution Name: {execution_name}")
+    logger.info(f"Input: {json.dumps(sfn_input, default=str)}")
+
+    response = sfn_client.start_execution(
+        stateMachineArn=state_machine_arn,
+        name=execution_name,
+        input=json.dumps(sfn_input, default=str)
+    )
+
+    execution_arn = response['executionArn']
+    start_date = response['startDate'].isoformat() if hasattr(response['startDate'], 'isoformat') else str(response['startDate'])
+
+    wait_until_completion = event.get('wait_until_completion', False)
+    if not wait_until_completion:
+        return {
+            'statusCode': 202,
+            'body': json.dumps({
+                'message': 'Step Functions execution started successfully (asynchronous).',
+                'state_machine_arn': state_machine_arn,
+                'execution_arn': execution_arn,
+                'execution_name': execution_name,
+                'start_date': start_date,
+                'status': 'RUNNING',
+                'input': sfn_input
+            }, default=str)
+        }
+
+    # Polling if wait_until_completion is True
+    poll_interval = int(event.get('poll_interval_seconds', 10))
+    timeout_seconds = int(event.get('timeout_seconds', 540))
+    start_time = time.time()
+
+    logger.info(f"Polling Step Function execution '{execution_arn}' every {poll_interval}s...")
+    while True:
+        elapsed = int(time.time() - start_time)
+        if elapsed > timeout_seconds:
+            raise TimeoutError(f"Step Function execution '{execution_name}' exceeded timeout of {timeout_seconds}s.")
+
+        desc = sfn_client.describe_execution(executionArn=execution_arn)
+        status = desc['status']
+        logger.info(f"[{elapsed}s] Step Function execution status: {status}")
+
+        if status in ('SUCCEEDED', 'FAILED', 'TIMED_OUT', 'ABORTED'):
+            status_code = 200 if status == 'SUCCEEDED' else 500
+            output = None
+            if 'output' in desc:
+                try:
+                    output = json.loads(desc['output'])
+                except Exception:
+                    output = desc['output']
+
+            return {
+                'statusCode': status_code,
+                'body': json.dumps({
+                    'status': status,
+                    'execution_arn': execution_arn,
+                    'execution_name': execution_name,
+                    'duration_seconds': elapsed,
+                    'stop_date': desc.get('stopDate', '').isoformat() if hasattr(desc.get('stopDate', ''), 'isoformat') else str(desc.get('stopDate', '')),
+                    'output': output,
+                    'error': desc.get('error'),
+                    'cause': desc.get('cause')
+                }, default=str)
+            }
+
+        time.sleep(poll_interval)
+
 
 
 def is_catalog_maintenance_event(event: Dict[str, Any]) -> bool:
@@ -1603,6 +1746,11 @@ def lambda_handler(event: Any, context: Any) -> Dict[str, Any]:
                 'statusCode': 200,
                 'body': json.dumps(res)
             }
+
+        # Route 0.5: AWS Step Functions State Machine Execution
+        if is_step_function_event(event):
+            logger.info("Step Functions request detected in payload. Routing to trigger_and_monitor_step_function...")
+            return trigger_and_monitor_step_function(event, context)
 
         # Route 1: Athena Query Execution
         if is_athena_query_event(event):
