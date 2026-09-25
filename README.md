@@ -88,14 +88,14 @@ Data-pipeline/
 │       │   └── bronze_config.json      # Ingestion configuration blueprint
 │       ├── config_loader.py            # Centralized config parser & {env} interpolator
 │       ├── connectors/                 # Modular upstream connectors
-│       │   ├── base_connector.py       # Abstract connector base class
-│       │   ├── database_connector.py   # JDBC streaming database connector
-│       │   ├── genesys_connector.py    # Genesys Cloud Analytics API connector
+│       │   ├── __init__.py             # Connector registry & CONNECTOR_MAP
+│       │   ├── database.py             # Relational database streaming connector
+│       │   ├── genesys.py              # Genesys Cloud Analytics API connector
 │       │   ├── http_client.py          # Resilient HTTP client with retry & rate limiting
-│       │   ├── moveworks_connector.py  # Moveworks Enterprise API connector
+│       │   ├── moveworks.py            # Moveworks Enterprise API connector
 │       │   ├── oauth.py                # OAuth2 client (client_credentials, password, refresh)
-│       │   ├── s3_connector.py         # S3 file feed connector (CSV, JSON, Parquet)
-│       │   └── servicenow_connector.py # ServiceNow REST Table API connector
+│       │   ├── s3_file.py              # S3 file feed connector (CSV, JSON, Parquet)
+│       │   └── servicenow.py           # ServiceNow REST Table API connector
 │       └── uax_bronze_load.py          # Main Bronze execution script
 ├── silver/                             # Silver Conformation & Iceberg Engine
 │   └── script/
@@ -126,7 +126,7 @@ Data-pipeline/
 │       └── gold_layer_manager.py       # Master Gold orchestration engine
 └── docs/                               # Enterprise Documentation Suite
 │   ├── ARCHITECTURE.md                 # System-wide architectural blueprint
-│   ├── ONBOARDING_GUIDE.md             # Developer setup, CLI args & onboarding recipe
+│   ├── ONBOARDING_GUIDE.md             # Developer setup, Glue job args & onboarding recipe
 │   ├── bronze/
 │   │   ├── BRONZE_LAYER.md             # Bronze low-level execution & auth guide
 │   │   └── CONFIG_BLUEPRINT.md         # Bronze configuration parameter reference
@@ -140,35 +140,59 @@ Data-pipeline/
 
 ---
 
-## 🚀 Execution Quickstart
+## 🚀 AWS Glue Job Execution & Arguments
 
-Each pipeline layer can be triggered independently via Python CLI or deployed as AWS Glue Jobs:
+Each pipeline layer runs as an **AWS Glue Job** orchestrated by AWS Step Functions or triggered via AWS CLI / Glue Job Run calls. Parameters follow a strict hierarchy: **Glue Job Arguments (`--KEY value`) take top priority; if omitted, the job resolves parameters from its JSON configuration.**
 
-### 1. Ingest Raw Data (Bronze)
+### 1. Ingest Raw Data (Bronze — AWS Glue Python Shell)
 ```bash
-python3 bronze/script/uax_bronze_load.py \
-  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/bronze/config/bronze_config.json" \
-  --ENV "dev" \
-  --SOURCE_SYSTEM "servicenow" \
-  --TABLE_NAME "incident"
+aws glue start-job-run \
+  --job-name "glue-bronze-servicenow-dev" \
+  --arguments '{
+    "--JOB_NAME": "glue-bronze-servicenow-dev",
+    "--SOURCE_SYSTEM": "servicenow",
+    "--ENV": "dev",
+    "--SOURCE_TABLE_NAME": "incident",
+    "--CONFIG_S3_PATH": "s3://uax-datalake-config-dev/bronze/config/bronze_config.json"
+  }'
 ```
+* **Mandatory Glue Arguments:** `--JOB_NAME`, `--SOURCE_SYSTEM`.
+* **Optional Glue Arguments (Fallback to `bronze_config.json`):** `--ENV` (default: `dev`), `--CONFIG_S3_PATH`, `--SOURCE_TABLE_NAME` (all tables under source if omitted), `--BRONZE_BUCKET`, `--STATE_BUCKET`, `--SECRET_NAME`, `--BATCH_SIZE`, `--INITIAL_LOAD_DATE`, `--UPPER_BOUND`, `--FLATTEN_NESTED_JSON`, `--ERROR_HANDLING_MODE`.
 
-### 2. Conform & Merge to Apache Iceberg (Silver)
+---
+
+### 2. Conform & Merge to Apache Iceberg (Silver — AWS Glue PySpark)
 ```bash
-python3 silver/script/uax_silver_etl.py \
-  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/silver/config/silver_config.json" \
-  --ENV "dev" \
-  --SOURCE_SYSTEM "servicenow" \
-  --TABLE_NAME "tbl_incident"
+aws glue start-job-run \
+  --job-name "glue-silver-servicenow-dev" \
+  --arguments '{
+    "--JOB_NAME": "glue-silver-servicenow-dev",
+    "--SOURCE_SYSTEM": "servicenow",
+    "--ENV": "dev",
+    "--SOURCE_TABLE_NAME": "tbl_incident",
+    "--CONFIG_S3_PATH": "s3://uax-datalake-config-dev/silver/config/silver_config.json"
+  }'
 ```
+* **Mandatory Glue Arguments:** `--JOB_NAME`, `--SOURCE_SYSTEM`.
+* **Optional Glue Arguments (Fallback to `silver_config.json`):** `--ENV` (default: `dev`), `--CONFIG_S3_PATH`, `--SOURCE_TABLE_NAME` (all tables under source if omitted), `--PROCESS_LAYER` (`silver`, `gold`, or `both`), `--DATA_LAKE_BUCKET`, `--GLUE_DATABASE`, `--TABLE_PREFIX`, `--BRONZE_DATA_PREFIX`, `--SILVER_DATA_PREFIX`, `--FULL_REFRESH`, `--INCREMENTAL`.
 
-### 3. Build Marts & Sync Serving Targets (Gold)
+---
+
+### 3. Build Marts & Sync Serving Targets (Gold — AWS Glue PySpark)
 ```bash
-python3 gold/script/gold_layer_manager.py \
-  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/gold/config/gold_config.json" \
-  --ENV "dev" \
-  --SOURCE_SYSTEM "moveworks" \
-  --TABLE_NAME "interactions"
+aws glue start-job-run \
+  --job-name "glue-gold-moveworks-dev" \
+  --arguments '{
+    "--JOB_NAME": "glue-gold-moveworks-dev",
+    "--SOURCE_SYSTEM": "moveworks",
+    "--ENV": "dev",
+    "--TABLE_NAME": "interactions",
+    "--GOLD_SCHEMA": "enterprise_reporting",
+    "--RDS_SECRET_NAME": "uax-datalake/aurora-credentials-dev"
+  }'
 ```
+* **Mandatory Glue Arguments:** `--JOB_NAME`, `--SOURCE_SYSTEM`.
+* **Required for Aurora MySQL Serving:** `--GOLD_SCHEMA` (or `aurora.schema` in `gold_config.json` — zero fallback allowed by policy).
+* **Optional Glue Arguments (Fallback to `gold_config.json`):** `--ENV` (default: `dev`), `--GOLD_CONFIG_S3_PATH`, `--TABLE_NAME` (all marts under source if omitted), `--DATA_LAKE_BUCKET`, `--GLUE_DATABASE`, `--RDS_SECRET_NAME`, `--GOLD_TARGETS`, `--FULL_REFRESH`, `--INCREMENTAL`.
 
-For detailed CLI argument definitions and onboarding instructions, consult the [Onboarding & Operations Guide](docs/ONBOARDING_GUIDE.md).
+For complete configuration blueprints and parameter definitions, consult the [Onboarding & Operations Guide](docs/ONBOARDING_GUIDE.md).

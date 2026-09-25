@@ -20,19 +20,19 @@ The following Mermaid diagram outlines the end-to-end execution flow of the Bron
 ```mermaid
 flowchart TD
     subgraph Initialization ["1. Job Initialization & Configuration"]
-        Start(["Start: uax_bronze_load.py"]) --> ParseArgs["Parse CLI Arguments\n(--CONFIG_S3_PATH, --ENV, --SOURCE_SYSTEM, etc.)"]
+        Start(["Start: uax_bronze_load.py"]) --> ParseArgs["Parse Glue Job Arguments\n(--CONFIG_S3_PATH, --ENV, --SOURCE_SYSTEM, etc.)"]
         ParseArgs --> LoadConfig["ConfigLoader.load_config()\nInterpolate {env} Variables"]
         LoadConfig --> FetchSecret["AWS Secrets Manager\nRetrieve Credentials & Endpoints"]
     end
 
     subgraph StateResolution ["2. High-Water Mark Resolution"]
         FetchSecret --> CheckFullRefresh{"Full Refresh\nRequested?"}
-        CheckFullRefresh -- Yes --> UseInitial["HWM = initial_load_date\n(config or CLI)"]
+        CheckFullRefresh -- Yes --> UseInitial["HWM = initial_load_date\n(config or Glue argument)"]
         CheckFullRefresh -- No --> ReadStateFile["Read S3 State JSON\nmetadata/bronze/{source}/{table}/watermark.json"]
         ReadStateFile --> ValidateHWM{"State Exists\n& Valid?"}
         ValidateHWM -- Yes --> UseState["HWM = state.last_load_date"]
         ValidateHWM -- No --> UseInitial
-        UseInitial --> SetUpperBound["Compute Upper Bound\n(config, CLI, or current UTC run time)"]
+        UseInitial --> SetUpperBound["Compute Upper Bound\n(config, Glue argument, or current UTC run time)"]
         UseState --> SetUpperBound
     end
 
@@ -69,20 +69,19 @@ The Bronze Layer is structured into standalone, modular Python components rather
 ```
 bronze/
 ├── script/
-│   ├── uax_bronze_load.py              # Main Glue job orchestrator & CLI entrypoint
+│   ├── uax_bronze_load.py              # Main Glue job orchestrator entrypoint
 │   ├── config_loader.py                # Centralized JSON parser & {env} interpolator
 │   ├── config/
 │   │   └── bronze_config.json          # Production configuration blueprint
 │   └── connectors/
-│       ├── __init__.py                 # Connector factory & discovery map
-│       ├── base_connector.py           # Abstract Base Class defining ingestion interface
+│       ├── __init__.py                 # Connector registry & CONNECTOR_MAP
+│       ├── database.py                 # Relational database streaming connector
+│       ├── genesys.py                  # Genesys Cloud Analytics API connector
 │       ├── http_client.py              # Requests session manager, backoff & retry
+│       ├── moveworks.py                # Moveworks Enterprise API connector
 │       ├── oauth.py                    # Multi-grant OAuth2 client & token cache
-│       ├── servicenow_connector.py     # ServiceNow REST Table API connector
-│       ├── genesys_connector.py        # Genesys Cloud Analytics API connector
-│       ├── moveworks_connector.py      # Moveworks Enterprise API connector
-│       ├── database_connector.py       # Relational database JDBC/streaming connector
-│       └── s3_connector.py             # S3 object ingestion connector (CSV/JSON)
+│       ├── s3_file.py                  # S3 object ingestion connector (CSV/JSON/Parquet)
+│       └── servicenow.py               # ServiceNow REST Table API connector
 ```
 
 ### Why Standalone Python Modules?
@@ -199,14 +198,14 @@ All sensitive credentials MUST reside in AWS Secrets Manager. Secrets are format
   - **Page Number**: Genesys uses `pageNumber` and `pageSize`.
   - **Window Sharding**: Moveworks splits long time ranges into discrete temporal windows (`shard_window_days: 15`) and queries parallel shards.
 
-### 5.2 Relational Database Streaming (`database_connector.py`)
+### 5.2 Relational Database Streaming (`database.py`)
 * Ingests data incrementally using streaming cursors (`fetch_size: 10000`) to prevent out-of-memory (OOM) conditions on high-volume tables.
 * Dynamic query synthesis:
   ```sql
   SELECT * FROM {table_name} WHERE {default_delta_filter} ORDER BY updated_at ASC
   ```
 
-### 5.3 S3 File Ingestion (`s3_connector.py`)
+### 5.3 S3 File Ingestion (`s3_file.py`)
 * Connects to external S3 buckets containing vendor drops.
 * Modes supported via `fetch_mode`:
   - `all`: Ingests all files whose `LastModified` timestamp is greater than the watermark.
@@ -270,19 +269,41 @@ Add the new source block under `source_systems` or append a table under an exist
 
 ### Step 3: Implement Custom Connector (If Not a Standard REST/DB/S3 Source)
 If the upstream source requires custom protocol handling:
-1. Create `bronze/script/connectors/new_source_connector.py` inheriting from `BaseConnector`.
+1. Create `bronze/script/connectors/new_source.py` implementing the classmethod `fetch_delta()`.
 2. Register the connector in `bronze/script/connectors/__init__.py` under `CONNECTOR_MAP`.
 
-### Step 4: Execute & Validate Locally or via Glue
+### Step 4: Execute & Validate via AWS Glue Job Run
 ```bash
-python3 bronze/script/uax_bronze_load.py \
-  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/bronze/config/bronze_config.json" \
-  --ENV "dev" \
-  --SOURCE_SYSTEM "new_api_source" \
-  --TABLE_NAME "audit_events" \
-  --BRONZE_BUCKET "uax-datalake-bronze-dev" \
-  --STATE_BUCKET "uax-datalake-state-dev"
+aws glue start-job-run \
+  --job-name "glue-bronze-new_api_source-dev" \
+  --arguments '{
+    "--JOB_NAME": "glue-bronze-new_api_source-dev",
+    "--SOURCE_SYSTEM": "new_api_source",
+    "--ENV": "dev",
+    "--SOURCE_TABLE_NAME": "audit_events",
+    "--CONFIG_S3_PATH": "s3://uax-datalake-config-dev/bronze/config/bronze_config.json",
+    "--BRONZE_BUCKET": "uax-datalake-bronze-dev",
+    "--STATE_BUCKET": "uax-datalake-state-dev"
+  }'
 ```
+
+#### AWS Glue Arguments Specification:
+* **Mandatory Glue Arguments:**
+  * `--JOB_NAME`: Unique AWS Glue job name.
+  * `--SOURCE_SYSTEM`: Target source identifier (e.g. `servicenow`, `genesys`, `moveworks`, `new_api_source`).
+* **Optional Glue Arguments (Fallback to `bronze_config.json` if omitted):**
+  * `--ENV`: Target environment (`dev`, `stage`, `prod`; default: `dev`).
+  * `--CONFIG_S3_PATH`: S3 path to `bronze_config.json`.
+  * `--SOURCE_TABLE_NAME`: Specific table(s) to extract (comma-separated; processes all configured source tables if omitted).
+  * `--BRONZE_BUCKET`: Target S3 bucket for Parquet output (fallback: `pipeline_defaults.bronze_bucket`).
+  * `--STATE_BUCKET`: S3 bucket storing state watermarks (fallback: `pipeline_defaults.state_bucket`).
+  * `--SECRET_NAME`: AWS Secrets Manager secret holding credentials (fallback: `source_config.secret_name`).
+  * `--BATCH_SIZE`: Page size (fallback: `source_config.batch_size` or default 1000).
+  * `--INITIAL_LOAD_DATE`: Override initial extraction timestamp.
+  * `--UPPER_BOUND`: Override upper extraction timestamp cutoff.
+  * `--FLATTEN_NESTED_JSON`: Enable/disable recursive JSON flattening (`true`/`false`).
+  * `--ERROR_HANDLING_MODE`: `CONTINUE_ON_ERROR` or `HALT_ON_ERROR`.
+
 Verify that:
 1. Parquet files appear under `s3://uax-datalake-bronze-dev/bronze/data/new_api_source/audit_events/_ingested_at={ISO8601_TIMESTAMP}/`.
 2. The state file is committed at `s3://uax-datalake-state-dev/metadata/bronze/new_api_source/audit_events/watermark.json`.

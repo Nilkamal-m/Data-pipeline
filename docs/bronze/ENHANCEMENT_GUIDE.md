@@ -8,20 +8,19 @@ This guide explains how the Bronze layer code is structured and how to safely ex
 
 ```
 bronze/script/
-├── uax_bronze_load.py          # Main entry point (CLI → orchestration loop)
+├── uax_bronze_load.py          # Main entry point (AWS Glue arguments → orchestration loop)
 ├── config_loader.py            # JSON config reader, {env} interpolation, watermark helpers
 ├── config/
 │   └── bronze_config.json      # All source and table definitions
 └── connectors/
     ├── __init__.py             # CONNECTOR_MAP — maps source type to connector class
-    ├── base_connector.py       # Abstract BaseConnector interface
+    ├── database.py             # Relational DB JDBC streaming
+    ├── genesys.py              # Genesys Cloud Analytics API
     ├── http_client.py          # Shared HTTP session, retry, backoff
+    ├── moveworks.py            # Moveworks Enterprise API
     ├── oauth.py                # OAuth2 multi-grant token manager
-    ├── servicenow_connector.py # ServiceNow REST Table API
-    ├── genesys_connector.py    # Genesys Cloud Analytics API
-    ├── moveworks_connector.py  # Moveworks Enterprise API
-    ├── database_connector.py   # Relational DB JDBC streaming
-    └── s3_file.py              # S3 file drop ingestion
+    ├── s3_file.py              # S3 file drop ingestion
+    └── servicenow.py           # ServiceNow REST Table API
 ```
 
 ---
@@ -69,12 +68,12 @@ The main job calls `get_connector(source_config)` which inspects `source_config[
 
 ---
 
-## 4. Connector Interface (`base_connector.py`)
+## 4. Connector Contract & Protocol Specification
 
-Every connector must implement:
+Every connector exposes a standardized classmethod protocol:
 
 ```python
-class BaseConnector:
+class CustomConnector:
     @classmethod
     def fetch_delta(
         cls,
@@ -85,7 +84,8 @@ class BaseConnector:
         custom_query: str | None,
         on_chunk_callback: callable,
         s3_chunk_size: int,
-    ) -> None:
+        upper_bound: str | None = None,
+    ) -> int:
         ...
 ```
 
@@ -156,8 +156,8 @@ Used when `"type": "s3_file"` is set in config. Key behaviors:
 If the API uses standard OAuth2 + pagination, reuse `GenesysConnector` or `MoveworksConnector` as a template.
 
 If it needs custom protocol handling:
-1. Create `bronze/script/connectors/my_new_api_connector.py`.
-2. Implement `fetch_delta(...)` following the `BaseConnector` interface.
+1. Create `bronze/script/connectors/my_new_api.py`.
+2. Implement `fetch_delta(...)` following the connector protocol.
 3. Register: `CONNECTOR_MAP["my_new_api"] = MyNewApiConnector`.
 
 ### Step 3 — Add Secrets Manager entry

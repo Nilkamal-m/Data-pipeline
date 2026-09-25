@@ -151,6 +151,33 @@ To eliminate duplicate record accumulation and maintain exact parity with the au
 * **Zero Downtime**: Power BI and BI analysts querying `{target_table}` experience continuous availability without locking or missing-table exceptions.
 * **Guaranteed Parity**: Aurora record counts always match Athena Iceberg record counts exactly (e.g. 5,477 rows in Athena $\equiv$ 5,477 rows in Aurora), preventing runaway duplicate counts on recurring runs.
 
+### 5.2 Aurora MySQL Secrets Manager Contract & Key-Value Specification
+
+To securely connect to Amazon Aurora MySQL (or Amazon RDS) without embedding credentials into scripts or configuration files, `GoldLayerManager._resolve_mysql_connection_info()` fetches credentials from AWS Secrets Manager using the secret specified via `--RDS_SECRET_NAME` (or configured under `source_systems.<source>.secret_name` in `gold_config.json`).
+
+#### Required Secret JSON Structure:
+```json
+{
+  "host": "aurora-mysql-cluster.cluster-xyz.us-east-1.rds.amazonaws.com",
+  "port": 3306,
+  "username": "pipeline_app_user",
+  "password": "YourStrongDatabasePassword123!",
+  "engine": "mysql"
+}
+```
+
+#### Key Resolution Reference:
+| Secret JSON Key | Permitted Aliases | Code Usage & Description |
+| :--- | :--- | :--- |
+| `host` | `HOST` | Cluster writer endpoint URL for the Aurora MySQL or RDS database instance. |
+| `port` | `PORT` | Network port for MySQL connectivity (defaults to `3306` if omitted). |
+| `username` | `user`, `USERNAME` | Database application username with DDL and DML privileges on the target reporting schema. |
+| `password` | `PASSWORD`, `pwd`, `db_password` | Database user password. If absent from the secret JSON, the job raises an explicit `ValueError`. |
+| `engine` | `db_type` | Database engine type (`mysql`). |
+
+> [!IMPORTANT]
+> **Schema Enforcement**: In accordance with enterprise shared database policy, zero fallback schema is permitted. You must explicitly supply the target database schema name via the `--GOLD_SCHEMA` Glue argument or `aurora.schema` in `gold_config.json` (e.g. `enterprise_reporting`). If missing, `GoldLayerManager` halts execution immediately.
+
 ---
 
 ## 6. Historical Data Migration & S3 Auto-Archival
@@ -206,15 +233,38 @@ Define the mart and target engines under `source_systems.<source>.tables`:
 }
 ```
 
-### Step 3: Run & Validate
+### Step 3: Run & Validate via AWS Glue Job Run
 ```bash
-python3 gold/script/gold_layer_manager.py \
-  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/gold/config/gold_config.json" \
-  --ENV "dev" \
-  --SOURCE_SYSTEM "servicenow" \
-  --TABLE_NAME "incidents_summary" \
-  --GOLD_BUCKET "uax-datalake-gold-dev"
+aws glue start-job-run \
+  --job-name "glue-gold-servicenow-dev" \
+  --arguments '{
+    "--JOB_NAME": "glue-gold-servicenow-dev",
+    "--SOURCE_SYSTEM": "servicenow",
+    "--ENV": "dev",
+    "--TABLE_NAME": "incidents_summary",
+    "--GOLD_SCHEMA": "enterprise_reporting",
+    "--RDS_SECRET_NAME": "uax-datalake/aurora-credentials-dev",
+    "--GOLD_CONFIG_S3_PATH": "s3://uax-datalake-config-dev/gold/config/gold_config.json"
+  }'
 ```
+
+#### AWS Glue Arguments Specification:
+* **Mandatory Glue Arguments:**
+  * `--JOB_NAME`: Unique AWS Glue job run name.
+  * `--SOURCE_SYSTEM`: Target business source identifier (e.g. `servicenow`, `moveworks`, `genesys`).
+* **Required for Aurora MySQL Serving:**
+  * `--GOLD_SCHEMA`: Target relational schema name (e.g. `enterprise_reporting`). Zero fallback schema is permitted by enterprise policy.
+  * `--RDS_SECRET_NAME`: AWS Secrets Manager secret holding Aurora MySQL credentials (fallback: `source_systems.<source>.secret_name`).
+* **Optional Glue Arguments (Fallback to `gold_config.json` if omitted):**
+  * `--ENV`: Target deployment environment (`dev`, `stage`, `prod`; default: `dev`).
+  * `--GOLD_CONFIG_S3_PATH`: S3 path to `gold_config.json`.
+  * `--TABLE_NAME`: Specific mart to process (processes all source marts if omitted).
+  * `--DATA_LAKE_BUCKET` / `--GOLD_BUCKET`: Target S3 bucket for Gold Iceberg marts.
+  * `--GLUE_DATABASE`: AWS Glue Data Catalog database name.
+  * `--GOLD_TARGETS`: Comma-separated list of serving engines (e.g. `aurora,athena,databricks,redshift`).
+  * `--FULL_REFRESH`: Forces full re-aggregation from Silver tables (`true`/`false`).
+  * `--INCREMENTAL`: Toggles incremental watermark filtering (`true`/`false`).
+
 Verify Athena and Aurora:
 * Athena: `SELECT COUNT(*) FROM uax_datalake_db_dev.gold_servicenow_incidents_summary;`
 * Aurora: `SELECT COUNT(*) FROM enterprise_reporting.gold_servicenow_incidents_summary;`

@@ -171,17 +171,25 @@ sequenceDiagram
 
 The Bronze layer runs as an **AWS Glue Python Shell job** — not PySpark. It uses `boto3` and `pandas` entirely in-process, keeping the runtime lightweight and eliminating Spark startup overhead for API and file-based workloads. Every design decision in this layer serves a single principle: **no data loss, no duplicate writes, no partial states.**
 
-#### 5.1.1 Parameter Resolution — 3-Tier Precedence
+#### 5.1.1 Parameter Resolution — 3-Tier Precedence & Glue Arguments
 
 Before extraction begins, `parse_arguments()` resolves every operating parameter through a strict three-tier chain:
 
 ```
-1. Glue CLI argument   (--KEY value)         ← highest priority
-2. bronze_config.json  (loaded from S3)       ← second
-3. Code hardcoded default                     ← lowest priority
+1. AWS Glue Job Arguments (--KEY value)         ← highest priority (overrides config)
+2. JSON Configuration File (loaded from S3)     ← second priority (default pipeline blueprint)
+3. Code Hardcoded Defaults                     ← lowest priority (safe baseline fallbacks)
 ```
 
 The config file is fetched once from S3 via `ConfigLoader.load_config()`, with all `{env}` placeholders substituted at load time. Bucket names, data prefixes, table lists, and catalog settings are all resolved from this merged context before any connector is initialised.
+
+##### Glue Arguments Contract Across Layers:
+
+| Layer | Mandatory Glue Arguments | Optional Glue Arguments (Fallback to Config) |
+|---|---|---|
+| **Bronze** (`uax_bronze_load.py`) | `--JOB_NAME`<br>`--SOURCE_SYSTEM` | `--ENV` (default: `dev`), `--CONFIG_S3_PATH`, `--SOURCE_TABLE_NAME` (all tables under source if omitted), `--BRONZE_BUCKET`, `--STATE_BUCKET`, `--SECRET_NAME`, `--BATCH_SIZE`, `--INITIAL_LOAD_DATE`, `--UPPER_BOUND`, `--FLATTEN_NESTED_JSON`, `--ERROR_HANDLING_MODE` |
+| **Silver** (`uax_silver_etl.py`) | `--JOB_NAME`<br>`--SOURCE_SYSTEM` | `--ENV` (default: `dev`), `--CONFIG_S3_PATH`, `--SOURCE_TABLE_NAME` (all tables under source if omitted), `--PROCESS_LAYER` (`silver`, `gold`, or `both`), `--DATA_LAKE_BUCKET`, `--GLUE_DATABASE`, `--TABLE_PREFIX`, `--BRONZE_DATA_PREFIX`, `--SILVER_DATA_PREFIX`, `--FULL_REFRESH`, `--INCREMENTAL` |
+| **Gold** (`gold_layer_manager.py`) | `--JOB_NAME`<br>`--SOURCE_SYSTEM` | `--ENV` (default: `dev`), `--GOLD_CONFIG_S3_PATH`, `--TABLE_NAME`, `--GOLD_SCHEMA` (or `aurora.schema` in config — **mandatory for RDS/Aurora**), `--RDS_SECRET_NAME`, `--DATA_LAKE_BUCKET`, `--GLUE_DATABASE`, `--GOLD_TARGETS`, `--FULL_REFRESH`, `--INCREMENTAL` |
 
 #### 5.1.2 Watermark State — Incremental Load Guard
 
@@ -738,7 +746,30 @@ cursor.execute(f"DROP TABLE IF EXISTS enterprise_reporting.gold_{mart_table}_old
 connection.commit()
 ```
 
-#### 5.4.2 Consumer Routing Matrix
+#### 5.4.2 Aurora MySQL Secrets Manager Credentials Contract
+
+To connect to Amazon Aurora MySQL without hardcoding database passwords, `GoldLayerManager._resolve_mysql_connection_info()` retrieves credentials from AWS Secrets Manager using `--RDS_SECRET_NAME` (or the configured `secret_name` under `source_systems.<source>` in `gold_config.json`).
+
+The secret stored in AWS Secrets Manager must adhere to the following JSON structure:
+
+```json
+{
+  "host": "aurora-mysql-cluster.cluster-xyz.us-east-1.rds.amazonaws.com",
+  "port": 3306,
+  "username": "pipeline_app_user",
+  "password": "ActualStrongPassword123!",
+  "engine": "mysql"
+}
+```
+
+##### Field Resolution & Enterprise Validation Rules:
+* **`host`** (or `HOST`, `RDS_HOST`): The Aurora MySQL cluster writer endpoint URL.
+* **`port`** (or `PORT`): Connection port (defaults to `3306`).
+* **`username`** (or `user`, `USERNAME`): Dedicated database user with DDL/DML permissions within the target reporting schema.
+* **`password`** (or `PASSWORD`, `pwd`, `db_password`): Database password. If missing from the secret JSON, the job immediately raises a critical auth `ValueError`.
+* **`gold_schema`** (Target Database Schema): Passed explicitly via `--GOLD_SCHEMA` Glue argument or `aurora.schema` in `gold_config.json` (e.g., `enterprise_reporting`). **In accordance with enterprise shared database policy, zero fallback schema is permitted.**
+
+#### 5.4.3 Consumer Routing Matrix
 
 | Consumer | Data Source | Access Method | Typical Latency |
 |---|---|---|---|

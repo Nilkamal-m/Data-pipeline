@@ -25,7 +25,7 @@ The following Mermaid diagram illustrates the Silver execution pipeline:
 ```mermaid
 flowchart TD
     subgraph Init ["1. Job Initialization & Watermarking"]
-        Start(["Start: uax_silver_etl.py"]) --> ParseArgs["Parse CLI Arguments\n(--DATA_LAKE_BUCKET, --SOURCE_SYSTEM, --TABLE_NAME, etc.)"]
+        Start(["Start: uax_silver_etl.py"]) --> ParseArgs["Parse Glue Job Arguments\n(--DATA_LAKE_BUCKET, --SOURCE_SYSTEM, --TABLE_NAME, etc.)"]
         ParseArgs --> LoadConfig["SilverConfigLoader.load_config()\nInterpolate {env} Variables"]
         LoadConfig --> GetWatermark["Fetch Watermark from S3:\ns3://{state_bucket}/metadata/silver/{source}_{table}_watermark.json"]
     end
@@ -203,16 +203,34 @@ If complex business logic is needed:
 2. Implement `def transform(df: DataFrame) -> DataFrame:`.
 3. Reference the script path in `silver_config.json` under `custom_transform_script`.
 
-### Step 3: Run & Validate
+### Step 3: Run & Validate via AWS Glue Job Run
 ```bash
-python3 silver/script/uax_silver_etl.py \
-  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/silver/config/silver_config.json" \
-  --ENV "dev" \
-  --SOURCE_SYSTEM "servicenow" \
-  --TABLE_NAME "tbl_new_entity" \
-  --DATA_LAKE_BUCKET "uax-datalake-silver-dev" \
-  --STATE_BUCKET "uax-datalake-state-dev"
+aws glue start-job-run \
+  --job-name "glue-silver-servicenow-dev" \
+  --arguments '{
+    "--JOB_NAME": "glue-silver-servicenow-dev",
+    "--SOURCE_SYSTEM": "servicenow",
+    "--ENV": "dev",
+    "--SOURCE_TABLE_NAME": "tbl_new_entity",
+    "--CONFIG_S3_PATH": "s3://uax-datalake-config-dev/silver/config/silver_config.json",
+    "--DATA_LAKE_BUCKET": "uax-datalake-silver-dev"
+  }'
 ```
+
+#### AWS Glue Arguments Specification:
+* **Mandatory Glue Arguments:**
+  * `--JOB_NAME`: Unique AWS Glue job run name.
+  * `--SOURCE_SYSTEM`: Target source system identifier matching `silver_config.json`.
+* **Optional Glue Arguments (Fallback to `silver_config.json` if omitted):**
+  * `--ENV`: Target deployment environment (`dev`, `stage`, `prod`; default: `dev`).
+  * `--CONFIG_S3_PATH`: S3 path to `silver_config.json`.
+  * `--SOURCE_TABLE_NAME`: Target table name to process (processes all source tables if omitted).
+  * `--PROCESS_LAYER`: Pipeline target layer (`silver`, `gold`, or `both`; default: `silver`).
+  * `--DATA_LAKE_BUCKET`: Target S3 bucket for Iceberg data and watermarks.
+  * `--GLUE_DATABASE`: AWS Glue Data Catalog database name.
+  * `--TABLE_PREFIX`: Prefix for conformed Silver tables (`tbl_`).
+  * `--FULL_REFRESH`: Forces full re-scan of all Bronze partitions (`true`/`false`).
+  * `--INCREMENTAL`: Toggles incremental watermark filtering (`true`/`false`).
 Verify via Amazon Athena:
 ```sql
 SELECT * FROM "uax_datalake_db_dev"."tbl_new_entity" LIMIT 10;

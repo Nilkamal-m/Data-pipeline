@@ -69,96 +69,124 @@ Every secret follows the enterprise naming format:
 }
 ```
 
-#### Relational Database — JDBC Ingestion / Aurora Serving
+#### Relational Database — Aurora MySQL Serving / RDS Ingestion
 ```json
 {
-  "db_type": "mysql",
-  "host": "aurora-cluster.prod.internal",
+  "host": "aurora-cluster.cluster-xyz.us-east-1.rds.amazonaws.com",
   "port": 3306,
-  "dbname": "enterprise_reporting",
-  "username": "uax_app_user",
-  "password": "SecureDatabasePassword456!"
+  "username": "pipeline_app_user",
+  "password": "SecureDatabasePassword456!",
+  "engine": "mysql"
 }
 ```
+* **`host`**: Aurora MySQL / RDS cluster writer endpoint URL.
+* **`port`**: Port number (`3306`).
+* **`username`**: Database application username.
+* **`password`**: User password.
+* **Target Schema**: Specified via `--GOLD_SCHEMA` (or `aurora.schema` in `gold_config.json`, e.g. `enterprise_reporting`). Mandatory per zero-fallback policy.
 
 ---
 
-## 3. Command-Line Interface (CLI) Reference
+## 3. AWS Glue Job Execution & Arguments Reference
 
-Each pipeline layer can be triggered on-demand via Python Shell / PySpark Glue job runs.
-
-### 3.1 Bronze Layer CLI (`uax_bronze_load.py`)
-```bash
-python3 bronze/script/uax_bronze_load.py \
-  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/bronze/config/bronze_config.json" \
-  --ENV "dev" \
-  --SOURCE_SYSTEM "servicenow" \
-  --TABLE_NAME "incident" \
-  --BRONZE_BUCKET "uax-datalake-bronze-dev" \
-  --STATE_BUCKET "uax-datalake-state-dev" \
-  --INITIAL_LOAD_DATE "2024-01-01 00:00:00" \
-  --FULL_REFRESH "false"
-```
-
-| Parameter | Required? | Description |
-| :--- | :--- | :--- |
-| `--CONFIG_S3_PATH` | Optional | S3 URI to `bronze_config.json`. If omitted, loads local config. |
-| `--ENV` | Optional | Target environment (`dev`, `stage`, `prod`). Defaults to `dev`. |
-| `--SOURCE_SYSTEM` | **Required** | Source system key under `source_systems` in config. |
-| `--TABLE_NAME` | Optional | Specific table to process. If omitted, runs all tables under source. |
-| `--BRONZE_BUCKET` | Optional | Destination S3 bucket for raw Parquet files. |
-| `--STATE_BUCKET` | Optional | S3 bucket storing state watermarks JSON. |
-| `--INITIAL_LOAD_DATE`| Optional | Overrides table initial start timestamp. |
-| `--UPPER_BOUND` | Optional | Upper limit timestamp cutoff for historical backfills. |
-| `--FULL_REFRESH` | Optional | Set `true` to ignore S3 state and reload from `initial_load_date`. |
+Each pipeline layer runs as an **AWS Glue Job** orchestrated by AWS Step Functions or triggered via `aws glue start-job-run`. Parameters follow a strict hierarchy: **Glue Job Arguments (`--KEY value`) take top priority; if omitted, the job resolves parameters from its JSON configuration.**
 
 ---
 
-### 3.2 Silver Layer CLI (`uax_silver_etl.py`)
+### 3.1 Bronze Layer Glue Job Arguments (`uax_bronze_load.py`)
+
 ```bash
-python3 silver/script/uax_silver_etl.py \
-  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/silver/config/silver_config.json" \
-  --ENV "dev" \
-  --SOURCE_SYSTEM "servicenow" \
-  --TABLE_NAME "tbl_incident" \
-  --DATA_LAKE_BUCKET "uax-datalake-silver-dev" \
-  --STATE_BUCKET "uax-datalake-state-dev" \
-  --FULL_REFRESH "false"
+aws glue start-job-run \
+  --job-name "glue-bronze-servicenow-dev" \
+  --arguments '{
+    "--JOB_NAME": "glue-bronze-servicenow-dev",
+    "--SOURCE_SYSTEM": "servicenow",
+    "--ENV": "dev",
+    "--SOURCE_TABLE_NAME": "incident",
+    "--CONFIG_S3_PATH": "s3://uax-datalake-config-dev/bronze/config/bronze_config.json",
+    "--BRONZE_BUCKET": "uax-datalake-bronze-dev",
+    "--STATE_BUCKET": "uax-datalake-state-dev"
+  }'
 ```
 
-| Parameter | Required? | Description |
-| :--- | :--- | :--- |
-| `--CONFIG_S3_PATH` | Optional | S3 URI to `silver_config.json`. Defaults to local config if omitted. |
-| `--ENV` | Optional | Target environment (`dev`, `stage`, `prod`). |
-| `--SOURCE_SYSTEM` | **Required** | Source system key (e.g., `servicenow`, `genesys`). |
-| `--TABLE_NAME` | Optional | Target Silver Iceberg table name (e.g., `tbl_incident`). |
-| `--DATA_LAKE_BUCKET`| Optional | S3 bucket containing Bronze data and Silver Iceberg tables. |
-| `--STATE_BUCKET` | Optional | S3 bucket holding Silver watermarks JSON. |
-| `--FULL_REFRESH` | Optional | Set `true` to re-process all Bronze partitions from the beginning. |
+| Parameter | Required? | Fallback Behavior if Omitted | Description |
+| :--- | :--- | :--- | :--- |
+| `--JOB_NAME` | **Mandatory** | None | Unique name of the AWS Glue job run. |
+| `--SOURCE_SYSTEM` | **Mandatory** | None | Target source system key (e.g. `servicenow`, `genesys`, `moveworks`). |
+| `--ENV` | Optional | `dev` | Target deployment environment (`dev`, `stage`, `prod`). |
+| `--CONFIG_S3_PATH` | Optional | `s3://{bronze_bucket}/bronze/script/config/bronze_config.json` | S3 URI to `bronze_config.json`. |
+| `--SOURCE_TABLE_NAME` | Optional | All tables configured under `source_systems.<source>.tables` | Specific table or comma-separated list of tables to extract. |
+| `--BRONZE_BUCKET` | Optional | `pipeline_defaults.bronze_bucket` in config | S3 bucket destination for raw Parquet files. |
+| `--STATE_BUCKET` | Optional | `pipeline_defaults.state_bucket` or `--BRONZE_BUCKET` | S3 bucket holding watermark state JSON files. |
+| `--SECRET_NAME` | Optional | `source_config.secret_name` in config | AWS Secrets Manager secret holding API credentials. |
+| `--BATCH_SIZE` | Optional | `source_config.batch_size` or default `1000` | Records per API page / JDBC streaming batch. |
+| `--INITIAL_LOAD_DATE` | Optional | `initial_load_date` in table config | Manual override start timestamp. |
+| `--UPPER_BOUND` | Optional | Current job start UTC timestamp | Upper limit timestamp cutoff for extraction. |
+| `--FLATTEN_NESTED_JSON` | Optional | `source_config.flatten_nested_json` or `true` | Flatten nested JSON payloads (`true`/`false`). |
+| `--ERROR_HANDLING_MODE` | Optional | `CONTINUE_ON_ERROR` | Error policy: `CONTINUE_ON_ERROR` or `HALT_ON_ERROR`. |
 
 ---
 
-### 3.3 Gold Layer CLI (`gold_layer_manager.py`)
+### 3.2 Silver Layer Glue Job Arguments (`uax_silver_etl.py`)
+
 ```bash
-python3 gold/script/gold_layer_manager.py \
-  --CONFIG_S3_PATH "s3://uax-datalake-config-dev/gold/config/gold_config.json" \
-  --ENV "dev" \
-  --SOURCE_SYSTEM "moveworks" \
-  --TABLE_NAME "interactions" \
-  --GOLD_BUCKET "uax-datalake-gold-dev" \
-  --FULL_REFRESH "false" \
-  --RELOAD_INITIAL "false"
+aws glue start-job-run \
+  --job-name "glue-silver-servicenow-dev" \
+  --arguments '{
+    "--JOB_NAME": "glue-silver-servicenow-dev",
+    "--SOURCE_SYSTEM": "servicenow",
+    "--ENV": "dev",
+    "--SOURCE_TABLE_NAME": "tbl_incident",
+    "--CONFIG_S3_PATH": "s3://uax-datalake-config-dev/silver/config/silver_config.json"
+  }'
 ```
 
-| Parameter | Required? | Description |
-| :--- | :--- | :--- |
-| `--CONFIG_S3_PATH` | Optional | S3 URI to `gold_config.json`. |
-| `--ENV` | Optional | Target environment (`dev`, `stage`, `prod`). |
-| `--SOURCE_SYSTEM` | **Required** | Source system key (e.g., `moveworks`, `genesys`). |
-| `--TABLE_NAME` | Optional | Specific Gold mart table to transform and serve. |
-| `--GOLD_BUCKET` | Optional | S3 bucket holding Gold Iceberg data and initial CSV drops. |
-| `--FULL_REFRESH` | Optional | Forces complete rebuild of Gold marts from Silver tables. |
-| `--RELOAD_INITIAL` | Optional | Forces re-ingestion of archived historical CSV files. |
+| Parameter | Required? | Fallback Behavior if Omitted | Description |
+| :--- | :--- | :--- | :--- |
+| `--JOB_NAME` | **Mandatory** | None | Unique name of the AWS Glue job run. |
+| `--SOURCE_SYSTEM` | **Mandatory** | None | Upstream source identifier matching `silver_config.json`. |
+| `--ENV` | Optional | `dev` | Target environment (`dev`, `stage`, `prod`). |
+| `--CONFIG_S3_PATH` | Optional | `s3://{data_lake_bucket}/silver/script/config/silver_config.json` | S3 URI to `silver_config.json`. |
+| `--SOURCE_TABLE_NAME` | Optional | All tables configured under `source_systems.<source>.tables` | Specific Silver Iceberg table name to process. |
+| `--PROCESS_LAYER` | Optional | `silver` | Pipeline stage: `silver`, `gold`, or `both`. |
+| `--DATA_LAKE_BUCKET` | Optional | `pipeline_defaults.data_lake_bucket` in config | S3 bucket containing Bronze data and Silver Iceberg tables. |
+| `--GLUE_DATABASE` | Optional | `pipeline_defaults.glue_database` or `uax_datalake_db_{env}` | AWS Glue Data Catalog database name. |
+| `--TABLE_PREFIX` | Optional | `pipeline_defaults.table_prefix` or `tbl_` | Standard prefix for conformed Silver tables. |
+| `--FULL_REFRESH` | Optional | `false` | Set `true` to reprocess all Bronze partitions from the beginning. |
+| `--INCREMENTAL` | Optional | `true` | Enables incremental filtering using `_ingested_at > last_watermark`. |
+
+---
+
+### 3.3 Gold Layer Glue Job Arguments (`gold_layer_manager.py`)
+
+```bash
+aws glue start-job-run \
+  --job-name "glue-gold-moveworks-dev" \
+  --arguments '{
+    "--JOB_NAME": "glue-gold-moveworks-dev",
+    "--SOURCE_SYSTEM": "moveworks",
+    "--ENV": "dev",
+    "--TABLE_NAME": "interactions",
+    "--GOLD_SCHEMA": "enterprise_reporting",
+    "--RDS_SECRET_NAME": "uax-datalake/aurora-credentials-dev",
+    "--GOLD_CONFIG_S3_PATH": "s3://uax-datalake-config-dev/gold/config/gold_config.json"
+  }'
+```
+
+| Parameter | Required? | Fallback Behavior if Omitted | Description |
+| :--- | :--- | :--- | :--- |
+| `--JOB_NAME` | **Mandatory** | None | Unique name of the AWS Glue job run. |
+| `--SOURCE_SYSTEM` | **Mandatory** | None | Target business domain source (e.g. `moveworks`, `genesys`). |
+| `--GOLD_SCHEMA` | **Required for Aurora** | `aurora.schema` in `gold_config.json` | Target MySQL schema (e.g. `enterprise_reporting`). No fallback allowed. |
+| `--RDS_SECRET_NAME` | **Required for Aurora** | `source_systems.<source>.secret_name` in config | AWS Secrets Manager secret holding Aurora MySQL credentials. |
+| `--ENV` | Optional | `dev` | Target environment (`dev`, `stage`, `prod`). |
+| `--GOLD_CONFIG_S3_PATH`| Optional | `s3://{gold_bucket}/gold/script/config/gold_config.json` | S3 URI to `gold_config.json`. |
+| `--TABLE_NAME` | Optional | All marts configured under `source_systems.<source>.tables` | Specific Gold mart table to transform and serve. |
+| `--DATA_LAKE_BUCKET` / `--GOLD_BUCKET` | Optional | `pipeline_defaults.gold_bucket` in config | S3 bucket holding Gold Iceberg data and initial CSV drops. |
+| `--GLUE_DATABASE` | Optional | `pipeline_defaults.glue_database` or `uax_datalake_db_{env}` | AWS Glue Data Catalog database name. |
+| `--GOLD_TARGETS` | Optional | `source_config.target_engines` in config | Comma-separated serving targets (e.g. `aurora,athena,databricks,redshift`). |
+| `--FULL_REFRESH` | Optional | `false` | Forces complete rebuild of Gold marts from Silver tables. |
+| `--INCREMENTAL` | Optional | `true` | Toggles incremental delta evaluation. |
 
 ---
 

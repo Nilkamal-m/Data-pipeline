@@ -86,7 +86,7 @@ This document provides the definitive configuration blueprint for `gold_config.j
 
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
-| `gold_bucket` | string | **Required** (Config or CLI) | *Used in `GoldLayerManager.run()`*: Target S3 bucket for Gold Iceberg marts and metadata storage. |
+| `gold_bucket` | string | **Required** (Config or Glue Argument) | *Used in `GoldLayerManager.run()`*: Target S3 bucket for Gold Iceberg marts and metadata storage. |
 | `gold_data_prefix` | string | Optional (Default: `gold/data`) | *Used in Iceberg table location*: S3 prefix where Gold Iceberg data files are written. |
 | `target_format` | string | Optional (Default: `iceberg`) | *Used in Spark DDL generation*: Target storage format for primary marts (`iceberg`). |
 | `table_prefix` | string | Optional (Default: `gold_{source}_`) | *Used in table naming convention*: Uniform prefix prepended across all serving engines. |
@@ -131,8 +131,19 @@ The config keys below tell `gold_layer_manager.py` **where** to write for each d
 #### Amazon Aurora MySQL (`aurora`)
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
-| `schema` | string | **Required** | *Used in `_serve_to_mysql()`*: Target MySQL database/schema name (e.g., `enterprise_reporting`). |
+| `schema` | string | **Required** | *Used in `_serve_to_mysql()`*: Target MySQL database/schema name (e.g., `enterprise_reporting`). Mandatory per zero-fallback policy. |
 | `table_name` | string | **Required** | *Used in `_serve_to_mysql()`*: Target physical MySQL table name (e.g., `gold_moveworks_interactions`). |
+
+##### AWS Secrets Manager Credentials Contract:
+Credentials for Aurora MySQL are fetched via the secret referenced by `--RDS_SECRET_NAME` (or `secret_name` in config). The secret JSON payload must provide:
+
+| Secret Key | Permitted Aliases | Description |
+| :--- | :--- | :--- |
+| `host` | `HOST` | Cluster writer endpoint URL for Aurora MySQL or RDS instance. |
+| `port` | `PORT` | MySQL connection port (`3306` default). |
+| `username` | `user`, `USERNAME` | Database application username with DDL/DML privileges. |
+| `password` | `PASSWORD`, `pwd`, `db_password` | Database password (raises `ValueError` if missing). |
+| `engine` | `db_type` | Database engine type (`mysql`). |
 
 > **Flow:** Gold Glue job materializes the Iceberg mart first, then reads it back via `spark.table()` and writes to Aurora using a staging-swap pattern. Aurora is **downstream of Iceberg**, not a parallel write target.
 

@@ -120,8 +120,8 @@ This document provides the complete, production-grade configuration blueprint fo
 
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
-| `silver_bucket` | string | **Required** (Config or CLI) | *Used in `uax_silver_etl.py` S3 path builder*: S3 bucket where conformed Iceberg data and metadata files reside. |
-| `state_bucket` | string | **Required** (Config or CLI) | *Used in `get_silver_last_load_date()`*: S3 bucket holding the watermarks JSON files. |
+| `silver_bucket` | string | **Required** (Config or Glue Argument) | *Used in `uax_silver_etl.py` S3 path builder*: S3 bucket where conformed Iceberg data and metadata files reside. |
+| `state_bucket` | string | **Required** (Config or Glue Argument) | *Used in `get_silver_last_load_date()`*: S3 bucket holding the watermarks JSON files. |
 | `target_format` | string | Optional (Default: `iceberg`) | *Used in DDL generation*: Target table storage format (`iceberg`). |
 | `table_prefix` | string | Optional (Default: `tbl_`) | *Used in naming resolution*: Standardized prefix prepended to all conformed Silver tables. |
 | `merge_strategy` | string | Optional (Default: `upsert`) | *Used in Spark SQL execution*: Default merge mode (`upsert`, `append`, `overwrite`). |

@@ -128,8 +128,8 @@ This document provides the definitive configuration blueprint for `bronze_config
 
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
-| `bronze_bucket` | string | **Required** (Config or CLI) | *Used in `BronzeLoadManager.run()`*: Target S3 bucket where raw Parquet files are written. Supports `{env}` interpolation. |
-| `state_bucket` | string | **Required** (Config or CLI) | *Used in `BronzeLoadManager._get_watermark()` / `_commit_watermark()`*: S3 bucket storing state JSON tracking `last_load_date`. |
+| `bronze_bucket` | string | **Required** (Config or Glue Argument) | *Used in `BronzeLoadManager.run()`*: Target S3 bucket where raw Parquet files are written. Supports `{env}` interpolation. |
+| `state_bucket` | string | **Required** (Config or Glue Argument) | *Used in `BronzeLoadManager._get_watermark()` / `_commit_watermark()`*: S3 bucket storing state JSON tracking `last_load_date`. |
 | `batch_size` | integer | Optional (Default: `1000`) | *Used in HTTP connectors (`HttpClient`)*: Number of records requested per pagination call. |
 | `s3_chunk_size` | integer | Optional (Default: `10000`) | *Used in `BronzeLoadManager._write_parquet_partition()`*: In-memory record batch threshold before flushing a Parquet file to S3. |
 | `max_retries` | integer | Optional (Default: `3`) | *Used in `http_client.py` (`Retry`)*: Maximum HTTP retry attempts on transient network or 5xx server errors. |
