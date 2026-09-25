@@ -35,7 +35,7 @@ flowchart LR
 
     subgraph Reporting ["Reporting Layer (Downstream Serving)"]
         Aurora[("Amazon Aurora MySQL\n(enterprise_reporting tables)")]
-        Databricks[("Databricks\n(Conformed Reporting)")]
+        Databricks[("Databricks Federated Layer\n(Mirrors Glue Catalog Tables directly)")]
         Redshift[("Amazon Redshift Spectrum\n(External Catalog)")]
         Snowflake[("Snowflake\n(Iceberg Tables)")]
     end
