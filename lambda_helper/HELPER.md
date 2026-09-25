@@ -94,23 +94,21 @@ If `"query"`, `"sql"`, `"athena_query"`, or `"query_file"` is provided, Lambda r
 
 ### 2.4 AWS Step Functions Orchestration Parameters
 
-If `"action": "step_function"`, `"layer": "step_function"`, or `"state_machine_arn"` is provided, Lambda triggers and optionally monitors an AWS Step Functions execution:
+To trigger an AWS Step Functions State Machine, **only 2 parameters are required**:
+1. `"action": "stepfunction"`
+2. `"stepfunction_name": "uax-pipeline-orchestrator-dev"`
 
-| Parameter | Type | Required | Default | Description |
+All pipeline configurations, task definitions, and Glue job arguments are encapsulated directly within the Step Functions state machine itself, meaning **there are zero mandatory dependencies or external pipeline arguments needed in the Lambda payload**.
+
+| Parameter | Type | Required / Optional | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `action` / `layer` | string | Optional* | - | Set to `"step_function"`, `"state_machine"`, or `"sfn"`. |
-| `state_machine_arn` | string | Optional* | `uax-pipeline-orchestrator-{env}` | Target State Machine ARN or name. |
-| `execution_name` | string | Optional | Auto-generated | Unique name for the execution (auto-appends timestamp & UUID). |
-| `source_system` | string | **Required** | `servicenow` | Upstream system to process (e.g. `servicenow`, `moveworks`, `genesys`). |
-| `env` | string | Optional | `dev` | Environment name (`dev`, `uat`, `prod`). |
-| `pipeline_layer` | string | Optional | `all` | Stages to run: `"all"` (Bronze $\rightarrow$ Silver $\rightarrow$ Gold), `"bronze"`, `"silver"`, or `"gold"`. |
-| `source_table_name` | string \| list | Optional | All configured | Specific table to process through the pipeline. |
-| `gold_schema` | string | Optional | `enterprise_reporting` | Target MySQL/Aurora schema when running Gold mart stages. |
-| `wait_until_completion` | boolean | Optional | `false` | When `false`, triggers async and returns HTTP 202 immediately. When `true`, polls until terminal status. |
-| `poll_interval_seconds` | integer | Optional | `10` | Polling interval in seconds when monitoring synchronously. |
-| `timeout_seconds` | integer | Optional | `540` | Maximum wait time before timeout. |
-
-*\*At least one of `"action": "step_function"`, `"layer": "step_function"`, or `"state_machine_arn"` must be provided.*
+| `action` | string | **Required** | - | Set to `"stepfunction"` (or `"step_function"`). |
+| `stepfunction_name` | string | **Required** | `uax-pipeline-orchestrator-dev` | Name of the Step Function State Machine (or full ARN). |
+| `execution_name` | string | Optional | Auto-generated | Custom execution identifier (auto-generated as `<name>-<timestamp>-<uuid>` if omitted). |
+| `wait_until_completion` | boolean | Optional | `false` | Default `false` (asynchronous fire-and-forget, returns HTTP 202). Set to `true` to synchronously poll. |
+| `poll_interval_seconds` | integer | Optional | `10` | Polling interval in seconds when `wait_until_completion: true`. |
+| `timeout_seconds` | integer | Optional | `540` | Polling timeout in seconds. |
+| *(Any extra keys)* | any | Optional | Pass-through | Any optional override parameters (e.g. `source_table_name`, `env`) will be passed directly into the Step Function's input JSON. |
 
 ---
 
@@ -491,14 +489,12 @@ python3 lambda_helper/lambda_function.py s3://uax-datalake-bronze-bucket-dev/bro
 
 ### G. AWS Step Functions State Machine Payloads (`"action": "stepfunction"`)
 
-#### 31. Standard Pipeline Trigger by Step Function Name
-Triggers the state machine by its name with `"action": "stepfunction"`:
+#### 31. Minimal Pipeline Trigger (Zero Dependencies)
+Triggers the full pipeline state machine with **only these 2 parameters**. All pipeline tasks, configurations, and Glue job parameters are defined within the Step Function itself:
 ```json
 {
   "action": "stepfunction",
-  "stepfunction_name": "uax-pipeline-orchestrator-dev",
-  "source_system": "servicenow",
-  "env": "dev"
+  "stepfunction_name": "uax-pipeline-orchestrator-dev"
 }
 ```
 

@@ -605,23 +605,28 @@ def is_step_function_event(event: Dict[str, Any]) -> bool:
 def trigger_and_monitor_step_function(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Triggers an AWS Step Functions State Machine execution and optionally monitors it until completion.
+    Only requires:
+      {
+        "action": "stepfunction",
+        "stepfunction_name": "uax-pipeline-orchestrator-dev"
+      }
+    Zero external dependencies required; all pipeline parameters are configured within the Step Function.
     """
     state_machine_arn = (
         event.get('state_machine_arn')
         or event.get('STATE_MACHINE_ARN')
         or DEFAULT_STATE_MACHINE_ARN
     )
-    env = event.get('env') or event.get('ENV') or os.environ.get('ENVIRONMENT', 'dev')
-    source_system = event.get('source_system') or event.get('SOURCE_SYSTEM', 'servicenow')
+
+    state_machine_name = (
+        event.get('stepfunction_name')
+        or event.get('step_function_name')
+        or event.get('state_machine_name')
+        or event.get('name')
+        or os.environ.get('DEFAULT_STATE_MACHINE_NAME', 'uax-pipeline-orchestrator-dev')
+    )
 
     if not state_machine_arn:
-        state_machine_name = (
-            event.get('stepfunction_name')
-            or event.get('step_function_name')
-            or event.get('state_machine_name')
-            or event.get('name')
-            or f"uax-pipeline-orchestrator-{env}"
-        )
         if state_machine_name.startswith('arn:aws:states:'):
             state_machine_arn = state_machine_name
         else:
@@ -633,17 +638,20 @@ def trigger_and_monitor_step_function(event: Dict[str, Any], context: Any) -> Di
             except Exception:
                 state_machine_arn = f"arn:aws:states:us-east-1:123456789012:stateMachine:{state_machine_name}"
 
-    # Extract input payload to pass to Step Function
+    # Extract input payload to pass to Step Function (no forced defaults)
     control_keys = {
-        'action', 'state_machine_arn', 'STATE_MACHINE_ARN', 'state_machine_name',
+        'action', 'layer', 'state_machine_arn', 'STATE_MACHINE_ARN', 'state_machine_name',
         'stepfunction_name', 'step_function_name', 'name',
         'execution_name', 'wait_until_completion', 'poll_interval_seconds', 'timeout_seconds'
     }
-    sfn_input = {k: v for k, v in event.items() if k not in control_keys}
-    sfn_input.setdefault('source_system', source_system)
-    sfn_input.setdefault('env', env)
-    if 'layer' not in sfn_input or sfn_input['layer'] in ('step_function', 'stepfunction', 'state_machine', 'sfn'):
-        sfn_input['layer'] = event.get('pipeline_layer', 'all')
+
+    if isinstance(event.get('input'), dict):
+        sfn_input = event['input']
+    elif isinstance(event.get('payload'), dict):
+        sfn_input = event['payload']
+    else:
+        # Pass only extra user-supplied parameters, if any (otherwise empty dict)
+        sfn_input = {k: v for k, v in event.items() if k not in control_keys}
 
     # Generate unique execution name
     execution_name = event.get('execution_name')
@@ -651,8 +659,9 @@ def trigger_and_monitor_step_function(event: Dict[str, Any], context: Any) -> Di
         import uuid
         ts = int(time.time())
         rnd = uuid.uuid4().hex[:6]
-        clean_source = re.sub(r'[^a-zA-Z0-9-_]', '', str(source_system))
-        execution_name = f"{clean_source}-{env}-{ts}-{rnd}"
+        base_name = state_machine_name.split(':')[-1]
+        clean_name = re.sub(r'[^a-zA-Z0-9-_]', '', str(base_name))[:40]
+        execution_name = f"{clean_name}-{ts}-{rnd}"
 
     logger.info(f"Triggering Step Function: {state_machine_arn}")
     logger.info(f"Execution Name: {execution_name}")
