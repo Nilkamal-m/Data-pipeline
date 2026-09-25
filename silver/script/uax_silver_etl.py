@@ -877,7 +877,7 @@ def perform_deduplication(df, nkeys, order_cols, strategy='latest_by_order_colum
     nkey_cols = [col(k) for k in (nkeys if isinstance(nkeys, list) else [nkeys])]
     order_col_list = order_cols if isinstance(order_cols, list) else [order_cols]
 
-    if strategy == 'earliest_by_order_column':
+    if strategy in ('earliest_by_order_column', 'oldest_by_order_column'):
         order_directions = [col(c).asc() for c in order_col_list]
     else:
         order_directions = [col(c).desc() for c in order_col_list]

@@ -123,11 +123,24 @@ In `silver_config.json`, `glue_catalog.trigger_crawler` is explicitly set to `fa
 ### 5.1 In-Batch Deduplication (`perform_deduplication`)
 Before executing any merge against the target Iceberg table, incoming Bronze micro-batches are deduplicated in-memory using Spark windowing:
 ```python
-window_spec = Window.partitionBy(*nkeys).orderBy(*[col(c).desc() for c in order_cols])
+if strategy in ('earliest_by_order_column', 'oldest_by_order_column'):
+    order_directions = [col(c).asc() for c in order_cols]
+else:
+    order_directions = [col(c).desc() for c in order_cols]
+
+window_spec = Window.partitionBy(*nkeys).orderBy(*order_directions)
 deduped_df = df.withColumn("_row_num", row_number().over(window_spec)) \
                .filter(col("_row_num") == 1) \
                .drop("_row_num")
 ```
+
+* **`latest_by_order_column` (Default)**: Orders descending (`.desc()`), selecting `_row_num == 1` which is the most recently updated record in the micro-batch. Essential for CDC / UPSERT operations.
+* **`oldest_by_order_column` / `earliest_by_order_column`**: Orders ascending (`.asc()`), selecting `_row_num == 1` which is the earliest / first-seen record in the micro-batch. Used for immutable audit logs, creation timestamps, and session attribution.
+
+> [!WARNING]
+> **Table-Level Deduplication Key Requirement:**
+> Do **NOT** rely on global default keys (`default_nkey: sys_id`, `default_order_column: sys_updated_on`). Every table in `silver_config.json` must explicitly specify its own `nkey` and `deduplication_order_by` columns.
+
 
 ### 5.2 SCD Type 1: In-Place UPSERT
 Used for operational entities where only the latest state is required (e.g., ticket status, user profile).

@@ -43,6 +43,7 @@ This document provides the complete, production-grade configuration blueprint fo
     "deduplication": {
       "enabled": true,
       "strategy": "latest_by_order_column",
+      "_warning": "CRITICAL: Do NOT rely on default_nkey/order_column. Every table MUST define its own nkey and deduplication_order_by!",
       "default_nkey": "sys_id",
       "default_order_column": "sys_updated_on"
     },
@@ -58,6 +59,7 @@ This document provides the complete, production-grade configuration blueprint fo
       "enabled": true,
       "database_name": "uax_datalake_db_{env}",
       "crawler_name": "uax-datalake-silver-crawler-{env}",
+      "_warning": "CRITICAL: trigger_crawler MUST remain false for Silver Iceberg tables to prevent catalog corruption!",
       "trigger_crawler": false,
       "sync_watermark_table": true,
       "watermark_table_name": "tbl_watermarks"
@@ -134,15 +136,88 @@ This document provides the complete, production-grade configuration blueprint fo
 
 ---
 
-### 2.2 Deduplication, Watermarking & SCD Blocks
+### 2.2 Deduplication, Watermarking, Catalog & SCD Blocks
 
 #### `deduplication` Block
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
 | `enabled` | boolean | Optional (Default: `true`) | *Used in `perform_deduplication()`*: If `true`, runs in-batch deduplication before merging into Iceberg. |
-| `strategy` | string | Optional (Default: `latest_by_order_column`) | *Used in `perform_deduplication()`*: Deduplication algorithm (`latest_by_order_column`). |
-| `default_nkey` | string | Optional (Default: `sys_id`) | *Used in `perform_deduplication()`*: Fallback primary key column when table config does not declare one. |
-| `default_order_column`| string | Optional (Default: `sys_updated_on`) | *Used in `perform_deduplication()`*: Fallback sort column for window ordering. |
+| `strategy` | string | Optional (Default: `latest_by_order_column`) | *Used in `perform_deduplication()`*: Deduplication algorithm (`latest_by_order_column`, `oldest_by_order_column`, or `earliest_by_order_column`). |
+| `default_nkey` | string | **DO NOT USE AS DEFAULT** (Legacy Default: `sys_id`) | *Used in `perform_deduplication()`*: Fallback primary key column when table config does not declare one. |
+| `default_order_column`| string | **DO NOT USE AS DEFAULT** (Legacy Default: `sys_updated_on`) | *Used in `perform_deduplication()`*: Fallback sort column for window ordering. |
+
+> [!WARNING]
+> **YELLOW WARNING — DO NOT RELY ON `default_nkey` OR `default_order_column` AS GLOBAL FALLBACKS!**
+> The values `"default_nkey": "sys_id"` and `"default_order_column": "sys_updated_on"` in `pipeline_defaults.deduplication` are **ServiceNow-specific legacy defaults**. If any table definition from other upstream sources (such as Genesys, Moveworks, Salesforce, relational databases, or flat files) omits its own deduplication key or ordering column, the pipeline will attempt to fall back to these defaults. Because those source tables do not contain `sys_id` or `sys_updated_on`, PySpark will immediately throw a critical `AnalysisException: Cannot resolve column name "sys_id"` or fail during windowing.
+
+> [!CAUTION]
+> **RED ALERT — MANDATORY TABLE-LEVEL CONFIGURATION POLICY:**
+> **Every single table** defined in `source_systems.<system>.tables.<table>` **MUST explicitly declare its own `nkey` (or `deduplication_keys`) and `deduplication_order_by`**.
+> * **Never** leave `nkey` or `deduplication_order_by` empty or omitted for any table.
+> * If a table does not have an explicit primary key or update timestamp, deduplication cannot determine which record is current, leading to severe runtime crashes or silent data corruption!
+
+---
+
+#### Deduplication Strategy Deep Dive: `latest_by_order_column` vs. `oldest_by_order_column`
+
+The Silver ETL engine performs windowed in-batch deduplication inside `perform_deduplication()` in [`uax_silver_etl.py`](file:///Users/nilkamalmahato/Documents/Data-pipeline/silver/script/uax_silver_etl.py).
+
+##### 1. How `"deduplication_strategy": "latest_by_order_column"` Works (Default)
+When set to `latest_by_order_column`:
+1. First, PySpark drops exact duplicate rows across all columns: `df.dropDuplicates()`.
+2. A window specification is built partitioned by the natural key(s) and ordered **descending (`.desc()`)** by the deduplication order column(s):
+   ```python
+   order_directions = [col(c).desc() for c in order_col_list]
+   window_spec = Window.partitionBy(*nkey_cols).orderBy(*order_directions)
+   ```
+3. A row number is assigned across the window, and only rows with `row_num == 1` are retained:
+   ```python
+   df.withColumn("row_num", row_number().over(window_spec)) \
+     .filter(col("row_num") == 1) \
+     .drop("row_num")
+   ```
+4. **Behavior**: If multiple records with the same natural key arrive in the batch, the one with the **highest / most recent timestamp** is kept. This is the standard behavior for Change Data Capture (CDC) and transactional UPSERT processing.
+
+##### 2. Does it provide `oldest_by_order_column`?
+**Yes!** The Silver ETL engine supports `oldest_by_order_column` (also aliased as `earliest_by_order_column`):
+```python
+if strategy in ('earliest_by_order_column', 'oldest_by_order_column'):
+    order_directions = [col(c).asc() for c in order_col_list]
+else:
+    order_directions = [col(c).desc() for c in order_col_list]
+```
+* When `"deduplication_strategy": "oldest_by_order_column"` is configured, the window is ordered in **ascending order (`.asc()`)**.
+* `row_num == 1` therefore selects the **first-ever / earliest timestamped record** in the micro-batch.
+* **Use Cases for `oldest_by_order_column`**:
+  * **Immutable Event Logs & Audit Trails**: When you need to preserve the initial occurrence / creation state of an event and ignore subsequent mutations.
+  * **Sessionization & Funnel Analysis**: Capturing first-touch attribution or initial entry points.
+
+---
+
+#### `glue_catalog` Block
+| Parameter | Type | Required / Optional | Code Usage & Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | boolean | Optional (Default: `true`) | *Used in catalog manager*: Registers and verifies Silver database in AWS Glue Data Catalog. |
+| `database_name` | string | **Required** | *Used in catalog resolution*: Target Glue database (e.g., `uax_datalake_db_{env}`). |
+| `crawler_name` | string | Optional | Name of Glue crawler (e.g., `uax-datalake-silver-crawler-{env}`). |
+| `trigger_crawler` | boolean | **CRITICAL: MUST BE `false`** (Default: `false`) | Controls whether an AWS Glue Crawler is triggered post-execution. |
+| `sync_watermark_table` | boolean | Optional (Default: `true`) | *Used in `sync_silver_watermark_catalog_table()`*: Registers watermark metadata as an Athena-queryable table. |
+| `watermark_table_name` | string | Optional (Default: `tbl_watermarks`) | Name of the catalog table tracking pipeline execution watermarks. |
+
+> [!WARNING]
+> **YELLOW WARNING — KEEP `trigger_crawler: false` FOR ALL SILVER ICEBERG TABLES!**
+> In `silver_config.json`, `"trigger_crawler"` is intentionally set to `false`. Silver tables are **Apache Iceberg tables**, not standard Hive/Parquet tables. Iceberg tables manage their own schema evolution, snapshot history, and file manifest lists directly via the Apache Iceberg Spark Catalog (`org.apache.iceberg.spark.SparkCatalog` backed by AWS Glue Catalog). Every write transaction updates the Glue Catalog atomically.
+
+> [!CAUTION]
+> **RED ALERT — NEVER TRIGGER A GLUE CRAWLER ON SILVER ICEBERG STORAGE FOLDERS:**
+> If an AWS Glue Crawler scans the Silver Iceberg S3 directory (`s3://<silver_bucket>/silver/data/...`):
+> 1. The crawler does **not** recognize the Iceberg snapshot transaction tree and will attempt to crawl raw Avro metadata and Parquet data files as a regular Hive table.
+> 2. It can **overwrite or corrupt** the Iceberg table definition in the AWS Glue Data Catalog, stripping the `table_type = ICEBERG` property and destroying the `metadata_location` pointer.
+> 3. This causes Athena queries to fail with `NOT_AN_ICEBERG_TABLE` or schema mismatch errors, and breaks future Spark `MERGE INTO` operations.
+>
+> **Policy:** Always keep `"trigger_crawler": false` in `silver_config.json`. Do not pass `--TRIGGER_CRAWLER true`.
+
+---
 
 #### `watermark` Block
 | Parameter | Type | Required / Optional | Code Usage & Description |
