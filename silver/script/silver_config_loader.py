@@ -169,9 +169,9 @@ class SilverConfigLoader:
         clean = table_name.strip().lower()
 
         base = clean
-        if base.startswith("raw_tbl_"):
+        while base.startswith("raw_tbl_"):
             base = base[len("raw_tbl_"):]
-        elif base.startswith("tbl_"):
+        while base.startswith("tbl_"):
             base = base[len("tbl_"):]
 
         candidates = [
@@ -199,6 +199,8 @@ class SilverConfigLoader:
                 cfg = dict(table_configs[cand])
                 if "target_table_name" not in cfg:
                     cfg["target_table_name"] = cand if cand.startswith("tbl_") else f"tbl_{base}"
+                while str(cfg["target_table_name"]).startswith("tbl_tbl_"):
+                    cfg["target_table_name"] = cfg["target_table_name"][len("tbl_"):]
                 return cfg
         return {}
 

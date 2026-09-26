@@ -344,11 +344,19 @@ class GoldConfigLoader:
         base = clean
         # Strip known prefixes
         for prefix in [f"gold_{source_system.lower()}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]:
-            if base.startswith(prefix):
+            while base.startswith(prefix):
                 base = base[len(prefix):]
-                break
 
-        candidates = [clean, base, base.replace('-', '_'), base.replace('_', '-')]
+        candidates = [
+            clean,
+            base,
+            base.replace('-', '_'),
+            base.replace('_', '-'),
+            f"gold_{source_system.lower()}_{base}",
+            f"gold_{source_system.lower()}_{base.replace('-', '_')}",
+            f"gold_{base}",
+            f"v_{base}"
+        ]
         for cand in candidates:
             for tbl_k, tbl_v in table_configs.items():
                 if tbl_k.strip().lower() == cand and isinstance(tbl_v, dict):
@@ -610,18 +618,32 @@ class GoldConfigLoader:
         tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
         clean_source = source_system.strip().lower()
         clean_table = table_name.strip().lower()
+        prefix_str = f"gold_{clean_source}_"
 
-        for prefix in [f"gold_{clean_source}_", "gold_tbl_", "gold_", "v_"]:
-            if clean_table.startswith(prefix):
-                clean_table = clean_table[len(prefix):]
-                break
-
+        # Check explicit engine override table_name
         engine_cfg = tbl_cfg.get(engine.lower(), {})
         if isinstance(engine_cfg, dict) and engine_cfg.get("table_name"):
-            return engine_cfg["table_name"]
+            explicit = str(engine_cfg["table_name"]).strip()
+            while explicit.startswith(f"{prefix_str}{prefix_str}"):
+                explicit = explicit[len(prefix_str):]
+            return explicit
 
         if tbl_cfg.get("table_name"):
-            return tbl_cfg["table_name"]
+            explicit = str(tbl_cfg["table_name"]).strip()
+            while explicit.startswith(f"{prefix_str}{prefix_str}"):
+                explicit = explicit[len(prefix_str):]
+            return explicit
+
+        # If table_name was already written as gold_<source>_<tablename>, directly go with it!
+        if clean_table.startswith(prefix_str):
+            clean_res = clean_table
+            while clean_res.startswith(f"{prefix_str}{prefix_str}"):
+                clean_res = clean_res[len(prefix_str):]
+            return clean_res
+
+        for prefix in [prefix_str, "gold_tbl_", "gold_", "v_"]:
+            while clean_table.startswith(prefix):
+                clean_table = clean_table[len(prefix):]
 
         defaults = cls.get_defaults(config_dict)
         prefix = defaults.get("table_prefix", "gold_{source}_")
@@ -630,4 +652,7 @@ class GoldConfigLoader:
         elif prefix == "gold_":
             prefix = f"gold_{clean_source}_"
 
-        return f"{prefix}{clean_table}"
+        result = f"{prefix}{clean_table}"
+        while result.startswith(f"{prefix}{prefix}"):
+            result = result[len(prefix):]
+        return result

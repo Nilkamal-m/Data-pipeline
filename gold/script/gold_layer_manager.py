@@ -650,6 +650,9 @@ class GoldLayerManager:
                 target_table_name = GoldConfigLoader.get_target_table_name(source_system, clean_base_name, 'athena', gold_cfg)
             else:
                 target_table_name = f"gold_{source_system}_{clean_base_name}"
+            prefix_g = f"gold_{source_system}_"
+            while target_table_name.startswith(f"{prefix_g}{prefix_g}"):
+                target_table_name = target_table_name[len(prefix_g):]
 
             view_name = f"v_{clean_base_name}"
 
@@ -2718,7 +2721,23 @@ class GoldLayerManager:
         Accepts both 'v_<table_name>.sql' and '<table_name>.sql'.
         Returns a dict mapping clean_base_name -> sql_text.
         """
-        queries = {}
+        queries: Dict[str, str] = {}
+        src = source_system.strip().lower() if source_system else ""
+
+        def _clean_query_key(raw_base: str) -> str:
+            k = raw_base.strip().lower()
+            if src and k.startswith(f"gold_{src}_"):
+                k = k[len(f"gold_{src}_"):]
+            elif k.startswith("v_"):
+                k = k[2:]
+                if src and k.startswith(f"gold_{src}_"):
+                    k = k[len(f"gold_{src}_"):]
+            elif k.startswith("gold_tbl_"):
+                k = k[len("gold_tbl_"):]
+            elif k.startswith("gold_"):
+                k = k[5:]
+            return k
+
         if query_path.startswith("s3://"):
             parsed = urlparse(query_path)
             s3_bucket = parsed.netloc or bucket
@@ -2727,7 +2746,7 @@ class GoldLayerManager:
                 if s3_prefix.endswith('.sql'):
                     file_name = os.path.basename(s3_prefix)
                     file_base = os.path.splitext(file_name)[0].replace('-', '_')
-                    clean_name = file_base[2:] if file_base.startswith('v_') else file_base
+                    clean_name = _clean_query_key(file_base)
                     resp = s3_client.get_object(Bucket=s3_bucket, Key=s3_prefix)
                     queries[clean_name] = resp['Body'].read().decode('utf-8')
                     logger.info(f"[QUERY DISCOVERY] Loaded single S3 query for '{clean_name}' from '{query_path}'")
@@ -2739,7 +2758,7 @@ class GoldLayerManager:
                             if key.endswith('.sql'):
                                 file_name = os.path.basename(key)
                                 file_base = os.path.splitext(file_name)[0].replace('-', '_')
-                                clean_name = file_base[2:] if file_base.startswith('v_') else file_base
+                                clean_name = _clean_query_key(file_base)
                                 resp = s3_client.get_object(Bucket=s3_bucket, Key=key)
                                 queries[clean_name] = resp['Body'].read().decode('utf-8')
                                 logger.info(f"[QUERY DISCOVERY] Loaded S3 query for '{clean_name}' from 's3://{s3_bucket}/{key}'")
@@ -2752,7 +2771,7 @@ class GoldLayerManager:
             for file_path in glob.glob(f"{local_dir}/*.sql"):
                 file_name = os.path.basename(file_path)
                 file_base = os.path.splitext(file_name)[0].replace('-', '_')
-                clean_name = file_base[2:] if file_base.startswith('v_') else file_base
+                clean_name = _clean_query_key(file_base)
                 if clean_name not in queries:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         queries[clean_name] = f.read()
@@ -2793,18 +2812,27 @@ class GoldLayerManager:
         Explicitly does NOT match tbl_<other> (Silver tables like tbl_conversations, tbl_interactions).
         """
         clean_sql = cls._strip_sql_comments(sql)
+        clean_src = source_system.strip().lower() if source_system else ""
+        clean_other = other_mart.strip().lower()
+        if clean_src and clean_other.startswith(f"gold_{clean_src}_"):
+            clean_other = clean_other[len(f"gold_{clean_src}_"):]
+        elif clean_other.startswith("v_"):
+            clean_other = clean_other[2:]
+        elif clean_other.startswith("gold_"):
+            clean_other = clean_other[5:]
 
         target_tables = [
-            f"gold_{source_system}_{other_mart}" if source_system else f"gold_{other_mart}",
-            f"gold_tbl_{other_mart}",
-            f"gold_{other_mart}",
-            f"v_{other_mart}"
+            f"gold_{clean_src}_{clean_other}" if clean_src else f"gold_{clean_other}",
+            f"gold_tbl_{clean_other}",
+            f"gold_{clean_other}",
+            f"v_{clean_other}",
+            clean_other
         ]
-        if GoldConfigLoader and source_system:
-            athena_tbl = GoldConfigLoader.get_target_table_name(source_system, other_mart, 'athena', gold_cfg)
+        if GoldConfigLoader and clean_src:
+            athena_tbl = GoldConfigLoader.get_target_table_name(clean_src, clean_other, 'athena', gold_cfg)
             if athena_tbl:
                 target_tables.append(athena_tbl)
-            aurora_tbl = GoldConfigLoader.get_target_table_name(source_system, other_mart, 'aurora', gold_cfg)
+            aurora_tbl = GoldConfigLoader.get_target_table_name(clean_src, clean_other, 'aurora', gold_cfg)
             if aurora_tbl:
                 target_tables.append(aurora_tbl)
 
@@ -2815,11 +2843,11 @@ class GoldLayerManager:
             if re.search(pat, clean_sql, re.IGNORECASE):
                 return True
 
-        generic_gold_pat = rf'(?:[`\w]+\.)?`?gold_\w+_{other_mart}`?\b'
+        generic_gold_pat = rf'(?:[`\w]+\.)?`?gold_\w+_{clean_other}`?\b'
         if re.search(generic_gold_pat, clean_sql, re.IGNORECASE):
             return True
 
-        from_join_pat = rf'\b(?:FROM|JOIN)\s+(?:[`\w]+\.)?`?{other_mart}`?\b'
+        from_join_pat = rf'\b(?:FROM|JOIN)\s+(?:[`\w]+\.)?`?{clean_other}`?\b'
         if re.search(from_join_pat, clean_sql, re.IGNORECASE):
             return True
 
@@ -2941,6 +2969,9 @@ class GoldLayerManager:
 
         clean_sql = cls._strip_sql_comments(sql_text)
         tokens = re.findall(r'\b(?:FROM|JOIN)\s+([`\w.]+)', clean_sql, re.IGNORECASE)
+        src = source_system.strip().lower() if source_system else ""
+        prefix_g = f"gold_{src}_" if src else "gold_"
+
         for token in tokens:
             raw_name = token.replace('`', '').split('.')[-1].lower()
             try:
@@ -2949,38 +2980,55 @@ class GoldLayerManager:
             except Exception:
                 pass
 
-            base_cand = raw_name
-            if base_cand.startswith("v_"):
-                base_cand = base_cand[2:]
-            elif source_system and base_cand.startswith(f"gold_{source_system}_"):
-                base_cand = base_cand[len(f"gold_{source_system}_"):]
-            elif base_cand.startswith("gold_tbl_"):
-                base_cand = base_cand[len("gold_tbl_"):]
-            elif base_cand.startswith("gold_"):
-                base_cand = base_cand[5:]
+            # If user writes gold_<source>_<tablename> in the query: directly go with it!
+            # If user writes only the table name in the query: add gold_<source>_!
+            if prefix_g and raw_name.startswith(prefix_g):
+                full_gold_name = raw_name
+                while full_gold_name.startswith(f"{prefix_g}{prefix_g}"):
+                    full_gold_name = full_gold_name[len(prefix_g):]
+                base_cand = full_gold_name[len(prefix_g):]
+            elif raw_name.startswith("v_"):
+                base_cand = raw_name[2:]
+                if prefix_g and base_cand.startswith(prefix_g):
+                    base_cand = base_cand[len(prefix_g):]
+                full_gold_name = f"{prefix_g}{base_cand}"
+            elif raw_name.startswith("gold_tbl_"):
+                base_cand = raw_name[len("gold_tbl_"):]
+                full_gold_name = f"{prefix_g}{base_cand}"
+            elif raw_name.startswith("gold_"):
+                base_cand = raw_name[5:]
+                full_gold_name = f"{prefix_g}{base_cand}"
+            else:
+                base_cand = raw_name
+                full_gold_name = f"{prefix_g}{base_cand}"
 
             candidates_to_try = [
-                f"{glue_database}.gold_{source_system}_{base_cand}" if source_system else f"{glue_database}.gold_{base_cand}",
+                f"{glue_database}.{full_gold_name}",
+                full_gold_name,
                 f"{glue_database}.{raw_name}",
-                f"{glue_database}.gold_{base_cand}"
+                raw_name,
+                f"{glue_database}.gold_{base_cand}",
+                f"{glue_database}.v_{base_cand}"
             ]
-            if GoldConfigLoader and source_system:
-                tgt = GoldConfigLoader.get_target_table_name(source_system, base_cand, 'athena', gold_cfg)
-                if tgt:
+            if GoldConfigLoader and src:
+                tgt = GoldConfigLoader.get_target_table_name(src, base_cand, 'athena', gold_cfg)
+                if tgt and tgt not in candidates_to_try:
                     candidates_to_try.insert(0, f"{glue_database}.{tgt}")
+                    candidates_to_try.insert(1, tgt)
 
-            for full_cand in candidates_to_try:
+            for full_cand in list(dict.fromkeys(candidates_to_try)):
                 try:
                     dep_df = spark.table(full_cand)
                     dep_df.createOrReplaceTempView(raw_name)
+                    dep_df.createOrReplaceTempView(full_gold_name)
                     dep_df.createOrReplaceTempView(base_cand)
                     dep_df.createOrReplaceTempView(f"v_{base_cand}")
                     dep_df.createOrReplaceTempView(f"gold_tbl_{base_cand}")
-                    if source_system:
-                        dep_df.createOrReplaceTempView(f"gold_{source_system}_{base_cand}")
+                    if src:
+                        dep_df.createOrReplaceTempView(f"gold_{src}_{base_cand}")
                     logger.info(
                         f"[DEPENDENCY RESOLUTION] Pre-loaded authoritative dependency table '{full_cand}' "
-                        f"into Spark view '{raw_name}' (aliases: 'v_{base_cand}', '{base_cand}')."
+                        f"into Spark view '{raw_name}' (aliases: '{full_gold_name}', 'v_{base_cand}', '{base_cand}')."
                     )
                     break
                 except Exception:

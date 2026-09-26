@@ -213,7 +213,13 @@ class ConfigLoader:
         config = source_config or cls.get_source_config(source_system)
         table_clean = table_name.strip()
         tables = config.get("tables", {})
-        for key in [table_clean, table_clean.replace('_', '-'), table_clean.replace('-', '_')]:
+        candidates = [table_clean, table_clean.replace('_', '-'), table_clean.replace('-', '_')]
+        if table_clean.startswith("raw_tbl_"):
+            base = table_clean[len("raw_tbl_"):]
+            candidates.extend([base, base.replace('_', '-'), base.replace('-', '_')])
+        else:
+            candidates.extend([f"raw_tbl_{table_clean}", f"raw_tbl_{table_clean.replace('-', '_')}"])
+        for key in candidates:
             if key in tables and isinstance(tables[key], dict):
                 return tables[key]
         return {}

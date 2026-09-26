@@ -251,3 +251,32 @@ REST APIs wrap arrays of records inside an outer JSON envelope object to attach 
 > [!TIP]
 > **Immediate Short-Circuit Rule for Encryption**:
 > If `encryption_columns` is omitted or empty on a table, the Bronze engine **immediately skips** all encryption processing. It does not check `encryption.enabled: true` and does not check or validate `lambda_arn`. Only when `encryption_columns` contains one or more non-empty column mappings does it validate `lambda_arn` (raising a `ValueError` if missing) and encrypt the batch in 500-record slices.
+
+---
+
+### 2.4 Table Naming Standards & Automatic Prefix Deduplication
+
+When configuring tables under `source_systems.<source>.tables` or passing `--SOURCE_TABLE_NAME`, you can write table names in either of the following formats:
+
+1. **Clean Business Entity Name (Recommended)**:
+   ```json
+   "tables": {
+     "incident": { ... },
+     "sys_user": { ... }
+   }
+   ```
+2. **Prefixed Catalog Name**:
+   ```json
+   "tables": {
+     "raw_tbl_incident": { ... },
+     "raw_tbl_sys_user": { ... }
+   }
+   ```
+
+#### Automatic Normalization & Single-Prefix Guarantee:
+The Bronze framework enforces an **automatic single-prefix normalization guarantee**:
+* **AWS Glue Data Catalog Table**: The catalog table is always formatted as `raw_tbl_<table_name>` (e.g., `raw_tbl_incident`). If you write `"raw_tbl_incident"` in the config or CLI, the engine automatically recognizes the prefix and will **never create** a double prefix like `raw_tbl_raw_tbl_incident`.
+* **S3 Data Lake Path**: S3 physical data partitions always use the clean domain entity name: `s3://<bronze_bucket>/bronze/data/<source>/<clean_table>/_ingested_at=<timestamp>/` (e.g. `.../servicenow/incident/`). Redundant `raw_tbl_` prefixes are stripped from the S3 key hierarchy to keep storage clean and conformed.
+* **REST API & JDBC Extraction**: Connectors always extract using the actual source entity name (`incident` or `sys_user`). The engine automatically strips any `raw_tbl_` prefix so external REST API calls (e.g. ServiceNow `/api/now/table/incident`) succeed without 404 resource errors.
+* **High-Water Mark Metadata**: State files and the Athena `raw_tbl_watermarks` table consistently record the single-prefixed table name (`raw_tbl_incident`).
+* **Seamless Config Lookup**: `ConfigLoader` resolves table configuration dictionaries, initial load dates, upper bounds, and query overrides identically whether the table is configured as `"incident"` or `"raw_tbl_incident"`.

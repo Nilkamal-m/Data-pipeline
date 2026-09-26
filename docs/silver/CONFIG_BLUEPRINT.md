@@ -252,3 +252,39 @@ else:
 | `exclude_columns` | array | Optional | *Used in `SilverTransformer`*: List of unwanted columns pruned before loading into Iceberg. |
 | `filter_expression` | string | Optional | *Used in `SilverTransformer`*: PySpark SQL filter expression to discard invalid records (e.g., `status != 'DELETED'`). |
 | `custom_transform_script` | string | Optional | *Used in `SilverTransformer`*: Path to external Python script executing custom PySpark DataFrame transformations. |
+
+---
+
+### 2.4 Table Naming Standards & Automatic Prefix Deduplication
+
+When configuring tables under `source_systems.<source>.tables` in `silver_config.json` or passing `--SOURCE_TABLE_NAME`, you can write table names in any of the following formats:
+
+1. **Clean Business Entity Name (Recommended)**:
+   ```json
+   "tables": {
+     "incident": { ... },
+     "conversations": { ... }
+   }
+   ```
+2. **Conformed Table Name (With `tbl_` prefix)**:
+   ```json
+   "tables": {
+     "tbl_incident": { ... },
+     "tbl_conversations": { ... }
+   }
+   ```
+3. **Upstream Bronze Table Name (With `raw_tbl_` prefix)**:
+   ```json
+   "tables": {
+     "raw_tbl_incident": { ... },
+     "raw_tbl_conversations": { ... }
+   }
+   ```
+
+#### Automatic Normalization & Single-Prefix Guarantee:
+The Silver Iceberg ETL engine enforces a strict single-prefix resolution policy:
+* **Target Conformed Silver Table**: The conformed Iceberg table in AWS Glue is always named `tbl_<table_name>` (e.g., `tbl_incident`). If you write `"tbl_incident"` in the config key or in `target_table_name`, the engine detects the existing prefix and will **never create** a duplicate prefix like `tbl_tbl_incident`.
+* **Upstream Bronze Source Table**: The engine automatically looks for `raw_tbl_<base_table_name>` (e.g., `raw_tbl_incident`). If the input was `"raw_tbl_incident"`, it will **never create** `raw_tbl_raw_tbl_incident`.
+* **Iceberg S3 Storage Location**: Silver data files are stored cleanly under `s3://<silver_bucket>/silver/data/<source>/<base_table_name>/` without redundant `tbl_` prefixes in folder names.
+* **Unified State Tracking**: Watermark tracking records the conformed table name (`tbl_incident`) in the central `tbl_watermarks` metadata table.
+* **Resilient Config Lookup**: `SilverConfigLoader` resolves table configuration, `nkey`, `deduplication_order_by`, and transforms seamlessly whether the table is looked up as `"incident"`, `"tbl_incident"`, or `"raw_tbl_incident"`.

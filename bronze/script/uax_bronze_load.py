@@ -722,7 +722,14 @@ def update_last_load_date(
     s3_path = f"s3://{state_bucket}/{state_key}"
     prefix = str(table_prefix).strip()
     clean_table = table_name.strip().replace('-', '_')
-    formatted_table_name = clean_table if clean_table.startswith(prefix) else f"{prefix}{clean_table}"
+    if clean_table.startswith(prefix):
+        formatted_table_name = clean_table
+    elif clean_table.startswith("raw_tbl_"):
+        formatted_table_name = clean_table
+    else:
+        formatted_table_name = f"{prefix}{clean_table}"
+    while formatted_table_name.startswith("raw_tbl_raw_tbl_"):
+        formatted_table_name = formatted_table_name[len("raw_tbl_"):]
     state_payload = {
         "source_system": source_system,
         "table_name": formatted_table_name,
@@ -902,8 +909,22 @@ def sync_bronze_catalog_table(
     Partition: _ingested_at=<ISO_TIMESTAMP> (Single partition on _ingested_at)
     """
     clean_name = table_name.strip().replace('-', '_')
-    catalog_table_name = f"{table_prefix}{clean_name}"
-    table_location = f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{clean_name}/"
+    prefix = (table_prefix or "").strip()
+    if prefix and clean_name.startswith(prefix):
+        catalog_table_name = clean_name
+    elif clean_name.startswith("raw_tbl_"):
+        catalog_table_name = clean_name
+    else:
+        catalog_table_name = f"{prefix}{clean_name}"
+    while catalog_table_name.startswith("raw_tbl_raw_tbl_"):
+        catalog_table_name = catalog_table_name[len("raw_tbl_"):]
+
+    # Ensure S3 directory is the clean business entity name without redundant raw_tbl_ prefix
+    s3_folder_name = clean_name
+    for p in (prefix, "raw_tbl_"):
+        if p and s3_folder_name.startswith(p):
+            s3_folder_name = s3_folder_name[len(p):]
+    table_location = f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{s3_folder_name}/"
     
     ingested_at_str = ingested_at or partition_date.strftime('%Y-%m-%dT%H:%M:%SZ')
     partition_location = f"{table_location}_ingested_at={ingested_at_str}/"
@@ -1342,10 +1363,14 @@ def main():
     # Loop through each requested table dynamically
     for table_idx, raw_table_name in enumerate(table_list, start=1):
         raw_clean = raw_table_name.strip()
-        if raw_clean.startswith(glue_table_prefix):
-            raw_clean = raw_clean[len(glue_table_prefix):]
+        for p in (glue_table_prefix, "raw_tbl_"):
+            if p:
+                while raw_clean.startswith(p):
+                    raw_clean = raw_clean[len(p):]
 
         configured_tables = list(source_config.get("default_tables", []))
+        if isinstance(source_config.get("tables"), dict):
+            configured_tables.extend(source_config["tables"].keys())
         for extra_k in ("table_initial_load_dates", "custom_table_endpoints", "table_query_overrides"):
             extra_m = source_config.get(extra_k, {})
             if isinstance(extra_m, dict):
@@ -1353,7 +1378,23 @@ def main():
 
         # Determine API Table Name (exact entity name with hyphens for API endpoint calls)
         api_table_name = raw_clean
-        if raw_clean not in configured_tables and raw_clean.replace('_', '-') in configured_tables:
+        clean_cfg_map = {}
+        for ct in configured_tables:
+            ct_stripped = ct.strip()
+            for p in (glue_table_prefix, "raw_tbl_"):
+                if p and ct_stripped.startswith(p):
+                    ct_stripped = ct_stripped[len(p):]
+            clean_cfg_map[ct_stripped] = ct
+            clean_cfg_map[ct_stripped.replace('_', '-')] = ct
+
+        if raw_clean.replace('_', '-') in clean_cfg_map:
+            matched_key = clean_cfg_map[raw_clean.replace('_', '-')]
+            matched_key_clean = matched_key
+            for p in (glue_table_prefix, "raw_tbl_"):
+                if p and matched_key_clean.startswith(p):
+                    matched_key_clean = matched_key_clean[len(p):]
+            api_table_name = matched_key_clean
+        elif raw_clean not in configured_tables and raw_clean.replace('_', '-') in configured_tables:
             api_table_name = raw_clean.replace('_', '-')
 
         # Determine Clean Lake Table Name (sanitizes hyphens to underscores for S3, Glue Catalog, Iceberg, and MySQL)
@@ -1401,10 +1442,14 @@ def main():
                 continue
 
         ub_table_display = table_upper_bound if table_upper_bound else 'Current Run Time (Open-ended)'
+        display_lake_table = clean_table_name if clean_table_name.startswith(glue_table_prefix) else f"{glue_table_prefix}{clean_table_name}"
+        while display_lake_table.startswith("raw_tbl_raw_tbl_"):
+            display_lake_table = display_lake_table[len("raw_tbl_"):]
+
         table_header = (
-            f"[TABLE START] {api_table_name} -> {glue_table_prefix}{clean_table_name} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {current_run_time}\n"
+            f"[TABLE START] {api_table_name} -> {display_lake_table} [{table_idx}/{len(table_list)}] | Source: {source_system} | Exec: {execution_id} | Timestamp: {current_run_time}\n"
             "+--------------------------------------------------------------------------------+\n"
-            f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {api_table_name.upper()} (Lake Table: {glue_table_prefix}{clean_table_name})\n"
+            f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {api_table_name.upper()} (Lake Table: {display_lake_table})\n"
             f"|     Execution ID       : {execution_id}\n"
             f"|     Upper Bound        : {ub_table_display}\n"
             f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"

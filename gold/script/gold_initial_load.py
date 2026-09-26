@@ -171,14 +171,22 @@ class GoldInitialLoader:
                     sql_text = f.read()
                 logger.info(f"[QUERY DISCOVERY] Loaded Gold query from local path '{query_path}'")
 
+        clean_tbl = table_name.strip().lower()
+        src = source_system.strip().lower()
+        for p in (f"gold_{src}_", "gold_tbl_", "gold_", "v_"):
+            while clean_tbl.startswith(p):
+                clean_tbl = clean_tbl[len(p):]
+
         # 3. Automatic Discovery in local repository
         if not sql_text:
             candidate_local_paths = [
-                os.path.join(script_dir, "..", "query", source_system, f"{table_name}.sql"),
-                os.path.join(script_dir, "..", "query", source_system, f"v_{table_name}.sql"),
-                os.path.join(script_dir, "..", "query", f"{table_name}.sql"),
-                os.path.join("gold", "query", source_system, f"{table_name}.sql"),
-                os.path.join("gold", "query", source_system, f"v_{table_name}.sql"),
+                os.path.join(script_dir, "..", "query", source_system, f"{clean_tbl}.sql"),
+                os.path.join(script_dir, "..", "query", source_system, f"v_{clean_tbl}.sql"),
+                os.path.join(script_dir, "..", "query", source_system, f"gold_{src}_{clean_tbl}.sql"),
+                os.path.join(script_dir, "..", "query", f"{clean_tbl}.sql"),
+                os.path.join("gold", "query", source_system, f"{clean_tbl}.sql"),
+                os.path.join("gold", "query", source_system, f"v_{clean_tbl}.sql"),
+                os.path.join("gold", "query", source_system, f"gold_{src}_{clean_tbl}.sql"),
             ]
             for c_path in candidate_local_paths:
                 norm_c = os.path.abspath(c_path)
@@ -194,7 +202,7 @@ class GoldInitialLoader:
         # 4. S3 discovery under default convention: s3://<bucket>/gold/query/<source>/<table>.sql
         if not sql_text and params.get('DATA_LAKE_BUCKET'):
             bucket_name = params.get('DATA_LAKE_BUCKET')
-            for q_name in [f"{table_name}.sql", f"v_{table_name}.sql"]:
+            for q_name in [f"{clean_tbl}.sql", f"v_{clean_tbl}.sql", f"gold_{src}_{clean_tbl}.sql", f"{table_name}.sql"]:
                 s3_key = f"gold/query/{source_system}/{q_name}"
                 try:
                     import boto3
@@ -214,6 +222,21 @@ class GoldInitialLoader:
         clean_sql = re.sub(r'--[^\r\n]*', '', sql_text).strip().rstrip(';')
         if not clean_sql:
             return None
+
+        # Pre-register any referenced upstream dependency views
+        if GoldLayerManager:
+            try:
+                g_db = params.get('GLUE_DATABASE') or params.get('DATABASE_NAME', '')
+                g_cfg = params.get('GOLD_CONFIG') or (GoldConfigLoader.load_config(env=params.get('ENV', 'dev')) if GoldConfigLoader else None)
+                GoldLayerManager._ensure_dependency_views_registered(
+                    spark=spark,
+                    sql_text=clean_sql,
+                    source_system=source_system,
+                    glue_database=g_db,
+                    gold_cfg=g_cfg
+                )
+            except Exception as dep_err:
+                logger.debug(f"[QUERY SCHEMA PROBE] Dependency view registration note: {dep_err}")
 
         # Execute ultra-fast zero-data probe query
         probe_sql = f"SELECT * FROM (\n{clean_sql}\n) AS probe_q WHERE 1=0"
@@ -361,7 +384,15 @@ class GoldInitialLoader:
         if GoldConfigLoader:
             target_table_name = GoldConfigLoader.get_target_table_name(source_system, table_name, 'athena', gold_cfg)
         else:
-            target_table_name = f"gold_{source_system}_{table_name}"
+            clean_t = table_name.strip().lower()
+            p_str = f"gold_{source_system}_"
+            if clean_t.startswith(p_str):
+                target_table_name = clean_t
+            else:
+                target_table_name = f"{p_str}{clean_t}"
+        p_str = f"gold_{source_system}_"
+        while target_table_name.startswith(f"{p_str}{p_str}"):
+            target_table_name = target_table_name[len(p_str):]
 
         # Resolve Natural Keys (nkey) / Primary Keys
         pks = []

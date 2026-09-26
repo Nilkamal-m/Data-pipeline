@@ -1335,20 +1335,32 @@ def main():
     for table_idx, table_name in enumerate(table_list, start=1):
         table_clean = table_name.strip().lower()
         raw_base_name = table_clean
-        if raw_base_name.startswith("raw_tbl_"):
+        while raw_base_name.startswith("raw_tbl_"):
             raw_base_name = raw_base_name[len("raw_tbl_"):]
-        elif raw_base_name.startswith("tbl_"):
+        while raw_base_name.startswith("tbl_"):
             raw_base_name = raw_base_name[len("tbl_"):]
         base_table_name = raw_base_name.replace("-", "_")
 
         table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
-        bronze_table_name = table_cfg.get('source_table_name') or f"raw_tbl_{base_table_name}"
+        bronze_table_name = (table_cfg.get('source_table_name') or f"raw_tbl_{base_table_name}").strip().replace("-", "_")
+        while bronze_table_name.startswith("raw_tbl_raw_tbl_"):
+            bronze_table_name = bronze_table_name[len("raw_tbl_"):]
         table_start_time = datetime.now(timezone.utc)
 
         defaults_cfg = SilverConfigLoader.get_defaults(silver_full_config)
         scd2_cfg = defaults_cfg.get('scd_type2_config', {})
 
-        target_table_name = (table_cfg.get('target_table_name') or f"{table_prefix}{base_table_name}").replace("-", "_")
+        raw_target = (table_cfg.get('target_table_name') or f"{table_prefix}{base_table_name}").strip().replace("-", "_")
+        prefix = table_prefix.strip()
+        if prefix and raw_target.startswith(prefix):
+            target_table_name = raw_target
+        else:
+            target_table_name = f"{prefix}{raw_target}"
+        if prefix:
+            while target_table_name.startswith(f"{prefix}{prefix}"):
+                target_table_name = target_table_name[len(prefix):]
+        while target_table_name.startswith("tbl_tbl_"):
+            target_table_name = target_table_name[len("tbl_"):]
         silver_table_name = f"glue_catalog.{glue_database}.{target_table_name}"
         bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
         silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{base_table_name}/"

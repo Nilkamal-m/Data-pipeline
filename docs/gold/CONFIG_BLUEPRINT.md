@@ -193,3 +193,64 @@ Credentials for Aurora MySQL are fetched via the secret referenced by `--RDS_SEC
 | `catalog` | string | **Required** | *Used in Databricks sync routing*: Databricks Unity Catalog name. |
 | `schema` | string | **Required** | *Used in Databricks sync routing*: Databricks schema name. |
 | `table_name` | string | **Required** | *Used in Databricks sync routing*: Unity Catalog registered table name. |
+
+---
+
+### 2.5 Table Naming Standards & Query Resolution Rules
+
+#### 1. How to Write Table Names in `gold_config.json`
+When defining marts under `source_systems.<source>.tables` or passing `--TABLE_NAME`, you can write table names in any of the following formats:
+
+* **Clean Mart Name (Recommended)**:
+  ```json
+  "tables": {
+    "conversations": { ... },
+    "interactions": { ... },
+    "incident_kpi": { ... }
+  }
+  ```
+* **Full Enterprise Table Name (With `gold_<source>_` prefix)**:
+  ```json
+  "tables": {
+    "gold_genesys_conversations": { ... },
+    "gold_moveworks_interactions": { ... },
+    "gold_servicenow_incident_kpi": { ... }
+  }
+  ```
+* **View Name (With `v_` prefix)**:
+  ```json
+  "tables": {
+    "v_conversations": { ... }
+  }
+  ```
+
+#### 2. Automatic Prefix Deduplication Guarantee:
+* The standardized enterprise convention across all serving targets (Athena, Aurora, Redshift, Snowflake, Databricks) is **`gold_<source>_<tablename>`**.
+* If a table key or engine override is configured as `"gold_genesys_conversations"`, the Gold engine detects the existing prefix and will **never create** duplicate prefixes like `gold_genesys_gold_genesys_conversations`.
+* `GoldConfigLoader` seamlessly resolves configuration whether the table is looked up by its clean name (`"conversations"`), full name (`"gold_genesys_conversations"`), or view name (`"v_conversations"`).
+
+#### 3. Query Resolution Rules in Gold SQL (`.sql` files & Spark SQL):
+When writing SQL queries for Gold marts (e.g., in `gold/query/<source>/<file>.sql`):
+
+* **Writing `gold_<source>_<tablename>` in the query**:
+  If your SQL explicitly references the full enterprise name:
+  ```sql
+  SELECT * FROM gold_moveworks_interactions
+  ```
+  The Gold engine **directly goes with it**. It recognizes `gold_moveworks_interactions` as the target table without adding another `gold_<source>_` prefix, pre-registers the view in Spark SQL, and executes the query directly.
+
+* **Writing only the Table Name in the query**:
+  If your SQL references only the bare table name or view name:
+  ```sql
+  SELECT * FROM interactions
+  -- OR
+  SELECT * FROM v_interactions
+  ```
+  The Gold engine automatically **adds the `gold_<source>_` prefix** (resolving to `gold_moveworks_interactions`), pre-loads the physical Iceberg table from the Glue Data Catalog, and creates in-session Spark temporary views for both `interactions` and `v_interactions`. The query executes seamlessly without requiring manual table prefixing or manual view registration.
+
+* **Mart Query File Discovery**:
+  Mart query files can be stored under `gold/query/<source>/` or `s3://<bucket>/gold/query/<source>/` using any convention:
+  * `interactions.sql`
+  * `v_interactions.sql`
+  * `gold_moveworks_interactions.sql`
+  The engine automatically normalizes the file base name, discovers the query, and binds it to the uniform `gold_<source>_<tablename>` physical mart.
