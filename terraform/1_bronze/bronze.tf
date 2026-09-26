@@ -452,7 +452,7 @@ module "bronze_glue_job" {
 
   default_arguments = {
     "--security-configuration" = aws_glue_security_configuration.glue_security_config.name
-    "--extra-py-files"         = "s3://${local.bucket_name}/bronze/script/config_loader.py,s3://${local.bucket_name}/bronze/script/connectors.zip"
+    "--extra-py-files"         = "s3://${local.bucket_name}/bronze/script/config_loader.py,s3://${local.bucket_name}/bronze/script/connectors.zip,s3://${local.bucket_name}/bronze/script/protegrity_encryption.py"
     "--CONFIG_S3_PATH"         = "s3://${local.bucket_name}/bronze/script/config/bronze_config.json"
     "--BRONZE_BUCKET"          = local.bucket_name
     "--OUTPUT_FORMAT"          = var.output_format

@@ -19,6 +19,7 @@ This document provides a line-by-line master index and component map for the ent
 | [`bronze/script/connectors/database.py`](../../bronze/script/connectors/database.py) | **RDBMS Connector** | JDBC / relational streaming extraction (`fetch_size: 10000`), SQL dialect templating, incremental timestamp filtering. |
 | [`bronze/script/connectors/s3_file.py`](../../bronze/script/connectors/s3_file.py) | **S3 File Drop Connector** | Vendor file ingestion, `fetch_mode` (`all` vs `latest`), pattern matching (`fnmatch`), CSV multi-line quote escape handling. |
 | [`bronze/script/config/bronze_config.json`](../../bronze/script/config/bronze_config.json) | **Pipeline Configuration** | Blueprint defining pipeline defaults, S3 storage prefixes, source system endpoints, and table metadata. |
+| [`bronze/script/protegrity_encryption.py`](../../bronze/script/protegrity_encryption.py) | **Protegrity PII Tokenizer** | Multi-column 500-record batching, exponential jitter backoff, Protegrity Protector Lambda API invocation (`/v2/protect`). |
 
 ---
 

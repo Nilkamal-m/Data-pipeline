@@ -28,6 +28,18 @@
       "sync_watermark_table": true,
       "watermark_table_name": "raw_tbl_watermarks"
     },
+    "encryption": {
+      "enabled": false,
+      "lambda_arn": "",
+      "_note_lambda_arn": "MANDATORY when enabled=true. Set to your Protegrity Protector Lambda ARN, e.g. 'arn:aws:lambda:<region>:<account>:function:<lambda-name>-{ENV}'. If empty when enabled=true, job raises ValueError.",
+      "batch_size": 500,
+      "secret_name": "uax/protegrity-credentials-{env}",
+      "user_secret_key": "protegrity_user_secret",
+      "default_data_element": "AES256",
+      "default_encoding": "utf8",
+      "max_retries": 5
+    },
+    "_note_encryption": "Protegrity PII encryption: when enabled=true in pipeline_defaults and table defines encryption_columns, Bronze encrypts those columns before writing to S3 staging.",
     "_note_env": "Dynamic environment templating: Any string containing '{env}' or '{ENV}' (e.g. database_name, crawler_name, bronze_bucket) is dynamically resolved at runtime from the --ENV / --ENVIRONMENT Glue parameter (defaults to 'dev')."
   },
   "source_systems": {
@@ -55,7 +67,12 @@
         },
         "sys_user": {
           "initial_load_date": "2024-01-01 00:00:00",
-          "upper_bound": ""
+          "upper_bound": "",
+          "encryption_columns": {
+            "first_name": "EMP_MEMBERNAME_ALPHANUM_LP",
+            "last_name": "EMP_MEMBERNAME_ALPHANUM_LP",
+            "email": "EMP_MEMBER_EMAIL_LP"
+          }
         },
         "u_custom_incident": {
           "initial_load_date": "2024-01-01 00:00:00",

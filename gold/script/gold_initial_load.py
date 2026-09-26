@@ -41,6 +41,14 @@ except ImportError:
     except ImportError:
         GoldLayerManager = None
 
+try:
+    from protegrity_encryption import ProtegrityEncryptionManager
+except ImportError:
+    try:
+        from gold.script.protegrity_encryption import ProtegrityEncryptionManager
+    except ImportError:
+        ProtegrityEncryptionManager = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -407,6 +415,33 @@ class GoldInitialLoader:
             logger.info(f"Loaded {int(raw_count):,} records from input file.")
         except Exception:
             logger.info(f"Loaded {raw_count} records from input file.")
+
+        # Protegrity Encryption for Historical Cold-Start Data
+        table_cfg = GoldConfigLoader.get_table_config(source_system, table_name, gold_cfg) if GoldConfigLoader else {}
+        encryption_cfg = defaults_cfg.get("encryption", {})
+        mart_enc_cols = (
+            table_cfg.get("encryption_columns")
+            or table_cfg.get("encryption", {}).get("columns")
+            or (init_cfg.get("encryption_columns") if 'init_cfg' in locals() and isinstance(init_cfg, dict) else None)
+        )
+
+        if mart_enc_cols and ProtegrityEncryptionManager:
+            try:
+                enc_mgr = ProtegrityEncryptionManager(global_config=defaults_cfg, env=env)
+                if enc_mgr.enabled:
+                    logger.info(
+                        f"[GOLD ENCRYPTION] Encrypting PII columns {list(mart_enc_cols.keys()) if isinstance(mart_enc_cols, dict) else mart_enc_cols} "
+                        f"using Protegrity Lambda for historical table '{source_system}.{table_name}'..."
+                    )
+                    df_raw = enc_mgr.encrypt_spark_dataframe(
+                        spark_df=df_raw,
+                        table_columns_config=mart_enc_cols,
+                        action="protect"
+                    )
+                    logger.info("[GOLD ENCRYPTION] Historical dataset encrypted successfully.")
+            except Exception as enc_err:
+                logger.error(f"[GOLD ENCRYPTION ERROR] Failed to encrypt historical columns: {enc_err}")
+                raise
 
         # 2. Check Target Table Schema for Reconciliation
         target_fields = None

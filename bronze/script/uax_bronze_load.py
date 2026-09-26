@@ -112,6 +112,14 @@ for candidate in candidate_zips:
 from config_loader import ConfigLoader
 
 try:
+    from protegrity_encryption import ProtegrityEncryptionManager
+except ImportError:
+    try:
+        from bronze.script.protegrity_encryption import ProtegrityEncryptionManager
+    except ImportError:
+        ProtegrityEncryptionManager = None
+
+try:
     from connectors import get_connector
 except ModuleNotFoundError:
     # Resilient fallback if connectors module files are unzipped directly at sys.path root
@@ -1315,6 +1323,19 @@ def main():
     connector_cls = get_connector(source_system, source_config)
     logger.info(f"Loaded connector class: {connector_cls.__name__}")
 
+    # Initialize Protegrity Encryption Manager (if enabled in pipeline_defaults or source_config)
+    encryption_manager = None
+    if ProtegrityEncryptionManager:
+        try:
+            enc_global_cfg = dict(pipeline_defaults) if pipeline_defaults else {}
+            if "encryption" in source_config:
+                enc_global_cfg["encryption"] = {**enc_global_cfg.get("encryption", {}), **source_config["encryption"]}
+            encryption_manager = ProtegrityEncryptionManager(global_config=enc_global_cfg, env=params.get('ENV', 'dev'))
+            if encryption_manager.enabled:
+                logger.info(f"[PROTEGERITY ENCRYPTION] Enabled for Bronze. Target Lambda ARN: {encryption_manager.lambda_arn}")
+        except Exception as enc_init_err:
+            logger.warning(f"Could not initialize ProtegrityEncryptionManager: {enc_init_err}")
+
     failed_tables = []
     table_stats = []
 
@@ -1425,6 +1446,25 @@ def main():
                     processed_chunk.append(record)
 
             records_chunk = processed_chunk
+
+            # Protegrity Column-Level Encryption
+            # Check table-level encryption_columns first: if not present or empty, immediately skip
+            table_cfg = (
+                source_config.get("tables", {}).get(api_table_name, {})
+                or source_config.get("tables", {}).get(clean_table_name, {})
+            )
+            table_enc_cols = (
+                table_cfg.get("encryption_columns")
+                or table_cfg.get("encryption", {}).get("columns")
+                or source_config.get("encryption_columns")
+            )
+            if table_enc_cols and encryption_manager:
+                records_chunk = encryption_manager.encrypt_record_chunk(
+                    records=records_chunk,
+                    table_columns_config=table_enc_cols,
+                    action="protect"
+                )
+
             total_table_records += len(records_chunk)
             parts_written += 1
             

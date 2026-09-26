@@ -31,6 +31,16 @@ This document provides the definitive configuration blueprint for `gold_config.j
       "format": "csv",
       "delimiter": ",",
       "has_header": true
+    },
+    "encryption": {
+      "enabled": false,
+      "lambda_arn": "",
+      "batch_size": 500,
+      "secret_name": "uax/protegrity-credentials-{env}",
+      "user_secret_key": "protegrity_user_secret",
+      "default_data_element": "AES256",
+      "default_encoding": "utf8",
+      "max_retries": 5
     }
   },
   "source_systems": {
@@ -50,6 +60,10 @@ This document provides the definitive configuration blueprint for `gold_config.j
             "format": "csv",
             "delimiter": ",",
             "has_header": true
+          },
+          "encryption_columns": {
+            "customer_name": "EMP_MEMBERNAME_ALPHANUM_LP",
+            "customer_email": "EMP_MEMBER_EMAIL_LP"
           },
           "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
           "api_secret_name": "uax-datalake/genesys-credentials-{env}",
@@ -100,6 +114,14 @@ This document provides the definitive configuration blueprint for `gold_config.j
 | `initial_load.format` | string | Optional (Default: `csv`) | *Used in Spark CSV reader*: Historical export file format (`csv`). |
 | `initial_load.delimiter` | string | Optional (Default: `,`) | *Used in Spark CSV reader*: Delimiter character for parsing historical files. |
 | `initial_load.has_header` | boolean | Optional (Default: `true`) | *Used in Spark CSV reader*: Flag indicating if the CSV contains a header row. |
+| `encryption.enabled` | boolean | Optional (Default: `false`) | Master switch for Protegrity PII tokenization during historical export cold-start ingestion. |
+| `encryption.lambda_arn` | string | **Mandatory if encryption used** | ARN of the Protegrity Protector Lambda service. Throws `ValueError` if empty when encryption columns are present. |
+| `encryption.batch_size` | integer | Optional (Default: `500`) | Number of records per synchronous Lambda invocation to stay well below the 6MB limit. |
+| `encryption.secret_name` | string | Optional | AWS Secrets Manager secret storing Protegrity user identity credentials. |
+| `encryption.user_secret_key` | string | Optional (Default: `protegrity_user_secret`) | Key inside Secrets Manager secret JSON containing the authorization GUID. |
+| `encryption.default_data_element` | string | Optional (Default: `AES256`) | Fallback Protegrity protection policy if not specified per column. |
+| `encryption.default_encoding` | string | Optional (Default: `utf8`) | Character encoding passed in the Protegrity payload (`utf8`). |
+| `encryption.max_retries` | integer | Optional (Default: `5`) | Maximum retry attempts for transient Lambda invocation failures with exponential backoff and jitter. |
 
 ---
 
@@ -121,6 +143,11 @@ This document provides the definitive configuration blueprint for `gold_config.j
 | `custom_transform_script` | string | Optional | *Used in `GoldLayerManager`*: Relative path to Python transformation script extending business logic. |
 | `api_secret_name` | string | Optional | *Used in custom transforms*: Secrets Manager key name for third-party APIs (e.g. LLM scoring endpoints). |
 | `initial_load.path` | string | Optional | *Used in `GoldInitialLoader`*: Specific S3 URI pointing to the historical CSV file for this table. |
+| `encryption_columns` | object / array | Optional | Defines sensitive columns to encrypt and their Protegrity data element (e.g. `{"customer_name": "EMP_MEMBERNAME_ALPHANUM_LP", "customer_email": "EMP_MEMBER_EMAIL_LP"}`). Used in `gold_initial_load.py` for cold-start CSV exports. |
+
+> [!TIP]
+> **Immediate Short-Circuit Rule for Encryption**:
+> If `encryption_columns` is omitted or empty on a table, the Gold initial load engine (`gold_initial_load.py`) **immediately skips** all encryption processing. It does not check `encryption.enabled: true` and does not check or validate `lambda_arn`. Only when `encryption_columns` contains one or more non-empty column mappings does it validate `lambda_arn` (raising an explicit `ValueError` if missing) and encrypt the raw historical DataFrame via `mapInPandas` micro-batches.
 
 ---
 

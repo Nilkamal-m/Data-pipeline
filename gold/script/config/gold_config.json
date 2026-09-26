@@ -24,6 +24,17 @@
       "delimiter": ",",
       "has_header": true,
       "_comment": "Default S3 path convention for historical report exports. Can be overridden per table."
+    },
+    "encryption": {
+      "enabled": false,
+      "lambda_arn": "",
+      "_note_lambda_arn": "MANDATORY when enabled=true. Set to your Protegrity Protector Lambda ARN, e.g. 'arn:aws:lambda:<region>:<account>:function:<lambda-name>-{ENV}'. If empty when enabled=true, job raises ValueError.",
+      "batch_size": 500,
+      "secret_name": "uax/protegrity-credentials-{env}",
+      "user_secret_key": "protegrity_user_secret",
+      "default_data_element": "AES256",
+      "default_encoding": "utf8",
+      "max_retries": 5
     }
   },
   "source_systems": {
@@ -43,6 +54,10 @@
             "format": "csv",
             "delimiter": ",",
             "has_header": true
+          },
+          "encryption_columns": {
+            "customer_name": "EMP_MEMBERNAME_ALPHANUM_LP",
+            "customer_email": "EMP_MEMBER_EMAIL_LP"
           },
           "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
           "api_secret_name": "dev/data-pipeline/genesys-llm-api",

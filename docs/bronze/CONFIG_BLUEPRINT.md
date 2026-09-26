@@ -32,6 +32,16 @@ This document provides the definitive configuration blueprint for `bronze_config
       "trigger_crawler": true,
       "sync_watermark_table": true,
       "watermark_table_name": "raw_tbl_watermarks"
+    },
+    "encryption": {
+      "enabled": false,
+      "lambda_arn": "",
+      "batch_size": 500,
+      "secret_name": "uax/protegrity-credentials-{env}",
+      "user_secret_key": "protegrity_user_secret",
+      "default_data_element": "AES256",
+      "default_encoding": "utf8",
+      "max_retries": 5
     }
   },
   "source_systems": {
@@ -45,7 +55,11 @@ This document provides the definitive configuration blueprint for `bronze_config
         "incident": {
           "initial_load_date": "2024-01-01 00:00:00",
           "upper_bound": "",
-          "query_override": "active=true^sys_updated_on>={last_load_date}"
+          "query_override": "active=true^sys_updated_on>={last_load_date}",
+          "encryption_columns": {
+            "caller_id": "EMP_MEMBERNAME_ALPHANUM_LP",
+            "caller_email": "EMP_MEMBER_EMAIL_LP"
+          }
         }
       }
     },
@@ -138,6 +152,14 @@ This document provides the definitive configuration blueprint for `bronze_config
 | `output_format` | string | Optional (Default: `parquet`) | *Used in `BronzeLoadManager` serializer*: Target file format (`parquet`). |
 | `parquet_compression` | string | Optional (Default: `snappy`) | *Used in PyArrow / Spark Parquet writer*: Compression codec (`snappy`, `gzip`, `none`). |
 | `flatten_nested_json` | boolean | Optional (Default: `true`) | *Used in `BronzeLoadManager._flatten_dict()`*: Recursively flattens nested JSON dictionaries into top-level columns. |
+| `encryption.enabled` | boolean | Optional (Default: `false`) | Master switch for Protegrity PII column tokenization. |
+| `encryption.lambda_arn` | string | **Mandatory if encryption used** | ARN of the Protegrity Protector Lambda service. Throws `ValueError` if empty when encryption columns are present. |
+| `encryption.batch_size` | integer | Optional (Default: `500`) | Number of records per synchronous Lambda invocation to stay well below the 6MB limit. |
+| `encryption.secret_name` | string | Optional | AWS Secrets Manager secret storing Protegrity user identity credentials. |
+| `encryption.user_secret_key` | string | Optional (Default: `protegrity_user_secret`) | Key inside Secrets Manager secret JSON containing the authorization GUID. |
+| `encryption.default_data_element` | string | Optional (Default: `AES256`) | Fallback Protegrity protection policy if not specified per column. |
+| `encryption.default_encoding` | string | Optional (Default: `utf8`) | Character encoding passed in the Protegrity payload (`utf8`). |
+| `encryption.max_retries` | integer | Optional (Default: `5`) | Maximum retry attempts for transient Lambda invocation failures with exponential backoff and jitter. |
 | `flatten_separator` | string | Optional (Default: `_`) | *Used in `BronzeLoadManager._flatten_dict()`*: Delimiter joining nested dictionary keys (e.g., `user_profile_id`). |
 | `error_handling_mode` | string | Optional (Default: `CONTINUE_ON_ERROR`) | *Used in multi-table loop*: `CONTINUE_ON_ERROR` (skip failed tables and proceed) or `HALT_ON_ERROR` (fail job immediately). |
 | `upper_bound` | string | Optional (Default: `""`) | *Used in watermark calculation*: Timestamp boundary (`YYYY-MM-DD HH:MM:SS`) to prevent reading beyond a set point during backfills. |
@@ -224,3 +246,8 @@ REST APIs wrap arrays of records inside an outer JSON envelope object to attach 
 | `custom_endpoint` | string | Optional | *Used in HTTP request URL builder*: Specific API path overriding `api_endpoint_template` for non-standard endpoints. |
 | `file_path` | string | Optional (S3 Feeds) | *Used in `s3_connector.py`*: Specific S3 subfolder path for this table's files. |
 | `fetch_mode` | string | Optional (S3 Feeds) | *Used in `s3_connector.py`*: Table-level override for `all` vs `latest` file selection. |
+| `encryption_columns` | object / array | Optional | Defines sensitive columns to encrypt and their Protegrity data element (e.g. `{"email": "EMP_MEMBER_EMAIL_LP", "first_name": "EMP_MEMBERNAME_ALPHANUM_LP"}`). |
+
+> [!TIP]
+> **Immediate Short-Circuit Rule for Encryption**:
+> If `encryption_columns` is omitted or empty on a table, the Bronze engine **immediately skips** all encryption processing. It does not check `encryption.enabled: true` and does not check or validate `lambda_arn`. Only when `encryption_columns` contains one or more non-empty column mappings does it validate `lambda_arn` (raising a `ValueError` if missing) and encrypt the batch in 500-record slices.

@@ -13,6 +13,7 @@ This document provides a line-by-line master index and component map for the ent
 | [`gold/script/gold_initial_load.py`](../../gold/script/gold_initial_load.py) | **Cold-Start Historical Ingestion Engine** | Historical full-table bootstrapping, schema reconciliation, target Iceberg table provisioning before incremental cycles begin. |
 | [`gold/script/config/gold_config.json`](../../gold/script/config/gold_config.json) | **Pipeline Configuration** | Blueprint defining Gold table targets, serving engines, natural keys, SQL queries, initial load thresholds, and DB credentials. |
 | [`gold/script/custom_transforms/`](../../gold/script/custom_transforms/) | **Custom Script Extensions** | External PySpark transform scripts dynamically loaded per mart (e.g. LLM embeddings, statistical scoring). |
+| [`gold/script/protegrity_encryption.py`](../../gold/script/protegrity_encryption.py) | **Protegrity PII Tokenizer** | PySpark DataFrame distributed encryption via `mapInPandas`, 500-record batching, Protegrity Protector Lambda API invocation (`/v2/protect`). |
 
 ---
 
