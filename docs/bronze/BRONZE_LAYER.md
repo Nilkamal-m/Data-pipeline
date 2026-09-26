@@ -211,6 +211,117 @@ All sensitive credentials MUST reside in AWS Secrets Manager. Secrets are format
   - `all`: Ingests all files whose `LastModified` timestamp is greater than the watermark.
   - `latest`: Identifies and processes only the single most recently modified file (ideal for daily full snapshots).
 
+### 5.4 Response Envelope Parsing (`response_records_key`)
+REST APIs wrap arrays of records inside parent response objects (envelopes). The connector requires `response_records_key` to extract the inner list of entities:
+
+| Response Key | Platform Standard | Example API Response Structure |
+| :--- | :--- | :--- |
+| **`"result"`** | **ServiceNow Table API** | `{"result": [{"sys_id": "...", ...}]}` |
+| **`"entities"`**| **Genesys Cloud CX API** | `{"entities": [{"id": "...", ...}], "pageSize": 100}` |
+| **`"value"`** | **Moveworks / OData / Microsoft Graph** | `{"@odata.context": "...", "value": [{...}], "@odata.nextLink": "..."}` |
+| **`"records"`**| **Salesforce REST API** | `{"totalSize": 250, "done": true, "records": [{...}]}` |
+| **`"issues"`** | **Jira Software API** | `{"startAt": 0, "maxResults": 50, "total": 100, "issues": [{...}]}` |
+
+> [!CAUTION]
+> **Mandatory Connector Validation**:
+> Connectors (`servicenow.py`, `genesys.py`, `moveworks.py`) explicitly require `response_records_key`. If not set or empty, the job raises `ValueError` immediately:
+> ```python
+> if not response_key:
+>     raise ValueError(
+>         f"Moveworks connector for '{table_name}': 'response_records_key' is not set. "
+>         "Add 'response_records_key' (typically 'value') to bronze_config.json."
+>     )
+> ```
+
+---
+
+### 5.5 In-Memory Flattening & Normalization Engine
+
+Before writing to S3, raw records are normalized via two core utility functions in `uax_bronze_load.py`:
+
+#### 1. Single Record Flattening: `flatten_dict_single(d, parent_key='', sep='_')`
+* **Purpose**: Flattens nested dictionaries recursively into a single flat key-value dictionary using `_` as separator.
+* **Rules**:
+  1. Nested dicts are unpacked: `{"user": {"id": 101}}` &rarr; `{"user_id": 101}`.
+  2. Primitive arrays are joined into comma-separated strings: `{"tags": ["urgent", "vip"]}` &rarr; `{"tags": "urgent, vip"}`.
+  3. Empty lists are safely assigned `None` to prevent schema type conflicts.
+  4. Lists of objects are kept as raw JSON strings in the parent column (`{"custom_fields": "[{...}]"}`) while their individual properties are unpacked into comma-separated projection columns (`"custom_fields_name": "fieldA, fieldB"`).
+  5. Never creates duplicate rows; always returns exactly **1 flat dictionary**.
+
+**Example:**
+*Input raw JSON:*
+```json
+{
+  "sys_id": "9a1b2c3d4e",
+  "assigned_to": {
+    "link": "https://service-now.com/api/user/101",
+    "value": "101"
+  },
+  "tags": ["network", "hardware"]
+}
+```
+*Output after `flatten_dict_single`:*
+```json
+{
+  "sys_id": "9a1b2c3d4e",
+  "assigned_to_link": "https://service-now.com/api/user/101",
+  "assigned_to_value": "101",
+  "tags": "network, hardware"
+}
+```
+
+---
+
+#### 2. Array Explosion & Expansion: `flatten_and_expand_record(record, parent_key='', sep='_')`
+* **Purpose**: Recursively flattens nested dicts **AND explodes arrays of objects into multiple rows** (1-to-N relationship).
+* **Rules**:
+  1. Base scalar fields and nested dictionaries are flattened across all rows.
+  2. If the record contains an array of objects (e.g. `external_ids`, `items`, `attachments`), it generates $N$ rows—one for each item in that array.
+  3. All base fields are duplicated across each child row, and the child object fields are unpacked with the array key prefix.
+  4. Returns a **list of dictionaries** (`list[dict]`).
+
+**Example:**
+*Input raw JSON (1 ticket entity with 2 external references):*
+```json
+{
+  "ticket_id": "INC00991",
+  "status": "In Progress",
+  "external_ids": [
+    { "system": "jira", "reference": "UAX-101" },
+    { "system": "pagerduty", "reference": "PD-505" }
+  ]
+}
+```
+*Output after `flatten_and_expand_record` (Exploded into 2 separate rows):*
+```json
+[
+  {
+    "ticket_id": "INC00991",
+    "status": "In Progress",
+    "external_ids_system": "jira",
+    "external_ids_reference": "UAX-101"
+  },
+  {
+    "ticket_id": "INC00991",
+    "status": "In Progress",
+    "external_ids_system": "pagerduty",
+    "external_ids_reference": "PD-505"
+  }
+]
+```
+
+---
+
+### 5.6 S3 Chunk Serialization & Error Policy
+* In `serialize_chunk_to_bytes()`, records are serialized directly into Snappy-compressed Apache Parquet format.
+* **No Silent Fallback to JSON**:
+  Silent fallback to JSON is strictly disabled to prevent creating corrupt mixed-format folders in S3. If Parquet conversion fails (e.g., due to schema variations, memory limits, or oversized chunks), the engine logs a clear diagnostic and raises a `RuntimeError`:
+  ```text
+  RuntimeError: Parquet serialization failed for chunk of 5000 record(s).
+  If extraction fails due to large payload size or memory limits,
+  reduce 'batch_size' in bronze_config.json (runtime.batch_size) or pass --BATCH_SIZE.
+  ```
+
 ---
 
 ## 6. High-Water Mark & State Management

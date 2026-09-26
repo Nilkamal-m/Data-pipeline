@@ -160,10 +160,38 @@ This document provides the definitive configuration blueprint for `bronze_config
 | `base_url` | string | **Required** (REST APIs) | *Used in HTTP connectors*: Root URL for the source API (e.g., `https://api.mypurecloud.com`). |
 | `api_endpoint_template` | string | **Required** (REST APIs) | *Used in HTTP request URL builder*: Path template with `{table_name}` token (e.g., `/api/v2/{table_name}`). |
 | `default_delta_filter` | string | Optional | *Used in request query param builder*: Template string for incremental filtering using `{last_load_date}` and `{upper_bound}`. |
-| `response_records_key` | string | Optional (Default: `""`) | *Used in HTTP response parser*: Key in API JSON response holding the record list (`result`, `entities`, `value`). |
+| `response_records_key` | string | **MANDATORY for REST APIs** | *Used in HTTP response parser*: The JSON envelope key holding the array of records. If omitted or null, connectors raise `ValueError`. |
 | `batch_size` | integer | Optional | *Used in pagination handler*: Overrides default batch size for this specific source. |
 | `connection_type` | string | Optional | *Used in `connectors/__init__.py`*: Set to `database` for relational DB sources. |
 | `type` | string | Optional | *Used in `connectors/__init__.py`*: Set to `s3_file` for external S3 bucket feeds. |
+
+---
+
+#### Understanding `response_records_key`: `result` vs. `entities` vs. `value`
+
+REST APIs wrap arrays of records inside an outer JSON envelope object to attach metadata, counts, or next-page links. The connector requires `response_records_key` to locate the list of records inside the response payload:
+
+| Value | Target Platform Standard | Example API Response Structure |
+| :--- | :--- | :--- |
+| **`"result"`** | **ServiceNow Table API** | `{"result": [{"sys_id": "9a1...", "number": "INC001"}, ...]}` |
+| **`"entities"`**| **Genesys Cloud CX API** | `{"entities": [{"id": "abc...", "name": "Queue A"}, ...], "pageSize": 100}` |
+| **`"value"`** | **Moveworks / OData / Microsoft Graph** | `{"@odata.context": "...", "value": [{"id": "1", ...}], "@odata.nextLink": "..."}` |
+| **`"records"`**| **Salesforce REST API** | `{"totalSize": 250, "done": true, "records": [{"Id": "001...", ...}]}` |
+| **`"issues"`** | **Jira Software API** | `{"startAt": 0, "maxResults": 50, "total": 100, "issues": [{"id": "1001", ...}]}` |
+
+> [!IMPORTANT]
+> **Strict Validation Policy in Connectors**:
+> Connectors (`servicenow.py`, `genesys.py`, `moveworks.py`) explicitly enforce this parameter:
+> ```python
+> response_key = config.get('response_records_key')
+> if not response_key:
+>     raise ValueError(
+>         f"Connector for '{table_name}': 'response_records_key' is not set. "
+>         f"Add 'response_records_key' (e.g. 'result', 'entities', or 'value') to bronze_config.json."
+>     )
+> ```
+> If `response_records_key` is missing or misspelled, extraction fails immediately to prevent empty data ingestion.
+
 
 #### Specific Connector Parameters
 * **Moveworks Parallel Sharding (`parallel_processing`)**:

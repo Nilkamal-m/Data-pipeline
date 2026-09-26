@@ -558,8 +558,17 @@ def serialize_chunk_to_bytes(records_chunk: list, output_format: str = "parquet"
             df.to_parquet(buffer, compression=parquet_compression, index=False)
             return buffer.getvalue(), "application/x-parquet", ".parquet"
         except Exception as err:
-            logger.warning(f"Parquet serialization via pandas failed ({err}). Falling back to JSON format.")
-            fmt = "json"
+            logger.error(
+                f"Parquet serialization failed for batch chunk ({err}). "
+                f"If chunk size ({len(records_chunk)} records) is too large or schema size causes memory constraints, "
+                f"reduce 'batch_size' in bronze_config.json (runtime.batch_size) or pass --BATCH_SIZE via Glue job arguments."
+            )
+            raise RuntimeError(
+                f"Parquet serialization failed for chunk of {len(records_chunk)} record(s) ({err}). "
+                "Silent fallback to JSON is disabled to preserve format consistency in Bronze storage. "
+                "If extraction fails due to large payload size or memory limits, "
+                "reduce 'batch_size' in bronze_config.json (runtime.batch_size) or pass --BATCH_SIZE."
+            ) from err
 
     # For JSON format, also guarantee data keys are first, system keys last in each dict (excluding partition key _ingested_at)
     reordered_records = []

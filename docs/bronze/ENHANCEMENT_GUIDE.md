@@ -68,31 +68,138 @@ The main job calls `get_connector(source_config)` which inspects `source_config[
 
 ---
 
-## 4. Connector Contract & Protocol Specification
+## 4. Connector Contract & Onboarding Class Pattern
 
-Every connector exposes a standardized classmethod protocol:
+To onboard a new upstream system, connectors follow a modular, duck-typed class pattern. **No base class inheritance is used**—any class implementing the standard `@classmethod def fetch_delta(...)` can be plugged directly into the pipeline.
+
+### 4.1 Production Boilerplate Connector Template
+
+Save new connectors under `bronze/script/connectors/<source_name>.py`:
 
 ```python
-class CustomConnector:
+import logging
+from typing import Dict, Any, Optional, Callable, List
+from .http_client import HttpClient
+from .oauth import OAuthHandler
+
+logger = logging.getLogger(__name__)
+
+class CustomApiConnector:
+    """
+    Modular upstream connector for Custom REST API.
+    Handles authentication, incremental pagination, response envelope extraction,
+    and streams batches to Bronze storage via on_chunk_callback.
+    """
+
     @classmethod
     def fetch_delta(
         cls,
         last_load_date: str,
-        secret_dict: dict,
+        secret_dict: Dict[str, Any],
         table_name: str,
-        source_config: dict,
-        custom_query: str | None,
-        on_chunk_callback: callable,
+        source_config: Dict[str, Any],
+        custom_query: Optional[str],
+        on_chunk_callback: Callable[[List[Dict[str, Any]], int], None],
         s3_chunk_size: int,
-        upper_bound: str | None = None,
+        upper_bound: Optional[str] = None,
     ) -> int:
-        ...
+        """
+        Extracts records from source API and streams chunks to Bronze via on_chunk_callback.
+
+        Args:
+            last_load_date: Watermark timestamp boundary ('YYYY-MM-DD HH:MM:SS').
+            secret_dict: Decrypted credentials from AWS Secrets Manager.
+            table_name: Logical table name being extracted.
+            source_config: Merged table and source configuration dictionary.
+            custom_query: Optional custom filter override.
+            on_chunk_callback: Callback function to flatten and write Parquet chunk to S3.
+            s3_chunk_size: Chunk threshold (records) before triggering on_chunk_callback.
+            upper_bound: Optional upper timestamp boundary.
+
+        Returns:
+            int: Total count of records ingested for this table.
+        """
+        # 1. Resolve response envelope key (Mandatory for REST APIs)
+        response_key = source_config.get('response_records_key')
+        if not response_key:
+            raise ValueError(
+                f"CustomApiConnector for '{table_name}': 'response_records_key' is not set. "
+                f"Add 'response_records_key' (e.g. 'result', 'entities', or 'value') to bronze_config.json."
+            )
+
+        # 2. Initialize authenticated HTTP session
+        base_url = secret_dict.get('api_base_url') or source_config.get('base_url')
+        token = OAuthHandler.get_token(secret_dict) if secret_dict.get('auth_type') == 'oauth' else None
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        client = HttpClient.get_session(retries=3, backoff_factor=1.5)
+
+        # 3. Construct endpoint and pagination parameters
+        endpoint_template = source_config.get('api_endpoint_template', '/api/v1/{table_name}')
+        url = f"{base_url.rstrip('/')}/{endpoint_template.format(table_name=table_name).lstrip('/')}"
+        
+        batch_size = source_config.get('batch_size', s3_chunk_size)
+        offset = 0
+        total_records = 0
+        part_num = 1
+        current_chunk = []
+
+        logger.info(f"Starting extraction for '{table_name}' from '{url}' with watermark > '{last_load_date}'...")
+
+        # 4. Ingestion / Pagination Loop
+        while True:
+            params = {
+                "limit": batch_size,
+                "offset": offset,
+                "updated_after": last_load_date
+            }
+            if upper_bound:
+                params["updated_before"] = upper_bound
+
+            resp = client.get(url, headers=headers, params=params, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # 5. Extract records using response_records_key
+            records = data.get(response_key, [])
+            if not records:
+                break
+
+            current_chunk.extend(records)
+            total_records += len(records)
+
+            # 6. Stream chunk to S3 when batch size threshold is reached
+            if len(current_chunk) >= s3_chunk_size:
+                on_chunk_callback(current_chunk, part_num)
+                part_num += 1
+                current_chunk = []
+
+            if len(records) < batch_size:
+                break  # Last page reached
+
+            offset += len(records)
+
+        # 7. Flush any remaining records in final chunk
+        if current_chunk:
+            on_chunk_callback(current_chunk, part_num)
+
+        logger.info(f"Completed extraction for '{table_name}': {total_records} record(s) ingested.")
+        return total_records
 ```
 
-- `last_load_date`: The watermark string (`YYYY-MM-DD HH:MM:SS`). The connector uses this to filter records.
-- `secret_dict`: Decrypted Secrets Manager payload (credentials, API base URLs).
-- `on_chunk_callback(records: list[dict], part: int)`: The connector calls this for each batch of records. The main job's callback flattens and writes a Parquet partition.
-- The connector **does not write to S3 directly** — it only yields record batches through the callback.
+### 4.2 Registering the Connector in `connectors/__init__.py`
+
+To activate the connector, import and register it in `bronze/script/connectors/__init__.py`:
+
+```python
+from .custom_api import CustomApiConnector
+
+CONNECTOR_MAP = {
+    "custom_api": CustomApiConnector,
+    ...
+}
+```
+
+Now any table in `bronze_config.json` with `"type": "custom_api"` or `"connection_type": "custom_api"` will automatically route to `CustomApiConnector`.
 
 ---
 

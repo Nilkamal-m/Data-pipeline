@@ -160,7 +160,7 @@ This document provides the complete, production-grade configuration blueprint fo
 
 #### Deduplication Strategy Deep Dive: `latest_by_order_column` vs. `oldest_by_order_column`
 
-The Silver ETL engine performs windowed in-batch deduplication inside `perform_deduplication()` in [`uax_silver_etl.py`](file:///Users/nilkamalmahato/Documents/Data-pipeline/silver/script/uax_silver_etl.py).
+The Silver ETL engine performs windowed in-batch deduplication inside `perform_deduplication()` in [`uax_silver_etl.py`](../../silver/script/uax_silver_etl.py).
 
 ##### 1. How `"deduplication_strategy": "latest_by_order_column"` Works (Default)
 When set to `latest_by_order_column`:
