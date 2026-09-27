@@ -86,7 +86,6 @@ Data-pipeline/
 │   └── script/
 │       ├── config/
 │       │   └── bronze_config.json      # Ingestion configuration blueprint
-│       ├── config_loader.py            # Centralized config parser & {env} interpolator
 │       ├── connectors/                 # Modular upstream connectors
 │       │   ├── __init__.py             # Connector registry & CONNECTOR_MAP
 │       │   ├── database.py             # Relational database streaming connector
@@ -96,46 +95,55 @@ Data-pipeline/
 │       │   ├── oauth.py                # OAuth2 client (client_credentials, password, refresh)
 │       │   ├── s3_file.py              # S3 file feed connector (CSV, JSON, Parquet)
 │       │   └── servicenow.py           # ServiceNow REST Table API connector
+│       ├── config_loader.py            # Centralized config parser & {env} interpolator
+│       ├── protegrity_encryption.py    # Protegrity PII tokenization & REST API batch encryptor
 │       └── uax_bronze_load.py          # Main Bronze execution script
 ├── silver/                             # Silver Conformation & Iceberg Engine
 │   └── script/
 │       ├── config/
 │       │   └── silver_config.json      # Silver transformation & Iceberg merge configuration
 │       ├── custom_transforms/          # Pluggable PySpark transformation scripts
+│       │   ├── __init__.py
+│       │   ├── moveworks_conversations.py
+│       │   ├── moveworks_interactions.py
+│       │   ├── moveworks_plugin_calls.py
+│       │   ├── moveworks_plugin_resources.py
+│       │   ├── moveworks_users.py
+│       │   └── servicenow_incident.py
 │       ├── silver_config_loader.py     # Silver config parser & cache manager
 │       ├── transformer.py              # Declarative transformation rules engine
 │       └── uax_silver_etl.py           # Main Silver PySpark Iceberg execution script
-├── gold/                               # Gold Analytics Marts & Multi-Target Serving Engine
-│   ├── initial_exports/                # Historical CSV data migration drop directory
+├── gold/                               # Gold Analytics Marts & Serving Engine
 │   ├── query/                          # Business SQL transformation queries
-│   │   ├── genesys/
-│   │   │   └── conversations.sql       # Genesys conversation dimensional mart query
-│   │   └── moveworks/
-│   │       └── interactions.sql        # Moveworks interaction mart query
+│   │   ├── moveworks/                  # Moveworks SQL queries (v_conversations, v_interactions, etc.)
+│   │   └── servicenow/                 # ServiceNow SQL queries (v_incident_kpi.sql)
 │   └── script/
-│       ├── adapters/                   # Multi-target serving database connectors
-│       │   ├── aurora.py               # Aurora MySQL isolated staging & PK UPSERT adapter
-│       │   ├── databricks.py           # Databricks Unity Catalog Iceberg adapter
-│       │   ├── redshift.py             # Amazon Redshift Spectrum external catalog adapter
-│       │   └── snowflake.py            # Snowflake external Iceberg table adapter
 │       ├── config/
-│       │   └── gold_config.json        # Multi-target serving configuration blueprint
+│       │   └── gold_config.json        # Gold serving configuration blueprint
 │       ├── custom_transforms/          # Domain-specific PySpark transformation hooks
+│       │   └── genesys_conversations.py
 │       ├── gold_config_loader.py       # Gold configuration loader & cache manager
-│       ├── gold_initial_load.py        # Historical CSV parser, validator & auto-archiver
-│       └── gold_layer_manager.py       # Master Gold orchestration engine
-└── docs/                               # Enterprise Documentation Suite
+│       ├── gold_initial_load.py        # Gold initial load & PySpark distributed encryptor
+│       ├── gold_layer_manager.py       # Master Gold orchestration engine
+│       └── protegrity_encryption.py    # Protegrity PII tokenization & PySpark mapInPandas batch encryptor
+├── docs/                               # Enterprise Documentation Suite
 │   ├── ARCHITECTURE.md                 # System-wide architectural blueprint
 │   ├── ONBOARDING_GUIDE.md             # Developer setup, Glue job args & onboarding recipe
 │   ├── bronze/
 │   │   ├── BRONZE_LAYER.md             # Bronze low-level execution & auth guide
-│   │   └── CONFIG_BLUEPRINT.md         # Bronze configuration parameter reference
+│   │   ├── CONFIG_BLUEPRINT.md         # Bronze configuration parameter reference
+│   │   ├── ENHANCEMENT_GUIDE.md        # Modular enhancement & connector creation guide
+│   │   └── REFERENCE_INDEX.md          # Comprehensive inventory of Bronze scripts & configs
 │   ├── silver/
 │   │   ├── SILVER_LAYER.md             # Silver low-level execution & Iceberg guide
-│   │   └── CONFIG_BLUEPRINT.md         # Silver configuration parameter reference
+│   │   ├── CONFIG_BLUEPRINT.md         # Silver configuration parameter reference
+│   │   ├── ENHANCEMENT_GUIDE.md        # Custom transform & rules engine guide
+│   │   └── REFERENCE_INDEX.md          # Comprehensive inventory of Silver scripts & configs
 │   └── gold/
-│       ├── GOLD_LAYER.md               # Gold low-level execution & multi-target guide
-│       └── CONFIG_BLUEPRINT.md         # Gold configuration parameter reference
+│       ├── GOLD_LAYER.md               # Gold low-level execution & serving guide
+│       ├── CONFIG_BLUEPRINT.md         # Gold configuration parameter reference
+│       ├── ENHANCEMENT_GUIDE.md        # Business query & target adapter guide
+│       └── REFERENCE_INDEX.md          # Comprehensive inventory of Gold scripts & configs
 ```
 
 ---
