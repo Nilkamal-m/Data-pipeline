@@ -214,7 +214,7 @@ class GoldInitialLoader:
                 except Exception:
                     pass
 
-        if not sql_text:
+        if not sql_text or not isinstance(sql_text, str):
             logger.info(f"[QUERY AUTO-DISCOVERY] No query found for '{source_system}.{table_name}'. Initial load will use input file schema.")
             return None
 
@@ -279,6 +279,40 @@ class GoldInitialLoader:
             except Exception:
                 pass
         return df.dropDuplicates(subset=valid_nkeys)
+
+    @classmethod
+    def _purge_s3_prefix(cls, s3_client, s3_uri: str) -> int:
+        """
+        Safely deletes orphaned or corrupted metadata/data files under an S3 URI.
+        Requires at least 3 path segments to avoid deleting shallow prefixes.
+        """
+        if not s3_client or not s3_uri or not s3_uri.startswith("s3://"):
+            return 0
+        try:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(s3_uri)
+            bucket = parsed.netloc
+            prefix = parsed.path.lstrip('/')
+            if not prefix.endswith('/'):
+                prefix += '/'
+            parts = [p for p in prefix.strip('/').split('/') if p]
+            if len(parts) < 3:
+                return 0
+
+            paginator = s3_client.get_paginator('list_objects_v2')
+            total_deleted = 0
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                objects = page.get('Contents', [])
+                if objects:
+                    delete_keys = [{'Key': obj['Key']} for obj in objects]
+                    s3_client.delete_objects(Bucket=bucket, Delete={'Objects': delete_keys})
+                    total_deleted += len(delete_keys)
+            if total_deleted > 0:
+                logger.info(f"Purged {total_deleted} corrupted/orphaned S3 object(s) under '{s3_uri}'.")
+            return total_deleted
+        except Exception as e:
+            logger.warning(f"Could not purge S3 prefix '{s3_uri}': {e}")
+            return 0
 
     @classmethod
     def _get_gold_layer_manager(cls):
@@ -485,15 +519,79 @@ class GoldInitialLoader:
                 logger.error(f"[GOLD ENCRYPTION ERROR] Failed to encrypt historical columns: {enc_err}")
                 raise
 
-        # 2. Check Target Table Schema for Reconciliation
+        s3_location = f"s3://{bucket_name}/gold/data/{source_system}/{table_name}"
+        glue_client = params.get('_glue_client')
+        s3_client = params.get('_s3_client')
+        if glue_client is None or s3_client is None:
+            try:
+                import boto3
+                region = params.get('AWS_REGION') or os.environ.get('AWS_REGION', 'us-east-1')
+                if glue_client is None:
+                    glue_client = boto3.client('glue', region_name=region)
+                if s3_client is None:
+                    s3_client = boto3.client('s3', region_name=region)
+            except Exception:
+                pass
+
+        # 2. Check Target Table Schema for Reconciliation & Detect Ghost Tables
         target_fields = None
         table_exists = False
-        try:
-            target_df = spark.table(f"{glue_database}.{target_table_name}")
-            target_fields = target_df.schema.fields
-            table_exists = True
-            logger.info(f"Found existing Gold table '{full_table}' with {len(target_fields)} column(s).")
-        except Exception:
+        table_found_in_glue = False
+        glue_metadata_location = None
+
+        if glue_client:
+            try:
+                glue_tbl = glue_client.get_table(DatabaseName=glue_database, Name=target_table_name)
+                table_found_in_glue = True
+                glue_metadata_location = glue_tbl.get('Table', {}).get('Parameters', {}).get('metadata_location')
+            except Exception:
+                table_found_in_glue = False
+
+        if table_found_in_glue and glue_metadata_location and s3_client:
+            try:
+                import urllib.parse
+                parsed = urllib.parse.urlparse(glue_metadata_location)
+                b = parsed.netloc
+                k = parsed.path.lstrip('/')
+                try:
+                    s3_client.head_object(Bucket=b, Key=k)
+                except Exception:
+                    logger.warning(
+                        f"[GHOST TABLE DETECTED] Glue Catalog table `{glue_database}`.`{target_table_name}` points to "
+                        f"non-existent S3 metadata '{glue_metadata_location}' (404 NoSuchKey). "
+                        f"Dropping stale Glue Catalog entry and purging S3 path to allow clean recreation..."
+                    )
+                    try:
+                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                        logger.info(f"Successfully dropped ghost table `{glue_database}`.`{target_table_name}` from Glue Catalog.")
+                    except Exception as del_err:
+                        logger.warning(f"Failed to delete ghost table from Glue: {del_err}")
+                    cls._purge_s3_prefix(s3_client, s3_location)
+                    table_found_in_glue = False
+            except Exception:
+                table_found_in_glue = False
+
+        if table_found_in_glue:
+            try:
+                target_df = spark.table(f"{glue_database}.{target_table_name}")
+                target_df.limit(1).collect()
+                target_fields = target_df.schema.fields
+                table_exists = True
+                logger.info(f"Found existing Gold table '{full_table}' with {len(target_fields)} column(s).")
+            except Exception as probe_err:
+                logger.warning(
+                    f"[INITIAL LOAD PROBE] Spark probe for Gold table '{full_table}' failed ({probe_err}). "
+                    f"Deleting stale catalog table via Glue API and purging S3 path to allow clean recreation..."
+                )
+                if glue_client:
+                    try:
+                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                        logger.info(f"Successfully dropped stale table `{glue_database}`.`{target_table_name}` via Glue API.")
+                    except Exception as del_err:
+                        logger.warning(f"Could not drop table from Glue Catalog: {del_err}")
+                cls._purge_s3_prefix(s3_client, s3_location)
+                table_exists = False
+        else:
             table_exists = False
             logger.info(f"Gold table '{full_table}' not found in catalog. Attempting automatic Gold query extraction...")
 
@@ -522,7 +620,6 @@ class GoldInitialLoader:
         # 5. Perform Idempotent UPSERT into Athena / Iceberg Table
         temp_view = f"incoming_initial_{table_name}"
         df_consolidated.createOrReplaceTempView(temp_view)
-        s3_location = f"s3://{bucket_name}/gold/data/{source_system}/{table_name}"
 
         glm = cls._get_gold_layer_manager()
         if table_exists:
@@ -545,10 +642,40 @@ class GoldInitialLoader:
             try:
                 spark.sql(merge_sql)
             except Exception as merge_err:
-                logger.warning(f"[INITIAL LOAD UPSERT] Spark SQL MERGE failed ({merge_err}). Overwriting to {s3_location}...")
-                df_consolidated.write.mode("overwrite").format("parquet").save(s3_location)
+                err_m_str = str(merge_err)
+                if any(x in err_m_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
+                    logger.warning(
+                        f"[INITIAL LOAD MERGE RECOVERY] Iceberg MERGE hit NoSuchKey ({merge_err}). "
+                        f"Metadata is missing in S3. Dropping Glue Catalog table and re-initializing cleanly..."
+                    )
+                    if glue_client:
+                        try:
+                            glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                        except Exception:
+                            pass
+                    cls._purge_s3_prefix(s3_client, s3_location)
+                    df_consolidated.write \
+                        .format("iceberg") \
+                        .mode("overwrite") \
+                        .option("path", s3_location) \
+                        .saveAsTable(f"{glue_database}.{target_table_name}")
+                else:
+                    logger.warning(f"[INITIAL LOAD UPSERT] Spark SQL MERGE failed ({merge_err}). Falling back to Iceberg insertInto on '{full_table}'...")
+                    try:
+                        df_consolidated.write.format("iceberg").mode("append").insertInto(f"{glue_database}.{target_table_name}")
+                    except Exception as ice_fallback_err:
+                        logger.error(f"[INITIAL LOAD UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
+                        raise
         else:
-            logger.info(f"[INITIAL LOAD WRITE] Writing initial Gold table {full_table} to '{s3_location}'...")
+            logger.info(f"[INITIAL LOAD WRITE] Initializing clean Gold Iceberg table {full_table} at '{s3_location}'...")
+            if glue_client:
+                try:
+                    glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                    logger.info(f"[CLEANUP] Deleted preexisting Glue Catalog registration for '{target_table_name}' before recreation.")
+                except Exception:
+                    pass
+            cls._purge_s3_prefix(s3_client, f"{s3_location.rstrip('/')}/metadata")
+
             try:
                 df_consolidated.write \
                     .format("iceberg") \
@@ -556,8 +683,26 @@ class GoldInitialLoader:
                     .option("path", s3_location) \
                     .saveAsTable(f"{glue_database}.{target_table_name}")
             except Exception as ice_err:
-                logger.warning(f"[INITIAL LOAD WRITE] Direct Iceberg saveAsTable fallback to Parquet: {ice_err}")
-                df_consolidated.write.mode("overwrite").format("parquet").save(s3_location)
+                err_text = str(ice_err)
+                if any(x in err_text for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
+                    logger.warning(
+                        f"[INITIAL LOAD WRITE RETRY] Iceberg saveAsTable hit NoSuchKey ({ice_err}). "
+                        f"Purging Glue Catalog entry and entire S3 table location '{s3_location}' then retrying fresh creation..."
+                    )
+                    if glue_client:
+                        try:
+                            glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                        except Exception:
+                            pass
+                    cls._purge_s3_prefix(s3_client, s3_location)
+                    df_consolidated.write \
+                        .format("iceberg") \
+                        .mode("overwrite") \
+                        .option("path", s3_location) \
+                        .saveAsTable(f"{glue_database}.{target_table_name}")
+                else:
+                    raise
+
         # 6. Optional Downstream Extension: Aurora MySQL Serving
         # Only created/served if requested by user/config (target_engines contains 'aurora' or --GOLD_TARGETS contains 'aurora')
         target_engines = []
@@ -571,7 +716,11 @@ class GoldInitialLoader:
         if needs_aurora and glm:
             logger.info(f"[AURORA EXTENSION] User requested Aurora serving for '{target_table_name}'. Reading from Athena table and serving to Aurora...")
             try:
-                df_athena = spark.table(full_table)
+                try:
+                    df_athena = spark.table(full_table)
+                except Exception as read_tbl_err:
+                    logger.warning(f"Could not read from spark.table({full_table}): {read_tbl_err}. Using consolidated DataFrame directly.")
+                    df_athena = df_consolidated
                 gold_schema = params.get('RDS_GOLD_SCHEMA')
                 if not gold_schema:
                     raise ValueError(
