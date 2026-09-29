@@ -143,17 +143,15 @@ class MoveworksConnector:
         upper_bound       = (
             str(configured_ub).strip()
             if configured_ub and str(configured_ub).strip()
-            else datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            else "9999-12-31 23:59:59"
         )
 
         is_full_initial_load = (
-            str(last_load_date).strip().startswith('1900') or
-            str(last_load_date).strip().startswith('1970')
+            str(last_load_date).strip().startswith('1900')
         ) and (
             not configured_ub or
             str(configured_ub).strip() == '' or
-            str(configured_ub).strip().startswith('9999') or
-            str(configured_ub).strip().startswith('9998')
+            str(configured_ub).strip().startswith('9999')
         )
 
         if is_full_initial_load:

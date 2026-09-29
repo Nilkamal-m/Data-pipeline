@@ -1334,7 +1334,7 @@ def main():
     sync_watermark_table = params.get('SYNC_WATERMARK_TABLE', True)
     watermark_table_name = params.get('WATERMARK_TABLE_NAME')
 
-    is_ub_open = bool(not upper_bound or str(upper_bound).strip().startswith('9999') or str(upper_bound).strip().startswith('9998'))
+    is_ub_open = bool(not upper_bound or str(upper_bound).strip().startswith('9999'))
     ub_display = f"{upper_bound} (Open-ended)" if (upper_bound and is_ub_open) else (upper_bound if upper_bound else 'Per-table / Open-ended')
 
     start_banner = (

@@ -74,5 +74,5 @@ This document provides a line-by-line master index and component map for the ent
 | `source_systems.<source>.base_url` | `connectors/*.py` L65 | Secrets Manager | Upstream REST API root URL endpoint. |
 | `source_systems.<source>.api_endpoint_template` | `connectors/*.py` L70 | `/api/v1/{table_name}` | Endpoint path template with dynamic `{table_name}` token. |
 | `source_systems.<source>.response_records_key` | `connectors/*.py` L80 | **MANDATORY** | JSON envelope key holding the record list (`result`, `entities`, `value`). |
-| `source_systems.<source>.tables.<table>.initial_load_date` | `uax_bronze_load.py` L645 | `1970-01-01 00:00:00` | Baseline watermark timestamp for cold-start extraction. |
+| `source_systems.<source>.tables.<table>.initial_load_date` | `uax_bronze_load.py` L645 | `1900-01-01 00:00:00` | Baseline watermark timestamp for cold-start extraction. |
 | `source_systems.<source>.tables.<table>.flatten_nested_json` | `uax_bronze_load.py` L260 | `true` | When `true`, invokes `flatten_and_expand_record` prior to serialization. |

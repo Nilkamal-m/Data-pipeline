@@ -626,11 +626,11 @@ result   = spark.sql(f"SELECT MAX(_updated_at) FROM glue_catalog.gold_db.{mart_t
 max_gold_ts = result[0][0] if result else None
 
 # Substitute into mart SQL — only Silver records newer than max_gold_ts flow through
-watermark_str   = str(max_gold_ts) if max_gold_ts else '1970-01-01'
+watermark_str   = str(max_gold_ts) if max_gold_ts else '1900-01-01'
 incremental_df  = spark.sql(mart_sql.replace('{watermark}', watermark_str))
 ```
 
-For tables marked `full_refresh: true` in `gold_config.json` (typically small dimensions), the watermark is set to `1970-01-01` to force a complete Silver scan on every run.
+For tables marked `full_refresh: true` in `gold_config.json` (typically small dimensions), the watermark is set to `1900-01-01` to force a complete Silver scan on every run.
 
 #### 5.3.3 Gold Iceberg MERGE
 
