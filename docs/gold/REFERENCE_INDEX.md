@@ -37,7 +37,7 @@ This document provides a line-by-line master index and component map for the ent
 | `_deduplicate_by_nkey()` | L1729–L1766 | In-memory windowed deduplication over natural keys (`ROW_NUMBER() OVER (PARTITION BY nkey ORDER BY ...)`). | Called prior to serving write. |
 | `filter_incremental_delta()` | L1768–L1851 | Anti-joins incoming delta against current target table state to filter out unchanged records. | Incremental delta processing at L640. |
 | `_validate_gold_table_name()` | L1853–L1857 | Enforces naming conventions and prevents SQL injection on table identifiers. | Called before all DDL/DML. |
-| `_validate_view_name()` | L1859–L1863 | Enforces naming conventions and prevents SQL injection on view identifiers. | Called before view creation. |
+| `_validate_view_name()` | L1795–L1799 | Enforces naming conventions on temporary in-memory Spark views. | Spark session temporary view registration. |
 | `_validate_droppable_table_name()` | L1865–L1873 | Security guard: strictly prevents dropping non-staging tables during swap cleanup. | Called in `_cleanup_staging_table()`. |
 | `_cleanup_staging_table()` | L1875–L1890 | Drops transient staging tables in MySQL (`staging_tbl_*`) upon failure or completion. | Staging lifecycle management. |
 | `_verify_schema_exists_or_raise()` | L1892–L1930 | Verifies target schema/database exists in MySQL before initiating write operations. | Pre-flight check at L1150. |

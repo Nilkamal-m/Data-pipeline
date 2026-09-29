@@ -67,11 +67,10 @@ variable "use_existing_glue_database" {
 }
 
 locals {
-  bucket_name         = "${var.app_name}-${var.environment}-bucket"
-  bucket_arn          = "arn:aws:s3:::${local.bucket_name}"
-  glue_role_arn       = module.glue_iam_role.iam_role_arn
-  glue_db_name        = "${replace(var.app_name, "-", "_")}_db_${var.environment}"
-  bronze_crawler_name = "${var.app_name}-bronze-crawler-${var.environment}"
+  bucket_name   = "${var.app_name}-${var.environment}-bucket"
+  bucket_arn    = "arn:aws:s3:::${local.bucket_name}"
+  glue_role_arn = module.glue_iam_role.iam_role_arn
+  glue_db_name  = "${replace(var.app_name, "-", "_")}_db_${var.environment}"
 }
 
 
@@ -315,9 +314,6 @@ module "glue_iam_policy" {
           "glue:GetPartition",
           "glue:GetPartitions",
           "glue:UpdatePartition",
-          "glue:StartCrawler",
-          "glue:GetCrawler",
-          "glue:GetCrawlerMetrics",
           "glue:StartJobRun",
           "glue:GetJobRun",
           "glue:GetJobRuns",
@@ -394,38 +390,6 @@ module "bronze_glue_catalog_database" {
   create      = !var.use_existing_glue_database
   name        = local.glue_db_name
   description = "AWS Glue Data Catalog Database for Bronze raw and Silver Iceberg Tables."
-}
-
-
-# ------------------------------------------------------------------------------
-# 3.3 AWS Glue Bronze Crawler using Enterprise Private Registry Module
-# ------------------------------------------------------------------------------
-module "bronze_crawler" {
-  source = "glue/aws//modules/crawler"
-
-  name          = local.bronze_crawler_name
-  database_name = local.glue_db_name
-  role          = local.glue_role_arn
-  table_prefix  = "raw_tbl_"
-  description   = "Crawls Bronze raw data partitions (s3://${local.bucket_name}/bronze/data/) into AWS Glue Data Catalog."
-
-  s3_target = [
-    {
-      path = "s3://${local.bucket_name}/bronze/data/"
-    }
-  ]
-
-  schema_change_policy = {
-    delete_behavior = "LOG"
-    update_behavior = "UPDATE_IN_DATABASE"
-  }
-
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-    Layer       = "Bronze"
-    ManagedBy   = "Terraform"
-  }
 }
 
 
@@ -515,9 +479,4 @@ output "kms_key_arn" {
 output "glue_database_name" {
   value       = local.glue_db_name
   description = "AWS Glue Data Catalog Database Name."
-}
-
-output "bronze_crawler_name" {
-  value       = local.bronze_crawler_name
-  description = "AWS Glue Bronze Crawler Name."
 }

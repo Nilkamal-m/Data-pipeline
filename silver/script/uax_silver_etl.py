@@ -619,15 +619,15 @@ def check_iceberg_table_exists(spark, glue_client, database_name: str, table_nam
             glue_table_type = table_meta.get('TableType', '').upper()
             table_location = table_meta.get('StorageDescriptor', {}).get('Location') or silver_location
 
-            # If the Glue Catalog table was created by a Crawler or legacy job as a standard Hive table
-            # (not an Iceberg table, or missing metadata_location), Iceberg SparkCatalog cannot operate on it.
-            # Drop the stale non-Iceberg registration so Iceberg can create the real table cleanly.
+            # If the Glue Catalog table is registered as a standard Hive table rather than Iceberg
+            # (e.g., from a legacy migration or non-Iceberg write missing metadata_location),
+            # Iceberg SparkCatalog cannot operate on it.
+            # Drop the stale non-Iceberg registration so Iceberg can create the authoritative table cleanly.
             if table_type != 'ICEBERG' or not metadata_location:
                 logger.warning(
                     f"[NON-ICEBERG CATALOG TABLE DETECTED] Glue Catalog table `{database_name}`.`{table_name}` "
                     f"is registered as a standard Hive table ({glue_table_type}, table_type='{table_type}', metadata_location={metadata_location}). "
-                    f"This was likely created by an AWS Glue Crawler. Automatically dropping stale catalog registration "
-                    f"so Iceberg can create the table cleanly..."
+                    f"Automatically dropping stale catalog registration so Iceberg can initialize cleanly..."
                 )
                 try:
                     glue_client.delete_table(DatabaseName=database_name, Name=table_name)
@@ -1378,7 +1378,7 @@ def main():
                     )
                     df_bronze = None
 
-            # 2. Fallback: Read directly from S3 Parquet location (handles cases where crawler has not yet run)
+            # 2. Resilient Fallback: Read directly from S3 Parquet location if catalog partition resolution is pending
             if df_bronze is None:
                 try:
                     logger.info(f"Attempting direct S3 Parquet load from '{bronze_path}'...")

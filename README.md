@@ -149,7 +149,7 @@ Data-pipeline/
 │       ├── gold_layer_manager.py       # Master Gold orchestration engine & standalone Glue job entrypoint
 │       └── protegrity_encryption.py    # Protegrity PII tokenization & PySpark mapInPandas batch encryptor
 ├── lambda_helper/                      # Operations & Query Helper Lambda
-│   ├── lambda_function.py              # Unified Lambda handler (Athena query, Glue workflows, Crawlers)
+│   ├── lambda_function.py              # Unified Lambda handler (Athena queries, Glue workflows, multi-stage pipelines)
 │   └── HELPER.md                       # Comprehensive event payload & operations guide
 ├── terraform/                          # Infrastructure as Code
 │   ├── 1_bronze/                       # Bronze S3 bucket, IAM, and Glue job Terraform

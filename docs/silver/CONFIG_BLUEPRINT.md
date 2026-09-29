@@ -58,9 +58,6 @@ This document provides the complete, production-grade configuration blueprint fo
     "glue_catalog": {
       "enabled": true,
       "database_name": "uax_datalake_db_{env}",
-      "crawler_name": "uax-datalake-silver-crawler-{env}",
-      "_warning": "CRITICAL: trigger_crawler MUST remain false for Silver Iceberg tables to prevent catalog corruption!",
-      "trigger_crawler": false,
       "sync_watermark_table": true,
       "watermark_table_name": "tbl_watermarks"
     },
@@ -199,23 +196,13 @@ else:
 | :--- | :--- | :--- | :--- |
 | `enabled` | boolean | Optional (Default: `true`) | *Used in catalog manager*: Registers and verifies Silver database in AWS Glue Data Catalog. |
 | `database_name` | string | **Required** | *Used in catalog resolution*: Target Glue database (e.g., `uax_datalake_db_{env}`). |
-| `crawler_name` | string | Optional | Name of Glue crawler (e.g., `uax-datalake-silver-crawler-{env}`). |
-| `trigger_crawler` | boolean | **CRITICAL: MUST BE `false`** (Default: `false`) | Controls whether an AWS Glue Crawler is triggered post-execution. |
 | `sync_watermark_table` | boolean | Optional (Default: `true`) | *Used in `sync_silver_watermark_catalog_table()`*: Registers watermark metadata as an Athena-queryable table. |
 | `watermark_table_name` | string | Optional (Default: `tbl_watermarks`) | Name of the catalog table tracking pipeline execution watermarks. |
+| *(Note on Crawlers)* | - | - | **Eliminated by Design**: Silver tables use native Apache Iceberg catalog registration (`org.apache.iceberg.spark.SparkCatalog`). Glue Crawlers are 100% eliminated from the platform. |
 
-> [!WARNING]
-> **YELLOW WARNING — KEEP `trigger_crawler: false` FOR ALL SILVER ICEBERG TABLES!**
-> In `silver_config.json`, `"trigger_crawler"` is intentionally set to `false`. Silver tables are **Apache Iceberg tables**, not standard Hive/Parquet tables. Iceberg tables manage their own schema evolution, snapshot history, and file manifest lists directly via the Apache Iceberg Spark Catalog (`org.apache.iceberg.spark.SparkCatalog` backed by AWS Glue Catalog). Every write transaction updates the Glue Catalog atomically.
-
-> [!CAUTION]
-> **RED ALERT — NEVER TRIGGER A GLUE CRAWLER ON SILVER ICEBERG STORAGE FOLDERS:**
-> If an AWS Glue Crawler scans the Silver Iceberg S3 directory (`s3://<silver_bucket>/silver/data/...`):
-> 1. The crawler does **not** recognize the Iceberg snapshot transaction tree and will attempt to crawl raw Avro metadata and Parquet data files as a regular Hive table.
-> 2. It can **overwrite or corrupt** the Iceberg table definition in the AWS Glue Data Catalog, stripping the `table_type = ICEBERG` property and destroying the `metadata_location` pointer.
-> 3. This causes Athena queries to fail with `NOT_AN_ICEBERG_TABLE` or schema mismatch errors, and breaks future Spark `MERGE INTO` operations.
->
-> **Policy:** Always keep `"trigger_crawler": false` in `silver_config.json`. Do not pass `--TRIGGER_CRAWLER true`.
+> [!NOTE]
+> **Native Iceberg Catalog Integration (Zero Crawlers)**:
+> Silver tables are managed natively via Apache Iceberg (`SparkCatalog`) backed by the AWS Glue Data Catalog. Every transaction writes snapshots, manifest lists, and schema changes atomically directly to the Glue Catalog metastore. Crawlers are completely eliminated across the entire platform, avoiding metadata corruption, crawl lag, and duplicate Hive table creation.
 
 ---
 

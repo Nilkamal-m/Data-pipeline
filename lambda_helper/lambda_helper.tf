@@ -81,10 +81,6 @@ resource "aws_iam_policy" "lambda_glue_trigger_policy" {
           "glue:GetJobRun",
           "glue:GetJobRuns",
           "glue:BatchStopJobRun",
-          "glue:StartCrawler",
-          "glue:GetCrawler",
-          "glue:GetCrawlers",
-          "glue:StopCrawler",
           "glue:GetTable",
           "glue:GetTables",
           "glue:UpdateTable",
@@ -95,8 +91,6 @@ resource "aws_iam_policy" "lambda_glue_trigger_policy" {
         ]
         Resource = [
           "arn:aws:glue:${var.aws_region}:*:job/${var.app_name}*",
-          "arn:aws:glue:${var.aws_region}:*:crawler/${var.app_name}*",
-          "arn:aws:glue:${var.aws_region}:*:crawler/*",
           "arn:aws:glue:${var.aws_region}:*:catalog",
           "arn:aws:glue:${var.aws_region}:*:database/*",
           "arn:aws:glue:${var.aws_region}:*:table/*/*"
@@ -206,7 +200,6 @@ resource "aws_lambda_function" "glue_trigger_lambda" {
       DEFAULT_BRONZE_JOB   = "${var.app_name}-bronze-ingestion-${var.environment}"
       DEFAULT_SILVER_JOB   = "${var.app_name}-silver-etl-${var.environment}"
       DEFAULT_GOLD_JOB     = "${var.app_name}-gold-marts-${var.environment}"
-      DEFAULT_CRAWLER_NAME = "${var.app_name}-bronze-crawler-${var.environment}"
       ENVIRONMENT          = var.environment
     }
   }

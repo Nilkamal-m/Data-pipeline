@@ -111,10 +111,10 @@ s3://uax-datalake-silver-dev/silver/data/servicenow/tbl_incident/
     └── 123456789-m0.avro
 ```
 
-### 4.2 Why AWS Glue Crawlers Are Disabled for Silver Iceberg
-In `silver_config.json`, `glue_catalog.trigger_crawler` is explicitly set to `false`.
-* **Standard crawlers corrupt Iceberg catalogs**: Standard Glue crawlers crawl both `/data` and `/metadata` directories, inadvertently generating duplicate or broken schema tables.
-* **Native Spark Catalog Registration**: When Spark executes Iceberg DDL (`CREATE TABLE iceberg_catalog.{db}.{table}`), the Spark-Iceberg runtime natively writes atomic Iceberg metadata pointers directly into the AWS Glue Data Catalog.
+### 4.2 Elimination of AWS Glue Crawlers — Native Apache Iceberg Catalog Integration
+AWS Glue Crawlers have been completely eliminated across the entire data platform:
+* **Standard crawlers corrupt Iceberg catalogs**: Standard Glue crawlers crawl both `/data` and `/metadata` directories, inadvertently generating duplicate, conflicting Hive schema tables.
+* **Native Spark Catalog Registration**: When Spark executes Iceberg operations (`org.apache.iceberg.spark.SparkCatalog`), the Spark-Iceberg runtime natively writes atomic Iceberg metadata pointers, snapshots, and schemas directly into the AWS Glue Data Catalog on every write transaction. No crawler is ever used.
 
 ---
 

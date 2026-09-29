@@ -2,8 +2,10 @@
 # SILVER LAYER TERRAFORM INFRASTRUCTURE (terraform/2_silver/silver.tf)
 # ==============================================================================
 # Self-contained Terraform script for Silver Iceberg ETL Layer.
-# Contains all variables, Glue Catalog DB, Iceberg Crawler, and PySpark ETL Job.
+# Contains all variables, Glue Catalog DB, and PySpark Iceberg ETL Job.
 # Includes pre-existence check logic to skip creating resources if already present.
+# Note: AWS Glue Crawlers are eliminated — Apache Iceberg natively manages table
+# metadata, snapshots, and schema evolution via SparkCatalog in AWS Glue Data Catalog.
 # ==============================================================================
 
 provider "aws" {
@@ -60,37 +62,6 @@ module "silver_glue_catalog_database" {
   description = "AWS Glue Data Catalog Database for Silver Layer Apache Iceberg Tables."
 }
 
-# ------------------------------------------------------------------------------
-# 2. AWS Glue Iceberg Crawler using Enterprise Private Registry Module
-# ------------------------------------------------------------------------------
-module "silver_iceberg_crawler" {
-  source = "glue/aws//modules/crawler"
-
-  name          = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
-  database_name = local.glue_db_name
-  role          = local.glue_role_arn
-  description   = "Crawls Silver Layer Apache Iceberg tables into AWS Glue Data Catalog."
-
-  s3_target = [
-    {
-      path = "s3://${local.bucket_name}/silver/data/"
-    }
-  ]
-
-  table_prefix = "tbl_"
-
-  schema_change_policy = {
-    delete_behavior = "LOG"
-    update_behavior = "UPDATE_IN_DATABASE"
-  }
-
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-    Layer       = "Silver"
-    ManagedBy   = "Terraform"
-  }
-}
 
 # ------------------------------------------------------------------------------
 # 3. AWS Glue PySpark Apache Iceberg ETL Job
@@ -138,11 +109,6 @@ module "silver_iceberg_job" {
 output "glue_catalog_database_name" {
   value       = local.glue_db_name
   description = "AWS Glue Data Catalog Database Name for Silver Iceberg Tables."
-}
-
-output "glue_silver_iceberg_crawler_name" {
-  value       = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
-  description = "AWS Glue Silver Iceberg Crawler Name."
 }
 
 

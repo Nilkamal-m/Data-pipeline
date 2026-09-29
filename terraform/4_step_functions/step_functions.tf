@@ -66,7 +66,7 @@ locals {
   sfn_role_arn        = var.use_existing_step_functions_role ? "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.app_name}-stepfunctions-role-${var.environment}" : module.step_functions_iam_role.iam_role_arn
   bronze_job_name     = "${var.app_name}-bronze-ingestion-${var.environment}"
   silver_job_name     = "${var.app_name}-silver-etl-${var.environment}"
-  silver_crawler_name = "${var.app_name}-silver-iceberg-crawler-${var.environment}"
+  gold_job_name       = "${var.app_name}-gold-marts-${var.environment}"
 }
 
 # ------------------------------------------------------------------------------
@@ -101,7 +101,7 @@ module "step_functions_iam_policy" {
 
   create_policy = !var.use_existing_step_functions_role
   name          = "${var.app_name}-stepfunctions-policy-${var.environment}"
-  description   = "Execution policy for AWS Step Functions orchestrating Glue jobs and Crawlers."
+  description   = "Execution policy for AWS Step Functions orchestrating sequential 3-job Glue pipeline."
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -112,9 +112,7 @@ module "step_functions_iam_policy" {
           "glue:StartJobRun",
           "glue:GetJobRun",
           "glue:GetJobRuns",
-          "glue:BatchStopJobRun",
-          "glue:StartCrawler",
-          "glue:GetCrawler"
+          "glue:BatchStopJobRun"
         ]
         Resource = "*"
       },
@@ -259,7 +257,7 @@ module "servicenow_state_machine" {
   role_arn = local.sfn_role_arn
 
   definition = jsonencode({
-    Comment = "Orchestrates ServiceNow Ingestion -> Silver Iceberg ETL -> Glue Crawler Sync -> SNS Alert"
+    Comment = "Orchestrates ServiceNow Ingestion -> Silver Iceberg ETL -> Gold Serving Marts -> SNS Alert"
     StartAt = "TriggerBronzeIngestion"
     States = {
       TriggerBronzeIngestion = {
@@ -300,14 +298,18 @@ module "servicenow_state_machine" {
             Next        = "SendFailureAlert"
           }
         ]
-        Next = "TriggerSilverCrawler"
+        Next = "TriggerGoldServingMarts"
       }
 
-      TriggerSilverCrawler = {
+      TriggerGoldServingMarts = {
         Type     = "Task"
-        Resource = "arn:aws:states:::glue:startCrawler"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
-          Name = local.silver_crawler_name
+          JobName = local.gold_job_name
+          Arguments = {
+            "--SOURCE_SYSTEM"        = "servicenow"
+            "--GOLD_CONFIG_S3_PATH" = "s3://${local.bucket_name}/gold/script/config/gold_config.json"
+          }
         }
         Catch = [
           {
@@ -315,34 +317,7 @@ module "servicenow_state_machine" {
             Next        = "SendFailureAlert"
           }
         ]
-        Next = "WaitForCrawler"
-      }
-
-      WaitForCrawler = {
-        Type    = "Wait"
-        Seconds = 15
-        Next    = "GetCrawlerStatus"
-      }
-
-      GetCrawlerStatus = {
-        Type     = "Task"
-        Resource = "arn:aws:states:::aws-sdk:glue:getCrawler"
-        Parameters = {
-          Name = local.silver_crawler_name
-        }
-        Next = "CheckCrawlerRunning"
-      }
-
-      CheckCrawlerRunning = {
-        Type = "Choice"
-        Choices = [
-          {
-            Variable     = "$.Crawler.State"
-            StringEquals = "RUNNING"
-            Next         = "WaitForCrawler"
-          }
-        ]
-        Default = "SendSuccessAlert"
+        Next = "SendSuccessAlert"
       }
 
       SendSuccessAlert = {
@@ -351,7 +326,7 @@ module "servicenow_state_machine" {
         Parameters = {
           TopicArn = local.sns_topic_arn
           Subject  = "SUCCESS: ServiceNow Pipeline Completed (${var.environment})"
-          Message  = "ServiceNow Bronze Ingestion, Silver Iceberg ETL, and Glue Crawler Sync completed successfully."
+          Message  = "ServiceNow Bronze Ingestion, Silver Iceberg ETL, and Gold Serving Marts completed successfully."
         }
         End = true
       }
@@ -385,7 +360,7 @@ module "moveworks_state_machine" {
   role_arn = local.sfn_role_arn
 
   definition = jsonencode({
-    Comment = "Orchestrates Moveworks Ingestion -> Silver Iceberg ETL -> Glue Crawler Sync -> SNS Alert"
+    Comment = "Orchestrates Moveworks Ingestion -> Silver Iceberg ETL -> Gold Serving Marts -> SNS Alert"
     StartAt = "TriggerBronzeIngestion"
     States = {
       TriggerBronzeIngestion = {
@@ -426,14 +401,18 @@ module "moveworks_state_machine" {
             Next        = "SendFailureAlert"
           }
         ]
-        Next = "TriggerSilverCrawler"
+        Next = "TriggerGoldServingMarts"
       }
 
-      TriggerSilverCrawler = {
+      TriggerGoldServingMarts = {
         Type     = "Task"
-        Resource = "arn:aws:states:::glue:startCrawler"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
-          Name = local.silver_crawler_name
+          JobName = local.gold_job_name
+          Arguments = {
+            "--SOURCE_SYSTEM"        = "moveworks"
+            "--GOLD_CONFIG_S3_PATH" = "s3://${local.bucket_name}/gold/script/config/gold_config.json"
+          }
         }
         Catch = [
           {
@@ -441,34 +420,7 @@ module "moveworks_state_machine" {
             Next        = "SendFailureAlert"
           }
         ]
-        Next = "WaitForCrawler"
-      }
-
-      WaitForCrawler = {
-        Type    = "Wait"
-        Seconds = 15
-        Next    = "GetCrawlerStatus"
-      }
-
-      GetCrawlerStatus = {
-        Type     = "Task"
-        Resource = "arn:aws:states:::aws-sdk:glue:getCrawler"
-        Parameters = {
-          Name = local.silver_crawler_name
-        }
-        Next = "CheckCrawlerRunning"
-      }
-
-      CheckCrawlerRunning = {
-        Type = "Choice"
-        Choices = [
-          {
-            Variable     = "$.Crawler.State"
-            StringEquals = "RUNNING"
-            Next         = "WaitForCrawler"
-          }
-        ]
-        Default = "SendSuccessAlert"
+        Next = "SendSuccessAlert"
       }
 
       SendSuccessAlert = {
@@ -477,7 +429,7 @@ module "moveworks_state_machine" {
         Parameters = {
           TopicArn = local.sns_topic_arn
           Subject  = "SUCCESS: Moveworks Pipeline Completed (${var.environment})"
-          Message  = "Moveworks Bronze Ingestion, Silver Iceberg ETL, and Glue Crawler Sync completed successfully."
+          Message  = "Moveworks Bronze Ingestion, Silver Iceberg ETL, and Gold Serving Marts completed successfully."
         }
         End = true
       }
@@ -511,7 +463,7 @@ module "genesys_state_machine" {
   role_arn = local.sfn_role_arn
 
   definition = jsonencode({
-    Comment = "Orchestrates Genesys Ingestion -> Silver Iceberg ETL -> Glue Crawler Sync -> SNS Alert"
+    Comment = "Orchestrates Genesys Ingestion -> Silver Iceberg ETL -> Gold Serving Marts -> SNS Alert"
     StartAt = "TriggerBronzeIngestion"
     States = {
       TriggerBronzeIngestion = {
@@ -552,14 +504,18 @@ module "genesys_state_machine" {
             Next        = "SendFailureAlert"
           }
         ]
-        Next = "TriggerSilverCrawler"
+        Next = "TriggerGoldServingMarts"
       }
 
-      TriggerSilverCrawler = {
+      TriggerGoldServingMarts = {
         Type     = "Task"
-        Resource = "arn:aws:states:::glue:startCrawler"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
         Parameters = {
-          Name = local.silver_crawler_name
+          JobName = local.gold_job_name
+          Arguments = {
+            "--SOURCE_SYSTEM"        = "genesys"
+            "--GOLD_CONFIG_S3_PATH" = "s3://${local.bucket_name}/gold/script/config/gold_config.json"
+          }
         }
         Catch = [
           {
@@ -567,34 +523,7 @@ module "genesys_state_machine" {
             Next        = "SendFailureAlert"
           }
         ]
-        Next = "WaitForCrawler"
-      }
-
-      WaitForCrawler = {
-        Type    = "Wait"
-        Seconds = 15
-        Next    = "GetCrawlerStatus"
-      }
-
-      GetCrawlerStatus = {
-        Type     = "Task"
-        Resource = "arn:aws:states:::aws-sdk:glue:getCrawler"
-        Parameters = {
-          Name = local.silver_crawler_name
-        }
-        Next = "CheckCrawlerRunning"
-      }
-
-      CheckCrawlerRunning = {
-        Type = "Choice"
-        Choices = [
-          {
-            Variable     = "$.Crawler.State"
-            StringEquals = "RUNNING"
-            Next         = "WaitForCrawler"
-          }
-        ]
-        Default = "SendSuccessAlert"
+        Next = "SendSuccessAlert"
       }
 
       SendSuccessAlert = {
@@ -603,7 +532,7 @@ module "genesys_state_machine" {
         Parameters = {
           TopicArn = local.sns_topic_arn
           Subject  = "SUCCESS: Genesys Pipeline Completed (${var.environment})"
-          Message  = "Genesys Bronze Ingestion, Silver Iceberg ETL, and Glue Crawler Sync completed successfully."
+          Message  = "Genesys Bronze Ingestion, Silver Iceberg ETL, and Gold Serving Marts completed successfully."
         }
         End = true
       }

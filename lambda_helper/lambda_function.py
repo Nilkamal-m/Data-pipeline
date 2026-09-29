@@ -75,6 +75,9 @@ WORKFLOW_TERMINAL_STATES = {'COMPLETED', 'STOPPED', 'ERROR'}
 DEFAULT_BRONZE_JOB = os.environ.get('DEFAULT_BRONZE_JOB', 'uax-datalake-bronze-ingestion-dev')
 DEFAULT_SILVER_JOB = os.environ.get('DEFAULT_SILVER_JOB', 'uax-datalake-silver-etl-dev')
 DEFAULT_GOLD_JOB = os.environ.get('DEFAULT_GOLD_JOB', 'uax-datalake-gold-marts-dev')
+# Note: AWS Glue Crawlers are eliminated from standard production workflows (replaced by direct Glue SDK
+# partition sync in Bronze and native Apache Iceberg SparkCatalog in Silver/Gold). Maintained strictly for
+# backward compatibility with legacy invocations.
 DEFAULT_CRAWLER_NAME = os.environ.get('DEFAULT_CRAWLER_NAME', 'uax-datalake-bronze-crawler-dev')
 DEFAULT_WORKFLOW_NAME = os.environ.get('DEFAULT_WORKFLOW_NAME', os.environ.get('GLUE_WORKFLOW_NAME', ''))
 
@@ -406,6 +409,9 @@ def is_crawler_event(event: Dict[str, Any]) -> bool:
       - Explicit action: "crawler", "run_crawler", "start_crawler", "trigger_crawler", "crawl"
       - Presence of "crawler_name" / "CRAWLER_NAME" when layer is not a Glue job layer or athena
     Excludes multi-stage pipelines (e.g. layers: [...] or layer='all').
+
+    Note: AWS Glue Crawlers are eliminated from the production 3-stage pipeline
+    (Bronze -> Silver -> Gold). This function is retained for backward compatibility.
     """
     if isinstance(event.get('layers'), list):
         return False
@@ -521,9 +527,14 @@ def poll_glue_crawler(crawler_name: str, poll_interval: int = 5, timeout_seconds
 def trigger_and_monitor_crawler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Triggers an AWS Glue Crawler and optionally monitors it until completion.
+    Note: Crawlers are eliminated from standard production pipeline execution.
+    Maintained for legacy compatibility.
     """
     crawler_name = resolve_crawler_name(event)
-    logger.info(f"Starting AWS Glue Crawler: '{crawler_name}'")
+    logger.warning(
+        f"[DEPRECATION WARNING] Glue Crawlers are eliminated from standard production pipeline. "
+        f"Invoking crawler '{crawler_name}' in legacy backward-compatibility mode."
+    )
 
     already_running = False
     try:

@@ -54,9 +54,9 @@ flowchart TD
     subgraph Finalization ["5. State Commit & Catalog Sync"]
         PartitionWrite --> CommitState["Atomically Write State to S3:\nUpdate last_load_date = max(_ingested_at)"]
         CommitState --> CatalogSync{"Glue Catalog\nSync Enabled?"}
-        CatalogSync -- Yes --> TriggerCrawler["Trigger AWS Glue Crawler or\nDirectly Update Data Catalog"]
+        CatalogSync -- Yes --> DirectCatalogSync["Deterministic AWS Glue Catalog API:\nRegister Table & Partition (<100ms)"]
         CatalogSync -- No --> Success(["Job Complete"])
-        TriggerCrawler --> Success
+        DirectCatalogSync --> Success
     end
 ```
 
@@ -88,7 +88,7 @@ bronze/
 1. **Separation of Concerns**: Connectors are decoupled from the orchestration loop. A change in the ServiceNow API pagination logic never impacts relational database extraction.
 2. **Independent Unit Testability**: Individual connectors, OAuth token lifecycle managers, and JSON flatteners can be tested in isolation using mocked HTTP responses without running a full Glue Spark context.
 3. **Dynamic Connector Routing**: The orchestrator (`uax_bronze_load.py`) relies on `CONNECTOR_MAP` in `connectors/__init__.py` to instantiate the appropriate connector class at runtime based on the configuration key.
-4. **Environment Isolation**: The `ConfigLoader` interpolates dynamic `{env}` variables across bucket names, database catalogs, and crawlers without hardcoding environment branches in the extraction code.
+4. **Environment Isolation**: The `ConfigLoader` interpolates dynamic `{env}` variables across bucket names and database catalogs without hardcoding environment branches in the extraction code.
 
 ---
 

@@ -360,38 +360,21 @@ glue_client.create_partition(
 
 Athena can query the table immediately after this step — no crawler run is needed to make the data available.
 
-#### 5.1.7 Glue Crawler — Purpose, Scope, and When to Use It
+#### 5.1.7 Elimination of AWS Glue Crawlers — Production Architecture Justification
 
-After the Catalog API registration, the Bronze job can optionally trigger an AWS Glue Crawler. This is controlled by `pipeline_defaults.glue_catalog.trigger_crawler` in `bronze_config.json`.
+AWS Glue Crawlers have been completely eliminated from the architecture across all layers. The pipeline operates entirely on deterministic, API-driven and engine-native catalog synchronization:
 
-**The crawler is not required for Athena queryability.** The table and partition are already registered by the direct API call above. The crawler's role is supplementary:
+| Architectural Concern | AWS Glue Crawler Approach (Eliminated) | Direct Engine / API Approach (Production Standard) |
+|---|---|---|
+| **Athena Query Latency** | High (crawlers take 3–5 minutes to poll and complete before queries work). | **Zero lag**: Partition is registered via `glue:CreatePartition` in <100ms during the Bronze job. |
+| **Catalog Metadata Integrity** | Poor (standard crawlers crawl both `/data` and `/metadata` directories, corrupting Apache Iceberg tables by registering duplicate Hive tables). | **100% Acid Compliant**: PySpark Iceberg `SparkCatalog` writes Iceberg metadata atomically. |
+| **Schema Evolution Determinism** | Non-deterministic (crawlers sample a subset of files and may misinterpret schema types). | **Deterministic**: Code strictly validates schemas, casts types (universal `STRING` in Gold), and evolves schemas systematically. |
+| **Pipeline Reliability & Chaining** | Flaky (crawler states like `CrawlerRunningException` complicate workflow DAGs). | **Sequential & Deterministic**: Orchestrated via AWS Step Functions / Glue Workflows: `Bronze -> Silver -> Gold -> SNS Alert`. |
 
-| Question | Answer |
-|---|---|
-| **Is it required for Athena to query the data?** | No. The table and partition are already in the Catalog via direct API. |
-| **What does it do?** | Crawls the S3 prefix, re-infers column types from the actual Parquet files, and updates the Catalog table definition. |
-| **When should it be enabled?** | When a source API starts returning new fields that the code-side schema inference missed, or during initial pipeline setup before a stable sample record is available. |
-| **What if it is already running?** | `CrawlerRunningException` is caught and logged as INFO. The pipeline does not fail — the Catalog is already correct from the API registration step. |
-| **What if it has not been provisioned?** | `EntityNotFoundException` is caught and ignored silently. The job continues normally. |
-
-```python
-def trigger_glue_crawler(crawler_name: str) -> None:
-    if not crawler_name or not crawler_name.strip():
-        return
-    try:
-        glue_client.start_crawler(Name=crawler_name.strip())
-        logger.info(f"Triggered Glue Crawler '{crawler_name}'.")
-    except ClientError as ce:
-        code = ce.response['Error']['Code']
-        if code == 'CrawlerRunningException':
-            logger.info("Crawler already RUNNING. Catalog will reflect latest data.")
-        elif code in ('EntityNotFoundException', 'NoSuchEntityException'):
-            logger.info("Crawler not provisioned. Catalog synced via direct API — no action needed.")
-        else:
-            logger.warning(f"Could not trigger crawler '{crawler_name}': {ce}")
-```
-
-For Silver Iceberg tables, the crawler default is `False`. Spark's Iceberg integration updates the Glue Catalog natively during each write — no external crawler is needed at the Silver layer.
+##### Layer-by-Layer Synchronization Mechanics:
+1. **Bronze Layer**: Directly registers the table definition via `glue:CreateTable` and every ingested partition timestamp via `glue:CreatePartition`. No crawler is ever triggered or required.
+2. **Silver Layer**: Apache Iceberg natively registers snapshots, manifest lists, and schemas directly in the AWS Glue Data Catalog via `org.apache.iceberg.spark.SparkCatalog`.
+3. **Gold Layer**: Materializes physical Apache Iceberg tables directly via `SparkCatalog` and executes zero-downtime atomic swap to Amazon Aurora MySQL. Zero views (`v_*`) are published to the catalog.
 
 #### 5.1.8 Watermark Commit — Final Step, Atomicity Guarantee
 

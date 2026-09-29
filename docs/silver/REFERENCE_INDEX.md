@@ -29,7 +29,6 @@ This document provides a line-by-line master index and component map for the ent
 | `quote_iceberg_table()` | L661–L667 | Quotes table names safely with backticks for Spark SQL execution. | Used across DDL and DML operations. |
 | `purge_s3_table_location()` | L669–L699 | Empties S3 table folder during full refresh before rebuilding Iceberg table metadata. | Called in full refresh handler at L765. |
 | `check_iceberg_table_exists()` | L701–L806 | Verifies whether the Iceberg table exists in AWS Glue Catalog and checks storage metadata. | Called in Step 4 Iceberg merge at L1690. |
-| `trigger_silver_iceberg_crawler()` | L808–L834 | **DISABLED BY POLICY (`trigger_crawler: false`)**: Logs skipped message to protect Iceberg metadata. | Called in job teardown at L1923. |
 | `get_payload_columns()` | L836–L849 | Extracts business payload columns while strictly excluding technical/metadata columns (`_*`). | Used for SCD1/2 payload hashing. |
 | `build_runtime_hash_expr()` | L851–L862 | Synthesizes SHA-256 hash expression (`sha2(concat_ws('\|\|', ...), 256)`) over payload columns. | Used for SCD Type 2 change detection. |
 | `perform_deduplication()` | L864–L889 | Windows records by natural key (`nkey`), sorts by order columns, and filters `row_num == 1`. Supports `latest_by_order_column` (DESC) and `oldest_by_order_column` (ASC). | Called in Step 2 at L1620. |
@@ -61,6 +60,5 @@ This document provides a line-by-line master index and component map for the ent
 | `pipeline_defaults.scd_type` | `uax_silver_etl.py` L270 | `scd1` | Default dimension tracking type (`scd1` or `scd2`). |
 | `pipeline_defaults.deduplication.strategy` | `uax_silver_etl.py` L864 | `latest_by_order_column` | Window sort direction: `latest_by_order_column` (.desc) vs `oldest_by_order_column` (.asc). |
 | `pipeline_defaults.deduplication.default_nkey` | `uax_silver_etl.py` L1563 | **DO NOT RELY ON DEFAULT** | Legacy fallback primary key (`sys_id`). Every table must explicitly configure `nkey`. |
-| `pipeline_defaults.glue_catalog.trigger_crawler` | `uax_silver_etl.py` L1922 | **`false`** | Strictly `false` to prevent Glue Crawlers from corrupting Iceberg catalog definitions. |
 | `source_systems.<source>.tables.<table>.nkey` | `uax_silver_etl.py` L1563 | **MANDATORY** | Natural/composite primary keys uniquely identifying entities. |
 | `source_systems.<source>.tables.<table>.deduplication_order_by` | `uax_silver_etl.py` L1596 | **MANDATORY** | Ordering timestamp column(s) used to resolve tie-breaks during deduplication. |

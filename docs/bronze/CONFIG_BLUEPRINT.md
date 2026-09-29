@@ -28,8 +28,6 @@ This document provides the definitive configuration blueprint for `bronze_config
       "enabled": true,
       "database_name": "uax_datalake_db_{env}",
       "table_prefix": "raw_tbl_",
-      "crawler_name": "uax-datalake-bronze-crawler-{env}",
-      "trigger_crawler": true,
       "sync_watermark_table": true,
       "watermark_table_name": "raw_tbl_watermarks"
     },
@@ -167,10 +165,9 @@ This document provides the definitive configuration blueprint for `bronze_config
 | `glue_catalog.enabled` | boolean | Optional (Default: `true`) | *Used in post-write step*: Whether to register/synchronize the ingested table with the AWS Glue Data Catalog. |
 | `glue_catalog.database_name` | string | Optional | *Used in Glue client*: Glue Database name for raw tables. Interpolates `{env}` (e.g., `uax_datalake_db_{env}`). |
 | `glue_catalog.table_prefix` | string | Optional (Default: `raw_tbl_`) | *Used in Glue table naming*: Prefix prepended to source table names in Athena/Glue. |
-| `glue_catalog.crawler_name` | string | Optional | *Used in Glue Crawler trigger*: Name of Glue Crawler to trigger. Interpolates `{env}`. |
-| `glue_catalog.trigger_crawler`| boolean | Optional (Default: `true`) | *Used in `BronzeLoadManager._trigger_crawler()`*: If `true`, invokes `boto3.client('glue').start_crawler()`. |
 | `glue_catalog.sync_watermark_table` | boolean | Optional (Default: `true`) | *Used in Glue metadata sync*: Updates the raw watermarks table in Glue for operational dashboards. |
 | `glue_catalog.watermark_table_name` | string | Optional (Default: `raw_tbl_watermarks`) | *Used in Glue metadata sync*: Athena table name storing pipeline watermarks. |
+| *(Note on Crawlers)* | - | - | **Eliminated by Design**: Bronze uses deterministic AWS SDK calls (`glue:CreateTable`, `glue:CreatePartition`) for zero-lag catalog registration without crawlers. |
 
 ---
 

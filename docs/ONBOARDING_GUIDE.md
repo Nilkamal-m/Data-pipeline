@@ -13,7 +13,7 @@ The entire data pipeline infrastructure, storage, security, and execution runtim
 > You do not need to configure local PySpark, Java runtimes, or local databases. Triggering the Terraform deployment scripts automatically provisions and configures all required cloud components across environments (`dev`, `stage`, `prod`):
 > * **Storage**: Amazon S3 Data Lake buckets (`bronze`, `silver`, `gold`, `state`) with lifecycle and partitioning rules.
 > * **Security & IAM**: Least-privilege IAM service roles and AWS Secrets Manager credential definitions.
-> * **Catalogs & Metastore**: AWS Glue Data Catalog databases, table definitions, and operational crawlers.
+> * **Catalogs & Metastore**: AWS Glue Data Catalog databases and deterministic API-managed table schemas (zero crawlers required).
 > * **Serverless Compute**: AWS Glue Job execution environments pre-configured with Spark, PyArrow, Iceberg runtimes, and external Python library dependencies.
 > * **Query Engine**: Amazon Athena workgroups with isolated query result storage.
 > * **Orchestration & Alerting**: AWS Glue Workflows and Amazon SNS alert topics for automated success and failure messaging.

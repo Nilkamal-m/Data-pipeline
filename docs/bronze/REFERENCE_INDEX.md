@@ -44,8 +44,7 @@ This document provides a line-by-line master index and component map for the ent
 | `sync_bronze_catalog_table()` | L878–L1096 | Automatically creates/evolves Glue Data Catalog Hive external tables pointing to Bronze S3 storage. | Called post-promotion at L1525. |
 | `sanitize_watermark_files()` | L1098–L1133 | Rewrites legacy multi-line JSON watermark files into single-line NDJSON for Athena compatibility. | Called in catalog sync at L1145. |
 | `sync_watermark_catalog_table()`| L1135–L1223 | Creates an Athena-queryable table over all Bronze watermark state files. | Called in `main()` at L1310. |
-| `trigger_glue_crawler()` | L1225–L1247 | Triggers AWS Glue Crawler if enabled in configuration (`trigger_crawler: true`). | Called in post-job catalog sync at L1650. |
-| `main()` | L1249–L1738 | Orchestrates the end-to-end extraction lifecycle across all configured tables. | Main CLI entrypoint. |
+| `main()` | L1304–L1738 | Orchestrates the end-to-end extraction lifecycle across all configured tables. | Main CLI entrypoint. |
 
 ---
 

@@ -14,31 +14,27 @@ The Helper Lambda function provides a unified control plane and execution interf
 
 | Operation | Trigger Indicator | Target Engine | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Glue Crawler** | `"layer": "crawler"` or `"crawler_name"` | AWS Glue Crawler | Triggers and monitors Glue Crawlers to discover newly ingested S3 partitions & evolve table schemas. |
+| **Glue Catalog Sync** | Direct API (`glue:CreatePartition`) | AWS Glue Data Catalog | Zero crawlers: registers partitions directly via Glue SDK in <100ms with zero crawl lag. |
 | **Catalog Maintenance** | `"action": "fix_catalog_table"` or `"layer": "catalog"` | AWS Glue Data Catalog | Removes duplicate columns (e.g. `_ingested_at`) from `StorageDescriptor.Columns` in 2 seconds without rewriting S3 data. |
-| **Athena SQL Query** | `"query"`, `"sql"`, or `"query_file"` | Amazon Athena v3 | Executes multiline queries, SQL files (e.g. `v_interactions.sql`), or ad-hoc queries with CLI tables in logs. |
+| **Athena SQL Query** | `"query"`, `"sql"`, or `"query_file"` | Amazon Athena v3 | Executes multiline queries, SQL files (e.g. `interactions.sql`), or ad-hoc queries with CLI tables in logs. |
 | **Bronze Ingestion** | `"layer": "bronze"` | Glue Python Shell 3.9 | Ingests raw source data from APIs/databases into S3 Bronze partitioned by `_ingested_at=<ISO_TIMESTAMP>`. |
 | **Silver Iceberg ETL** | `"layer": "silver"` | Glue PySpark 4.0 | Deduplicates Bronze raw data, applies audit columns, and merges into Iceberg tables (`tbl_<name>`). |
-| **Gold Serving Marts** | `"layer": "gold"` | Glue PySpark 4.0 | Runs source-specific SQL marts (`bucket/gold/query/<source>/v_*.sql`) and publishes to shared MySQL with atomic swap. |
-| **End-to-End Pipeline** | `"layer": "all"` or `"layers": [...]` | Multi-Stage Sequential | Sequentially executes stages (e.g. `Bronze -> Crawler -> Silver -> Gold`), failing fast if any stage fails. |
-| **Step Functions Orchestrator** | `"action": "step_function"` or `"state_machine_arn"` | AWS Step Functions | Triggers and optionally monitors full 3-stage pipeline state machine (`uax-pipeline-orchestrator-{env}`). |
-| **Glue Workflow** | `"action": "workflow"` or `"workflow_name"` | AWS Glue Workflow | Triggers and monitors multi-job DAG workflows (Bronze -> Silver -> Gold) with run properties. |
+| **Gold Serving Marts** | `"layer": "gold"` | Glue PySpark 4.0 | Runs analytical SQL marts (`bucket/gold/query/<source>/*.sql`) and publishes to shared Aurora MySQL with atomic swap. |
+| **End-to-End Pipeline** | `"layer": "all"` or `"layers": [...]` | Multi-Stage Sequential | Sequentially executes stages (`Bronze -> Silver -> Gold`), failing fast if any stage fails. |
+| **Step Functions Orchestrator** | `"action": "step_function"` or `"state_machine_arn"` | AWS Step Functions | Triggers full 3-stage sequential state machine (`uax-pipeline-orchestrator-{env}`) with automated SNS alerts. |
+| **Glue Workflow** | `"action": "workflow"` or `"workflow_name"` | AWS Glue Workflow | Triggers and monitors multi-job DAG workflows (`Bronze -> Silver -> Gold`) with run properties. |
 
 ---
 
 ## 2. Event Payload Parameters Reference
 
-### 2.1 Glue Crawler Parameters
+### 2.1 Elimination of Glue Crawlers & Deterministic Catalog Synchronization
 
-If `"layer": "crawler"`, `"action": "crawler"`, or `"crawler_name"` is provided, Lambda triggers and monitors an AWS Glue Crawler:
-
-| Parameter | Type | Required | Default | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `layer` / `action` | string | Optional | - | Set to `"crawler"`, `"glue_crawler"`, or `"run_crawler"`. |
-| `crawler_name` | string | Optional | `uax-datalake-bronze-crawler-dev` | Name of the Glue Crawler to trigger. |
-| `wait_until_completion` | boolean | Optional | `true` | When `true`, polls until `READY` and reports metrics. When `false`, returns HTTP 202 immediately. |
-| `poll_interval_seconds` | integer | Optional | `5` | Crawler polling interval in seconds. |
-| `timeout_seconds` | integer | Optional | `540` | Maximum wait duration before timeout. |
+> [!IMPORTANT]
+> **Glue Crawlers are 100% eliminated from production architecture**:
+> - **Bronze**: Partitions and table schemas are registered directly via AWS Glue SDK (`glue:CreateTable`, `glue:CreatePartition`, `glue:UpdatePartition`) in <100ms. Newly ingested data is instantly queryable in Athena without crawler lag.
+> - **Silver & Gold**: Managed natively through Apache Iceberg (`SparkCatalog`) backed by AWS Glue Catalog. Manifest files and snapshots are committed atomically per transaction.
+> - **Zero Corruption**: Eliminates duplicate Hive tables created when crawlers scan Iceberg metadata directories.
 
 ---
 
@@ -115,7 +111,7 @@ All pipeline configurations, task definitions, and Glue job arguments are encaps
 
 ### 2.5 AWS Glue Workflow Parameters
 
-To trigger an AWS Glue Workflow (e.g. an end-to-end DAG orchestrating Bronze, Silver, Crawler, and Gold triggers):
+To trigger an AWS Glue Workflow (e.g. an end-to-end DAG orchestrating sequential Bronze, Silver, and Gold Glue jobs with automated SNS alerts):
 
 | Parameter | Type | Required / Optional | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -316,56 +312,65 @@ Applies illegal character removal and Moveworks domain/entity mapping:
 }
 ```
 
-#### 14. Full Pipeline with Catalog Crawler Chaining (`Bronze -> Crawler -> Silver -> Gold`)
-Discovers new Bronze partitions & newly evolved Parquet columns before Silver runs:
+#### 14. Full Pipeline with Custom Stage List (`Bronze -> Silver -> Gold`)
+Executes all 3 pipeline layers sequentially without intermediary crawlers:
 ```json
 {
-  "layers": ["bronze", "crawler", "silver", "gold"],
+  "layers": ["bronze", "silver", "gold"],
   "source_system": "moveworks",
-  "crawler_name": "uax-datalake-bronze-crawler-dev",
   "gold_schema": "enterprise_reporting",
   "rds_secret_name": "prod/rds/mysql_credentials"
 }
 ```
 
-#### 15. Custom Pipeline Stages (`Crawler -> Silver`)
+#### 15. Custom Pipeline Stages (`Bronze -> Silver`)
 ```json
 {
-  "layers": ["crawler", "silver"],
+  "layers": ["bronze", "silver"],
   "source_system": "moveworks",
-  "crawler_name": "uax-datalake-bronze-crawler-dev",
   "source_table_name": "raw_tbl_interactions"
 }
 ```
 
 ---
 
-### E. AWS Glue Crawler Payloads (`layer: "crawler"`)
+### E. AWS Glue Workflow DAG Orchestration Payloads (`action: "workflow"`)
 
-#### 16. Trigger Bronze Data Catalog Crawler (Synchronous with Metrics)
+#### 16. Trigger Production Glue Workflow (Sequential 3-Job DAG)
+Triggers the full AWS Glue Workflow (`Bronze -> Silver -> Gold -> SNS Alert`):
 ```json
 {
-  "layer": "crawler",
-  "crawler_name": "uax-datalake-bronze-crawler-dev",
-  "wait_until_completion": true,
-  "poll_interval_seconds": 5
+  "action": "workflow",
+  "workflow_name": "uax-datalake-moveworks-workflow-dev",
+  "run_properties": {
+    "ENV": "dev",
+    "SOURCE_SYSTEM": "moveworks",
+    "NOTIFICATION_TOPIC_ARN": "arn:aws:sns:us-east-1:123456789012:uax-datalake-alerts-dev"
+  }
 }
 ```
 
-#### 17. Trigger Crawler Asynchronously (Fire-and-Forget)
+#### 17. Trigger ServiceNow Ingestion & Transformation Workflow
 ```json
 {
-  "layer": "crawler",
-  "crawler_name": "uax-datalake-bronze-crawler-dev",
-  "wait_until_completion": false
+  "action": "workflow",
+  "workflow_name": "uax-datalake-servicenow-workflow-dev",
+  "run_properties": {
+    "ENV": "dev",
+    "SOURCE_SYSTEM": "servicenow"
+  }
 }
 ```
 
-#### 18. Trigger Source-Specific Crawler by `source_system`
+#### 18. Trigger Genesys Cloud Analytics Workflow
 ```json
 {
-  "layer": "crawler",
-  "source_system": "moveworks"
+  "action": "workflow",
+  "workflow_name": "uax-datalake-genesys-workflow-dev",
+  "run_properties": {
+    "ENV": "dev",
+    "SOURCE_SYSTEM": "genesys"
+  }
 }
 ```
 
@@ -462,11 +467,11 @@ Executes the full multiline Gold aggregation query from the repository:
 
 ---
 
-### G. S3 Parquet File Column Deletion (Simple S3 Rewrite + Manual Crawler Workflow)
+### G. S3 Parquet File Column Deletion (Simple S3 Rewrite & Direct Catalog Schema Synchronization)
 
 #### 27. Simple In-Place Parquet Rewrite (Recommended)
 > **Use Case**: Reads every Parquet file under the specified S3 path, deletes `_ingested_at` (or any specified column) directly from the Parquet schema, and rewrites the file in-place with snappy compression.
-> **Note**: Completely decoupled from Glue Catalog! Even if the table was dropped or does not exist, this executes cleanly without throwing 400 errors. You can then trigger your Glue Crawler manually to create the table cleanly.
+> **Note**: Completely decoupled from Glue Catalog! Even if the table was dropped or does not exist, this executes cleanly without throwing 400 errors. You can then synchronize the Glue Catalog table directly via Glue API or rerun Bronze ingestion.
 
 ```json
 {
@@ -698,8 +703,8 @@ DATABASE TABLE VIEW:
    - For Bronze ingestion: Paste payload #1 through #3.
    - For Silver ETL: Paste payload #4 through #6.
    - For Gold serving: Paste payload #7 through #9.
-   - For sequential multi-stage pipeline: Paste payload #10 through #12.
-   - For Glue Crawler: Paste payload #16 through #18.
+   - For sequential multi-stage pipeline: Paste payload #10 through #15.
+   - For Glue Workflows: Paste payload #16 through #18.
    - For Step Functions State Machine: Paste payload #31 through #34.
 4. Click **Test**.
 5. Inspect the execution logs and JSON output card directly in the console.
