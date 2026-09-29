@@ -764,14 +764,6 @@ class GoldLayerManager:
                 logger.info(f"[PRIMARY KEY] Natural keys resolved for '{clean_base_name}': {pks}")
                 mart_keys[clean_base_name] = pks
 
-                # Register in-session Spark views so downstream dependent marts resolve seamlessly
-                try:
-                    df_mart.createOrReplaceTempView(f"v_{clean_base_name}")
-                    df_mart.createOrReplaceTempView(f"gold_tbl_{clean_base_name}")
-                    df_mart.createOrReplaceTempView(target_table_name)
-                    df_mart.createOrReplaceTempView(clean_base_name)
-                except Exception as temp_err:
-                    logger.debug(f"[SPARK VIEW] Note on temporary view registration: {temp_err}")
 
                 # 6. Physical Materialization & UPSERT into Athena / Iceberg Table
                 mart_s3_dest = f"{data_s3_path.rstrip('/')}/{clean_base_name}"
@@ -786,18 +778,15 @@ class GoldLayerManager:
                     params=params
                 )
 
-                # Refresh in-session Spark temp views directly from the authoritative physical Iceberg table
-                # so downstream dependent marts (e.g., feedbacks reading v_interactions) see the complete dataset
+                # Cache authoritative DataFrame and register single uniform physical table in session
+                # so downstream dependent marts querying gold_<source>_<basetable> resolve seamlessly
                 try:
                     full_gold_df = spark.table(f"{glue_database}.{target_table_name}")
-                    full_gold_df.createOrReplaceTempView(f"v_{clean_base_name}")
-                    full_gold_df.createOrReplaceTempView(clean_base_name)
-                    full_gold_df.createOrReplaceTempView(f"gold_tbl_{clean_base_name}")
                     full_gold_df.createOrReplaceTempView(target_table_name)
                     materialized_dfs[clean_base_name] = full_gold_df
-                    logger.info(f"[DEPENDENCY REGISTRY] Refreshed Spark temp views for '{clean_base_name}' from full Iceberg table '{glue_database}.{target_table_name}'")
+                    logger.info(f"[DEPENDENCY REGISTRY] Registered in-session table '{target_table_name}' from Iceberg table '{glue_database}.{target_table_name}'")
                 except Exception as refresh_err:
-                    logger.debug(f"[DEPENDENCY REGISTRY] Note refreshing temp views for '{clean_base_name}': {refresh_err}")
+                    logger.debug(f"[DEPENDENCY REGISTRY] Note registering in-session table for '{target_table_name}': {refresh_err}")
                     if clean_base_name not in materialized_dfs:
                         materialized_dfs[clean_base_name] = df_mart
 
@@ -1181,14 +1170,6 @@ class GoldLayerManager:
 
                 cls._log_schema_introspection(df_mart, f"Gold Query Output Schema: '{clean_base_name}'")
 
-                # Register in-session Spark views
-                try:
-                    df_mart.createOrReplaceTempView(f"v_{clean_base_name}")
-                    df_mart.createOrReplaceTempView(f"gold_tbl_{clean_base_name}")
-                    df_mart.createOrReplaceTempView(target_table)
-                    df_mart.createOrReplaceTempView(clean_base_name)
-                except Exception as temp_err:
-                    logger.debug(f"[SPARK VIEW] Note on temporary view registration: {temp_err}")
 
                 # 2. Schema Evolution Check & Staging Table Write
                 cls._detect_schema_evolution(jdbc_conn_info, gold_schema, target_table, df_mart)
@@ -2683,13 +2664,10 @@ class GoldLayerManager:
                             if spark and glue_database:
                                 try:
                                     dep_df = spark.table(f"{glue_database}.{target_tbl}")
-                                    dep_df.createOrReplaceTempView(f"v_{cand_name}")
-                                    dep_df.createOrReplaceTempView(cand_name)
-                                    dep_df.createOrReplaceTempView(f"gold_tbl_{cand_name}")
                                     dep_df.createOrReplaceTempView(target_tbl)
                                     logger.info(
                                         f"[DEPENDENCY RESOLUTION] Pre-loaded authoritative existing table '{glue_database}.{target_tbl}' "
-                                        f"into Spark view 'v_{cand_name}' for dependent mart '{name}'."
+                                        f"for dependent mart '{name}'."
                                     )
                                 except Exception as pre_err:
                                     logger.debug(f"[DEPENDENCY RESOLUTION] Note pre-loading '{cand_name}': {pre_err}")
@@ -2768,16 +2746,12 @@ class GoldLayerManager:
             for full_cand in list(dict.fromkeys(candidates_to_try)):
                 try:
                     dep_df = spark.table(full_cand)
-                    dep_df.createOrReplaceTempView(raw_name)
                     dep_df.createOrReplaceTempView(full_gold_name)
-                    dep_df.createOrReplaceTempView(base_cand)
-                    dep_df.createOrReplaceTempView(f"v_{base_cand}")
-                    dep_df.createOrReplaceTempView(f"gold_tbl_{base_cand}")
-                    if src:
-                        dep_df.createOrReplaceTempView(f"gold_{src}_{base_cand}")
+                    if raw_name != full_gold_name:
+                        dep_df.createOrReplaceTempView(raw_name)
                     logger.info(
                         f"[DEPENDENCY RESOLUTION] Pre-loaded authoritative dependency table '{full_cand}' "
-                        f"into Spark view '{raw_name}' (aliases: '{full_gold_name}', 'v_{base_cand}', '{base_cand}')."
+                        f"into Spark session as '{full_gold_name}'."
                     )
                     break
                 except Exception:
