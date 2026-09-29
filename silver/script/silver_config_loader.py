@@ -336,21 +336,7 @@ class SilverConfigLoader:
             db_str = db_str.replace("{env}", effective_env).replace("{ENV}", effective_env.upper())
         return db_str
 
-    @classmethod
-    def get_crawler_name(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> str:
-        """
-        Retrieves crawler_name for Silver layer tables from centralized defaults.
-        Dynamically interpolates {env} if present.
-        """
-        effective_env = (env or os.environ.get('ENV') or os.environ.get('ENVIRONMENT') or 'dev').strip().lower()
-        defaults = cls.get_defaults(config_dict, env=effective_env)
-        crawler = defaults.get("crawler_name") or defaults.get("glue_catalog", {}).get("crawler_name")
-        if not crawler or not str(crawler).strip():
-            return f"uax-datalake-silver-crawler-{effective_env}"
-        c_str = str(crawler).strip()
-        if "{env}" in c_str or "{ENV}" in c_str:
-            c_str = c_str.replace("{env}", effective_env).replace("{ENV}", effective_env.upper())
-        return c_str
+
 
     @classmethod
     def get_silver_table_name(

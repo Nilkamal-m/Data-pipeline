@@ -783,12 +783,11 @@ class TestDynamicEnvInterpolationAcrossAllLayers(unittest.TestCase):
 
         prod_cfg = SilverConfigLoader.load_config(env="prod")
         self.assertEqual(prod_cfg["pipeline_defaults"]["glue_catalog"]["database_name"], "uax_datalake_db_prod")
-        self.assertEqual(prod_cfg["pipeline_defaults"]["glue_catalog"]["crawler_name"], "uax-datalake-silver-crawler-prod")
+        self.assertNotIn("crawler_name", prod_cfg["pipeline_defaults"]["glue_catalog"])
 
         db_prod = SilverConfigLoader.get_glue_database(env="prod")
         self.assertEqual(db_prod, "uax_datalake_db_prod")
-        crawler_prod = SilverConfigLoader.get_crawler_name(env="prod")
-        self.assertEqual(crawler_prod, "uax-datalake-silver-crawler-prod")
+        self.assertFalse(hasattr(SilverConfigLoader, "get_crawler_name"))
 
     def test_silver_etl_parse_spark_arguments_resolves_env(self):
         from silver.script.uax_silver_etl import parse_spark_arguments
@@ -805,7 +804,7 @@ class TestDynamicEnvInterpolationAcrossAllLayers(unittest.TestCase):
             self.assertEqual(parsed['ENV'], 'prod')
             self.assertEqual(parsed['DATA_LAKE_BUCKET'], 'my-bucket-prod')
             self.assertEqual(parsed['GLUE_DATABASE'], 'uax_datalake_db_prod')
-            self.assertEqual(parsed['CRAWLER_NAME'], 'uax-datalake-silver-crawler-prod')
+            self.assertNotIn('CRAWLER_NAME', parsed)
 
     def test_gold_layer_manager_resolves_env_dynamically(self):
         mock_spark = MagicMock()

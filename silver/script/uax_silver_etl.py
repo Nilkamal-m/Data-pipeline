@@ -305,25 +305,6 @@ def parse_spark_arguments() -> dict:
     # Metadata Prefix: Config > 'metadata/silver'
     metadata_prefix = watermark_cfg.get('metadata_prefix', 'metadata/silver').strip('/')
 
-    # Crawler Parameters: CLI > Config
-    crawler_name = (
-        get_cli_arg('CRAWLER_NAME', 'crawler_name', 'SILVER_CRAWLER_NAME', 'silver_crawler_name')
-        or defaults_cfg.get('crawler_name')
-        or defaults_cfg.get('silver_crawler_name')
-        or defaults_cfg.get('glue_catalog', {}).get('crawler_name')
-        or f"uax-datalake-silver-crawler-{env}"
-    )
-    if crawler_name:
-        crawler_name = str(crawler_name).replace('{env}', env).replace('{ENV}', env.upper()).strip()
-
-    cli_trigger_crawler = get_cli_arg('TRIGGER_CRAWLER', 'trigger_crawler')
-    if cli_trigger_crawler is not None:
-        trigger_crawler = str(cli_trigger_crawler).strip().lower() in ('true', '1', 'yes')
-    else:
-        # Defaults to False for Silver Iceberg: Spark natively updates the Glue Data Catalog.
-        glue_cat_cfg = defaults_cfg.get('glue_catalog', {})
-        trigger_crawler = bool(glue_cat_cfg.get('trigger_crawler', False))
-
     # Gold Serving Layer Parameters
     gold_targets_raw = get_cli_arg('GOLD_TARGETS', 'gold_targets', 'GOLD_TARGET', 'gold_target', default='aurora')
     gold_targets = [t.strip().lower() for t in str(gold_targets_raw).split(',') if t.strip()]
@@ -398,8 +379,6 @@ def parse_spark_arguments() -> dict:
         'SYNC_WATERMARK_TABLE': sync_watermark_table,
         'WATERMARK_TABLE_NAME': watermark_table_name,
         'METADATA_PREFIX': metadata_prefix,
-        'CRAWLER_NAME': crawler_name,
-        'TRIGGER_CRAWLER': trigger_crawler,
         'SILVER_FULL_CONFIG': silver_full_config,
         'RDS_GOLD_SCHEMA': gold_schema,
         'GOLD_TARGET': gold_target,
@@ -807,31 +786,6 @@ def check_iceberg_table_exists(spark, glue_client, database_name: str, table_nam
         return False
 
 
-def trigger_silver_iceberg_crawler(glue_client, crawler_name: str):
-    """
-    Triggers the Silver Iceberg Glue Crawler to sync the Glue Data Catalog with newly created/updated Iceberg tables.
-    Safely handles running crawlers or non-existent crawler names without failing the ETL job.
-    """
-    if not glue_client or not crawler_name:
-        return
-    try:
-        crawler = glue_client.get_crawler(Name=crawler_name)
-        status = crawler.get('Crawler', {}).get('State')
-        if status in ('READY', 'STOPPED'):
-            glue_client.start_crawler(Name=crawler_name)
-            logger.info(f"Successfully triggered Silver Iceberg Crawler: '{crawler_name}'")
-        else:
-            logger.info(f"Silver Iceberg Crawler '{crawler_name}' is currently in state '{status}'. Skipping trigger.")
-    except ClientError as e:
-        code = e.response.get('Error', {}).get('Code')
-        if code == 'CrawlerRunningException':
-            logger.info(f"Silver Iceberg Crawler '{crawler_name}' is already running.")
-        elif code == 'EntityNotFoundException':
-            logger.warning(f"Silver Iceberg Crawler '{crawler_name}' does not exist. Skipping.")
-        else:
-            logger.warning(f"Failed to start Silver Iceberg Crawler '{crawler_name}': {e}")
-    except Exception as e:
-        logger.warning(f"Unexpected error triggering crawler '{crawler_name}': {e}")
 
 
 
@@ -1924,34 +1878,6 @@ def main():
             )
             logger.error(failed_card)
             failed_tables.append((target_table_name, str(err)))
-
-    # Trigger Silver Iceberg Crawler if:
-    # 1. Explicitly requested via --TRIGGER_CRAWLER / TRIGGER_CRAWLER = true
-    # 2. Explicitly provided --CRAWLER_NAME parameter (and TRIGGER_CRAWLER is not explicitly false)
-    # 3. Any new Iceberg table was created for the first time (tables_created > 0)
-    # 4. Any table schema was evolved with new columns (schemas_evolved > 0)
-    # Silver Iceberg tables natively register and evolve schemas in Glue Catalog via Spark SQL.
-    # Crawlers should ONLY trigger if explicitly enabled (TRIGGER_CRAWLER = True) to prevent
-    # standard crawlers from traversing /data and /metadata and creating duplicate junk tables.
-    cli_trigger_crawler = params.get('TRIGGER_CRAWLER')
-    cli_crawler_name = params.get('CRAWLER_NAME') or params.get('ARG_DICT', {}).get('CRAWLER_NAME') or params.get('ARG_DICT', {}).get('SILVER_CRAWLER_NAME')
-
-    should_trigger_crawler = bool(cli_trigger_crawler) if cli_trigger_crawler is not None else False
-    if not should_trigger_crawler:
-        logger.info("Silver Iceberg Crawler trigger skipped (trigger_crawler is false/disabled; Iceberg tables commit directly to Glue Catalog).")
-
-    if should_trigger_crawler:
-        crawler_name = (
-            cli_crawler_name
-            or glue_database.replace('_db_', '-silver-iceberg-crawler-').replace('-db-', '-silver-iceberg-crawler-').replace('_', '-')
-        )
-        logger.info(
-            f"Triggering Silver Iceberg Crawler '{crawler_name}' "
-            f"(tables_created: {tables_created}, schemas_evolved: {schemas_evolved}, "
-            f"cli_crawler: {cli_crawler_name}, trigger_param: {cli_trigger_crawler})..."
-        )
-        trigger_silver_iceberg_crawler(glue_client, crawler_name)
-
     job.commit()
 
     execution_end_utc = datetime.now(timezone.utc)
