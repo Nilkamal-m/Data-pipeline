@@ -888,42 +888,6 @@ class GoldLayerManager:
                 gold_cfg=gold_cfg
             )
 
-        # Target: Databricks (Delta Lake)
-        if 'databricks' in gold_targets:
-            logger.info(
-                f"\n================================================================================\n"
-                f"[GOLD STEP 4] Serving Gold Marts to Databricks (Delta Lake)\n"
-                f"--------------------------------------------------------------------------------"
-            )
-            for clean_base_name, df_mart in materialized_dfs.items():
-                db_table = GoldConfigLoader.get_target_table_name(source_system, clean_base_name, 'databricks', gold_cfg) if GoldConfigLoader else f"gold_{source_system}_{clean_base_name}"
-                cls._run_databricks_serving(
-                    spark=spark,
-                    params=params,
-                    df_mart=df_mart,
-                    clean_base_name=clean_base_name,
-                    target_table_name=db_table,
-                    primary_keys=mart_keys.get(clean_base_name, []),
-                    mart_stats=mart_stats
-                )
-
-        # Target: Amazon Redshift
-        if 'redshift' in gold_targets:
-            logger.info(
-                f"\n================================================================================\n"
-                f"[GOLD STEP 5] Serving Gold Marts to Amazon Redshift / Redshift Spectrum\n"
-                f"--------------------------------------------------------------------------------"
-            )
-            cls._run_redshift_serving(spark, params, queries, glue_database, mart_stats)
-
-        # Target: Snowflake
-        if 'snowflake' in gold_targets:
-            logger.info(
-                f"\n================================================================================\n"
-                f"[GOLD STEP 6] Serving Gold Marts to Snowflake (External Iceberg / Direct Load)\n"
-                f"--------------------------------------------------------------------------------"
-            )
-            cls._run_snowflake_serving(spark, params, queries, glue_database, mart_stats)
 
         # Overall Gold Execution Summary
         cls._log_final_gold_summary(mart_stats, execution_start)
@@ -1167,16 +1131,14 @@ class GoldLayerManager:
             if GoldConfigLoader and source_system:
                 target_table = GoldConfigLoader.get_target_table_name(source_system, clean_base_name, 'aurora', gold_cfg)
             else:
-                target_table = f"gold_{source_system}_{clean_base_name}" if source_system else f"gold_tbl_{clean_base_name}"
+                target_table = f"gold_{source_system}_{clean_base_name}" if source_system else f"gold_{clean_base_name}"
 
             staging_table = f"{target_table}_staging"
             old_backup_table = f"{target_table}_old"
-            view_name = f"v_{clean_base_name}"
 
             cls._validate_gold_table_name(target_table)
             cls._validate_gold_table_name(staging_table)
             cls._validate_gold_table_name(old_backup_table)
-            cls._validate_view_name(view_name)
             assert staging_table.endswith("_staging"), f"Safety Error: Invalid staging table {staging_table}"
             assert old_backup_table.endswith("_old"), f"Safety Error: Invalid backup table {old_backup_table}"
 
@@ -1251,8 +1213,6 @@ class GoldLayerManager:
                         target_table=target_table,
                         staging_table=staging_table,
                         old_backup_table=old_backup_table,
-                        view_name=view_name,
-                        create_view=False,
                         primary_keys=pks
                     )
 
@@ -1281,196 +1241,13 @@ class GoldLayerManager:
                 mart_stats.append({
                     "mart_name": clean_base_name,
                     "target_table": f"{gold_schema}.{target_table}",
-                    "view_name": f"{gold_schema}.{view_name}",
+                    "view_name": f"{gold_schema}.{target_table}",
                     "status": "FAILED",
                     "rows_served": 0,
                     "duration_seconds": round(mart_duration, 2),
                     "error_message": str(err)
                 })
 
-    # --------------------------------------------------------------------------
-    # Redshift Serving Adapter (Spectrum & Direct DW)
-    # --------------------------------------------------------------------------
-    @classmethod
-    def _run_redshift_serving(
-        cls,
-        spark: SparkSession,
-        params: Dict[str, Any],
-        queries: Dict[str, str],
-        glue_database: str,
-        mart_stats: List[Dict[str, Any]]
-    ) -> None:
-        """
-        Amazon Redshift serving adapter.
-        Redshift Spectrum maps directly to AWS Glue Data Catalog Iceberg tables and Athena views.
-        """
-        redshift_schema = params.get('REDSHIFT_SCHEMA', 'gold_spectrum_schema')
-        iam_role = params.get('REDSHIFT_IAM_ROLE', 'arn:aws:iam::<account-id>:role/RedshiftGlueSpectrumRole')
-
-        spectrum_ddl = (
-            f"CREATE EXTERNAL SCHEMA IF NOT EXISTS {redshift_schema} "
-            f"FROM DATA CATALOG DATABASE '{glue_database}' "
-            f"IAM_ROLE '{iam_role}' CREATE EXTERNAL DATABASE IF NOT EXISTS;"
-        )
-
-        card = (
-            f"\n+================================================================================+\n"
-            f"|  AMAZON REDSHIFT SPECTRUM SERVING ADAPTER ACTIVATED                            |\n"
-            f"+================================================================================+\n"
-            f"|  * Redshift External Schema : {redshift_schema}\n"
-            f"|  * Glue Database Source     : {glue_database}\n"
-            f"|  * IAM Role Configured      : {iam_role}\n"
-            f"|  * Zero Data Movement       : Queries run directly over Iceberg tables and     |\n"
-            f"|                               Athena views in S3 via Redshift Spectrum.        |\n"
-            f"|  * Recommended DDL Setup    :\n"
-            f"|    {spectrum_ddl}\n"
-            f"+================================================================================+\n"
-        )
-        logger.info(card)
-
-        for clean_base_name in queries.keys():
-            mart_stats.append({
-                "mart_name": clean_base_name,
-                "target_table": f"{redshift_schema}.gold_tbl_{clean_base_name}",
-                "view_name": f"{redshift_schema}.v_{clean_base_name}",
-                "status": "SUCCESS",
-                "rows_served": None,
-                "duration_seconds": 0.0,
-                "error_message": None
-            })
-
-    # --------------------------------------------------------------------------
-    # Snowflake Serving Adapter (External Iceberg & Direct DW)
-    # --------------------------------------------------------------------------
-    @classmethod
-    def _run_snowflake_serving(
-        cls,
-        spark: SparkSession,
-        params: Dict[str, Any],
-        queries: Dict[str, str],
-        glue_database: str,
-        mart_stats: List[Dict[str, Any]]
-    ) -> None:
-        """
-        Snowflake serving adapter.
-        Configures External Volume and AWS Glue Data Catalog integration for External Iceberg Tables.
-        """
-        sf_database = params.get('SNOWFLAKE_DATABASE', 'UAX_ANALYTICS_DB')
-        sf_schema = params.get('SNOWFLAKE_SCHEMA', 'GOLD_MARTS')
-        sf_ext_volume = params.get('SNOWFLAKE_EXTERNAL_VOLUME', 'UAX_S3_ICEBERG_VOLUME')
-
-        card = (
-            f"\n+================================================================================+\n"
-            f"|  SNOWFLAKE EXTERNAL ICEBERG SERVING ADAPTER ACTIVATED                          |\n"
-            f"+================================================================================+\n"
-            f"|  * Snowflake Target DB      : {sf_database}\n"
-            f"|  * Snowflake Target Schema  : {sf_schema}\n"
-            f"|  * External Volume          : {sf_ext_volume}\n"
-            f"|  * Catalog Integration      : AWS_GLUE (Database: {glue_database})\n"
-            f"|  * Zero-Copy Architecture   : Snowflake queries S3 Iceberg metadata directly. |\n"
-            f"+================================================================================+\n"
-        )
-        logger.info(card)
-
-        for clean_base_name in queries.keys():
-            target_table = f"gold_tbl_{clean_base_name}"
-            sf_ddl = (
-                f"CREATE OR REPLACE ICEBERG TABLE {sf_database}.{sf_schema}.{target_table} "
-                f"EXTERNAL_VOLUME = '{sf_ext_volume}' CATALOG = 'AWS_GLUE' "
-                f"CATALOG_TABLE_NAME = '{target_table}';"
-            )
-            logger.info(f"[SNOWFLAKE DDL TEMPLATE] {sf_ddl}")
-            mart_stats.append({
-                "mart_name": clean_base_name,
-                "target_table": f"{sf_database}.{sf_schema}.{target_table}",
-                "view_name": f"{sf_database}.{sf_schema}.v_{clean_base_name}",
-                "status": "SUCCESS",
-                "rows_served": None,
-                "duration_seconds": 0.0,
-                "error_message": None
-            })
-
-    # --------------------------------------------------------------------------
-    # Databricks Serving Adapter (Delta Lake / Unity Catalog)
-    # --------------------------------------------------------------------------
-    @classmethod
-    def _run_databricks_serving(
-        cls,
-        spark: SparkSession,
-        params: Dict[str, Any],
-        df_mart: DataFrame,
-        clean_base_name: str,
-        target_table_name: str,
-        primary_keys: List[str],
-        mart_stats: List[Dict[str, Any]]
-    ) -> None:
-        """
-        Databricks Delta Lake serving adapter with native MERGE INTO upsert support.
-        Supports Unity Catalog (<catalog>.<schema>.<table_name>) or legacy hive_metastore.
-        """
-        catalog = params.get('DATABRICKS_CATALOG', 'main')
-        schema = params.get('DATABRICKS_SCHEMA', 'gold')
-        full_table = f"`{catalog}`.`{schema}`.`{target_table_name}`"
-
-        card = (
-            f"\n+================================================================================+\n"
-            f"|  DATABRICKS DELTA LAKE SERVING ADAPTER ACTIVATED                               |\n"
-            f"+================================================================================+\n"
-            f"|  * Databricks Target Catalog : {catalog}\n"
-            f"|  * Databricks Target Schema  : {schema}\n"
-            f"|  * Target Table              : {full_table}\n"
-            f"|  * Primary Keys              : {primary_keys or 'None (Overwrite)'}\n"
-            f"|  * Serving Strategy          : MERGE INTO (Delta Lake)\n"
-            f"+================================================================================+\n"
-        )
-        logger.info(card)
-
-        try:
-            temp_view = f"incoming_databricks_{clean_base_name}"
-            df_mart.createOrReplaceTempView(temp_view)
-
-            table_exists = False
-            try:
-                spark.sql(f"DESCRIBE TABLE {full_table}")
-                table_exists = True
-            except Exception:
-                table_exists = False
-
-            if table_exists and primary_keys:
-                join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in primary_keys])
-                merge_sql = (
-                    f"MERGE INTO {full_table} AS target\n"
-                    f"USING {temp_view} AS source\n"
-                    f"ON {join_cond}\n"
-                    f"WHEN MATCHED THEN UPDATE SET *\n"
-                    f"WHEN NOT MATCHED THEN INSERT *"
-                )
-                logger.info(f"[DATABRICKS MERGE] Executing Delta Lake upsert:\n{merge_sql}")
-                spark.sql(merge_sql)
-            else:
-                logger.info(f"[DATABRICKS WRITE] Initializing Delta table '{full_table}'...")
-                df_mart.write.format("delta").mode("overwrite").saveAsTable(full_table)
-
-            mart_stats.append({
-                "mart_name": clean_base_name,
-                "target_table": full_table,
-                "view_name": f"{full_table}_view",
-                "status": "SUCCESS",
-                "rows_served": df_mart.count(),
-                "duration_seconds": 0.0,
-                "error_message": None
-            })
-        except Exception as err:
-            logger.error(f"[DATABRICKS ERROR] Failed to serve mart '{clean_base_name}' to Databricks: {err}")
-            mart_stats.append({
-                "mart_name": clean_base_name,
-                "target_table": full_table,
-                "view_name": f"{full_table}_view",
-                "status": "FAILED",
-                "rows_served": 0,
-                "duration_seconds": 0.0,
-                "error_message": str(err)
-            })
 
     @classmethod
     def _sync_iceberg_schema(cls, spark: SparkSession, full_table: str, incoming_df: DataFrame) -> bool:
@@ -2368,37 +2145,10 @@ class GoldLayerManager:
         if primary_keys:
             cls._ensure_mysql_index(jdbc_info, schema_name, target_table, primary_keys)
 
-        # Optional Presentation View Creation (Skipped by default for MySQL shared DB)
-        if create_view and view_name:
-            cls._validate_view_name(view_name)
-            cls._validate_gold_table_name(target_table)
-            if not cls._table_exists(jdbc_info, schema_name, target_table):
-                raise RuntimeError(
-                    f"Pre-check failed before CREATE VIEW: Target table '{schema_name}.{target_table}' does not exist. "
-                    f"Cannot create presentation view '{view_name}'."
-                )
-
-            view_sql = (
-                f"CREATE OR REPLACE VIEW `{schema_name}`.`{view_name}` AS "
-                f"SELECT * FROM `{schema_name}`.`{target_table}`"
-            )
-            logger.info(f"[DDL AUDIT - VIEW] Creating or refreshing presentation view: '{schema_name}.{view_name}'")
-            try:
-                cls._execute_ddl(jdbc_info, view_sql)
-            except Exception as e:
-                err_str = str(e)
-                if "1142" in err_str or "denied" in err_str.lower() or "permission" in err_str.lower():
-                    logger.warning(
-                        f"[DDL AUDIT - VIEW] Database user lacks CREATE VIEW permission in MySQL: {e}. "
-                        f"Skipping view creation; Power BI users query physical Gold table '{schema_name}.{target_table}' directly."
-                    )
-                else:
-                    raise
-        else:
-            logger.info(
-                f"[DDL AUDIT - MYSQL TABLE] Zero-downtime Gold table '{schema_name}.{target_table}' is active for Power BI consumers. "
-                f"MySQL view creation omitted (user lacks CREATE VIEW permission; physical Gold table is authoritative)."
-            )
+        logger.info(
+            f"[DDL AUDIT - MYSQL TABLE] Zero-downtime Gold physical table '{schema_name}.{target_table}' is active. "
+            f"No view created (physical Gold table is authoritative)."
+        )
 
     @classmethod
     def _ensure_mysql_index(
@@ -2726,16 +2476,15 @@ class GoldLayerManager:
 
         def _clean_query_key(raw_base: str) -> str:
             k = raw_base.strip().lower()
-            if src and k.startswith(f"gold_{src}_"):
-                k = k[len(f"gold_{src}_"):]
-            elif k.startswith("v_"):
-                k = k[2:]
-                if src and k.startswith(f"gold_{src}_"):
-                    k = k[len(f"gold_{src}_"):]
-            elif k.startswith("gold_tbl_"):
-                k = k[len("gold_tbl_"):]
-            elif k.startswith("gold_"):
-                k = k[5:]
+            prefixes = [f"gold_{src}_", f"{src}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"] if src else ["gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]
+            changed = True
+            while changed:
+                changed = False
+                for prefix in prefixes:
+                    if k.startswith(prefix):
+                        k = k[len(prefix):]
+                        changed = True
+                        break
             return k
 
         if query_path.startswith("s3://"):

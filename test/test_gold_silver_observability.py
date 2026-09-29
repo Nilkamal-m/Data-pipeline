@@ -283,20 +283,18 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
                 # 5. View creation is omitted by default (user lacks CREATE VIEW)
                 self.assertFalse(any("CREATE OR REPLACE VIEW" in d for d in executed_ddls))
 
-        # Explicit create_view=True executes view creation
+        # Enforce zero-view policy: Physical tables only, no views created
         with patch.object(GoldLayerManager, '_table_exists', side_effect=mock_table_exists):
             with patch.object(GoldLayerManager, '_execute_ddl') as mock_ddl:
                 GoldLayerManager._execute_isolated_atomic_swap(
                     jdbc_info=jdbc_info,
                     schema_name="enterprise_reporting",
-                    target_table="gold_tbl_interactions",
-                    staging_table="gold_tbl_interactions_staging",
-                    old_backup_table="gold_tbl_interactions_old",
-                    view_name="v_interactions",
-                    create_view=True
+                    target_table="gold_moveworks_interactions",
+                    staging_table="gold_moveworks_interactions_staging",
+                    old_backup_table="gold_moveworks_interactions_old"
                 )
                 executed_ddls = [call[0][1] for call in mock_ddl.call_args_list]
-                self.assertTrue(any("CREATE OR REPLACE VIEW `enterprise_reporting`.`v_interactions`" in d for d in executed_ddls))
+                self.assertFalse(any("CREATE OR REPLACE VIEW" in d for d in executed_ddls))
 
 
     def test_mysql_ssl_context_builder(self):
@@ -1872,11 +1870,11 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         self.assertEqual(res.data['text'][1], 'Clean\tText\n')
 
     def test_gold_moveworks_interactions_sql_file(self):
-        """Validates that gold/query/moveworks/v_interactions.sql exists and contains expected CTEs and columns."""
-        sql_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "gold", "query", "moveworks", "v_interactions.sql"
-        )
+        """Validates that gold/query/moveworks/interactions.sql exists and contains expected CTEs and columns."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "interactions.sql")
+        if not os.path.exists(sql_path):
+            sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "v_interactions.sql")
         self.assertTrue(os.path.exists(sql_path), f"File not found: {sql_path}")
         with open(sql_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -2843,11 +2841,11 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         self.assertNotIn("-- Gold Mart Query", clean[:50])
 
     def test_v_interactions_sql_syntax_compatibility(self):
-        """Validates that v_interactions.sql uses Trino/Presto compatible VARCHAR cast and CURRENT_TIMESTAMP."""
-        sql_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "gold", "query", "moveworks", "v_interactions.sql"
-        )
+        """Validates that interactions.sql uses Trino/Presto compatible VARCHAR cast and CURRENT_TIMESTAMP."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "interactions.sql")
+        if not os.path.exists(sql_path):
+            sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "v_interactions.sql")
         with open(sql_path, "r", encoding="utf-8") as f:
             content = f.read()
 
@@ -2860,17 +2858,20 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         self.assertIn("CURRENT_TIMESTAMP", content)
 
     def test_v_feedbacks_sql_exists_and_conforms_to_spec(self):
-        """Validates that gold/query/moveworks/v_feedbacks.sql exists and adheres strictly to specification."""
-        sql_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "gold", "query", "moveworks", "v_feedbacks.sql"
-        )
+        """Validates that gold/query/moveworks/feedbacks.sql exists and adheres strictly to specification."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "feedbacks.sql")
+        if not os.path.exists(sql_path):
+            sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "v_feedbacks.sql")
         self.assertTrue(os.path.exists(sql_path), f"File not found: {sql_path}")
         with open(sql_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # Must be built directly from v_interactions
-        self.assertIn("FROM v_interactions", content)
+        # Must be built directly from gold_moveworks_interactions (or legacy v_interactions)
+        self.assertTrue(
+            "FROM gold_moveworks_interactions" in content or "FROM v_interactions" in content,
+            "feedbacks.sql must query gold_moveworks_interactions"
+        )
 
         # Grain & identification logic: link_click with helpful / not helpful
         self.assertIn("link_click", content.lower())
@@ -2888,7 +2889,7 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
             "_data_as_of"
         ]
         for col in expected_cols:
-            self.assertIn(col, content, f"Expected output column '{col}' missing from v_feedbacks.sql")
+            self.assertIn(col, content, f"Expected output column '{col}' missing from feedbacks.sql")
 
     def test_sort_queries_by_dependency(self):
         """Validates that queries are ordered so dependencies (v_interactions) run before dependent marts (v_feedbacks)."""
@@ -2906,17 +2907,20 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         self.assertLess(keys.index("feedbacks"), keys.index("summary_kpi"))
 
     def test_v_conversations_sql_exists_and_conforms_to_spec(self):
-        """Validates that gold/query/moveworks/v_conversations.sql exists and conforms to specifications."""
-        sql_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "gold", "query", "moveworks", "v_conversations.sql"
-        )
+        """Validates that gold/query/moveworks/conversations.sql exists and conforms to specifications."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "conversations.sql")
+        if not os.path.exists(sql_path):
+            sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "v_conversations.sql")
         self.assertTrue(os.path.exists(sql_path), f"File not found: {sql_path}")
         with open(sql_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # Must be built directly from v_interactions
-        self.assertIn("FROM v_interactions", content)
+        # Must be built directly from gold_moveworks_interactions (or legacy v_interactions)
+        self.assertTrue(
+            "FROM gold_moveworks_interactions" in content or "FROM v_interactions" in content,
+            "conversations.sql must query gold_moveworks_interactions"
+        )
 
         # Expected output columns matching Word doc specification
         expected_cols = [
@@ -2930,7 +2934,7 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
             "_data_as_of"
         ]
         for col in expected_cols:
-            self.assertIn(col, content, f"Expected output column '{col}' missing from v_conversations.sql")
+            self.assertIn(col, content, f"Expected output column '{col}' missing from conversations.sql")
 
         # Escalation and agent classification logic checks
         self.assertIn("start live agent chat", content.lower())

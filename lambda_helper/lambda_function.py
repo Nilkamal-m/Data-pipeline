@@ -1144,14 +1144,24 @@ def resolve_sql_query(event: Dict[str, Any]) -> str:
         bucket_name, key_name = s3_path.split('/', 1)
         resp = s3_client.get_object(Bucket=bucket_name, Key=key_name)
         sql_content = resp['Body'].read().decode('utf-8')
-    # Check if raw_query is a local file path (e.g. gold/query/moveworks/v_interactions.sql)
+    # Check if raw_query is a local file path (e.g. gold/query/moveworks/interactions.sql)
     elif os.path.isfile(raw_query):
         logger.info(f"Loading SQL query from local file path: {raw_query}")
         with open(raw_query, 'r', encoding='utf-8') as f:
             sql_content = f.read()
+    elif os.path.isfile(raw_query.replace("/v_", "/")):
+        resolved_path = raw_query.replace("/v_", "/")
+        logger.info(f"Loading SQL query from local file path (non-view canonical): {resolved_path}")
+        with open(resolved_path, 'r', encoding='utf-8') as f:
+            sql_content = f.read()
     elif os.path.isfile(os.path.join(repo_root, raw_query)):
         resolved_path = os.path.join(repo_root, raw_query)
         logger.info(f"Loading SQL query from workspace file path: {resolved_path}")
+        with open(resolved_path, 'r', encoding='utf-8') as f:
+            sql_content = f.read()
+    elif os.path.isfile(os.path.join(repo_root, raw_query.replace("/v_", "/"))):
+        resolved_path = os.path.join(repo_root, raw_query.replace("/v_", "/"))
+        logger.info(f"Loading SQL query from workspace file path (non-view canonical): {resolved_path}")
         with open(resolved_path, 'r', encoding='utf-8') as f:
             sql_content = f.read()
     else:

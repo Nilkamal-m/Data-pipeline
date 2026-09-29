@@ -5,7 +5,7 @@
     "gold_data_prefix": "gold/data",
     "target_format": "iceberg",
     "table_prefix": "gold_{source}_",
-    "_note_table_prefix": "Uniform table naming standard: 'gold_{source}_{table_name}'. Identical physical table names across Athena, Aurora, Redshift, Snowflake, and Databricks. Physical tables only (no views).",
+    "_note_table_prefix": "Uniform table naming standard: 'gold_{source}_{table_name}'. Identical physical table names across Athena and Aurora MySQL. Physical tables only (no views).",
     "merge_strategy": "upsert",
     "glue_catalog": {
       "enabled": true,
@@ -63,20 +63,6 @@
           "api_secret_name": "dev/data-pipeline/genesys-llm-api",
           "aurora": {
             "schema": "enterprise_reporting",
-            "table_name": "gold_genesys_conversations"
-          },
-          "redshift": {
-            "schema": "gold_spectrum_schema",
-            "table_name": "gold_genesys_conversations"
-          },
-          "snowflake": {
-            "database": "UAX_ANALYTICS_DB",
-            "schema": "GOLD_MARTS",
-            "table_name": "gold_genesys_conversations"
-          },
-          "databricks": {
-            "catalog": "main",
-            "schema": "gold",
             "table_name": "gold_genesys_conversations"
           }
         },

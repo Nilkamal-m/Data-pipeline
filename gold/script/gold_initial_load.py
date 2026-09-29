@@ -6,7 +6,7 @@ Imports historical exports (CSV/Parquet) into Gold tables with flexible schema c
    - Missing in CSV, present in Gold -> filled with NULL (cast to target type).
    - Present in CSV, missing in Gold -> retained for schema evolution.
 2. Performs idempotent UPSERT (MERGE INTO) into Gold table using primary keys.
-3. Propagates consolidated records to downstream serving targets (Athena, Aurora, Databricks, Redshift, Snowflake).
+3. Propagates consolidated records to downstream serving targets (Athena Iceberg table, Aurora MySQL).
 """
 
 import sys
@@ -329,10 +329,15 @@ class GoldInitialLoader:
             )
 
         # Clean table name
-        for prefix in [f"gold_{source_system}_", "gold_tbl_", "gold_", "v_"]:
-            if table_name.startswith(prefix):
-                table_name = table_name[len(prefix):]
-                break
+        prefixes = [f"gold_{source_system}_", f"{source_system}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if table_name.startswith(prefix):
+                    table_name = table_name[len(prefix):]
+                    changed = True
+                    break
 
         # Load gold_config.json with dynamic {env} interpolation
         gold_cfg = GoldConfigLoader.load_config(env=env) if GoldConfigLoader else {}

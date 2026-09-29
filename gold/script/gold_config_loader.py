@@ -28,10 +28,16 @@ class GoldConfigLoader:
     def _clean_table_name(cls, table_name: str, source_system: str) -> str:
         clean = (table_name or '').strip().lower()
         base = clean
-        for prefix in [f"gold_{source_system.lower()}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]:
-            if base.startswith(prefix):
-                base = base[len(prefix):]
-                break
+        src = (source_system or '').strip().lower()
+        prefixes = [f"gold_{src}_", f"{src}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"] if src else ["gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if base.startswith(prefix):
+                    base = base[len(prefix):]
+                    changed = True
+                    break
         return base
 
     @classmethod
@@ -611,48 +617,21 @@ class GoldConfigLoader:
     ) -> str:
         """
         Determines the target table name for the specified engine.
-        Standard enterprise convention: gold_<source>_<tablename>
-        Identical across Athena, Aurora, Redshift, Snowflake, and Databricks.
-        Can be overridden in table config under engine specific section (e.g. aurora.table_name).
+        Standard enterprise convention: gold_<source>_<basetablename>
+        Identical across Athena and Aurora MySQL. Physical tables only (no views).
         """
         tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
-        clean_source = source_system.strip().lower()
-        clean_table = table_name.strip().lower()
-        prefix_str = f"gold_{clean_source}_"
+        clean_source = (source_system or "").strip().lower()
+        clean_base = cls._clean_table_name(table_name, clean_source)
 
-        # Check explicit engine override table_name
+        # Check explicit engine override table_name if configured in gold_config.json
         engine_cfg = tbl_cfg.get(engine.lower(), {})
         if isinstance(engine_cfg, dict) and engine_cfg.get("table_name"):
-            explicit = str(engine_cfg["table_name"]).strip()
-            while explicit.startswith(f"{prefix_str}{prefix_str}"):
-                explicit = explicit[len(prefix_str):]
-            return explicit
+            return str(engine_cfg["table_name"]).strip()
 
         if tbl_cfg.get("table_name"):
-            explicit = str(tbl_cfg["table_name"]).strip()
-            while explicit.startswith(f"{prefix_str}{prefix_str}"):
-                explicit = explicit[len(prefix_str):]
-            return explicit
+            return str(tbl_cfg["table_name"]).strip()
 
-        # If table_name was already written as gold_<source>_<tablename>, directly go with it!
-        if clean_table.startswith(prefix_str):
-            clean_res = clean_table
-            while clean_res.startswith(f"{prefix_str}{prefix_str}"):
-                clean_res = clean_res[len(prefix_str):]
-            return clean_res
-
-        for prefix in [prefix_str, "gold_tbl_", "gold_", "v_"]:
-            while clean_table.startswith(prefix):
-                clean_table = clean_table[len(prefix):]
-
-        defaults = cls.get_defaults(config_dict)
-        prefix = defaults.get("table_prefix", "gold_{source}_")
-        if "{source}" in prefix or "{source_system}" in prefix:
-            prefix = prefix.replace("{source}", clean_source).replace("{source_system}", clean_source)
-        elif prefix == "gold_":
-            prefix = f"gold_{clean_source}_"
-
-        result = f"{prefix}{clean_table}"
-        while result.startswith(f"{prefix}{prefix}"):
-            result = result[len(prefix):]
-        return result
+        if clean_source:
+            return f"gold_{clean_source}_{clean_base}"
+        return f"gold_{clean_base}"

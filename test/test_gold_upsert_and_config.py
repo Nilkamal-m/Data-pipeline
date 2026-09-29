@@ -964,11 +964,11 @@ class TestGoldMartDependencyAndOmittedColumns(unittest.TestCase):
         self.assertEqual(keys[1], "feedbacks")
 
     def test_v_feedbacks_sql_projects_feedback_id(self):
-        """v_feedbacks.sql projects feedback_id to match gold_config.json nkey."""
-        sql_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "gold", "query", "moveworks", "v_feedbacks.sql"
-        )
+        """feedbacks.sql projects feedback_id to match gold_config.json nkey."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "feedbacks.sql")
+        if not os.path.exists(sql_path):
+            sql_path = os.path.join(base_dir, "gold", "query", "moveworks", "v_feedbacks.sql")
         with open(sql_path, "r", encoding="utf-8") as f:
             sql_text = f.read()
         self.assertIn("feedback_id", sql_text)

@@ -1,10 +1,10 @@
 -- ==============================================================================
--- Gold Mart Query: v_interactions.sql
+-- Gold Mart Query: interactions.sql
 -- Source System: moveworks
--- Hierarchy: s3://<bucket>/gold/query/moveworks/v_interactions.sql
+-- Hierarchy: s3://<bucket>/gold/query/moveworks/interactions.sql
 -- Produces:
---   - Athena Mandatory View : v_interactions
---   - Downstream MySQL Mart : gold_tbl_interactions (View: v_interactions)
+--   - Athena Physical Table : gold_moveworks_interactions (Iceberg Table)
+--   - Downstream MySQL Mart : gold_moveworks_interactions (Zero-Downtime Physical Table)
 -- S3 Storage: s3://<bucket>/gold/data/moveworks/interactions/
 --
 -- Description:
@@ -187,39 +187,39 @@ SELECT
     ui.id AS interaction_id,
     COALESCE(ui.type, 'UNKNOWN') AS interaction_type,
 
--- Conversation Details
-COALESCE(c.primary_domain, '') AS conversation_domain,
-COALESCE(ct.conversation_topic, '') AS conversation_topic,
-COALESCE(ct.conversation_topic, '') AS conversation_topics,
+    -- Conversation Details
+    COALESCE(c.primary_domain, '') AS conversation_domain,
+    COALESCE(ct.conversation_topic, '') AS conversation_topic,
+    COALESCE(ct.conversation_topic, '') AS conversation_topics,
 
--- Content & Bot Response
-COALESCE(ui.detail_content, '') AS interaction_content,
-COALESCE(br.bot_response, '') AS bot_response,
+    -- Content & Bot Response
+    COALESCE(ui.detail_content, '') AS interaction_content,
+    COALESCE(br.bot_response, '') AS bot_response,
 
--- Plugin Activity
-COALESCE(pa.unsuccessful_plugins, '') AS unsuccessful_plugins,
-COALESCE(pa.plugin_served, '') AS plugin_served,
-COALESCE(pa.plugin_used, '') AS plugin_used,
+    -- Plugin Activity
+    COALESCE(pa.unsuccessful_plugins, '') AS unsuccessful_plugins,
+    COALESCE(pa.plugin_served, '') AS plugin_served,
+    COALESCE(pa.plugin_used, '') AS plugin_used,
 
--- Resource & Citation Details
-COALESCE(ra.resource_domain, '') AS resource_domain,
-COALESCE(ra.no_of_citations, 0) AS no_of_citations,
-COALESCE(ra.content_item_name, '') AS content_item_name,
-COALESCE(ra.content_item_id, '') AS content_item_id,
-COALESCE(ra.ticket_type, '') AS ticket_type,
-COALESCE(ra.ticket_id, '') AS ticket_id,
+    -- Resource & Citation Details
+    COALESCE(ra.resource_domain, '') AS resource_domain,
+    COALESCE(ra.no_of_citations, 0) AS no_of_citations,
+    COALESCE(ra.content_item_name, '') AS content_item_name,
+    COALESCE(ra.content_item_id, '') AS content_item_id,
+    COALESCE(ra.ticket_type, '') AS ticket_type,
+    COALESCE(ra.ticket_id, '') AS ticket_id,
 
--- Surface Platform & User Identity
-COALESCE(ui.platform, '') AS interaction_surface,
-COALESCE(u.user_preferred_language, '') AS user_preferred_language,
+    -- Surface Platform & User Identity
+    COALESCE(ui.platform, '') AS interaction_surface,
+    COALESCE(u.user_preferred_language, '') AS user_preferred_language,
 
--- Placeholder Dimensions for External HR/Identity Enrichment
-CAST(NULL AS VARCHAR(255)) AS user_department,
-CAST(NULL AS VARCHAR(255)) AS user_location,
-CAST(NULL AS VARCHAR(255)) AS user_country,
+    -- Placeholder Dimensions for External HR/Identity Enrichment
+    CAST(NULL AS VARCHAR(255)) AS user_department,
+    CAST(NULL AS VARCHAR(255)) AS user_location,
+    CAST(NULL AS VARCHAR(255)) AS user_country,
 
--- Audit Timestamp
-CURRENT_TIMESTAMP AS _data_as_of
+    -- Audit Timestamp
+    CURRENT_TIMESTAMP AS _data_as_of
 FROM tbl_interactions ui
 
 -- Join conversation domain from conversations table (active records only)
