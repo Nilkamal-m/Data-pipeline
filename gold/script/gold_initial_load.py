@@ -767,15 +767,12 @@ class GoldInitialLoader:
 
 def main():
     """Glue entrypoint when executed as a Glue Job."""
+    from pyspark import SparkConf
     from pyspark.context import SparkContext
     from awsglue.context import GlueContext
     from awsglue.utils import getResolvedOptions
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
-    sc = SparkContext.getOrCreate()
-    glueContext = GlueContext(sc)
-    spark = glueContext.spark_session
 
     expected_args = [
         'JOB_NAME', 'SOURCE_SYSTEM', 'TABLE_NAME'
@@ -783,12 +780,52 @@ def main():
     optional_args = [
         'CSV_PATH', 'NKEY', 'PRIMARY_KEY', 'SECRET_NAME', 'RDS_SECRET_NAME',
         'API_SECRET_NAME', 'LLM_SECRET_NAME',
-        'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'DELIMITER', 'HAS_HEADER',
+        'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'GOLD_BUCKET', 'DELIMITER', 'HAS_HEADER',
         'ENV', 'ENVIRONMENT', 'INITIAL_LOAD_PATH', 'INPUT_FILE', 'MART_NAME'
     ]
 
     args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv or f"--{a.lower()}" in sys.argv]
     resolved = getResolvedOptions(sys.argv, args_to_check)
+
+    bucket_name = resolved.get('DATA_LAKE_BUCKET') or resolved.get('GOLD_BUCKET') or 'uax-datalake-dev-bucket'
+    env_val = resolved.get('ENV') or 'dev'
+    clean_bucket = str(bucket_name).replace('{env}', env_val).strip()
+
+    conf = SparkConf()
+    conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    conf.set("spark.sql.catalog.glue_catalog.warehouse", f"s3://{clean_bucket}/gold/data/")
+    conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    conf.set("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true")
+    conf.set("spark.sql.catalog.glue_catalog.skip-name-validation", "true")
+    conf.set("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true")
+    conf.set("spark.sql.defaultCatalog", "glue_catalog")
+    conf.set("spark.sql.iceberg.schema-evolution", "true")
+    conf.set("spark.sql.iceberg.check-nullability", "false")
+    conf.set("spark.sql.parquet.enableVectorizedReader", "false")
+
+    sc = SparkContext.getOrCreate(conf=conf)
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+
+    for k, v in [
+        ("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog"),
+        ("spark.sql.catalog.glue_catalog.warehouse", f"s3://{clean_bucket}/gold/data/"),
+        ("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog"),
+        ("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO"),
+        ("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true"),
+        ("spark.sql.catalog.glue_catalog.skip-name-validation", "true"),
+        ("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true"),
+        ("spark.sql.defaultCatalog", "glue_catalog"),
+        ("spark.sql.iceberg.schema-evolution", "true"),
+        ("spark.sql.iceberg.check-nullability", "false"),
+        ("spark.sql.parquet.enableVectorizedReader", "false"),
+    ]:
+        try:
+            spark.conf.set(k, v)
+        except Exception:
+            pass
 
     GoldInitialLoader.run_initial_load(spark, resolved)
 

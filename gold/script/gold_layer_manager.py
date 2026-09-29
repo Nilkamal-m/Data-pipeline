@@ -533,6 +533,29 @@ class GoldLayerManager:
         )
         glue_database = str(raw_glue_db).replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
+        # Ensure Iceberg Glue Catalog is configured on SparkSession
+        gold_prefix = params.get('GOLD_DATA_PREFIX') or (defaults_cfg.get('gold_data_prefix') if isinstance(defaults_cfg, dict) else 'gold/data') or 'gold/data'
+        warehouse_uri = f"s3://{bucket_name}/{str(gold_prefix).strip('/')}/"
+
+        if spark:
+            for k, v in [
+                ("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog"),
+                ("spark.sql.catalog.glue_catalog.warehouse", warehouse_uri),
+                ("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog"),
+                ("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO"),
+                ("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true"),
+                ("spark.sql.catalog.glue_catalog.skip-name-validation", "true"),
+                ("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true"),
+                ("spark.sql.defaultCatalog", "glue_catalog"),
+                ("spark.sql.iceberg.schema-evolution", "true"),
+                ("spark.sql.iceberg.check-nullability", "false"),
+                ("spark.sql.parquet.enableVectorizedReader", "false"),
+            ]:
+                try:
+                    spark.conf.set(k, v)
+                except Exception as conf_err:
+                    logger.debug(f"[SPARK CONF NOTE] Could not set '{k}': {conf_err}")
+
         # Strict SOURCE_SYSTEM Enforcement
         source_system = (params.get('SOURCE_SYSTEM') or '').strip().lower()
         if not source_system:
@@ -661,8 +684,12 @@ class GoldLayerManager:
         # Set Spark active database to GLUE_DATABASE so queries can use direct table names
         if glue_database and spark:
             try:
-                spark.sql(f"USE `{glue_database}`")
-                logger.info(f"[GOLD PREP] Set Spark active catalog and database to '{glue_database}'. Direct table names (e.g. 'tbl_interactions') are fully supported.")
+                try:
+                    spark.sql(f"USE glue_catalog.`{glue_database}`")
+                    logger.info(f"[GOLD PREP] Set Spark active catalog and database to 'glue_catalog.{glue_database}'. Direct table names are fully supported.")
+                except Exception:
+                    spark.sql(f"USE `{glue_database}`")
+                    logger.info(f"[GOLD PREP] Set Spark active database to '{glue_database}'. Direct table names are fully supported.")
             except Exception as use_err:
                 logger.warning(f"[GOLD PREP] Could not set Spark active database to '{glue_database}': {use_err}")
 
@@ -3549,6 +3576,7 @@ def parse_spark_arguments(args: Optional[List[str]] = None) -> Dict[str, Any]:
 
 def main():
     """Glue entrypoint when executed as an AWS Glue Job."""
+    from pyspark import SparkConf
     from pyspark.context import SparkContext
     from awsglue.context import GlueContext
     from awsglue.job import Job
@@ -3556,14 +3584,10 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-    sc = SparkContext.getOrCreate()
-    glueContext = GlueContext(sc)
-    spark = glueContext.spark_session
-
     expected_args = ['JOB_NAME']
     optional_args = [
         'SOURCE_SYSTEM', 'SECRET_NAME', 'RDS_SECRET_NAME', 'API_SECRET_NAME', 'LLM_SECRET_NAME',
-        'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'INCREMENTAL', 'FULL_REFRESH',
+        'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'GOLD_BUCKET', 'INCREMENTAL', 'FULL_REFRESH',
         'RDS_HOST', 'RDS_PORT', 'RDS_USER', 'RDS_PASSWORD',
         'GOLD_SCHEMA', 'RDS_GOLD_SCHEMA', 'GOLD_TARGETS', 'TARGET_ENGINES',
         'CONNECTION_NAME', 'GLUE_CONNECTION_NAME', 'ENV', 'ENVIRONMENT',
@@ -3575,6 +3599,47 @@ def main():
 
     args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv or f"--{a.lower()}" in sys.argv]
     resolved = getResolvedOptions(sys.argv, args_to_check)
+
+    # Initialize SparkConf with Iceberg & GlueCatalog settings
+    bucket_name = resolved.get('DATA_LAKE_BUCKET') or resolved.get('GOLD_BUCKET') or 'uax-datalake-dev-bucket'
+    env_val = resolved.get('ENV') or 'dev'
+    clean_bucket = str(bucket_name).replace('{env}', env_val).strip()
+
+    conf = SparkConf()
+    conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    conf.set("spark.sql.catalog.glue_catalog.warehouse", f"s3://{clean_bucket}/gold/data/")
+    conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    conf.set("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true")
+    conf.set("spark.sql.catalog.glue_catalog.skip-name-validation", "true")
+    conf.set("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true")
+    conf.set("spark.sql.defaultCatalog", "glue_catalog")
+    conf.set("spark.sql.iceberg.schema-evolution", "true")
+    conf.set("spark.sql.iceberg.check-nullability", "false")
+    conf.set("spark.sql.parquet.enableVectorizedReader", "false")
+
+    sc = SparkContext.getOrCreate(conf=conf)
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+
+    for k, v in [
+        ("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog"),
+        ("spark.sql.catalog.glue_catalog.warehouse", f"s3://{clean_bucket}/gold/data/"),
+        ("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog"),
+        ("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO"),
+        ("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true"),
+        ("spark.sql.catalog.glue_catalog.skip-name-validation", "true"),
+        ("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true"),
+        ("spark.sql.defaultCatalog", "glue_catalog"),
+        ("spark.sql.iceberg.schema-evolution", "true"),
+        ("spark.sql.iceberg.check-nullability", "false"),
+        ("spark.sql.parquet.enableVectorizedReader", "false"),
+    ]:
+        try:
+            spark.conf.set(k, v)
+        except Exception:
+            pass
 
     job = Job(glueContext)
     job.init(resolved['JOB_NAME'], resolved)
