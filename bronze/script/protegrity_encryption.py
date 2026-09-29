@@ -15,6 +15,8 @@ Features:
    - Resolves Protegrity user identity secret from AWS Secrets Manager or direct configuration.
 """
 
+import os
+import re
 import json
 import logging
 import random
@@ -53,7 +55,13 @@ class ProtegrityEncryptionManager:
         self.enabled = bool(self.enc_defaults.get("enabled", False))
         
         # Resolve Lambda ARN (validated lazily when encryption is actually triggered for table columns)
-        raw_arn = self.enc_defaults.get("lambda_arn", "")
+        raw_arn = (
+            self.enc_defaults.get("lambda_arn")
+            or self.enc_defaults.get("protegrity_lambda_arn")
+            or cfg.get("protegrity_lambda_arn")
+            or cfg.get("lambda_arn")
+            or ""
+        )
         self.lambda_arn = str(raw_arn).replace("{ENV}", self.env.upper()).replace("{env}", self.env.lower()).strip() if raw_arn else ""
         
         # Batch size (default: 500 records per invocation)
@@ -62,8 +70,9 @@ class ProtegrityEncryptionManager:
         self.default_encoding = str(self.enc_defaults.get("default_encoding", "utf8")).strip()
         self.max_retries = int(self.enc_defaults.get("max_retries", 5))
 
-        # Resolve AWS Region from Lambda ARN
-        self.region = self._extract_region_from_arn(self.lambda_arn)
+        # Resolve AWS Region from Lambda ARN or config
+        extracted_reg = self._extract_region_from_arn(self.lambda_arn) if self.lambda_arn else ""
+        self.region = extracted_reg or self.enc_defaults.get("region") or cfg.get("aws_region") or cfg.get("region") or "us-east-1"
         self._lambda_client = None
         self._user_secret = None
 
@@ -72,6 +81,11 @@ class ProtegrityEncryptionManager:
         """Extracts the AWS region from a Lambda ARN."""
         parts = arn.split(":")
         return parts[3] if len(parts) >= 4 else "us-east-2"
+
+    @staticmethod
+    def _clean_key(k: str) -> str:
+        """Sanitizes and normalizes column names for robust matching."""
+        return re.sub(r'[^a-zA-Z0-9_]', '', re.sub(r'[\s\.\-]+', '_', str(k).strip())).lower()
 
     @property
     def lambda_client(self):
@@ -122,13 +136,21 @@ class ProtegrityEncryptionManager:
         """
         Normalizes column configurations into a uniform dictionary mapping:
         { "col_name": { "data_element": "...", "encoding": "utf8" } }
+        Supports dictionaries, lists, comma-separated strings, and JSON strings.
         """
         normalized: Dict[str, Dict[str, str]] = {}
         if not columns_cfg:
             return normalized
 
         if isinstance(columns_cfg, str):
-            columns_cfg = [c.strip() for c in columns_cfg.split(",") if c.strip()]
+            clean_str = columns_cfg.strip()
+            if clean_str.startswith("{") or clean_str.startswith("["):
+                try:
+                    columns_cfg = json.loads(clean_str)
+                except Exception:
+                    columns_cfg = [c.strip() for c in clean_str.split(",") if c.strip()]
+            else:
+                columns_cfg = [c.strip() for c in clean_str.split(",") if c.strip()]
 
         if isinstance(columns_cfg, list):
             for col in columns_cfg:
@@ -229,6 +251,8 @@ class ProtegrityEncryptionManager:
                 f"(attempt {attempt + 1}/{self.max_retries})..."
             )
             time.sleep(backoff_sec)
+
+        raise TimeoutError(f"Protegrity Lambda call failed after {self.max_retries} attempts.")
 
     def _validate_lambda_arn(self) -> None:
         """Validates that lambda_arn is configured when encryption is actively invoked."""
@@ -379,12 +403,27 @@ class ProtegrityEncryptionManager:
 
         self._validate_lambda_arn()
 
-        # Verify which target columns are present in the DataFrame schema
-        df_cols_lower = {c.lower(): c for c in spark_df.columns}
-        active_cols = {col_k: meta for col_k, meta in target_cols.items() if col_k in df_cols_lower}
+        def _clean_key(k: str) -> str:
+            return re.sub(r'[^a-zA-Z0-9_]', '', re.sub(r'[\s\.\-]+', '_', str(k).strip())).lower()
+
+        # Map DataFrame columns to target columns (case-insensitive and sanitized)
+        # df_col_lookup: lowercase & normalized -> actual_df_col_name
+        df_col_lookup = {}
+        for c in spark_df.columns:
+            df_col_lookup[c.lower()] = c
+            df_col_lookup[_clean_key(c)] = c
+
+        active_cols: Dict[str, Dict[str, str]] = {}
+        for target_name, meta in target_cols.items():
+            matched_actual_col = df_col_lookup.get(target_name.lower()) or df_col_lookup.get(_clean_key(target_name))
+            if matched_actual_col:
+                active_cols[matched_actual_col] = meta
 
         if not active_cols:
-            logger.info("[Protegrity] None of the configured encryption columns are present in DataFrame. Skipping.")
+            logger.info(
+                f"[Protegrity] None of the configured encryption columns ({list(target_cols.keys())}) "
+                f"found in DataFrame ({spark_df.columns}). Skipping."
+            )
             return spark_df
 
         # State dictionary broadcasted to Spark worker tasks
@@ -400,18 +439,72 @@ class ProtegrityEncryptionManager:
 
         def process_partition(iterator):
             """Executes on Spark worker per partition."""
+            import boto3
+            import json
+            import uuid
+            import time
+            import random
+            from botocore.exceptions import ClientError
+            import pandas as pd
+
             client = boto3.client("lambda", region_name=worker_state["region"])
             b_size = worker_state["batch_size"]
             lambda_arn = worker_state["lambda_arn"]
             user_secret = worker_state["user_secret"]
             active_target_cols = worker_state["target_cols"]
             act = worker_state["action"]
+            m_retries = worker_state.get("max_retries", 5)
+
+            def _invoke_lambda_with_retry(arguments):
+                envelope = {
+                    "httpMethod": "POST",
+                    "path": f"/v2/{act}",
+                    "body": json.dumps({
+                        "query_id": str(uuid.uuid4()),
+                        "user": user_secret,
+                        "arguments": arguments
+                    })
+                }
+                for attempt in range(m_retries):
+                    try:
+                        resp = client.invoke(
+                            FunctionName=lambda_arn,
+                            InvocationType="RequestResponse",
+                            Payload=json.dumps(envelope).encode("utf-8")
+                        )
+                        sc = resp.get("StatusCode", 0)
+                        if sc != 200:
+                            func_err = resp.get("FunctionError", "Unknown")
+                            raise RuntimeError(f"Lambda returned status {sc}, error: {func_err}")
+                        raw_payload = json.loads(resp["Payload"].read().decode("utf-8"))
+                        gw_status = raw_payload.get("statusCode", 200)
+                        if gw_status == 200:
+                            b_val = raw_payload.get("body", "{}")
+                            return json.loads(b_val) if isinstance(b_val, str) else b_val
+                        raise RuntimeError(f"Protegrity API returned error code {gw_status}: {raw_payload}")
+                    except ClientError as ce:
+                        err_code = ce.response.get("Error", {}).get("Code", "")
+                        if err_code in ("TooManyRequestsException", "ThrottlingException") and attempt < m_retries - 1:
+                            pass
+                        else:
+                            raise
+                    except Exception as e:
+                        if attempt == m_retries - 1:
+                            raise
+                    backoff = min(10.0, (2 ** attempt)) * (random.randint(0, 1000) / 1000.0)
+                    time.sleep(backoff)
+                raise TimeoutError(f"Protegrity Lambda worker call failed after {m_retries} attempts.")
 
             for pdf in iterator:
+                if pdf.empty:
+                    yield pdf
+                    continue
+
+                orig_columns = list(pdf.columns)
                 records = pdf.to_dict(orient="records")
                 total_rows = len(records)
 
-                # Process partition in slices of 500 records
+                # Process partition in slices of batch_size (e.g. 500 records)
                 for start_idx in range(0, total_rows, b_size):
                     end_idx = min(start_idx + b_size, total_rows)
                     slice_records = records[start_idx:end_idx]
@@ -419,17 +512,16 @@ class ProtegrityEncryptionManager:
                     arguments = []
                     pos_map: Dict[str, List[Tuple[int, str]]] = {}
 
-                    for col_name, meta in active_target_cols.items():
+                    for actual_col_name, meta in active_target_cols.items():
                         vals, pos = [], []
                         for offset, r in enumerate(slice_records):
-                            # Case-insensitive column match
-                            actual_key = next((k for k in r.keys() if k.lower() == col_name), None)
-                            if actual_key and r[actual_key] is not None and str(r[actual_key]).strip() != "":
-                                vals.append(str(r[actual_key]))
-                                pos.append((start_idx + offset, actual_key))
+                            val = r.get(actual_col_name)
+                            if val is not None and str(val).strip() != "" and str(val).lower() not in ("nan", "none", "null"):
+                                vals.append(str(val))
+                                pos.append((start_idx + offset, actual_col_name))
 
                         if vals:
-                            aid = f"protect_{col_name}"
+                            aid = f"protect_{actual_col_name}"
                             arguments.append({
                                 "id": aid,
                                 "data_element": meta["data_element"],
@@ -441,34 +533,22 @@ class ProtegrityEncryptionManager:
                     if not arguments:
                         continue
 
-                    # Invoke Lambda for this 500-row slice
-                    envelope = {
-                        "httpMethod": "POST",
-                        "path": f"/v2/{act}",
-                        "body": json.dumps({
-                            "query_id": str(uuid.uuid4()),
-                            "user": user_secret,
-                            "arguments": arguments
-                        })
-                    }
-
-                    resp = client.invoke(
-                        FunctionName=lambda_arn,
-                        InvocationType="RequestResponse",
-                        Payload=json.dumps(envelope).encode("utf-8")
-                    )
-                    raw_p = json.loads(resp["Payload"].read().decode("utf-8"))
-                    body_val = raw_p.get("body", "{}")
-                    body_obj = json.loads(body_val) if isinstance(body_val, str) else body_val
+                    body_obj = _invoke_lambda_with_retry(arguments)
 
                     for res_block in body_obj.get("results", []):
                         aid = res_block.get("id")
                         tokens = res_block.get("results", [])
-                        for (target_idx, target_col), tkn in zip(pos_map.get(aid, []), tokens):
-                            records[target_idx][target_col] = tkn
+                        positions = pos_map.get(aid, [])
+                        if len(tokens) == len(positions):
+                            for (target_idx, target_col), tkn in zip(positions, tokens):
+                                records[target_idx][target_col] = tkn
+                        else:
+                            logger.warning(
+                                f"[Protegrity] Token count mismatch for '{aid}': expected {len(positions)}, got {len(tokens)}"
+                            )
 
-                import pandas as pd
-                yield pd.DataFrame(records)
+                res_df = pd.DataFrame(records, columns=orig_columns)
+                yield res_df
 
         return spark_df.mapInPandas(process_partition, schema=spark_df.schema)
 

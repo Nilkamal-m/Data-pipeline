@@ -35,7 +35,10 @@ from urllib.parse import urlparse
 import boto3
 from botocore.exceptions import ClientError
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import current_timestamp, lit, col
+from pyspark.sql.functions import (
+    current_timestamp, lit, col, to_timestamp, date_format,
+    when, coalesce, from_unixtime, trim, lower
+)
 
 # Ensure gold script directory is in sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -3124,32 +3127,206 @@ class GoldInitialLoader:
         return clean.lower()
 
     @classmethod
+    def _is_timestamp_column(
+        cls,
+        col_name: str,
+        source_type: Optional[Any] = None,
+        target_type: Optional[Any] = None
+    ) -> bool:
+        """
+        Determines whether a column represents a date/time/timestamp:
+        1. If source_type or target_type is TimestampType/DateType/TimestampNTZType.
+        2. If column name matches common timestamp conventions (exact, prefix, suffix, phrase).
+        Excludes technical audit metadata columns (_updated_at, _inserted_at, _data_as_of).
+        """
+        if not col_name:
+            return False
+
+        c_clean = str(col_name).strip()
+        if c_clean in ("_updated_at", "_inserted_at", "_data_as_of"):
+            return False
+
+        # 1. Inspect PySpark data types if available
+        for dt in (source_type, target_type):
+            if dt is not None:
+                type_name = str(dt).lower()
+                if any(k in type_name for k in ("timestamptype", "datetype", "timestamp_ntz")) and not any(k in type_name for k in ("string", "varchar")):
+                    return True
+                if hasattr(dt, "typeName"):
+                    try:
+                        tn = str(dt.typeName()).lower()
+                        if tn in ("timestamp", "date", "timestamp_ntz"):
+                            return True
+                    except Exception:
+                        pass
+
+        # 2. Inspect Column Name Naming Conventions (normalized lowercase)
+        c_norm = cls.sanitize_column_name(c_clean).lower()
+
+        # Exact matches
+        if c_norm in (
+            "timestamp", "ts", "datetime", "date", "time",
+            "start_time", "end_time", "created_time", "updated_time",
+            "start_date", "end_date", "conversation_start", "conversation_end",
+            "created_at", "updated_at", "closed_at", "resolved_at"
+        ):
+            return True
+
+        # Suffixes
+        if c_norm.endswith((
+            "_timestamp", "_ts", "_datetime", "_at", "_time",
+            "_date", "_dt", "_on", "_start", "_end"
+        )):
+            return True
+
+        # Prefixes
+        if c_norm.startswith(("timestamp_", "datetime_", "date_", "time_")):
+            return True
+
+        # Specific compound phrases
+        if any(p in c_norm for p in (
+            "_timestamp_", "_datetime_", "_date_", "_time_",
+            "conversation_start", "conversation_end", "start_time", "end_time",
+            "created_at", "updated_at", "sys_created", "sys_updated",
+            "event_time", "event_timestamp"
+        )):
+            return True
+
+        return False
+
+    @classmethod
+    def _conform_timestamp_to_string(
+        cls,
+        df: DataFrame,
+        col_name: str,
+        data_type: Optional[Any] = None
+    ) -> DataFrame:
+        """
+        Converts an identified timestamp column to 'YYYY-MM-DD HH:MM:SS' format
+        and ensures its final type is StringType.
+        Handles:
+        - Native TimestampType, DateType, TimestampNTZType
+        - Numeric epochs (seconds: 10 digits, milliseconds: 13 digits)
+        - ISO-8601 strings ('2024-09-24T11:00:00Z', '2024-09-24T11:00:00.000Z', '2024-09-24T11:00:00+00:00')
+        - Standard space-separated strings ('2024-09-24 11:00:00', '2024-09-24 11:00:00.123')
+        - Slash strings ('2024/09/24 11:00:00', '09/24/2024 11:00:00')
+        - Date-only strings ('2024-09-24', '2024/09/24', '09/24/2024')
+        - Null / empty / blank strings -> NULL (cast to string)
+        """
+        type_str = str(data_type).lower() if data_type is not None else ""
+
+        # Case 1: Native TimestampType / DateType / TimestampNTZType
+        if any(t in type_str for t in ("timestamptype", "datetype", "timestamp_ntz", "timestamp", "date")) and not any(t in type_str for t in ("string", "varchar")):
+            return df.withColumn(
+                col_name,
+                when(col(col_name).isNull(), lit(None).cast("string"))
+                .otherwise(date_format(col(col_name), "yyyy-MM-dd HH:mm:ss").cast("string"))
+            )
+
+        # Case 2: Numeric Epoch Type (LongType, IntegerType, DoubleType, DecimalType)
+        if any(t in type_str for t in ("longtype", "integertype", "shorttype", "doubletype", "floattype", "decimaltype", "bigint", "int", "integer", "double", "float")):
+            col_d = col(col_name).cast("double")
+            ts_from_epoch = when(
+                (col_d >= 1e11) & (col_d <= 3e12),
+                to_timestamp(from_unixtime(col_d / 1000.0))
+            ).when(
+                (col_d >= 1e8) & (col_d <= 3e10),
+                to_timestamp(from_unixtime(col_d))
+            )
+            return df.withColumn(
+                col_name,
+                when(col(col_name).isNull(), lit(None).cast("string"))
+                .when(ts_from_epoch.isNotNull(), date_format(ts_from_epoch, "yyyy-MM-dd HH:mm:ss").cast("string"))
+                .otherwise(col(col_name).cast("string"))
+            )
+
+        # Case 3: String Type (or un-inferred CSV column)
+        col_str = trim(col(col_name).cast("string"))
+        is_empty_or_null = (
+            col(col_name).isNull()
+            | (col_str == "")
+            | lower(col_str).isin("null", "none", "nan", "undefined")
+        )
+
+        parsed_ts = coalesce(
+            to_timestamp(col_str),
+            to_timestamp(col_str, "yyyy-MM-dd'T'HH:mm:ss.SSSX"),
+            to_timestamp(col_str, "yyyy-MM-dd'T'HH:mm:ssX"),
+            to_timestamp(col_str, "yyyy-MM-dd'T'HH:mm:ss.SSS"),
+            to_timestamp(col_str, "yyyy-MM-dd'T'HH:mm:ss"),
+            to_timestamp(col_str, "yyyy-MM-dd HH:mm:ss"),
+            to_timestamp(col_str, "yyyy-MM-dd HH:mm:ss.SSSSSS"),
+            to_timestamp(col_str, "yyyy-MM-dd HH:mm:ss.SSS"),
+            to_timestamp(col_str, "yyyy-MM-dd"),
+            to_timestamp(col_str, "yyyy/MM/dd HH:mm:ss"),
+            to_timestamp(col_str, "yyyy/MM/dd"),
+            to_timestamp(col_str, "MM/dd/yyyy HH:mm:ss"),
+            to_timestamp(col_str, "MM/dd/yyyy"),
+            to_timestamp(col_str, "dd/MM/yyyy HH:mm:ss"),
+            to_timestamp(col_str, "dd/MM/yyyy"),
+            # Epoch millis (13 digits)
+            when(col_str.rlike(r"^\d{13}$"), to_timestamp(from_unixtime(col_str.cast("double") / 1000.0))),
+            # Epoch seconds (10 digits)
+            when(col_str.rlike(r"^\d{10}$"), to_timestamp(from_unixtime(col_str.cast("double"))))
+        )
+
+        return df.withColumn(
+            col_name,
+            when(is_empty_or_null, lit(None).cast("string"))
+            .when(parsed_ts.isNotNull(), date_format(parsed_ts, "yyyy-MM-dd HH:mm:ss").cast("string"))
+            .otherwise(col_str.cast("string"))
+        )
+
+    @classmethod
     def reconcile_schema(
         cls,
         df_source: DataFrame,
         target_schema_fields: Optional[List[Any]] = None
     ) -> DataFrame:
+        # 1. Cleanse source column names (spaces -> _, dots -> _, hyphens -> _)
         for orig_col in list(df_source.columns):
             clean_col = cls.sanitize_column_name(orig_col)
             if clean_col != orig_col:
                 logger.info(f"[COLUMN CLEANSING] Renaming '{orig_col}' -> '{clean_col}'")
                 df_source = df_source.withColumnRenamed(orig_col, clean_col)
 
-        # Convert all business columns in source to StringType (ensures all things in string in Gold layer)
+        # Build target field map early if available: normalized_name -> (canonical_target_name, dataType)
+        target_field_map = {}
+        if target_schema_fields:
+            for f in target_schema_fields:
+                norm_name = cls.sanitize_column_name(f.name)
+                target_field_map[norm_name] = (f.name, f.dataType)
+
+        # 2. Identify timestamp columns and standardize to 'YYYY-MM-DD HH:MM:SS', then cast to StringType
         for c in df_source.columns:
-            if c not in ("_updated_at", "_inserted_at", "_data_as_of"):
+            if c in ("_updated_at", "_inserted_at", "_data_as_of"):
+                continue
+            norm_c = cls.sanitize_column_name(c)
+            target_data_type = target_field_map[norm_c][1] if norm_c in target_field_map else None
+            source_data_type = None
+            try:
+                source_data_type = df_source.schema[c].dataType
+            except Exception:
+                pass
+
+            effective_data_type = target_data_type or source_data_type
+            if target_data_type and cls._is_timestamp_column(c, None, target_data_type):
+                effective_data_type = target_data_type
+            elif source_data_type and cls._is_timestamp_column(c, source_data_type, None):
+                effective_data_type = source_data_type
+
+            if cls._is_timestamp_column(c, source_data_type, target_data_type):
+                logger.info(f"[TIMESTAMP STANDARDIZATION] Standardizing timestamp column '{c}' to 'YYYY-MM-DD HH:MM:SS' string format.")
+                df_source = cls._conform_timestamp_to_string(df_source, c, effective_data_type)
+            else:
                 df_source = df_source.withColumn(c, col(c).cast("string"))
 
         if not target_schema_fields:
             return df_source
 
-        target_field_map = {}
-        for f in target_schema_fields:
-            norm_name = cls.sanitize_column_name(f.name)
-            target_field_map[norm_name] = (f.name, f.dataType)
-
         source_cols = {cls.sanitize_column_name(c): c for c in df_source.columns}
 
+        # 3. Pad missing columns with NULL cast to string (or target type for audit timestamps)
         missing_in_source = []
         for norm_name, (target_name, data_type) in target_field_map.items():
             if norm_name not in source_cols:
@@ -3160,12 +3337,11 @@ class GoldInitialLoader:
                 actual_col = source_cols[norm_name]
                 if actual_col != target_name:
                     df_source = df_source.withColumnRenamed(actual_col, target_name)
-                if target_name not in ("_updated_at", "_inserted_at", "_data_as_of"):
-                    df_source = df_source.withColumn(target_name, col(target_name).cast("string"))
 
         if missing_in_source:
             logger.info(f"[SCHEMA CONSOLIDATION] Padding {len(missing_in_source)} missing column(s) with NULL: {missing_in_source}")
 
+        # 4. Retain extra columns from source for schema evolution (already cast to string)
         extra_in_source = [source_cols[norm_name] for norm_name in source_cols if norm_name not in target_field_map]
         if extra_in_source:
             logger.info(f"[SCHEMA CONSOLIDATION] Preserving {len(extra_in_source)} extra column(s) from CSV for schema evolution: {extra_in_source}")
@@ -3231,6 +3407,33 @@ class GoldInitialLoader:
     def _purge_s3_prefix(cls, s3_client, s3_uri: str) -> int:
         """Safely deletes orphaned or corrupted metadata/data files under an S3 URI."""
         return GoldLayerManager._purge_s3_prefix(s3_client, s3_uri)
+
+    @classmethod
+    def _get_protegrity_encryption_manager(cls):
+        """Lazily and dynamically imports ProtegrityEncryptionManager class."""
+        global ProtegrityEncryptionManager
+        if ProtegrityEncryptionManager is not None:
+            return ProtegrityEncryptionManager
+        for p in [
+            script_dir,
+            os.path.abspath(os.path.join(script_dir, "..", "script")),
+            os.path.abspath("gold/script"),
+            os.path.abspath("bronze/script"),
+            os.getcwd()
+        ]:
+            if os.path.isdir(p) and p not in sys.path:
+                sys.path.insert(0, p)
+        try:
+            from protegrity_encryption import ProtegrityEncryptionManager as pem
+            ProtegrityEncryptionManager = pem
+            return ProtegrityEncryptionManager
+        except ImportError:
+            try:
+                from gold.script.protegrity_encryption import ProtegrityEncryptionManager as pem
+                ProtegrityEncryptionManager = pem
+                return ProtegrityEncryptionManager
+            except ImportError:
+                return None
 
     @classmethod
     def run_initial_load(
@@ -3361,25 +3564,86 @@ class GoldInitialLoader:
         raw_count = df_raw.count()
         logger.info(f"Loaded {raw_count:,} records from input file.")
 
-        # Protegrity Encryption for Historical Cold-Start Data
+        # Cleanse column names in df_raw immediately (ensures column names align with encryption_columns)
+        for orig_col in list(df_raw.columns):
+            clean_col = cls.sanitize_column_name(orig_col)
+            if clean_col != orig_col:
+                logger.info(f"[COLUMN CLEANSING] Renaming '{orig_col}' -> '{clean_col}'")
+                df_raw = df_raw.withColumnRenamed(orig_col, clean_col)
+
+        # Protegrity Encryption for Historical Initial Load Data
         table_cfg = GoldConfigLoader.get_table_config(source_system, table_name, gold_cfg) if GoldConfigLoader else {}
+        init_cfg = GoldConfigLoader.get_initial_load_config(source_system, table_name, gold_cfg) if GoldConfigLoader else {}
+        defaults_cfg = GoldConfigLoader.get_defaults(gold_cfg, env=env) if GoldConfigLoader else {}
+
+        # 1. Resolve encryption columns
         mart_enc_cols = (
-            table_cfg.get("encryption_columns")
+            params.get("ENCRYPTION_COLUMNS")
+            or params.get("ENCRYPT_COLUMNS")
+            or table_cfg.get("encryption_columns")
             or table_cfg.get("encryption", {}).get("columns")
+            or init_cfg.get("encryption_columns")
+            or init_cfg.get("encryption", {}).get("columns")
         )
-        if mart_enc_cols and ProtegrityEncryptionManager:
+        if isinstance(mart_enc_cols, str) and (mart_enc_cols.strip().startswith("{") or mart_enc_cols.strip().startswith("[")):
             try:
-                enc_mgr = ProtegrityEncryptionManager(global_config=defaults_cfg, env=env)
-                if enc_mgr.enabled:
-                    logger.info(
-                        f"[GOLD ENCRYPTION] Encrypting PII columns for historical table '{source_system}.{table_name}'..."
-                    )
-                    df_raw = enc_mgr.encrypt_spark_dataframe(
-                        spark_df=df_raw,
-                        table_columns_config=mart_enc_cols,
-                        action="protect"
-                    )
-                    logger.info("[GOLD ENCRYPTION] Historical dataset encrypted successfully.")
+                import json
+                mart_enc_cols = json.loads(mart_enc_cols.strip())
+            except Exception:
+                pass
+
+        # 2. Merge encryption settings (defaults < table_cfg < params)
+        enc_defaults = dict(defaults_cfg.get("encryption", {}))
+        if "encryption" in table_cfg and isinstance(table_cfg["encryption"], dict):
+            enc_defaults.update({k: v for k, v in table_cfg["encryption"].items() if k != "columns"})
+        if "encryption" in init_cfg and isinstance(init_cfg["encryption"], dict):
+            enc_defaults.update({k: v for k, v in init_cfg["encryption"].items() if k != "columns"})
+
+        cli_enabled = (
+            str(params.get('ENABLE_ENCRYPTION', '')).strip().lower() in ('true', '1', 'yes')
+            or str(params.get('ENCRYPTION_ENABLED', '')).strip().lower() in ('true', '1', 'yes')
+        )
+        cli_disabled = (
+            str(params.get('ENABLE_ENCRYPTION', '')).strip().lower() in ('false', '0', 'no')
+            or str(params.get('ENCRYPTION_ENABLED', '')).strip().lower() in ('false', '0', 'no')
+        )
+        cli_lambda_arn = params.get('PROTEGRITY_LAMBDA_ARN') or params.get('LAMBDA_ARN')
+        cli_secret_name = params.get('SECRET_NAME') or params.get('PROTEGRITY_SECRET_NAME')
+        cli_enc_key = params.get('ENCRYPTION_KEY') or params.get('USER_SECRET')
+
+        if cli_lambda_arn:
+            enc_defaults["lambda_arn"] = cli_lambda_arn
+        if cli_secret_name:
+            enc_defaults["secret_name"] = cli_secret_name
+        if cli_enc_key:
+            enc_defaults["encryption_key"] = cli_enc_key
+
+        has_lambda_arn = bool(enc_defaults.get("lambda_arn") or enc_defaults.get("protegrity_lambda_arn"))
+        config_enabled = bool(enc_defaults.get("enabled", False))
+
+        should_encrypt = (
+            not cli_disabled
+            and bool(mart_enc_cols)
+            and (cli_enabled or has_lambda_arn or config_enabled)
+        )
+        if should_encrypt:
+            enc_defaults["enabled"] = True
+
+        enc_cls = cls._get_protegrity_encryption_manager()
+        if should_encrypt and mart_enc_cols and enc_cls:
+            try:
+                enc_mgr = enc_cls(global_config={"encryption": enc_defaults}, env=env)
+                logger.info(
+                    f"[GOLD ENCRYPTION] Encrypting PII columns "
+                    f"{list(mart_enc_cols.keys()) if isinstance(mart_enc_cols, dict) else mart_enc_cols} "
+                    f"using Protegrity Lambda for initial load table '{source_system}.{table_name}'..."
+                )
+                df_raw = enc_mgr.encrypt_spark_dataframe(
+                    spark_df=df_raw,
+                    table_columns_config=mart_enc_cols,
+                    action="protect"
+                )
+                logger.info("[GOLD ENCRYPTION] Historical dataset encrypted successfully.")
             except Exception as enc_err:
                 logger.error(f"[GOLD ENCRYPTION ERROR] Failed to encrypt historical columns: {enc_err}")
                 raise
@@ -3456,9 +3720,9 @@ class GoldInitialLoader:
         df_consolidated = cls.reconcile_schema(df_raw, target_fields)
 
         if "_updated_at" not in df_consolidated.columns:
-            df_consolidated = df_consolidated.withColumn("_updated_at", current_timestamp())
+            df_consolidated = df_consolidated.withColumn("_updated_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
         if "_inserted_at" not in df_consolidated.columns:
-            df_consolidated = df_consolidated.withColumn("_inserted_at", current_timestamp())
+            df_consolidated = df_consolidated.withColumn("_inserted_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
 
         # Ensure row uniqueness by natural keys (nkey) from gold config
         df_consolidated = GoldLayerManager._deduplicate_by_nkey(df_consolidated, pks)
@@ -3687,7 +3951,10 @@ def main():
         'GOLD_CONFIG_S3_PATH', 'GOLD_CONFIG_JSON', 'ATHENA_WORKGROUP', 'WORKGROUP',
         'MART_NAME', 'TABLE_NAME', 'TABLE_LIST', 'CSV_PATH', 'INITIAL_LOAD_PATH',
         'INPUT_FILE', 'SKIP_INITIAL_LOAD', 'RELOAD_INITIAL', 'DELIMITER', 'HAS_HEADER',
-        'NKEY', 'PRIMARY_KEY', 'AWS_REGION'
+        'NKEY', 'PRIMARY_KEY', 'AWS_REGION',
+        'ENABLE_ENCRYPTION', 'ENCRYPTION_ENABLED', 'PROTEGRITY_LAMBDA_ARN', 'LAMBDA_ARN',
+        'ENCRYPTION_KEY', 'USER_SECRET_KEY', 'USER_SECRET', 'PROTEGRITY_SECRET_NAME',
+        'ENCRYPTION_COLUMNS', 'ENCRYPT_COLUMNS'
     ]
 
     args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv or f"--{a.lower()}" in sys.argv]

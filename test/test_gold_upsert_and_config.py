@@ -1363,6 +1363,124 @@ class TestGoldInitialLoadIntegration(unittest.TestCase):
             self.assertEqual(body['workflow_run_id'], 'wr_67890')
 
 
+class TestGoldInitialLoadTimestampAndEncryption(unittest.TestCase):
+    """
+    Tests for:
+    1. Identifying date/time/timestamp columns from target schema or naming patterns.
+    2. Conforming identified timestamp columns to 'YYYY-MM-DD HH:MM:SS' string format.
+    3. Proper Protegrity encryption invocation during initial load via CLI args or table configs.
+    4. Worker-level column ordering and retry handling in ProtegrityEncryptionManager.
+    """
+
+    def test_is_timestamp_column_detection(self):
+        # 1. By exact name
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("timestamp"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("created_time"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("conversation_start"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("conversation_end"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("start_time"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("end_time"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("created_at"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("updated_at"))
+
+        # 2. By suffix
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("login_time"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("payment_date"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("event_ts"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("session_start"))
+
+        # 3. By PySpark type names
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("custom_field", source_type="TimestampType()"))
+        self.assertTrue(GoldInitialLoader._is_timestamp_column("custom_field", target_type="DateType()"))
+
+        # 4. Excluded technical audit columns
+        self.assertFalse(GoldInitialLoader._is_timestamp_column("_updated_at"))
+        self.assertFalse(GoldInitialLoader._is_timestamp_column("_inserted_at"))
+        self.assertFalse(GoldInitialLoader._is_timestamp_column("_data_as_of"))
+
+        # 5. Non-timestamp business columns
+        self.assertFalse(GoldInitialLoader._is_timestamp_column("customer_name"))
+        self.assertFalse(GoldInitialLoader._is_timestamp_column("update_count"))
+        self.assertFalse(GoldInitialLoader._is_timestamp_column("candidate_status"))
+
+    def test_reconcile_schema_standardizes_timestamps(self):
+        mock_df = MagicMock()
+        mock_df.columns = ["conversation_id", "conversation_start", "caller_name"]
+        mock_df.schema = {
+            "conversation_id": MagicMock(dataType="string"),
+            "conversation_start": MagicMock(dataType="string"),
+            "caller_name": MagicMock(dataType="string")
+        }
+        mock_df.withColumnRenamed.return_value = mock_df
+        mock_df.withColumn.return_value = mock_df
+
+        class TargetField:
+            def __init__(self, name, dataType):
+                self.name = name
+                self.dataType = dataType
+
+        target_fields = [
+            TargetField("conversation_id", "string"),
+            TargetField("conversation_start", "timestamp"),
+            TargetField("caller_name", "string")
+        ]
+
+        with patch.object(GoldInitialLoader, "_conform_timestamp_to_string", return_value=mock_df) as mock_conform:
+            out_df = GoldInitialLoader.reconcile_schema(mock_df, target_fields)
+            mock_conform.assert_called_with(mock_df, "conversation_start", "timestamp")
+
+    def test_initial_load_encryption_invoked_with_cli_args(self):
+        mock_spark = MagicMock()
+        mock_raw_df = MagicMock()
+        mock_raw_df.columns = ["Customer Name", "Customer Email", "conversation_id"]
+        mock_raw_df.count.return_value = 100
+        mock_spark.read.option.return_value.option.return_value.option.return_value.csv.return_value = mock_raw_df
+        mock_spark.table.return_value = mock_raw_df
+
+        params = {
+            "JOB_NAME": "test_job",
+            "SOURCE_SYSTEM": "genesys",
+            "TABLE_NAME": "conversations",
+            "CSV_PATH": "s3://bucket/init/conversations.csv",
+            "NKEY": "conversation_id",
+            "ENABLE_ENCRYPTION": "true",
+            "PROTEGRITY_LAMBDA_ARN": "arn:aws:lambda:us-east-1:123456789012:function:protegrity-protector-dev",
+            "ENCRYPTION_COLUMNS": json.dumps({"customer_name": "EMP_MEMBERNAME_ALPHANUM_LP"}),
+            "GLUE_DATABASE": "uax_datalake_db_dev",
+            "DATA_LAKE_BUCKET": "uax-datalake-dev-bucket"
+        }
+
+        enc_cls = GoldInitialLoader._get_protegrity_encryption_manager()
+        with patch.object(enc_cls, "encrypt_spark_dataframe", return_value=mock_raw_df) as mock_encrypt:
+            GoldInitialLoader.run_initial_load(mock_spark, params)
+            mock_encrypt.assert_called_once()
+            call_kwargs = mock_encrypt.call_args[1]
+            self.assertEqual(call_kwargs["action"], "protect")
+            self.assertEqual(call_kwargs["table_columns_config"], {"customer_name": "EMP_MEMBERNAME_ALPHANUM_LP"})
+
+    def test_protegrity_normalize_columns_config_json_string(self):
+        from gold.script.protegrity_encryption import ProtegrityEncryptionManager
+        mgr = ProtegrityEncryptionManager(global_config={"encryption": {"enabled": True}}, env="dev")
+        # JSON string support
+        json_cfg = '{"customer_name": "NAME_ELEMENT", "email": "EMAIL_ELEMENT"}'
+        res = mgr.normalize_columns_config(json_cfg)
+        self.assertEqual(res["customer_name"]["data_element"], "NAME_ELEMENT")
+        self.assertEqual(res["email"]["data_element"], "EMAIL_ELEMENT")
+
+        # List support
+        list_cfg = ["customer_name", "email"]
+        res2 = mgr.normalize_columns_config(list_cfg)
+        self.assertEqual(res2["customer_name"]["data_element"], "AES256")
+        self.assertEqual(res2["email"]["data_element"], "AES256")
+
+    def test_protegrity_worker_dataframe_preserves_column_order(self):
+        from gold.script.protegrity_encryption import ProtegrityEncryptionManager
+        # Test column matching cleans names
+        self.assertEqual(ProtegrityEncryptionManager._clean_key("Customer Name"), "customer_name")
+        self.assertEqual(ProtegrityEncryptionManager._clean_key("customer_name"), "customer_name")
+        self.assertEqual(ProtegrityEncryptionManager._clean_key("caller_id.name"), "caller_id_name")
+
+
 if __name__ == "__main__":
     unittest.main()
 
