@@ -2766,23 +2766,10 @@ class GoldLayerManager:
         failed_at = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
         return (
-            f"\n+================================================================================+\n"
-            f"|  ERROR DIAGNOSTIC CARD: GOLD MART FAILURE [FAILED]\n"
-            f"+================================================================================+\n"
-            f"|  * Execution Layer    : {layer}\n"
-            f"|  * Step Name          : {step_name}\n"
-            f"|  * Target Entity      : {target_entity}\n"
-            f"|  * Query Source       : {query_source}\n"
-            f"|  * Target Host        : {safe_host}\n"
-            f"|  * Target User        : {safe_user}\n"
-            f"|  * Target Schema      : {safe_db}\n"
-            f"|  * Failed At (UTC)    : {failed_at}\n"
-            f"|  * Exception Type     : {exception.__class__.__name__}\n"
-            f"|  * Exception Message  : {str(exception)}\n"
-            f"+--------------------------------------------------------------------------------+\n"
-            f"|  COMPLETE STACK TRACE:\n"
-            f"{tb}\n"
-            f"+================================================================================+"
+            f"[ERROR DIAGNOSTIC] GOLD MART FAILURE [FAILED] | Layer: {layer} | Step: {step_name} | "
+            f"Entity: {target_entity} | Query: {query_source} | Host: {safe_host} | User: {safe_user} | "
+            f"Schema: {safe_db} | Failed At: {failed_at} | Exception: {exception.__class__.__name__}: {exception}\n"
+            f"Stack Trace:\n{tb}"
         )
 
     @classmethod
@@ -2805,24 +2792,11 @@ class GoldLayerManager:
                 breakdown_lines.append(f"|         └── Error: {m['error_message']}")
 
         breakdown_str = "\n".join(breakdown_lines)
-
         summary_card = (
-            f"\n[JOB REPORT] GOLD SERVING LAYER | Status: {overall_status} | Marts: {len(stats) - failed_count}/{len(stats)} | Duration: {total_duration:.2f}s\n"
-            f"+================================================================================+\n"
-            f"|                    GOLD SERVING LAYER FINAL EXECUTION REPORT                   |\n"
-            f"+================================================================================+\n"
-            f"|  Overall Status        : {overall_status}\n"
-            f"|  Total Marts Evaluated : {len(stats)} (Succeeded: {len(stats) - failed_count}, Failed: {failed_count})\n"
-            f"|  Start Time (UTC)      : {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"|  End Time (UTC)        : {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"|  Total Duration        : {total_duration:.2f}s\n"
-            f"+--------------------------------------------------------------------------------+\n"
-            f"|  MART EXECUTION BREAKDOWN:\n"
-            f"{breakdown_str}\n"
-            f"+================================================================================+"
+            f"[JOB REPORT] GOLD SERVING LAYER | Status: {overall_status} | Marts: {len(stats) - failed_count}/{len(stats)} | Duration: {total_duration:.2f}s\n"
+            f"MART EXECUTION BREAKDOWN:\n{breakdown_str}"
         )
         logger.info(summary_card)
-
 
     @classmethod
     def run_initial_load(
@@ -2830,238 +2804,25 @@ class GoldLayerManager:
         spark: SparkSession,
         params: Dict[str, Any]
     ) -> Dict[str, Any]:
-        start_time = datetime.now(timezone.utc)
-        env = (
-            params.get('ENV')
-            or params.get('env')
-            or params.get('ENVIRONMENT')
-            or params.get('environment')
-            or os.environ.get('ENV')
-            or os.environ.get('ENVIRONMENT')
-            or 'dev'
-        ).strip().lower()
-
-        source_system = (params.get('SOURCE_SYSTEM') or '').strip().lower()
-        table_name = (params.get('TABLE_NAME') or params.get('MART_NAME') or '').strip().lower()
-
-        if not source_system or not table_name:
-            raise ValueError("CRITICAL ERROR: '--SOURCE_SYSTEM' and '--TABLE_NAME' are required for Gold initial load.")
-
-        for prefix in [f"gold_{source_system}_", "gold_tbl_", "gold_", "v_"]:
-            if table_name.startswith(prefix):
-                table_name = table_name[len(prefix):]
-                break
-
-        gold_cfg = GoldConfigLoader.load_config(env=env) if GoldConfigLoader else {}
-        defaults_cfg = GoldConfigLoader.get_defaults(gold_cfg, env=env) if GoldConfigLoader else {}
-
-        raw_bucket = (
-            params.get('DATA_LAKE_BUCKET')
-            or defaults_cfg.get('gold_bucket')
-            or f"uax-datalake-{env}-bucket"
-        )
-        bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
-
-        raw_glue_db = (
-            params.get('GLUE_DATABASE')
-            or (GoldConfigLoader.get_glue_database(gold_cfg, env=env) if GoldConfigLoader else None)
-            or f"uax_datalake_db_{env}"
-        )
-        glue_database = str(raw_glue_db).replace('{env}', env).replace('{ENV}', env.upper()).strip()
-
-        csv_path = params.get('CSV_PATH') or params.get('INITIAL_LOAD_PATH') or params.get('INPUT_FILE')
-        if not csv_path and GoldConfigLoader:
-            init_cfg = GoldConfigLoader.get_initial_load_config(source_system, table_name, gold_cfg)
-            csv_path = init_cfg.get('path')
-            if not params.get('DELIMITER') and init_cfg.get('delimiter'):
-                params['DELIMITER'] = init_cfg.get('delimiter')
-            if not params.get('HAS_HEADER') and 'has_header' in init_cfg:
-                params['HAS_HEADER'] = init_cfg.get('has_header')
-
-        if csv_path and isinstance(csv_path, str):
-            csv_path = (
-                csv_path
-                .replace("{bucket}", bucket_name)
-                .replace("{env}", env)
-                .replace("{ENV}", env.upper())
-                .replace("{source}", source_system)
-                .replace("{table}", table_name)
-            )
-
-        if not csv_path:
-            csv_path = f"s3://{bucket_name}/gold/initial_exports/{source_system}/{table_name}.csv"
-
-        if GoldConfigLoader:
-            target_table_name = GoldConfigLoader.get_target_table_name(source_system, table_name, 'athena', gold_cfg)
-        else:
-            target_table_name = f"gold_{source_system}_{table_name}"
-
-        # Use GoldLayerManager explicitly (not cls) since this method may be called via
-        # GoldInitialLoader.run_initial_load(), which does not inherit _resolve_natural_keys.
-        pks = GoldLayerManager._resolve_natural_keys(source_system, table_name, gold_cfg, params)
-        if not pks:
-            raise ValueError(
-                f"CRITICAL CONFIG ERROR: Missing 'nkey' in gold configuration for table '{table_name}' "
-                f"under source system '{source_system}'. A natural key is mandatory for initial load."
-            )
-
-        full_table = f"`{glue_database}`.`{target_table_name}`"
-
-        logger.info(
-            f"\n+================================================================================+\n"
-            f"|                STARTING GOLD INITIAL LOAD & CONSOLIDATION                      |\n"
-            f"+================================================================================+\n"
-            f"|  * Source System     : {source_system.upper()}\n"
-            f"|  * Table Name        : {table_name}\n"
-            f"|  * Target Table      : {full_table}\n"
-            f"|  * Natural Keys      : {pks or 'None (Overwrite)'}\n"
-            f"|  * Input File Path   : {csv_path}\n"
-            f"|  * Glue Database     : {glue_database}\n"
-            f"|  * Execution Time    : {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"+================================================================================+"
-        )
-
-        if csv_path.endswith('.parquet'):
-            logger.info(f"Reading input Parquet file from '{csv_path}'...")
-            df_raw = spark.read.parquet(csv_path)
-        else:
-            delimiter = params.get('DELIMITER', ',')
-            has_header = str(params.get('HAS_HEADER', 'true')).strip().lower() in ('true', '1', 'yes')
-            logger.info(f"Reading input CSV file from '{csv_path}' (delimiter='{delimiter}', header={has_header})...")
-            df_raw = spark.read \
-                .option("header", str(has_header).lower()) \
-                .option("delimiter", delimiter) \
-                .option("quote", '"') \
-                .option("escape", '"') \
-                .option("multiLine", "true") \
-                .option("inferSchema", "false") \
-                .csv(csv_path)
-
-        raw_count = df_raw.count()
-        logger.info(f"Loaded {raw_count:,} records from input file.")
-
-        target_fields = None
-        table_exists = False
-        try:
-            target_df = spark.table(f"{glue_database}.{target_table_name}")
-            target_fields = target_df.schema.fields
-            table_exists = True
-            logger.info(f"Found existing Gold table '{full_table}' with {len(target_fields)} column(s).")
-        except Exception:
-            table_exists = False
-            logger.info(f"Gold table '{full_table}' not found in catalog. Attempting automatic Gold query extraction...")
-
-        if not target_fields:
-            target_fields = cls._probe_target_schema_from_query(
-                spark=spark,
-                source_system=source_system,
-                table_name=table_name,
-                params=params
-            )
-
-        df_consolidated = cls.reconcile_schema(df_raw, target_fields)
-
-        if "_updated_at" not in df_consolidated.columns:
-            df_consolidated = df_consolidated.withColumn("_updated_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
-        if "_inserted_at" not in df_consolidated.columns:
-            df_consolidated = df_consolidated.withColumn("_inserted_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
-
-        # Ensure row uniqueness by natural keys (nkey) from gold config
-        df_consolidated = GoldLayerManager._deduplicate_by_nkey(df_consolidated, pks)
-        dedup_count = df_consolidated.count()
-        logger.info(f"[PRIMARY KEY] Natural keys resolved for '{table_name}': {pks} (Records after deduplication: {dedup_count:,}, raw: {raw_count:,})")
-
-        temp_view = f"incoming_initial_{table_name}"
-        df_consolidated.createOrReplaceTempView(temp_view)
-        s3_location = f"s3://{bucket_name}/gold/data/{source_system}/{table_name}"
-
-        if table_exists:
+        """Executes initial load for Gold layer by delegating to GoldInitialLoader."""
+        loader = GoldInitialLoader
+        if loader is None:
             try:
-                GoldLayerManager._sync_iceberg_schema(spark, full_table, df_consolidated)
-            except Exception as sync_err:
-                logger.debug(f"[INITIAL LOAD] Note on Iceberg schema sync: {sync_err}")
+                from gold_initial_load import GoldInitialLoader as loader
+            except ImportError:
+                from gold.script.gold_initial_load import GoldInitialLoader as loader
+        return loader.run_initial_load(spark, params)
 
-        if table_exists and pks:
-            join_cond = " AND ".join([f"target.`{k}` = source.`{k}`" for k in pks])
-            merge_sql = (
-                f"MERGE INTO {full_table} AS target\n"
-                f"USING {temp_view} AS source\n"
-                f"ON {join_cond}\n"
-                f"WHEN MATCHED THEN UPDATE SET *\n"
-                f"WHEN NOT MATCHED THEN INSERT *"
-            )
-            logger.info(f"[INITIAL LOAD UPSERT] Executing Iceberg MERGE INTO on {full_table}:\n{merge_sql}")
+    @classmethod
+    def reconcile_schema(cls, df_raw, target_fields):
+        """Reconciles incoming schema against target catalog fields via GoldInitialLoader."""
+        loader = GoldInitialLoader
+        if loader is None:
             try:
-                spark.sql(merge_sql)
-            except Exception as merge_err:
-                logger.warning(f"[INITIAL LOAD UPSERT] Spark SQL MERGE failed ({merge_err}). Overwriting to {s3_location}...")
-                df_consolidated.write.mode("overwrite").format("parquet").save(s3_location)
-        else:
-            logger.info(f"[INITIAL LOAD WRITE] Writing initial Gold table {full_table} to '{s3_location}'...")
-            try:
-                df_consolidated.write \
-                    .format("iceberg") \
-                    .mode("overwrite") \
-                    .option("path", s3_location) \
-                    .saveAsTable(f"{glue_database}.{target_table_name}")
-            except Exception as ice_err:
-                logger.warning(f"[INITIAL LOAD WRITE] Direct Iceberg saveAsTable fallback to Parquet: {ice_err}")
-                df_consolidated.write.mode("overwrite").format("parquet").save(s3_location)
-
-        target_engines = []
-        if params.get('GOLD_TARGETS') or params.get('TARGET_ENGINES'):
-            target_engines = [t.strip().lower() for t in str(params.get('GOLD_TARGETS') or params.get('TARGET_ENGINES')).split(',') if t.strip()]
-        elif GoldConfigLoader:
-            target_engines = GoldConfigLoader.get_target_engines(source_system, table_name, gold_cfg)
-
-        skip_aurora = str(params.get('SKIP_AURORA_SERVE', 'false')).strip().lower() in ('true', '1', 'yes')
-        needs_aurora = not skip_aurora and any(t in target_engines for t in ('aurora', 'rds', 'mysql'))
-        if needs_aurora:
-            logger.info(f"[AURORA EXTENSION] User requested Aurora serving for '{target_table_name}'. Reading from Athena table and serving to Aurora...")
-            try:
-                df_athena = spark.table(full_table)
-                gold_schema = params.get('RDS_GOLD_SCHEMA')
-                if not gold_schema:
-                    raise ValueError(
-                        "CRITICAL CONFIG ERROR: Missing required parameter '--RDS_GOLD_SCHEMA'.\n"
-                        "Aurora serving requires an explicit target schema. Please specify: --RDS_GOLD_SCHEMA <schema_name>"
-                    )
-                GoldLayerManager._serve_to_mysql(
-                    spark=spark,
-                    queries={table_name: ""},
-                    gold_schema=gold_schema,
-                    data_s3_path=s3_location,
-                    params=params,
-                    glue_client=None,
-                    secrets_client=None,
-                    mart_stats=[],
-                    source_system=source_system,
-                    materialized_dfs={table_name: df_athena},
-                    mart_keys={table_name: pks}
-                )
-                logger.info(f"[AURORA EXTENSION] Successfully served Athena table '{full_table}' to Aurora '{gold_schema}.{target_table_name}'.")
-            except Exception as aurora_err:
-                logger.error(f"[AURORA EXTENSION ERROR] Failed to serve to Aurora: {aurora_err}")
-
-        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
-        logger.info(
-            f"\n+================================================================================+\n"
-            f"|                GOLD INITIAL LOAD COMPLETED SUCCESSFULLY                        |\n"
-            f"+================================================================================+\n"
-            f"|  * Target Table    : {full_table}\n"
-            f"|  * Records Loaded  : {raw_count:,}\n"
-            f"|  * Duration        : {duration:.2f}s\n"
-            f"+================================================================================+"
-        )
-
-        return {
-            "source_system": source_system,
-            "table_name": table_name,
-            "target_table": f"{glue_database}.{target_table_name}",
-            "records_loaded": raw_count,
-            "duration_seconds": round(duration, 2),
-            "status": "SUCCESS"
-        }
+                from gold_initial_load import GoldInitialLoader as loader
+            except ImportError:
+                from gold.script.gold_initial_load import GoldInitialLoader as loader
+        return loader.reconcile_schema(df_raw, target_fields)
 
 
 def main():

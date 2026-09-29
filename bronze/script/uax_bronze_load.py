@@ -1338,25 +1338,9 @@ def main():
     ub_display = f"{upper_bound} (Open-ended)" if (upper_bound and is_ub_open) else (upper_bound if upper_bound else 'Per-table / Open-ended')
 
     start_banner = (
-        f"[JOB START] UAX BRONZE INGESTION | Source: {source_system.upper()} | Tables: {', '.join(table_list)} | Mode: {error_handling_mode}\n"
-        "+================================================================================+\n"
-        "|                  UAX DATA LAKE - BRONZE INGESTION ENGINE                       |\n"
-        "+================================================================================+\n"
-        f"|  Execution ID       : {execution_id:<57}|\n"
-        f"|  Environment        : {params.get('ENV', 'dev').upper():<57}|\n"
-        f"|  Source System      : {source_system.upper():<57}|\n"
-        f"|  Target Tables      : {', '.join(table_list):<57}|\n"
-        f"|  Output Format      : {f'{output_format.upper()} (Compression: {parquet_compression})':<57}|\n"
-        f"|  Error Handling     : {error_handling_mode:<57}|\n"
-        f"|  Bronze Bucket      : {f's3://{bronze_bucket}/':<57}|\n"
-        f"|  Bronze Data Path   : {f's3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/':<57}|\n"
-        f"|  State S3 Bucket    : {f's3://{state_bucket}/':<57}|\n"
-        f"|  Upper Bound        : {ub_display:<57}|\n"
-        f"|  Glue Database      : {glue_database_name:<57}|\n"
-        f"|  Catalog Prefix     : {glue_table_prefix:<57}|\n"
-        f"|  Watermark Athena   : {watermark_table_name:<57}|\n"
-        f"|  Start Time (UTC)   : {current_run_time:<57}|\n"
-        "+================================================================================+"
+        f"[JOB START] UAX BRONZE INGESTION | Source: {source_system.upper()} | Tables: {', '.join(table_list)} | Mode: {error_handling_mode} | "
+        f"Format: {output_format.upper()} ({parquet_compression}) | S3: s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/ | "
+        f"Database: {glue_database_name} | Prefix: {glue_table_prefix} | Start: {current_run_time}"
     )
     logger.info(start_banner)
 
@@ -1661,20 +1645,8 @@ def main():
 
             failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             failed_card = (
-                f"[TABLE FAILED] {clean_table_name} | FAILED | Duration: {duration_sec:.2f}s | Error: {str(table_err)[:60]}\n"
-                "+================================================================================+\n"
-                f"|  TABLE EXTRACTION FAILED: {clean_table_name} [FAILED]\n"
-                "+--------------------------------------------------------------------------------+\n"
-                f"|  * Source System    : {source_system}\n"
-                f"|  * Lake Table Name  : {clean_table_name}\n"
-                f"|  * API Entity Name  : {api_table_name}\n"
-                f"|  * Status           : FAILED\n"
-                f"|  * Extraction Range : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {current_run_time}\n"
-                f"|  * Error Details    : {table_err}\n"
-                f"|  * Table Duration   : {duration_sec:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"|  * Failed At (UTC)  : {failed_time_str}\n"
-                "+================================================================================+"
+                f"[ERROR DIAGNOSTIC] Bronze extraction failed: {clean_table_name} ({api_table_name}) | "
+                f"Source: {source_system} | Duration: {duration_sec:.2f}s | Failed At: {failed_time_str} | Error: {table_err}"
             )
             logger.error(failed_card)
             
@@ -1764,34 +1736,9 @@ def main():
     breakdown_str = "\n".join(breakdown_lines)
 
     overall_card = (
-        f"[JOB REPORT] UAX BRONZE INGESTION | Status: {overall_status} | Records: {total_records_all:,} | Tables: {len(table_list) - len(failed_tables)}/{len(table_list)} | Duration: {total_job_duration:.2f}s\n"
-        "+================================================================================+\n"
-        "|                  BRONZE INGESTION FINAL EXECUTION REPORT                       |\n"
-        "+================================================================================+\n"
-        f"|  Execution ID          : {execution_id}\n"
-        f"|  Source System         : {source_system.upper()}\n"
-        f"|  Overall Job Status    : {overall_status}\n"
-        f"|  Total Tables          : {len(table_list)} (Succeeded: {len(table_list) - len(failed_tables)}, Failed: {len(failed_tables)})\n"
-        f"|  Total Records Ingested: {total_records_all:,}\n"
-        f"|  Start Time (UTC)      : {current_run_time}\n"
-        f"|  End Time (UTC)        : {execution_end_utc.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"|  Total Job Duration    : {total_job_duration:.2f}s\n"
-        "+--------------------------------------------------------------------------------+\n"
-        "|  TABLE EXECUTION BREAKDOWN:\n"
-        f"{breakdown_str}\n"
-        "+--------------------------------------------------------------------------------+\n"
-        "|  S3 PERSISTENCE LOCATIONS:\n"
-        f"|  * Raw Data Path       : s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/\n"
-        f"|  * Watermark State     : s3://{state_bucket}/metadata/bronze/{source_system}/\n"
-        f"|  * S3 Execution Log    : s3://{state_bucket}/metadata/logs/bronze/{source_system}/execution_{execution_id}.json\n"
-        f"|  * Latest Log Pointer  : s3://{state_bucket}/metadata/logs/bronze/{source_system}/latest_execution.json\n"
-        "+--------------------------------------------------------------------------------+\n"
-        "|  GLUE CATALOG & ATHENA INTEGRATION:\n"
-        f"|  * Environment        : {params.get('ENV', 'dev')}\n"
-        f"|  * Glue Database       : {glue_database_name}\n"
-        f"|  * Catalog Tables      : {glue_database_name}.{glue_table_prefix}<tablename>\n"
-        f"|  * Watermark Athena Tbl: {glue_database_name}.{watermark_table_name}\n"
-        "+================================================================================+"
+        f"[JOB REPORT] UAX BRONZE INGESTION | Status: {overall_status} | Records: {total_records_all:,} | "
+        f"Tables: {len(table_list) - len(failed_tables)}/{len(table_list)} | Duration: {total_job_duration:.2f}s\n"
+        f"TABLE EXECUTION BREAKDOWN:\n{breakdown_str}"
     )
     logger.info(overall_card)
 

@@ -1818,28 +1818,9 @@ def main():
                 "records_processed": batch_count,
                 "error_message": None
             })
-
             summary_card = (
-                f"[TABLE SUMMARY] {bronze_table_name} -> {target_table_name} | SUCCESS | SCD: {scd_type.upper()} | Merge: {merge_strategy.upper()} | Duration: {table_duration:.2f}s\n"
-                "+================================================================================+\n"
-                f"|  SILVER TABLE COMPLETED: {target_table_name} [SUCCESS]\n"
-                "+--------------------------------------------------------------------------------+\n"
-                f"|  * Source System    : {source_system}\n"
-                f"|  * Bronze Table     : {glue_database}.{bronze_table_name}\n"
-                f"|  * Target Silver    : {silver_table_name}\n"
-                f"|  * SCD Type         : {scd_type.upper()}\n"
-                f"|  * Merge Strategy   : {merge_strategy.upper()}\n"
-                f"|  * Natural Key Nkey : {nkeys}\n"
-                f"|  * Order By Columns : {order_cols}\n"
-                f"|  * Records Ingested : {batch_count}\n"
-                f"|  * Last Watermark   : {last_load_date or ('INITIAL_FULL_LOAD' if watermark_enabled else 'DISABLED')}\n"
-                f"|  * New Watermark    : {new_watermark if watermark_enabled else 'DISABLED'}\n"
-                f"|  * Watermark S3 Key : {state_key if watermark_enabled else 'DISABLED'}\n"
-                f"|  * Table Duration   : {table_duration:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"|  * End Time (UTC)   : {table_end_time_str}\n"
-                f"|  * Silver Location  : {silver_location}\n"
-                f"+================================================================================+"
+                f"[TABLE SUMMARY] {bronze_table_name} -> {target_table_name} | SUCCESS | SCD: {scd_type.upper()} | "
+                f"Merge: {merge_strategy.upper()} | Records: {batch_count} | Duration: {table_duration:.2f}s | Location: {silver_location}"
             )
             logger.info(summary_card)
 
@@ -1857,24 +1838,8 @@ def main():
                 "error_message": str(err)
             })
             failed_card = (
-                f"\n+================================================================================+\n"
-                f"|  ERROR DIAGNOSTIC CARD: SILVER TABLE FAILURE [FAILED]\n"
-                f"+================================================================================+\n"
-                f"|  * Execution Layer    : SILVER\n"
-                f"|  * Failed Entity      : {target_table_name}\n"
-                f"|  * Source System      : {source_system}\n"
-                f"|  * Bronze Table       : {glue_database}.{bronze_table_name}\n"
-                f"|  * Target Silver      : {silver_table_name}\n"
-                f"|  * SCD / Merge Mode   : SCD: {scd_type.upper()} | Merge: {merge_strategy.upper()}\n"
-                f"|  * S3 Silver Location : {silver_location}\n"
-                f"|  * Table Duration     : {table_duration:.2f}s\n"
-                f"|  * Failed At (UTC)    : {failed_time_str}\n"
-                f"|  * Exception Type     : {err.__class__.__name__}\n"
-                f"|  * Exception Message  : {str(err)}\n"
-                f"+--------------------------------------------------------------------------------+\n"
-                f"|  * Full Python / Spark Stack Trace:\n"
-                f"{tb.strip()}\n"
-                f"+================================================================================+"
+                f"[ERROR DIAGNOSTIC] Silver table failed: {target_table_name} ({glue_database}.{bronze_table_name}) | "
+                f"SCD: {scd_type.upper()} | Duration: {table_duration:.2f}s | Error: {err}\nStack trace:\n{tb.strip()}"
             )
             logger.error(failed_card)
             failed_tables.append((target_table_name, str(err)))
@@ -1898,26 +1863,7 @@ def main():
 
     overall_card = (
         f"[JOB REPORT] SILVER ICEBERG ETL | Status: {overall_status} | Tables: {len(table_list) - len(failed_tables)}/{len(table_list)} | Duration: {total_job_duration:.2f}s\n"
-        "+================================================================================+\n"
-        "|                  SILVER ICEBERG ETL FINAL EXECUTION REPORT                     |\n"
-        "+================================================================================+\n"
-        f"|  Job Name              : {job_name}\n"
-        f"|  Source System         : {source_system.upper()}\n"
-        f"|  Overall Job Status    : {overall_status}\n"
-        f"|  Total Tables          : {len(table_list)} (Succeeded: {len(table_list) - len(failed_tables)}, Failed: {len(failed_tables)})\n"
-        f"|  Glue Database         : {glue_database}\n"
-        f"|  Start Time (UTC)      : {current_run_time}\n"
-        f"|  End Time (UTC)        : {execution_end_utc.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"|  Total Job Duration    : {total_job_duration:.2f}s\n"
-        "+--------------------------------------------------------------------------------+\n"
-        "|  TABLE EXECUTION BREAKDOWN:\n"
-        f"{breakdown_str}\n"
-        "+--------------------------------------------------------------------------------+\n"
-        "|  S3 PERSISTENCE LOCATIONS:\n"
-        f"|  * Silver Tables Path  : s3://{bucket_name}/{silver_data_prefix}/{source_system}/\n"
-        f"|  * Watermark State     : s3://{bucket_name}/{metadata_prefix}/{source_system}/\n"
-        f"|  * Watermark Athena Tbl: {glue_database}.{watermark_table_name}\n"
-        "+================================================================================+"
+        f"TABLE EXECUTION BREAKDOWN:\n{breakdown_str}"
     )
     logger.info(overall_card)
 
