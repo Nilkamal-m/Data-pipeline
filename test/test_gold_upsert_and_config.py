@@ -962,6 +962,31 @@ class TestGoldMartDependencyAndOmittedColumns(unittest.TestCase):
         self.assertEqual(keys[0], "interactions")
         self.assertEqual(keys[1], "feedbacks")
 
+    def test_ensure_dependency_views_registered_iceberg_catalog_support(self):
+        """_ensure_dependency_views_registered queries glue_catalog.<db>.<tbl> for upstream Silver Iceberg tables."""
+        mock_spark = MagicMock()
+        mock_spark.catalog.tableExists.return_value = False
+        mock_df = MagicMock()
+        mock_spark.table.return_value = mock_df
+
+        sql_text = "SELECT * FROM tbl_interactions ui JOIN tbl_conversations c ON ui.conversation_id = c.conversation_id"
+        GoldLayerManager._ensure_dependency_views_registered(
+            spark=mock_spark,
+            sql_text=sql_text,
+            source_system="moveworks",
+            glue_database="uax_datalake_db_dev"
+        )
+
+        # Assert spark.table was called with glue_catalog prefix
+        called_tables = [call[0][0] for call in mock_spark.table.call_args_list]
+        self.assertIn("glue_catalog.uax_datalake_db_dev.tbl_interactions", called_tables)
+        self.assertIn("glue_catalog.uax_datalake_db_dev.tbl_conversations", called_tables)
+
+        # Assert temp views were created for direct table name resolution
+        created_views = [call[0][0] for call in mock_df.createOrReplaceTempView.call_args_list]
+        self.assertIn("tbl_interactions", created_views)
+        self.assertIn("tbl_conversations", created_views)
+
     def test_v_feedbacks_sql_projects_feedback_id(self):
         """feedbacks.sql projects feedback_id to match gold_config.json nkey."""
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

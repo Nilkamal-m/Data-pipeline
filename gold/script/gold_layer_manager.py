@@ -452,13 +452,17 @@ class GoldLayerManager:
         queries = cls._sort_queries_by_dependency(queries, source_system=source_system, glue_database=glue_database, gold_cfg=gold_cfg)
         logger.info(f"[GOLD STEP 1] Query execution order resolved (dependencies first): {list(queries.keys())}")
 
-        # Set Spark active database to GLUE_DATABASE so queries can use direct table names (e.g. tbl_incident)
+        # Set Spark active database to GLUE_DATABASE so queries can use direct table names (e.g. tbl_incident, tbl_interactions)
         if glue_database and spark:
             try:
-                spark.sql(f"USE `{glue_database}`")
-                logger.info(f"[GOLD PREP] Set Spark active database to '{glue_database}'. Direct table names (e.g. 'tbl_incident') are fully supported.")
-            except Exception as use_err:
-                logger.warning(f"[GOLD PREP] Could not set Spark active database to '{glue_database}': {use_err}")
+                spark.sql(f"USE glue_catalog.`{glue_database}`")
+                logger.info(f"[GOLD PREP] Set Spark active catalog and database to 'glue_catalog.{glue_database}'. Direct table names (e.g. 'tbl_incident', 'tbl_interactions') are fully supported.")
+            except Exception:
+                try:
+                    spark.sql(f"USE `{glue_database}`")
+                    logger.info(f"[GOLD PREP] Set Spark active database to '{glue_database}'. Direct table names (e.g. 'tbl_incident', 'tbl_interactions') are fully supported.")
+                except Exception as use_err:
+                    logger.warning(f"[GOLD PREP] Could not set Spark active database to '{glue_database}': {use_err}")
 
         # ----------------------------------------------------------------------
         # [GOLD STEP 2 - MANDATORY] Athena / Iceberg Table Materialization & UPSERT
@@ -522,13 +526,14 @@ class GoldLayerManager:
             )
 
             try:
-                # 3. Ensure upstream dependency temporary views (e.g. v_interactions) are registered
+                # 3. Ensure upstream dependency temporary views (e.g. tbl_interactions, v_interactions) are registered
                 cls._ensure_dependency_views_registered(
                     spark=spark,
                     sql_text=sql_text,
                     source_system=source_system,
                     glue_database=glue_database,
-                    gold_cfg=gold_cfg
+                    gold_cfg=gold_cfg,
+                    glue_client=glue_client
                 )
 
                 # Execute Mart SQL Query
@@ -641,6 +646,22 @@ class GoldLayerManager:
                 })
             except Exception as err:
                 duration = (datetime.now(timezone.utc) - mart_start).total_seconds()
+                err_str = str(err)
+                if any(k in err_str for k in ("Table or view not found: tbl_", "UnresolvedRelation [tbl_", "Table or view not found: `tbl_")):
+                    logger.error(
+                        f"\n+================================================================================+\n"
+                        f"|  [MISSING UPSTREAM SILVER TABLE] Prerequisite Dependency Check Failed!         |\n"
+                        f"+================================================================================+\n"
+                        f"|  Query for mart '{clean_base_name}' failed because an upstream Silver table    |\n"
+                        f"|  could not be found in Spark session or AWS Glue Catalog ('{glue_database}').    |\n"
+                        f"|                                                                                |\n"
+                        f"|  Action Required:                                                              |\n"
+                        f"|  1. Verify the Silver ETL job for source '{source_system}' has been executed   |\n"
+                        f"|     to create the required Silver Iceberg tables (e.g. tbl_interactions).      |\n"
+                        f"|  2. Check Glue Data Catalog to ensure database '{glue_database}' contains      |\n"
+                        f"|     the Silver table referenced by '{clean_base_name}.sql'.                     |\n"
+                        f"+================================================================================+"
+                    )
                 logger.error(f"[ATHENA MATERIALIZE ERROR] Failed for '{clean_base_name}': {err}\n{traceback.format_exc()}")
                 mart_stats.append({
                     "mart_name": clean_base_name,
@@ -2533,13 +2554,15 @@ class GoldLayerManager:
         sql_text: str,
         source_system: str = '',
         glue_database: str = '',
-        gold_cfg: Optional[Dict[str, Any]] = None
+        gold_cfg: Optional[Dict[str, Any]] = None,
+        glue_client: Optional[Any] = None
     ) -> None:
         """
         Inspects SQL query text for references to upstream Gold tables or views
-        (e.g., v_interactions, interactions, gold_moveworks_interactions).
+        (e.g., v_interactions, interactions, gold_moveworks_interactions) as well as
+        upstream Silver Iceberg tables (e.g. tbl_interactions, tbl_conversations, tbl_users).
         If the view is not registered in Spark's temp views but exists in the Glue
-        Data Catalog, loads it into Spark temp views so downstream queries resolve seamlessly.
+        Data Catalog, loads it into Spark temp views so queries resolve seamlessly.
         """
         if not spark or not sql_text or not glue_database:
             return
@@ -2581,25 +2604,32 @@ class GoldLayerManager:
 
             if raw_name.startswith(("tbl_", "raw_tbl_", "silver_")):
                 candidates_to_try = [
+                    f"glue_catalog.{glue_database}.{raw_name}",
                     f"{glue_database}.{raw_name}",
+                    f"iceberg_catalog.{glue_database}.{raw_name}",
                     raw_name
                 ]
                 full_gold_name = raw_name
             else:
                 candidates_to_try = [
+                    f"glue_catalog.{glue_database}.{full_gold_name}",
+                    f"glue_catalog.{glue_database}.{raw_name}",
                     f"{glue_database}.{full_gold_name}",
                     full_gold_name,
                     f"{glue_database}.{raw_name}",
                     raw_name,
+                    f"glue_catalog.{glue_database}.gold_{base_cand}",
                     f"{glue_database}.gold_{base_cand}",
                     f"{glue_database}.v_{base_cand}"
                 ]
                 if GoldConfigLoader and src:
                     tgt = GoldConfigLoader.get_target_table_name(src, base_cand, 'athena', gold_cfg)
                     if tgt and tgt not in candidates_to_try:
-                        candidates_to_try.insert(0, f"{glue_database}.{tgt}")
-                        candidates_to_try.insert(1, tgt)
+                        candidates_to_try.insert(0, f"glue_catalog.{glue_database}.{tgt}")
+                        candidates_to_try.insert(1, f"{glue_database}.{tgt}")
+                        candidates_to_try.insert(2, tgt)
 
+            loaded = False
             for full_cand in list(dict.fromkeys(candidates_to_try)):
                 try:
                     dep_df = spark.table(full_cand)
@@ -2610,9 +2640,33 @@ class GoldLayerManager:
                         f"[DEPENDENCY RESOLUTION] Pre-loaded authoritative dependency table '{full_cand}' "
                         f"into Spark session as '{full_gold_name}'."
                     )
+                    loaded = True
                     break
                 except Exception:
                     continue
+
+            if not loaded and raw_name.startswith(("tbl_", "silver_")):
+                # Check if it exists in Glue Data Catalog
+                tbl_exists_in_glue = False
+                if glue_client and glue_database:
+                    try:
+                        glue_client.get_table(DatabaseName=glue_database, Name=raw_name)
+                        tbl_exists_in_glue = True
+                    except Exception:
+                        tbl_exists_in_glue = False
+
+                if tbl_exists_in_glue:
+                    logger.warning(
+                        f"[DEPENDENCY WARNING] Table '{raw_name}' exists in Glue Catalog under database '{glue_database}', "
+                        f"but could not be loaded into Spark session ('glue_catalog.{glue_database}.{raw_name}'). "
+                        f"Ensure Spark Iceberg catalog is properly configured."
+                    )
+                else:
+                    logger.warning(
+                        f"[DEPENDENCY NOT FOUND] Upstream Silver table '{raw_name}' was NOT found in Glue Data Catalog "
+                        f"under database '{glue_database}'. If this table has not been ingested yet, please run the "
+                        f"Silver ETL pipeline for source '{source_system}' before executing Gold marts."
+                    )
 
     # --------------------------------------------------------------------------
     # Connection Resolution
@@ -3172,11 +3226,29 @@ def main(argv: Optional[List[str]] = None):
 
     glue_job = None
     try:
+        from pyspark import SparkConf
         from pyspark.context import SparkContext
         from awsglue.context import GlueContext
         from awsglue.job import Job
 
-        sc = SparkContext.getOrCreate()
+        conf = SparkConf()
+        conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+        conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+        if data_lake_bucket:
+            conf.set("spark.sql.catalog.glue_catalog.warehouse", f"s3://{data_lake_bucket}/gold/data/")
+        conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+        conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+        conf.set("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true")
+        conf.set("spark.sql.catalog.glue_catalog.skip-name-validation", "true")
+        conf.set("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true")
+        conf.set("spark.sql.defaultCatalog", "glue_catalog")
+        conf.set("spark.sql.iceberg.schema-evolution", "true")
+        conf.set("spark.sql.iceberg.check-nullability", "false")
+        conf.set("spark.sql.parquet.enableVectorizedReader", "false")
+        conf.set("spark.sql.parquet.recordLevelFilter.enabled", "false")
+        conf.set("spark.sql.parquet.mergeSchema", "false")
+
+        sc = SparkContext.getOrCreate(conf=conf)
         glueContext = GlueContext(sc)
         spark = glueContext.spark_session
 
@@ -3186,7 +3258,16 @@ def main(argv: Optional[List[str]] = None):
         logger.info("awsglue library not available, initializing standard SparkSession...")
         spark = SparkSession.builder.appName(job_name).getOrCreate()
 
-    # Iceberg & Parquet optimization configurations
+    # Iceberg & Parquet optimization configurations on active session
+    spark.conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    spark.conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    spark.conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    spark.conf.set("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true")
+    spark.conf.set("spark.sql.catalog.glue_catalog.skip-name-validation", "true")
+    spark.conf.set("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true")
+    spark.conf.set("spark.sql.defaultCatalog", "glue_catalog")
+    spark.conf.set("spark.sql.iceberg.schema-evolution", "true")
+    spark.conf.set("spark.sql.iceberg.check-nullability", "false")
     spark.conf.set("spark.sql.parquet.enableVectorizedReader", "false")
     spark.conf.set("spark.sql.parquet.recordLevelFilter.enabled", "false")
     spark.conf.set("spark.sql.parquet.mergeSchema", "false")
