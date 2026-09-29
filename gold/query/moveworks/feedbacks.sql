@@ -118,16 +118,16 @@ WITH
 SELECT
     -- Output Fields
     fb.interaction_id AS feedback_id,
-    fb.conversation_id AS conversation_id,
-    fb.timestamp AS timestamp,
-    COALESCE(rp.what_user_said, '') AS what_user_said,
-    COALESCE(rp.what_bot_said, '') AS what_bot_said,
-    CASE
+    CAST(fb.conversation_id AS STRING) AS conversation_id,
+    CAST(fb.timestamp AS STRING) AS timestamp,
+    CAST(COALESCE(rp.what_user_said, '') AS STRING) AS what_user_said,
+    CAST(COALESCE(rp.what_bot_said, '') AS STRING) AS what_bot_said,
+    CAST(CASE
         WHEN lower(trim(fb.interaction_content)) = 'helpful' THEN 'Helpful'
         WHEN lower(trim(fb.interaction_content)) = 'not helpful' THEN 'Not Helpful'
         ELSE fb.interaction_content
-    END AS rating,
-    COALESCE(fb.feedback_text, '') AS feedback_text,
+    END AS STRING) AS rating,
+    CAST(COALESCE(fb.feedback_text, '') AS STRING) AS feedback_text,
     CURRENT_TIMESTAMP AS _data_as_of
 FROM
     feedback_events fb

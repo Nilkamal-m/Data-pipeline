@@ -1118,125 +1118,60 @@ class TestSilverUniformConfigAndGoldMandatoryAthenaView(unittest.TestCase):
         self.assertEqual(silver_name_3, "uax_db.tbl_incident")
 
     def test_mandatory_athena_view_creation_via_boto3(self):
-        mock_spark = MagicMock()
-        mock_athena = MagicMock()
-        mock_athena.start_query_execution.return_value = {'QueryExecutionId': 'athena_query_123'}
-        mock_athena.get_query_execution.return_value = {
-            'QueryExecution': {
-                'Status': {
-                    'State': 'SUCCEEDED'
-                }
-            }
-        }
-
-        params = {
-            'DATA_LAKE_BUCKET': 'test-lake-bucket',
-            'GLUE_DATABASE': 'uax_datalake_db_dev'
-        }
-
-        created = GoldLayerManager.create_athena_view(
-            spark=mock_spark,
-            glue_database='uax_datalake_db_dev',
-            view_name='v_interactions',
-            sql_text='SELECT * FROM tbl_interactions;',
-            params=params,
-            athena_client=mock_athena
-        )
-        self.assertTrue(created)
-        mock_athena.start_query_execution.assert_called_once()
-        call_kwargs = mock_athena.start_query_execution.call_args[1]
-        self.assertIn("CREATE OR REPLACE VIEW uax_datalake_db_dev.v_interactions AS", call_kwargs['QueryString'])
-        self.assertEqual(call_kwargs['WorkGroup'], 'uax-datalake-workgroup-dev')
+        """Enforces that Gold layer operates strictly on physical tables and view creation is removed."""
+        self.assertFalse(hasattr(GoldLayerManager, 'create_athena_view'))
 
     def test_mandatory_athena_view_creation_fallback_to_spark_sql(self):
+        """Validates that _materialize_athena_table materializes physical Iceberg tables without creating views."""
         mock_spark = MagicMock()
-        mock_athena = MagicMock()
-        mock_athena.start_query_execution.side_effect = Exception("Athena service unavailable")
+        mock_df = MagicMock()
+        mock_df.columns = ['interaction_id', 'bot_response']
+        mock_df.dropDuplicates.return_value = mock_df
+        mock_df.count.return_value = 10
+        mock_writer = MagicMock()
+        mock_df.write.format.return_value.mode.return_value.option.return_value = mock_writer
+        mock_glue = MagicMock()
+        mock_glue.get_table.side_effect = Exception("Table not found")
+        mock_s3 = MagicMock()
 
-        params = {
-            'DATA_LAKE_BUCKET': 'test-lake-bucket',
-            'GLUE_DATABASE': 'uax_datalake_db_dev'
-        }
-
-        created = GoldLayerManager.create_athena_view(
+        count = GoldLayerManager._materialize_athena_table(
             spark=mock_spark,
+            df_mart=mock_df,
             glue_database='uax_datalake_db_dev',
-            view_name='v_incident_kpi',
-            sql_text='SELECT * FROM tbl_incident',
-            params=params,
-            athena_client=mock_athena
+            target_table_name='gold_moveworks_interactions',
+            primary_keys=['interaction_id'],
+            s3_location='s3://test-bucket/gold/data/moveworks/interactions/',
+            clean_base_name='interactions',
+            params={'AWS_REGION': 'us-east-1'},
+            glue_client=mock_glue,
+            s3_client=mock_s3
         )
-        self.assertTrue(created)
-        mock_spark.sql.assert_called_once()
-        spark_call = mock_spark.sql.call_args[0][0]
-        self.assertIn("CREATE OR REPLACE VIEW `uax_datalake_db_dev`.`v_incident_kpi` AS", spark_call)
+        self.assertEqual(count, 10)
+        mock_writer.saveAsTable.assert_called_once_with('uax_datalake_db_dev.gold_moveworks_interactions')
 
     def test_athena_view_creation_handles_enforced_workgroup_configuration(self):
-        mock_spark = MagicMock()
-        mock_athena = MagicMock()
-        # First call fails with workgroup configuration error, second succeeds
-        from botocore.exceptions import ClientError
-        mock_athena.start_query_execution.side_effect = [
-            Exception("InvalidRequestException: Workgroup configuration enforces query output location. Do not provide ResultConfiguration.OutputLocation."),
-            {'QueryExecutionId': 'athena_retry_success_456'}
-        ]
-        mock_athena.get_query_execution.return_value = {
-            'QueryExecution': {
-                'Status': {
-                    'State': 'SUCCEEDED'
-                }
-            }
-        }
-
-        params = {
-            'DATA_LAKE_BUCKET': 'test-lake-bucket',
-            'GLUE_DATABASE': 'uax_datalake_db_dev',
-            'ATHENA_WORKGROUP': 'uax-datalake-workgroup-dev'
-        }
-
-        created = GoldLayerManager.create_athena_view(
-            spark=mock_spark,
-            glue_database='uax_datalake_db_dev',
-            view_name='v_interactions',
-            sql_text='SELECT * FROM tbl_interactions',
-            params=params,
-            athena_client=mock_athena
-        )
-        self.assertTrue(created)
-        self.assertEqual(mock_athena.start_query_execution.call_count, 2)
-        # Second call should not have ResultConfiguration
-        second_call_kwargs = mock_athena.start_query_execution.call_args_list[1][1]
-        self.assertNotIn('ResultConfiguration', second_call_kwargs)
+        """Validates that MySQL serving executes zero-downtime atomic swap on physical tables without creating views."""
+        mock_jdbc = {'url': 'jdbc:mysql://host:3306/enterprise_reporting', 'user': 'u', 'password': 'p'}
+        with patch.object(GoldLayerManager, '_table_exists', return_value=True):
+            with patch.object(GoldLayerManager, '_execute_ddl') as mock_ddl:
+                GoldLayerManager._execute_isolated_atomic_swap(
+                    jdbc_info=mock_jdbc,
+                    schema_name='enterprise_reporting',
+                    target_table='gold_moveworks_interactions',
+                    staging_table='gold_moveworks_interactions_staging',
+                    old_backup_table='gold_moveworks_interactions_old',
+                    primary_keys=['interaction_id']
+                )
+                executed = [c[0][1] for c in mock_ddl.call_args_list]
+                self.assertFalse(any("CREATE OR REPLACE VIEW" in d or "CREATE VIEW" in d for d in executed))
+                self.assertTrue(any("RENAME TABLE" in d for d in executed))
 
     def test_athena_view_creation_fallback_to_glue_catalog_when_iceberg_catalog_fails(self):
-        mock_spark = MagicMock()
-        mock_athena = MagicMock()
-        mock_glue = MagicMock()
-        # Athena fails
-        mock_athena.start_query_execution.side_effect = Exception("Athena query failed")
-        # Spark SQL fails with Iceberg catalog error
-        mock_spark.sql.side_effect = Exception("AnalysisException: Catalog glue_catalog does not support views")
-
-        params = {
-            'DATA_LAKE_BUCKET': 'test-lake-bucket',
-            'GLUE_DATABASE': 'uax_datalake_db_dev'
-        }
-
-        created = GoldLayerManager.create_athena_view(
-            spark=mock_spark,
-            glue_database='uax_datalake_db_dev',
-            view_name='v_interactions',
-            sql_text='SELECT * FROM tbl_interactions',
-            params=params,
-            athena_client=mock_athena,
-            glue_client=mock_glue
-        )
-        self.assertTrue(created)
-        mock_glue.create_table.assert_called_once()
-        glue_call = mock_glue.create_table.call_args[1]
-        self.assertEqual(glue_call['DatabaseName'], 'uax_datalake_db_dev')
-        self.assertEqual(glue_call['TableInput']['Name'], 'v_interactions')
-        self.assertEqual(glue_call['TableInput']['TableType'], 'VIRTUAL_VIEW')
+        """Validates that GoldLayerManager swap method has removed view creation options in favor of physical tables."""
+        import inspect
+        sig = inspect.signature(GoldLayerManager._execute_isolated_atomic_swap)
+        self.assertNotIn('view_name', sig.parameters)
+        self.assertNotIn('create_view', sig.parameters)
 
     def test_lambda_build_glue_arguments_defaults_athena_workgroup_for_gold(self):
         from lambda_helper.lambda_function import build_glue_arguments

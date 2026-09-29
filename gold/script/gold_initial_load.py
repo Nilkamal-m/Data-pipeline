@@ -90,10 +90,11 @@ class GoldInitialLoader:
         """
         Consolidates source DataFrame columns against target table schema fields:
         1. Cleanses and sanitizes all source column names (converting ' ' and '.' to '_').
-        2. Matches source columns against target schema fields (case-insensitively).
-        3. Missing in source -> padded with NULL (cast to target data type).
-        4. Extra in source -> retained for schema evolution.
-        Returns the cleansed and reconciled DataFrame.
+        2. Converts all business columns to StringType to enforce uniform string schema in Gold layer.
+        3. Matches source columns against target schema fields (case-insensitively).
+        4. Missing in source -> padded with NULL (cast to StringType).
+        5. Extra in source -> retained for schema evolution as StringType.
+        Returns the cleansed and reconciled DataFrame with uniform string types.
         """
         # 1. Cleanse source column names (spaces -> _, dots -> _, hyphens -> _)
         for orig_col in list(df_source.columns):
@@ -102,10 +103,15 @@ class GoldInitialLoader:
                 logger.info(f"[COLUMN CLEANSING] Renaming '{orig_col}' -> '{clean_col}'")
                 df_source = df_source.withColumnRenamed(orig_col, clean_col)
 
+        # 2. Convert all business columns in source to StringType (ensures all things in string in Gold layer)
+        for c in df_source.columns:
+            if c not in ("_updated_at", "_inserted_at", "_data_as_of"):
+                df_source = df_source.withColumn(c, col(c).cast("string"))
+
         if not target_schema_fields:
             return df_source
 
-        # 2. Build target field map: normalized_name -> (canonical_target_name, dataType)
+        # 3. Build target field map: normalized_name -> (canonical_target_name, dataType)
         target_field_map = {}
         for f in target_schema_fields:
             norm_name = cls.sanitize_column_name(f.name)
@@ -113,21 +119,24 @@ class GoldInitialLoader:
 
         source_cols = {cls.sanitize_column_name(c): c for c in df_source.columns}
 
-        # 3. Pad missing columns with NULL cast to target type
+        # 4. Pad missing columns with NULL cast to string (or target type for audit timestamps)
         missing_in_source = []
         for norm_name, (target_name, data_type) in target_field_map.items():
             if norm_name not in source_cols:
                 missing_in_source.append(target_name)
-                df_source = df_source.withColumn(target_name, lit(None).cast(data_type))
+                cast_type = data_type if target_name in ("_updated_at", "_inserted_at", "_data_as_of") else "string"
+                df_source = df_source.withColumn(target_name, lit(None).cast(cast_type))
             else:
                 actual_col = source_cols[norm_name]
                 if actual_col != target_name:
                     df_source = df_source.withColumnRenamed(actual_col, target_name)
+                if target_name not in ("_updated_at", "_inserted_at", "_data_as_of"):
+                    df_source = df_source.withColumn(target_name, col(target_name).cast("string"))
 
         if missing_in_source:
             logger.info(f"[SCHEMA CONSOLIDATION] Padding {len(missing_in_source)} missing column(s) with NULL: {missing_in_source}")
 
-        # 4. Retain extra columns from source for schema evolution
+        # 5. Retain extra columns from source for schema evolution (already cast to string)
         extra_in_source = [source_cols[norm_name] for norm_name in source_cols if norm_name not in target_field_map]
         if extra_in_source:
             logger.info(f"[SCHEMA CONSOLIDATION] Preserving {len(extra_in_source)} extra column(s) from CSV for schema evolution: {extra_in_source}")
@@ -313,6 +322,61 @@ class GoldInitialLoader:
         except Exception as e:
             logger.warning(f"Could not purge S3 prefix '{s3_uri}': {e}")
             return 0
+
+    @classmethod
+    def _check_and_resolve_iceberg_incompatibilities(
+        cls,
+        spark: SparkSession,
+        glue_database: str,
+        target_table_name: str,
+        incoming_df: DataFrame,
+        s3_location: str,
+        glue_client=None,
+        s3_client=None
+    ) -> bool:
+        """
+        Checks if the existing Iceberg table has incompatible column data types
+        (e.g., existing table column is bigint/int/double, but incoming is string).
+        Because Iceberg prohibits altering column types from primitive/numeric to string,
+        any such incompatibility requires dropping the stale catalog registration and S3 metadata
+        so the table can be cleanly recreated with the updated schema.
+        Returns True if table was incompatible and purged (so it needs fresh creation), False otherwise.
+        """
+        full_table = f"`{glue_database}`.`{target_table_name}`"
+        try:
+            target_df = spark.table(f"{glue_database}.{target_table_name}")
+            target_types = {f.name.lower(): (f.name, f.dataType.simpleString()) for f in target_df.schema.fields}
+            incompatible = []
+            for inf in incoming_df.schema.fields:
+                norm = inf.name.lower()
+                if norm in target_types:
+                    t_orig_name, t_type = target_types[norm]
+                    inc_type = inf.dataType.simpleString()
+                    if t_type != inc_type:
+                        incompatible.append(f"{t_orig_name} ({t_type} -> {inc_type})")
+            if incompatible:
+                logger.warning(
+                    f"[ICEBERG SCHEMA INCOMPATIBILITY DETECTED] Table '{glue_database}.{target_table_name}' "
+                    f"has incompatible column data types: {incompatible}.\n"
+                    f"Iceberg does not support in-place type changes for these columns.\n"
+                    f"Purging stale Glue Catalog entry and S3 metadata to recreate table cleanly with conformed string schema..."
+                )
+                if glue_client:
+                    try:
+                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                        logger.info(f"Deleted stale Glue Catalog table '{glue_database}.{target_table_name}'.")
+                    except Exception as del_err:
+                        logger.warning(f"Note deleting table from Glue: {del_err}")
+                try:
+                    spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
+                except Exception:
+                    pass
+                cls._purge_s3_prefix(s3_client, s3_location)
+                return True
+            return False
+        except Exception as err:
+            logger.debug(f"[SCHEMA COMPATIBILITY CHECK] Note checking table '{full_table}': {err}")
+            return False
 
     @classmethod
     def _get_gold_layer_manager(cls):
@@ -618,14 +682,31 @@ class GoldInitialLoader:
         logger.info(f"[PRIMARY KEY] Natural keys resolved for '{table_name}': {pks}")
 
         # 5. Perform Idempotent UPSERT into Athena / Iceberg Table
+        # 5. Perform Idempotent UPSERT into Athena / Iceberg Table
         temp_view = f"incoming_initial_{table_name}"
         df_consolidated.createOrReplaceTempView(temp_view)
 
         glm = cls._get_gold_layer_manager()
         if table_exists:
+            # Check for column type incompatibility (e.g. existing table has bigint while incoming has string)
+            was_purged = cls._check_and_resolve_iceberg_incompatibilities(
+                spark=spark,
+                glue_database=glue_database,
+                target_table_name=target_table_name,
+                incoming_df=df_consolidated,
+                s3_location=s3_location,
+                glue_client=glue_client,
+                s3_client=s3_client
+            )
+            if was_purged:
+                table_exists = False
+
+        if table_exists:
             try:
                 if glm and hasattr(glm, "_sync_iceberg_schema"):
                     glm._sync_iceberg_schema(spark, full_table, df_consolidated)
+                elif hasattr(cls, "_sync_iceberg_schema"):
+                    cls._sync_iceberg_schema(spark, full_table, df_consolidated)
             except Exception as sync_err:
                 logger.debug(f"[INITIAL LOAD] Note on Iceberg schema sync: {sync_err}")
 
@@ -643,16 +724,23 @@ class GoldInitialLoader:
                 spark.sql(merge_sql)
             except Exception as merge_err:
                 err_m_str = str(merge_err)
-                if any(x in err_m_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
+                if any(x in err_m_str for x in (
+                    "NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404",
+                    "Cannot safely cast", "Cannot write incompatible data", "incompatible"
+                )):
                     logger.warning(
-                        f"[INITIAL LOAD MERGE RECOVERY] Iceberg MERGE hit NoSuchKey ({merge_err}). "
-                        f"Metadata is missing in S3. Dropping Glue Catalog table and re-initializing cleanly..."
+                        f"[INITIAL LOAD MERGE RECOVERY] Iceberg MERGE hit {merge_err}. "
+                        f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
                     )
                     if glue_client:
                         try:
                             glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
                         except Exception:
                             pass
+                    try:
+                        spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
+                    except Exception:
+                        pass
                     cls._purge_s3_prefix(s3_client, s3_location)
                     df_consolidated.write \
                         .format("iceberg") \
@@ -664,8 +752,32 @@ class GoldInitialLoader:
                     try:
                         df_consolidated.write.format("iceberg").mode("append").insertInto(f"{glue_database}.{target_table_name}")
                     except Exception as ice_fallback_err:
-                        logger.error(f"[INITIAL LOAD UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
-                        raise
+                        err_fb_str = str(ice_fallback_err)
+                        if any(x in err_fb_str for x in (
+                            "Cannot safely cast", "Cannot write incompatible data", "incompatible", "NoSuchKey"
+                        )):
+                            logger.warning(
+                                f"[INITIAL LOAD RECOVERY] Fallback hit incompatible schema ({ice_fallback_err}). "
+                                f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
+                            )
+                            if glue_client:
+                                try:
+                                    glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                                except Exception:
+                                    pass
+                            try:
+                                spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
+                            except Exception:
+                                pass
+                            cls._purge_s3_prefix(s3_client, s3_location)
+                            df_consolidated.write \
+                                .format("iceberg") \
+                                .mode("overwrite") \
+                                .option("path", s3_location) \
+                                .saveAsTable(f"{glue_database}.{target_table_name}")
+                        else:
+                            logger.error(f"[INITIAL LOAD UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
+                            raise
         else:
             logger.info(f"[INITIAL LOAD WRITE] Initializing clean Gold Iceberg table {full_table} at '{s3_location}'...")
             if glue_client:

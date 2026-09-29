@@ -9,14 +9,14 @@
 -- ==============================================================================
 
 SELECT
-    COALESCE(priority, 'Unassigned')                         AS priority_level,
-    COALESCE(incident_state, 'Unknown')                      AS incident_state,
-    COALESCE(category, 'General')                            AS incident_category,
-    COUNT(DISTINCT sys_id)                                   AS total_incidents,
-    SUM(CASE WHEN _is_deleted = 'Y' THEN 1 ELSE 0 END)       AS soft_deleted_incidents,
-    SUM(CASE WHEN incident_state IN ('Closed', 'Resolved', '7', '6') THEN 1 ELSE 0 END) AS resolved_incidents,
-    SUM(CASE WHEN incident_state NOT IN ('Closed', 'Resolved', '7', '6') THEN 1 ELSE 0 END) AS active_open_incidents,
-    CURRENT_TIMESTAMP                                        AS _data_as_of
+    CAST(COALESCE(priority, 'Unassigned') AS STRING)                         AS priority_level,
+    CAST(COALESCE(incident_state, 'Unknown') AS STRING)                      AS incident_state,
+    CAST(COALESCE(category, 'General') AS STRING)                            AS incident_category,
+    CAST(COUNT(DISTINCT sys_id) AS STRING)                                   AS total_incidents,
+    CAST(SUM(CASE WHEN _is_deleted = 'Y' THEN 1 ELSE 0 END) AS STRING)       AS soft_deleted_incidents,
+    CAST(SUM(CASE WHEN incident_state IN ('Closed', 'Resolved', '7', '6') THEN 1 ELSE 0 END) AS STRING) AS resolved_incidents,
+    CAST(SUM(CASE WHEN incident_state NOT IN ('Closed', 'Resolved', '7', '6') THEN 1 ELSE 0 END) AS STRING) AS active_open_incidents,
+    CURRENT_TIMESTAMP                                                        AS _data_as_of
 FROM
     tbl_incident
 GROUP BY

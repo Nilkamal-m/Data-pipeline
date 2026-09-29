@@ -101,13 +101,13 @@ WITH
     )
 SELECT
     -- Output Fields
-    cb.conversation_id AS conversation_id,
-    cb.conversation_start AS conversation_start,
-    cb.conversation_end AS conversation_end,
-    COALESCE(pa.interaction_content, '') AS interaction_content,
-    COALESCE(ra.bot_response, '') AS bot_response,
-    cb.escalated AS escalated,
-    CASE
+    CAST(cb.conversation_id AS STRING) AS conversation_id,
+    CAST(cb.conversation_start AS STRING) AS conversation_start,
+    CAST(cb.conversation_end AS STRING) AS conversation_end,
+    CAST(COALESCE(pa.interaction_content, '') AS STRING) AS interaction_content,
+    CAST(COALESCE(ra.bot_response, '') AS STRING) AS bot_response,
+    CAST(cb.escalated AS STRING) AS escalated,
+    CAST(CASE
         WHEN cb.escalated = 1 THEN CASE
             WHEN lower(coalesce(ra.bot_response, '')) LIKE '%hr%' THEN 'HR'
             WHEN lower(coalesce(ra.bot_response, '')) LIKE '%live%' THEN 'IT'
@@ -117,7 +117,7 @@ SELECT
             ELSE 'HR'
         END
         ELSE ''
-    END AS hr_vs_it_agent,
+    END AS STRING) AS hr_vs_it_agent,
     CURRENT_TIMESTAMP AS _data_as_of
 FROM
     conversation_bounds cb

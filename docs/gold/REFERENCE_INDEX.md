@@ -27,7 +27,7 @@ This document provides a line-by-line master index and component map for the ent
 | `_resolve_natural_keys()` | L308–L418 | Extracts business natural keys from configuration or SQL annotations for deduplication and incremental upserts. | Called during query planning at L500. |
 | `_purge_s3_prefix()` | L420–L454 | Recursively deletes orphan S3 objects during initial load or ghost table recovery. | Initial load & recovery. |
 | `run_gold_pipeline()` | L455–L939 | **Core Orchestration Engine**: Discovers SQL queries, resolves DAG dependencies, executes queries in topological order, manages Iceberg materialization, and delegates to Aurora serving. | Main entrypoint invoked by `main()` at L3583. |
-| `create_athena_view()` | L941–L1131 | Generates and executes DDL in Athena to create or replace optional presentation views over underlying Iceberg tables. | Called when query specifies `view` materialization. |
+| Physical Iceberg Materialization | L1420–L1650 | Gold layer materializes authoritative physical Iceberg tables directly (no presentation views required). | Primary data lake serving target. |
 | `_serve_to_mysql()` | L1133–L1277 | High-performance RDS/MySQL serving layer. Coordinates staging table write, schema validation, index creation, and zero-downtime atomic swap or upsert. | Called when `aurora` engine is enabled at L880. |
 | `_sync_iceberg_schema()` | L1279–L1301 | Introspects incoming Spark DataFrame columns against target Gold Iceberg table and executes schema updates. | Called before Iceberg table writes at L1610. |
 | `_get_gold_initial_loader()` | L1303–L1312 | Dynamically imports and instantiates `GoldInitialLoader`. | Used by cold-start checks. |

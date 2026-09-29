@@ -182,36 +182,36 @@ WITH
     )
 SELECT
     -- Base Interaction Attributes
-    ui.created_time AS timestamp,
-    ui.conversation_id AS conversation_id,
-    ui.id AS interaction_id,
-    COALESCE(ui.type, 'UNKNOWN') AS interaction_type,
+    CAST(ui.created_time AS STRING) AS timestamp,
+    CAST(ui.conversation_id AS STRING) AS conversation_id,
+    CAST(ui.id AS STRING) AS interaction_id,
+    CAST(COALESCE(ui.type, 'UNKNOWN') AS STRING) AS interaction_type,
 
     -- Conversation Details
-    COALESCE(c.primary_domain, '') AS conversation_domain,
-    COALESCE(ct.conversation_topic, '') AS conversation_topic,
-    COALESCE(ct.conversation_topic, '') AS conversation_topics,
+    CAST(COALESCE(c.primary_domain, '') AS STRING) AS conversation_domain,
+    CAST(COALESCE(ct.conversation_topic, '') AS STRING) AS conversation_topic,
+    CAST(COALESCE(ct.conversation_topic, '') AS STRING) AS conversation_topics,
 
     -- Content & Bot Response
-    COALESCE(ui.detail_content, '') AS interaction_content,
-    COALESCE(br.bot_response, '') AS bot_response,
+    CAST(COALESCE(ui.detail_content, '') AS STRING) AS interaction_content,
+    CAST(COALESCE(br.bot_response, '') AS STRING) AS bot_response,
 
     -- Plugin Activity
-    COALESCE(pa.unsuccessful_plugins, '') AS unsuccessful_plugins,
-    COALESCE(pa.plugin_served, '') AS plugin_served,
-    COALESCE(pa.plugin_used, '') AS plugin_used,
+    CAST(COALESCE(pa.unsuccessful_plugins, '') AS STRING) AS unsuccessful_plugins,
+    CAST(COALESCE(pa.plugin_served, '') AS STRING) AS plugin_served,
+    CAST(COALESCE(pa.plugin_used, '') AS STRING) AS plugin_used,
 
     -- Resource & Citation Details
-    COALESCE(ra.resource_domain, '') AS resource_domain,
-    COALESCE(ra.no_of_citations, 0) AS no_of_citations,
-    COALESCE(ra.content_item_name, '') AS content_item_name,
-    COALESCE(ra.content_item_id, '') AS content_item_id,
-    COALESCE(ra.ticket_type, '') AS ticket_type,
-    COALESCE(ra.ticket_id, '') AS ticket_id,
+    CAST(COALESCE(ra.resource_domain, '') AS STRING) AS resource_domain,
+    CAST(COALESCE(ra.no_of_citations, 0) AS STRING) AS no_of_citations,
+    CAST(COALESCE(ra.content_item_name, '') AS STRING) AS content_item_name,
+    CAST(COALESCE(ra.content_item_id, '') AS STRING) AS content_item_id,
+    CAST(COALESCE(ra.ticket_type, '') AS STRING) AS ticket_type,
+    CAST(COALESCE(ra.ticket_id, '') AS STRING) AS ticket_id,
 
     -- Surface Platform & User Identity
-    COALESCE(ui.platform, '') AS interaction_surface,
-    COALESCE(u.user_preferred_language, '') AS user_preferred_language,
+    CAST(COALESCE(ui.platform, '') AS STRING) AS interaction_surface,
+    CAST(COALESCE(u.user_preferred_language, '') AS STRING) AS user_preferred_language,
 
     -- Placeholder Dimensions for External HR/Identity Enrichment
     CAST(NULL AS VARCHAR(255)) AS user_department,

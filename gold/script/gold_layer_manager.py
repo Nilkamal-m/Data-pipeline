@@ -698,7 +698,7 @@ class GoldLayerManager:
         # ----------------------------------------------------------------------
         logger.info(
             f"\n================================================================================\n"
-            f"[GOLD STEP 2 - MANDATORY] Materializing / Upserting Athena Tables & Views\n"
+            f"[GOLD STEP 2 - MANDATORY] Materializing / Upserting Athena Iceberg Tables\n"
             f"--------------------------------------------------------------------------------"
         )
         materialized_dfs: Dict[str, DataFrame] = {}
@@ -730,7 +730,7 @@ class GoldLayerManager:
                 f"|  PROCESSING ATHENA GOLD MART: '{clean_base_name}'\n"
                 f"|  * Target Table    : {glue_database}.{target_table_name} (Physical Iceberg Table)\n"
                 f"|  * Primary Keys    : {pks or 'None (Overwrite/Append)'}\n"
-                f"|  * Output Model    : Physical Table (No Redundant Views)\n"
+                f"|  * Output Model    : Physical Table (No Views Required)\n"
                 f"+--------------------------------------------------------------------------------+"
             )
 
@@ -824,6 +824,11 @@ class GoldLayerManager:
                     df_mart = df_mart.withColumn("_updated_at", current_timestamp())
                 if "_inserted_at" not in df_mart.columns:
                     df_mart = df_mart.withColumn("_inserted_at", current_timestamp())
+
+                # Convert all business/data columns to StringType to enforce uniform string schema in Gold layer
+                for col_name in df_mart.columns:
+                    if col_name not in ("_updated_at", "_inserted_at", "_data_as_of"):
+                        df_mart = df_mart.withColumn(col_name, col(col_name).cast("string"))
 
                 # Ensure row uniqueness by natural keys (nkey) from gold config
                 df_mart = cls._deduplicate_by_nkey(df_mart, pks)
@@ -962,198 +967,6 @@ class GoldLayerManager:
         return mart_stats
 
     # --------------------------------------------------------------------------
-    # Mandatory Athena View Creation
-    # --------------------------------------------------------------------------
-    @classmethod
-    def create_athena_view(
-        cls,
-        spark: SparkSession,
-        glue_database: str,
-        view_name: str,
-        sql_text: str,
-        params: Dict[str, Any],
-        athena_client=None,
-        glue_client=None
-    ) -> bool:
-        """
-        Mandatory Gold Step: Creates or replaces the presentation view in AWS Athena / Glue Data Catalog.
-        View is created under `<glue_database>.<view_name>` (e.g. uax_datalake_db_dev.v_interactions).
-        Executes via Athena Boto3 client with automatic retry, dedicated workgroup routing, and Glue Catalog fallback.
-        """
-        clean_sql = sql_text.strip().rstrip(';')
-        clean_sql = re.sub(r'^(?:\s*(?:--[^\r\n]*|/\*[\s\S]*?\*/)\s*)+', '', clean_sql).strip()
-        view_ddl = f"CREATE OR REPLACE VIEW {glue_database}.{view_name} AS\n{clean_sql}"
-        athena_succeeded = False
-
-        # 1. Resolve Target Athena Workgroup
-        # Dynamically determine the dedicated data lake workgroup: uax-datalake-workgroup-{env}
-        env = (
-            params.get('ENV')
-            or params.get('env')
-            or params.get('ENVIRONMENT')
-            or params.get('environment')
-            or 'dev'
-        ).strip().lower()
-        if not env or env == 'dev':
-            if glue_database:
-                parts = glue_database.split('_')
-                if len(parts) > 1 and parts[-1] in ('dev', 'qa', 'staging', 'prod', 'test'):
-                    env = parts[-1]
-        default_workgroup = f"uax-datalake-workgroup-{env}"
-
-        configured_wg = (
-            params.get('ATHENA_WORKGROUP')
-            or params.get('WORKGROUP')
-            or os.environ.get('ATHENA_WORKGROUP')
-            or os.environ.get('DEFAULT_ATHENA_WORKGROUP')
-        )
-        # Avoid using 'primary' by default because it is frequently misconfigured, disabled, or unrouted
-        if not configured_wg or str(configured_wg).strip().lower() == 'primary':
-            workgroup = default_workgroup
-        else:
-            workgroup = str(configured_wg).strip()
-
-        bucket_name = params.get('DATA_LAKE_BUCKET', 'uax-datalake-dev-bucket')
-        output_location = params.get('ATHENA_OUTPUT_LOCATION') or f"s3://{bucket_name}/athena-query-results/"
-
-        def _execute_athena_ddl(target_wg: str) -> bool:
-            """Submits view DDL to an Athena workgroup, handling enforced workgroup configurations gracefully."""
-            start_kwargs = {
-                'QueryString': view_ddl,
-                'QueryExecutionContext': {'Database': glue_database},
-                'WorkGroup': target_wg
-            }
-            if output_location:
-                start_kwargs['ResultConfiguration'] = {'OutputLocation': output_location}
-
-            logger.info(f"[ATHENA VIEW DDL] Submitting DDL for '{glue_database}.{view_name}' to Athena workgroup '{target_wg}'...")
-            try:
-                resp = athena_client.start_query_execution(**start_kwargs)
-            except Exception as start_err:
-                err_msg = str(start_err)
-                if 'InvalidRequestException' in err_msg and ('workgroup' in err_msg.lower() or 'configuration' in err_msg.lower()):
-                    logger.info(f"[ATHENA VIEW] Workgroup '{target_wg}' enforces output location. Retrying without explicit ResultConfiguration...")
-                    start_kwargs.pop('ResultConfiguration', None)
-                    resp = athena_client.start_query_execution(**start_kwargs)
-                else:
-                    raise
-
-            query_exec_id = resp.get('QueryExecutionId')
-            logger.info(f"[ATHENA VIEW] Query execution submitted. Execution ID: {query_exec_id}")
-
-            max_wait_seconds = int(params.get('ATHENA_TIMEOUT_SECONDS', 60))
-            poll_interval = 2
-            elapsed = 0
-            while elapsed < max_wait_seconds:
-                query_status_resp = athena_client.get_query_execution(QueryExecutionId=query_exec_id)
-                state = query_status_resp['QueryExecution']['Status']['State']
-                if state == 'SUCCEEDED':
-                    logger.info(f"[ATHENA VIEW] Successfully created Athena view '{glue_database}.{view_name}' (Execution ID: {query_exec_id}).")
-                    return True
-                elif state in ('FAILED', 'CANCELLED'):
-                    reason = query_status_resp['QueryExecution']['Status'].get('StateChangeReason', 'Unknown reason')
-                    logger.warning(f"[ATHENA VIEW] Athena execution {state} on workgroup '{target_wg}': {reason}")
-                    return False
-                time.sleep(poll_interval)
-                elapsed += poll_interval
-            logger.warning(f"[ATHENA VIEW] Athena execution timed out after {max_wait_seconds}s on workgroup '{target_wg}'.")
-            return False
-
-        # Attempt Athena Execution with dedicated workgroup fallback
-        try:
-            if not athena_client:
-                athena_client = boto3.client('athena')
-
-            try:
-                athena_succeeded = _execute_athena_ddl(workgroup)
-            except Exception as wg_err:
-                logger.warning(f"[ATHENA VIEW] Submission to workgroup '{workgroup}' encountered error: {wg_err}")
-                if workgroup != default_workgroup:
-                    logger.info(f"[ATHENA VIEW] Retrying view creation with dedicated data lake workgroup '{default_workgroup}'...")
-                    try:
-                        athena_succeeded = _execute_athena_ddl(default_workgroup)
-                    except Exception as def_err:
-                        logger.warning(f"[ATHENA VIEW] Dedicated workgroup '{default_workgroup}' also failed: {def_err}")
-                        athena_succeeded = False
-                else:
-                    athena_succeeded = False
-        except Exception as ath_err:
-            logger.warning(f"[ATHENA VIEW] Boto3 Athena execution failed: {ath_err}")
-            athena_succeeded = False
-
-        # Fallback: Spark SQL view or AWS Glue Data Catalog Virtual View
-        if not athena_succeeded:
-            # 1. Attempt Spark SQL (supported if catalog supports views)
-            try:
-                spark_view_ddl = f"CREATE OR REPLACE VIEW `{glue_database}`.`{view_name}` AS\n{clean_sql}"
-                logger.info(f"[ATHENA VIEW] Executing view creation via Spark SQL:\n{spark_view_ddl}")
-                spark.sql(spark_view_ddl)
-                logger.info(f"[ATHENA VIEW] Successfully created view `{glue_database}`.`{view_name}` via Spark SQL.")
-                athena_succeeded = True
-            except Exception as spark_err:
-                logger.warning(f"[ATHENA VIEW] Spark SQL view creation not supported by catalog ({spark_err}). Attempting Glue Data Catalog API fallback...")
-                # 2. Attempt direct Glue Data Catalog Virtual View registration
-                try:
-                    if not glue_client:
-                        glue_client = boto3.client('glue')
-                    table_input = {
-                        'Name': view_name,
-                        'TableType': 'VIRTUAL_VIEW',
-                        'ViewOriginalText': clean_sql,
-                        'ViewExpandedText': clean_sql,
-                        'StorageDescriptor': {
-                            'Columns': [],
-                            'Location': f"s3://{bucket_name}/gold/views/{view_name}/",
-                            'SerdeInfo': {
-                                'SerializationLibrary': 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
-                            }
-                        },
-                        'Parameters': {
-                            'presto_view': 'true',
-                            'comment': 'Gold Layer Virtual View registered via Glue Catalog API'
-                        }
-                    }
-                    try:
-                        glue_client.create_table(DatabaseName=glue_database, TableInput=table_input)
-                        logger.info(f"[GLUE VIEW] Successfully created Virtual View '{glue_database}.{view_name}' in Glue Data Catalog.")
-                        athena_succeeded = True
-                    except getattr(getattr(glue_client, 'exceptions', None), 'AlreadyExistsException', Exception):
-                        glue_client.update_table(DatabaseName=glue_database, TableInput=table_input)
-                        logger.info(f"[GLUE VIEW] Successfully updated Virtual View '{glue_database}.{view_name}' in Glue Data Catalog.")
-                        athena_succeeded = True
-                except Exception as glue_cat_err:
-                    logger.warning(f"[GLUE VIEW] Glue Data Catalog view registration fallback also failed: {glue_cat_err}")
-                # Register in-session Spark temporary view if catalog view creation failed
-                try:
-                    spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW `{view_name}` AS\n{clean_sql}")
-                    logger.info(f"[ATHENA VIEW] Registered Spark in-session temporary view `{view_name}`.")
-                except Exception as temp_err:
-                    logger.debug(f"[ATHENA VIEW] Spark temporary view note: {temp_err}")
-
-        if not athena_succeeded:
-            logger.error(f"[ATHENA VIEW ERROR] Failed to register view `{glue_database}`.`{view_name}` via Athena, Spark SQL, and Glue Data Catalog.")
-            fail_on_error = str(params.get('FAIL_ON_VIEW_ERROR', 'false')).strip().lower() in ('true', '1', 'yes')
-            if fail_on_error:
-                raise RuntimeError(
-                    f"CRITICAL ERROR: Mandatory Athena View creation failed for '{glue_database}.{view_name}'."
-                )
-            return False
-
-        view_card = (
-            f"\n+================================================================================+\n"
-            f"|  MANDATORY GOLD ATHENA VIEW REGISTERED: {view_name} [SUCCESS]\n"
-            f"+================================================================================+\n"
-            f"|  * Glue Database      : {glue_database}\n"
-            f"|  * View Name          : {view_name}\n"
-            f"|  * Fully Qualified    : {glue_database}.{view_name}\n"
-            f"|  * Catalog Engine     : AWS Athena / Glue Data Catalog\n"
-            f"|  * Access Status      : Queryable in Athena console and downstream BI immediately.\n"
-            f"+================================================================================+\n"
-        )
-        logger.info(view_card)
-        return True
-
-    # --------------------------------------------------------------------------
     # Aurora / RDS MySQL Serving Engine
     # --------------------------------------------------------------------------
     @classmethod
@@ -1198,12 +1011,10 @@ class GoldLayerManager:
 
             staging_table = f"{target_table}_staging"
             old_backup_table = f"{target_table}_old"
-            view_name = f"v_{clean_base_name}"
 
             cls._validate_gold_table_name(target_table)
             cls._validate_gold_table_name(staging_table)
             cls._validate_gold_table_name(old_backup_table)
-            cls._validate_view_name(view_name)
 
             pks = mart_keys.get(clean_base_name, [])
             if not pks:
@@ -1265,8 +1076,6 @@ class GoldLayerManager:
                         target_table=target_table,
                         staging_table=staging_table,
                         old_backup_table=old_backup_table,
-                        view_name=view_name,
-                        create_view=False,
                         primary_keys=pks
                     )
 
@@ -1295,7 +1104,7 @@ class GoldLayerManager:
                 mart_stats.append({
                     "mart_name": clean_base_name,
                     "target_table": f"{gold_schema}.{target_table}",
-                    "view_name": f"{gold_schema}.{view_name}",
+                    "view_name": f"{gold_schema}.{target_table}",
                     "status": "FAILED",
                     "rows_served": 0,
                     "duration_seconds": round(mart_duration, 2),
@@ -1324,6 +1133,61 @@ class GoldLayerManager:
             return False
         except Exception as e:
             logger.warning(f"[ATHENA/ICEBERG SCHEMA SYNC NOTE] Could not evolve Iceberg schema for '{full_table}': {e}")
+            return False
+
+    @classmethod
+    def _check_and_resolve_iceberg_incompatibilities(
+        cls,
+        spark: SparkSession,
+        glue_database: str,
+        target_table_name: str,
+        incoming_df: DataFrame,
+        s3_location: str,
+        glue_client=None,
+        s3_client=None
+    ) -> bool:
+        """
+        Checks if the existing Iceberg table has incompatible column data types
+        (e.g., existing table column is bigint/int/double, but incoming is string).
+        Because Iceberg prohibits altering column types from primitive/numeric to string,
+        any such incompatibility requires dropping the stale catalog registration and S3 metadata
+        so the table can be cleanly recreated with the updated schema.
+        Returns True if table was incompatible and purged (so it needs fresh creation), False otherwise.
+        """
+        full_table = f"`{glue_database}`.`{target_table_name}`"
+        try:
+            target_df = spark.table(f"{glue_database}.{target_table_name}")
+            target_types = {f.name.lower(): (f.name, f.dataType.simpleString()) for f in target_df.schema.fields}
+            incompatible = []
+            for inf in incoming_df.schema.fields:
+                norm = inf.name.lower()
+                if norm in target_types:
+                    t_orig_name, t_type = target_types[norm]
+                    inc_type = inf.dataType.simpleString()
+                    if t_type != inc_type:
+                        incompatible.append(f"{t_orig_name} ({t_type} -> {inc_type})")
+            if incompatible:
+                logger.warning(
+                    f"[ICEBERG SCHEMA INCOMPATIBILITY DETECTED] Table '{glue_database}.{target_table_name}' "
+                    f"has incompatible column data types: {incompatible}.\n"
+                    f"Iceberg does not support in-place type changes for these columns.\n"
+                    f"Purging stale Glue Catalog entry and S3 metadata to recreate table cleanly with conformed string schema..."
+                )
+                if glue_client:
+                    try:
+                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                        logger.info(f"Deleted stale Glue Catalog table '{glue_database}.{target_table_name}'.")
+                    except Exception as del_err:
+                        logger.warning(f"Note deleting table from Glue: {del_err}")
+                try:
+                    spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
+                except Exception:
+                    pass
+                cls._purge_s3_prefix(s3_client, s3_location)
+                return True
+            return False
+        except Exception as err:
+            logger.debug(f"[SCHEMA COMPATIBILITY CHECK] Note checking table '{full_table}': {err}")
             return False
 
     @classmethod
@@ -1645,6 +1509,20 @@ class GoldLayerManager:
             table_exists = False
 
         if table_exists:
+            # Check for column type incompatibility (e.g. existing table has bigint while incoming has string)
+            was_purged = cls._check_and_resolve_iceberg_incompatibilities(
+                spark=spark,
+                glue_database=glue_database,
+                target_table_name=target_table_name,
+                incoming_df=df_mart,
+                s3_location=s3_location,
+                glue_client=glue_client,
+                s3_client=s3_client
+            )
+            if was_purged:
+                table_exists = False
+
+        if table_exists:
             cls._sync_iceberg_schema(spark, full_table, df_mart)
 
             try:
@@ -1677,16 +1555,23 @@ class GoldLayerManager:
                     spark.sql(merge_sql)
                 except Exception as merge_err:
                     err_m_str = str(merge_err)
-                    if any(x in err_m_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
+                    if any(x in err_m_str for x in (
+                        "NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404",
+                        "Cannot safely cast", "Cannot write incompatible data", "incompatible"
+                    )):
                         logger.warning(
-                            f"[ATHENA/ICEBERG MERGE RECOVERY] Iceberg MERGE hit NoSuchKey ({merge_err}). "
-                            f"Metadata is missing in S3. Dropping Glue Catalog table and re-initializing cleanly..."
+                            f"[ATHENA/ICEBERG MERGE RECOVERY] Iceberg MERGE hit {merge_err}. "
+                            f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
                         )
                         if glue_client:
                             try:
                                 glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
                             except Exception:
                                 pass
+                        try:
+                            spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
+                        except Exception:
+                            pass
                         cls._purge_s3_prefix(s3_client, s3_location)
                         df_mart.write \
                             .format("iceberg") \
@@ -1701,8 +1586,32 @@ class GoldLayerManager:
                         try:
                             df_mart.write.format("iceberg").mode("append").insertInto(f"{glue_database}.{target_table_name}")
                         except Exception as ice_fallback_err:
-                            logger.error(f"[ATHENA/ICEBERG UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
-                            raise
+                            err_fb_str = str(ice_fallback_err)
+                            if any(x in err_fb_str for x in (
+                                "Cannot safely cast", "Cannot write incompatible data", "incompatible", "NoSuchKey"
+                            )):
+                                logger.warning(
+                                    f"[ATHENA/ICEBERG RECOVERY] Fallback hit incompatible schema ({ice_fallback_err}). "
+                                    f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
+                                )
+                                if glue_client:
+                                    try:
+                                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                                    except Exception:
+                                        pass
+                                try:
+                                    spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
+                                except Exception:
+                                    pass
+                                cls._purge_s3_prefix(s3_client, s3_location)
+                                df_mart.write \
+                                    .format("iceberg") \
+                                    .mode("overwrite") \
+                                    .option("path", s3_location) \
+                                    .saveAsTable(f"{glue_database}.{target_table_name}")
+                            else:
+                                logger.error(f"[ATHENA/ICEBERG UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
+                                raise
         else:
             logger.info(f"[ATHENA/ICEBERG WRITE] Initializing clean Gold Iceberg table {full_table} at '{s3_location}'...")
             if glue_client:
@@ -2159,16 +2068,13 @@ class GoldLayerManager:
         target_table: str,
         staging_table: str,
         old_backup_table: str,
-        view_name: Optional[str] = None,
-        create_view: bool = False,
-        primary_keys: Optional[List[str]] = None
+        primary_keys: Optional[List[str]] = None,
+        **kwargs
     ) -> None:
-        """Executes zero-downtime RENAME TABLE atomic swap in MySQL."""
+        """Executes zero-downtime RENAME TABLE atomic swap in MySQL for physical tables."""
         cls._validate_gold_table_name(target_table)
         cls._validate_gold_table_name(staging_table)
         cls._validate_gold_table_name(old_backup_table)
-        if view_name:
-            cls._validate_view_name(view_name)
         assert staging_table.endswith("_staging"), f"Safety Error: Invalid staging table {staging_table}"
         assert old_backup_table.endswith("_old"), f"Safety Error: Invalid backup table {old_backup_table}"
 
@@ -3061,6 +2967,11 @@ class GoldInitialLoader:
                 logger.info(f"[COLUMN CLEANSING] Renaming '{orig_col}' -> '{clean_col}'")
                 df_source = df_source.withColumnRenamed(orig_col, clean_col)
 
+        # Convert all business columns in source to StringType (ensures all things in string in Gold layer)
+        for c in df_source.columns:
+            if c not in ("_updated_at", "_inserted_at", "_data_as_of"):
+                df_source = df_source.withColumn(c, col(c).cast("string"))
+
         if not target_schema_fields:
             return df_source
 
@@ -3075,11 +2986,14 @@ class GoldInitialLoader:
         for norm_name, (target_name, data_type) in target_field_map.items():
             if norm_name not in source_cols:
                 missing_in_source.append(target_name)
-                df_source = df_source.withColumn(target_name, lit(None).cast(data_type))
+                cast_type = data_type if target_name in ("_updated_at", "_inserted_at", "_data_as_of") else "string"
+                df_source = df_source.withColumn(target_name, lit(None).cast(cast_type))
             else:
                 actual_col = source_cols[norm_name]
                 if actual_col != target_name:
                     df_source = df_source.withColumnRenamed(actual_col, target_name)
+                if target_name not in ("_updated_at", "_inserted_at", "_data_as_of"):
+                    df_source = df_source.withColumn(target_name, col(target_name).cast("string"))
 
         if missing_in_source:
             logger.info(f"[SCHEMA CONSOLIDATION] Padding {len(missing_in_source)} missing column(s) with NULL: {missing_in_source}")
@@ -3387,6 +3301,20 @@ class GoldInitialLoader:
         df_consolidated.createOrReplaceTempView(temp_view)
 
         if table_exists:
+            # Check for column type incompatibility (e.g. existing table has bigint while incoming has string)
+            was_purged = GoldLayerManager._check_and_resolve_iceberg_incompatibilities(
+                spark=spark,
+                glue_database=glue_database,
+                target_table_name=target_table_name,
+                incoming_df=df_consolidated,
+                s3_location=s3_location,
+                glue_client=glue_client,
+                s3_client=s3_client
+            )
+            if was_purged:
+                table_exists = False
+
+        if table_exists:
             try:
                 GoldLayerManager._sync_iceberg_schema(spark, full_table, df_consolidated)
             except Exception as sync_err:
@@ -3406,16 +3334,23 @@ class GoldInitialLoader:
                 spark.sql(merge_sql)
             except Exception as merge_err:
                 err_m_str = str(merge_err)
-                if any(x in err_m_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
+                if any(x in err_m_str for x in (
+                    "NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404",
+                    "Cannot safely cast", "Cannot write incompatible data", "incompatible"
+                )):
                     logger.warning(
-                        f"[INITIAL LOAD MERGE RECOVERY] Iceberg MERGE hit NoSuchKey ({merge_err}). "
-                        f"Metadata is missing in S3. Dropping Glue Catalog table and re-initializing cleanly..."
+                        f"[INITIAL LOAD MERGE RECOVERY] Iceberg MERGE hit {merge_err}. "
+                        f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
                     )
                     if glue_client:
                         try:
                             glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
                         except Exception:
                             pass
+                    try:
+                        spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
+                    except Exception:
+                        pass
                     cls._purge_s3_prefix(s3_client, s3_location)
                     df_consolidated.write \
                         .format("iceberg") \
@@ -3427,8 +3362,32 @@ class GoldInitialLoader:
                     try:
                         df_consolidated.write.format("iceberg").mode("append").insertInto(f"{glue_database}.{target_table_name}")
                     except Exception as ice_fallback_err:
-                        logger.error(f"[INITIAL LOAD UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
-                        raise
+                        err_fb_str = str(ice_fallback_err)
+                        if any(x in err_fb_str for x in (
+                            "Cannot safely cast", "Cannot write incompatible data", "incompatible", "NoSuchKey"
+                        )):
+                            logger.warning(
+                                f"[INITIAL LOAD RECOVERY] Fallback hit incompatible schema ({ice_fallback_err}). "
+                                f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
+                            )
+                            if glue_client:
+                                try:
+                                    glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                                except Exception:
+                                    pass
+                            try:
+                                spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
+                            except Exception:
+                                pass
+                            cls._purge_s3_prefix(s3_client, s3_location)
+                            df_consolidated.write \
+                                .format("iceberg") \
+                                .mode("overwrite") \
+                                .option("path", s3_location) \
+                                .saveAsTable(f"{glue_database}.{target_table_name}")
+                        else:
+                            logger.error(f"[INITIAL LOAD UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
+                            raise
         else:
             logger.info(f"[INITIAL LOAD WRITE] Initializing clean Gold Iceberg table {full_table} at '{s3_location}'...")
             if glue_client:
