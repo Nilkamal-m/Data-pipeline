@@ -119,7 +119,7 @@ class TestProcessLayerOptions(unittest.TestCase):
             "uax_silver_etl.py",
             "--PROCESS_LAYER", "gold",
             "--SOURCE_SYSTEM", "servicenow",
-            "--GOLD_SCHEMA", "gold_marts",
+            "--RDS_GOLD_SCHEMA", "gold_marts",
             "--GOLD_TARGET", "aurora",
             "--DATA_LAKE_BUCKET", "test-bucket",
             "--GLUE_DATABASE", "test_db",
@@ -130,11 +130,11 @@ class TestProcessLayerOptions(unittest.TestCase):
             params = parse_spark_arguments()
             self.assertEqual(params['PROCESS_LAYER'], 'gold')
             self.assertEqual(params['SOURCE_SYSTEM'], 'servicenow')
-            self.assertEqual(params['GOLD_SCHEMA'], 'gold_marts')
+            self.assertEqual(params['RDS_GOLD_SCHEMA'], 'gold_marts')
             self.assertEqual(params['GOLD_TARGET'], 'aurora')
 
     def test_gold_layer_missing_schema_raises_value_error(self):
-        """Omitting --GOLD_SCHEMA when --PROCESS_LAYER=gold must raise a guiding ValueError."""
+        """Omitting --RDS_GOLD_SCHEMA when --PROCESS_LAYER=gold must raise a guiding ValueError."""
         test_args = [
             "uax_silver_etl.py",
             "--PROCESS_LAYER", "gold",
@@ -145,7 +145,7 @@ class TestProcessLayerOptions(unittest.TestCase):
             from uax_silver_etl import parse_spark_arguments
             with self.assertRaises(ValueError) as ctx:
                 parse_spark_arguments()
-            self.assertIn("Missing required parameter '--GOLD_SCHEMA'", str(ctx.exception))
+            self.assertIn("Missing required parameter '--RDS_GOLD_SCHEMA'", str(ctx.exception))
             self.assertIn("no fallback schema is permitted", str(ctx.exception))
 
     def test_gold_layer_missing_source_system_raises_value_error(self):
@@ -153,7 +153,7 @@ class TestProcessLayerOptions(unittest.TestCase):
         test_args = [
             "uax_silver_etl.py",
             "--PROCESS_LAYER", "gold",
-            "--GOLD_SCHEMA", "my_mart",
+            "--RDS_GOLD_SCHEMA", "my_mart",
             "--DATA_LAKE_BUCKET", "test-bucket"
         ]
         with patch.object(sys, 'argv', test_args):
@@ -354,7 +354,7 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
     def test_password_manual_option(self):
         """Tests that manual password via --RDS_PASSWORD is used."""
         params = {
-            "GOLD_SCHEMA": "enterprise_reporting",
+            "RDS_GOLD_SCHEMA": "enterprise_reporting",
             "RDS_PASSWORD": "manual_secure_password_123",
             "RDS_HOST": "aurora-cluster.internal",
             "RDS_USER": "report_user"
@@ -376,7 +376,7 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
             })
         }
         params = {
-            "GOLD_SCHEMA": "enterprise_reporting",
+            "RDS_GOLD_SCHEMA": "enterprise_reporting",
             "RDS_SECRET_NAME": "prod/rds/mysql_credentials"
         }
         conn = GoldLayerManager._resolve_mysql_connection_info(params, secrets_client=mock_secrets)
@@ -393,7 +393,7 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
             "SecretString": "raw_plain_password\n"
         }
         params = {
-            "GOLD_SCHEMA": "enterprise_reporting",
+            "RDS_GOLD_SCHEMA": "enterprise_reporting",
             "SECRET_NAME": "prod/rds/raw_password"
         }
         conn = GoldLayerManager._resolve_mysql_connection_info(params, secrets_client=mock_secrets)
@@ -405,7 +405,7 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
         mock_secrets = MagicMock()
         mock_secrets.get_secret_value.side_effect = Exception("AccessDenied: User is not authorized")
         params = {
-            "GOLD_SCHEMA": "enterprise_reporting",
+            "RDS_GOLD_SCHEMA": "enterprise_reporting",
             "RDS_SECRET_NAME": "prod/rds/denied_secret"
         }
         with self.assertRaises(ValueError) as ctx:
@@ -416,7 +416,7 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
     def test_missing_password_raises_guiding_error(self):
         """Tests that missing database password raises an explicit guiding ValueError."""
         params = {
-            "GOLD_SCHEMA": "enterprise_reporting"
+            "RDS_GOLD_SCHEMA": "enterprise_reporting"
         }
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(ValueError) as ctx:
@@ -432,7 +432,7 @@ class TestGoldSharedDatabaseSafety(unittest.TestCase):
         }
         with self.assertRaises(ValueError) as ctx:
             GoldLayerManager._resolve_mysql_connection_info(params)
-        self.assertIn("CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_SCHEMA'", str(ctx.exception))
+        self.assertIn("CRITICAL CONFIG ERROR: Missing required parameter '--RDS_GOLD_SCHEMA'", str(ctx.exception))
         self.assertIn("no fallback schema is permitted", str(ctx.exception))
 
 
@@ -590,7 +590,7 @@ class TestCustomTransformsAndApiEnrichment(unittest.TestCase):
             "--PROCESS_LAYER", "gold",
             "--SOURCE_SYSTEM", "servicenow",
             "--DATA_LAKE_BUCKET", "my-test-bucket",
-            "--GOLD_SCHEMA", "gold_marts"
+            "--RDS_GOLD_SCHEMA", "gold_marts"
         ]
         with patch.object(sys, 'argv', test_args):
             params = parse_spark_arguments()
@@ -622,7 +622,7 @@ class TestLambdaHelper(unittest.TestCase):
         args = build_glue_arguments(event)
         self.assertEqual(args["--SOURCE_SYSTEM"], "servicenow")
         self.assertEqual(args["--PROCESS_LAYER"], "gold")
-        self.assertEqual(args["--GOLD_SCHEMA"], "enterprise_reporting")
+        self.assertEqual(args["--RDS_GOLD_SCHEMA"], "enterprise_reporting")
         self.assertEqual(args["--RDS_SECRET_NAME"], "prod/rds/credentials")
         self.assertEqual(args["--RDS_PASSWORD"], "manual_password")
         self.assertEqual(args["--RDS_HOST"], "db.internal")
@@ -2791,7 +2791,7 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         }
         glue_args = lambda_function.build_glue_arguments(event)
         self.assertEqual(glue_args["--PROCESS_LAYER"], "gold")
-        self.assertEqual(glue_args["--GOLD_SCHEMA"], "enterprise_reporting")
+        self.assertEqual(glue_args["--RDS_GOLD_SCHEMA"], "enterprise_reporting")
         self.assertEqual(glue_args["--RDS_HOST"], "aurora-mysql-prod.cluster-xyz.us-east-1.rds.amazonaws.com")
         self.assertEqual(glue_args["--RDS_PORT"], "3306")
         self.assertEqual(glue_args["--RDS_USER"], "reporting_user")
@@ -2808,7 +2808,7 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         }
         glue_args = lambda_function.build_glue_arguments(event)
         self.assertEqual(glue_args["--PROCESS_LAYER"], "gold")
-        self.assertEqual(glue_args["--GOLD_SCHEMA"], "enterprise_reporting")
+        self.assertEqual(glue_args["--RDS_GOLD_SCHEMA"], "enterprise_reporting")
         self.assertEqual(glue_args["--RDS_SECRET_NAME"], "prod/rds/mysql_credentials")
 
     def test_gold_trigger_typo_alias_support(self):

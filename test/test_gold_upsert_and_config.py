@@ -418,7 +418,7 @@ class TestGoldIncrementalDelta(unittest.TestCase):
             # 1. When CLI SECRET_NAME is provided
             conn_info_cli = GoldLayerManager._resolve_mysql_connection_info({
                 "SECRET_NAME": "rds/cli-secret",
-                "GOLD_SCHEMA": "enterprise_reporting",
+                "RDS_GOLD_SCHEMA": "enterprise_reporting",
                 "RDS_HOST": "aurora.cluster.test",
                 "SOURCE_SYSTEM": "genesys"
             }, secrets_client=mock_secrets_client)
@@ -428,7 +428,7 @@ class TestGoldIncrementalDelta(unittest.TestCase):
             # 2. When CLI SECRET_NAME is omitted, falls back to config secret
             mock_secrets_client.reset_mock()
             conn_info_fallback = GoldLayerManager._resolve_mysql_connection_info({
-                "GOLD_SCHEMA": "enterprise_reporting",
+                "RDS_GOLD_SCHEMA": "enterprise_reporting",
                 "RDS_HOST": "aurora.cluster.test",
                 "SOURCE_SYSTEM": "genesys"
             }, secrets_client=mock_secrets_client)
@@ -710,7 +710,7 @@ class TestAthenaToAuroraExtension(unittest.TestCase):
             "CSV_PATH": "s3://bucket/init/conversations.csv",
             "GOLD_TARGETS": "athena,aurora",
             "GLUE_DATABASE": "uax_datalake_db_dev",
-            "GOLD_SCHEMA": "enterprise_reporting"
+            "RDS_GOLD_SCHEMA": "enterprise_reporting"
         }
 
         with patch.object(GoldLayerManager, "_serve_to_mysql") as mock_mysql_serve:
@@ -1231,7 +1231,7 @@ class TestGoldInitialLoadIntegration(unittest.TestCase):
         }
         args = build_glue_arguments(event)
         self.assertEqual(args.get("--PROCESS_LAYER"), "gold")
-        self.assertEqual(args.get("--GOLD_SCHEMA"), "enterprise_reporting")
+        self.assertEqual(args.get("--RDS_GOLD_SCHEMA"), "enterprise_reporting")
         self.assertIn("--GOLD_CONFIG_S3_PATH", args)
         self.assertTrue(args["--GOLD_CONFIG_S3_PATH"].endswith("gold/script/config/gold_config.json"))
 

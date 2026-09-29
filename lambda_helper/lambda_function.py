@@ -206,14 +206,16 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         'deduplication_strategy': '--DEDUPLICATION_STRATEGY',
         'DEDUPLICATION_STRATEGY': '--DEDUPLICATION_STRATEGY',
         # Gold Serving Layer parameters
-        'gold_schema': '--GOLD_SCHEMA',
-        'GOLD_SCHEMA': '--GOLD_SCHEMA',
-        'rds_schema': '--GOLD_SCHEMA',
-        'RDS_SCHEMA': '--GOLD_SCHEMA',
-        'schema_name': '--GOLD_SCHEMA',
-        'SCHEMA_NAME': '--GOLD_SCHEMA',
-        'schema': '--GOLD_SCHEMA',
-        'SCHEMA': '--GOLD_SCHEMA',
+        'rds_gold_schema': '--RDS_GOLD_SCHEMA',
+        'RDS_GOLD_SCHEMA': '--RDS_GOLD_SCHEMA',
+        'gold_schema': '--RDS_GOLD_SCHEMA',
+        'GOLD_SCHEMA': '--RDS_GOLD_SCHEMA',
+        'rds_schema': '--RDS_GOLD_SCHEMA',
+        'RDS_SCHEMA': '--RDS_GOLD_SCHEMA',
+        'schema_name': '--RDS_GOLD_SCHEMA',
+        'SCHEMA_NAME': '--RDS_GOLD_SCHEMA',
+        'schema': '--RDS_GOLD_SCHEMA',
+        'SCHEMA': '--RDS_GOLD_SCHEMA',
         'gold_target': '--GOLD_TARGET',
         'GOLD_TARGET': '--GOLD_TARGET',
         'gold_targets': '--GOLD_TARGETS',
@@ -316,7 +318,7 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
     elif layer == 'gold':
         glue_args['--PROCESS_LAYER'] = 'gold'
     elif not glue_args.get('--PROCESS_LAYER'):
-        gold_identifiers = ('gold_schema', 'GOLD_SCHEMA', 'rds_schema', 'RDS_SCHEMA', 'schema_name', 'SCHEMA_NAME', 'db_secret', 'DB_SECRET', 'rds_secret_name')
+        gold_identifiers = ('rds_gold_schema', 'RDS_GOLD_SCHEMA', 'gold_schema', 'GOLD_SCHEMA', 'rds_schema', 'RDS_SCHEMA', 'schema_name', 'SCHEMA_NAME', 'db_secret', 'DB_SECRET', 'rds_secret_name')
         if any(k in event for k in gold_identifiers) or event.get('action') == 'gold':
             glue_args['--PROCESS_LAYER'] = 'gold'
         else:
@@ -328,14 +330,16 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
             glue_args['--ATHENA_WORKGROUP'] = DEFAULT_ATHENA_WORKGROUP
 
     # Strict Gold Schema Validation (Enterprise Shared DB Policy - Zero Fallback)
-    if glue_args.get('--PROCESS_LAYER') == 'gold':
-        gold_schema = glue_args.get('--GOLD_SCHEMA')
+    if glue_args.get('--PROCESS_LAYER') in ('gold', 'both') or layer == 'gold':
+        gold_schema = glue_args.get('--RDS_GOLD_SCHEMA') or glue_args.get('--GOLD_SCHEMA')
         if not gold_schema or not str(gold_schema).strip():
             raise ValueError(
-                "CRITICAL CONFIG ERROR: Missing required parameter 'gold_schema' (or 'rds_schema' / 'GOLD_SCHEMA') in event payload for Gold layer.\n"
+                "CRITICAL CONFIG ERROR: Missing required parameter 'gold_schema' / '--RDS_GOLD_SCHEMA' in event payload for Gold layer.\n"
                 "In accordance with enterprise shared database policy, no fallback schema is permitted.\n"
-                "Example: {'layer': 'gold', 'source_system': 'servicenow', 'rds_schema': 'enterprise_reporting'}"
+                "Example: {'layer': 'gold', 'source_system': 'servicenow', 'rds_gold_schema': 'enterprise_reporting'}"
             )
+        glue_args['--RDS_GOLD_SCHEMA'] = str(gold_schema).strip()
+        glue_args.pop('--GOLD_SCHEMA', None)
 
     # Auto-default --GOLD_CONFIG_S3_PATH for Gold layer if not explicitly specified
     if glue_args.get('--PROCESS_LAYER') in ('gold', 'both') or layer == 'gold':
@@ -1794,7 +1798,7 @@ def lambda_handler(event: Any, context: Any) -> Dict[str, Any]:
             layer = event['action'].strip().lower()
 
         if not layer or layer not in ('bronze', 'silver', 'gold', 'all', 'pipeline', 'e2e', 'full'):
-            gold_identifiers = ('gold_schema', 'GOLD_SCHEMA', 'rds_schema', 'RDS_SCHEMA', 'schema_name', 'SCHEMA_NAME', 'db_secret', 'DB_SECRET', 'rds_secret_name', 'gold_target')
+            gold_identifiers = ('rds_gold_schema', 'RDS_GOLD_SCHEMA', 'gold_schema', 'GOLD_SCHEMA', 'rds_schema', 'RDS_SCHEMA', 'schema_name', 'SCHEMA_NAME', 'db_secret', 'DB_SECRET', 'rds_secret_name', 'gold_target')
             if any(k in event for k in gold_identifiers):
                 layer = 'gold'
             elif any(k in event for k in ('silver_config_s3_path', 'scd_type', 'deduplication_order_by')):
@@ -1876,7 +1880,8 @@ def lambda_handler(event: Any, context: Any) -> Dict[str, Any]:
             'source_system': glue_args.get('--SOURCE_SYSTEM'),
             'source_table_name': glue_args.get('--SOURCE_TABLE_NAME', 'ALL_CONFIGURED'),
             'process_layer': glue_args.get('--PROCESS_LAYER'),
-            'gold_schema': glue_args.get('--GOLD_SCHEMA'),
+            'rds_gold_schema': glue_args.get('--RDS_GOLD_SCHEMA'),
+            'gold_schema': glue_args.get('--RDS_GOLD_SCHEMA'),
             'cloudwatch_log_group': final_result.get('LogGroupName', '/aws-glue/jobs/output'),
             'error_message': final_result.get('ErrorMessage', '') if not is_success else None
         }

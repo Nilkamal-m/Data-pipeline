@@ -284,17 +284,23 @@ class GoldInitialLoader:
     def _get_gold_layer_manager(cls):
         """Lazily imports GoldLayerManager to prevent circular import locks."""
         global GoldLayerManager
-        if GoldLayerManager is None:
+        if 'gold_layer_manager' in sys.modules and hasattr(sys.modules['gold_layer_manager'], 'GoldLayerManager'):
+            return sys.modules['gold_layer_manager'].GoldLayerManager
+        if 'gold.script.gold_layer_manager' in sys.modules and hasattr(sys.modules['gold.script.gold_layer_manager'], 'GoldLayerManager'):
+            return sys.modules['gold.script.gold_layer_manager'].GoldLayerManager
+        if GoldLayerManager is not None:
+            return GoldLayerManager
+        try:
+            from gold_layer_manager import GoldLayerManager as glm
+            GoldLayerManager = glm
+            return GoldLayerManager
+        except ImportError:
             try:
-                from gold_layer_manager import GoldLayerManager as glm
+                from gold.script.gold_layer_manager import GoldLayerManager as glm
                 GoldLayerManager = glm
+                return GoldLayerManager
             except ImportError:
-                try:
-                    from gold.script.gold_layer_manager import GoldLayerManager as glm
-                    GoldLayerManager = glm
-                except ImportError:
-                    pass
-        return GoldLayerManager
+                return None
 
     @classmethod
     def run_initial_load(
@@ -566,7 +572,12 @@ class GoldInitialLoader:
             logger.info(f"[AURORA EXTENSION] User requested Aurora serving for '{target_table_name}'. Reading from Athena table and serving to Aurora...")
             try:
                 df_athena = spark.table(full_table)
-                gold_schema = params.get('GOLD_SCHEMA') or 'enterprise_reporting'
+                gold_schema = params.get('RDS_GOLD_SCHEMA')
+                if not gold_schema:
+                    raise ValueError(
+                        "CRITICAL CONFIG ERROR: Missing required parameter '--RDS_GOLD_SCHEMA'.\n"
+                        "Aurora serving requires an explicit target schema. Please specify: --RDS_GOLD_SCHEMA <schema_name>"
+                    )
                 glm._serve_to_mysql(
                     spark=spark,
                     queries={table_name: ""},

@@ -45,6 +45,14 @@ except ImportError:
     except ImportError:
         GoldConfigLoader = None
 
+try:
+    from gold_initial_load import GoldInitialLoader
+except ImportError:
+    try:
+        from gold.script.gold_initial_load import GoldInitialLoader
+    except ImportError:
+        GoldInitialLoader = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,234 +72,36 @@ class GoldLayerManager:
         bucket_name: Optional[str] = None,
         params: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """
-        Loads Gold configuration dictionary using GoldConfigLoader if available,
-        or a self-contained fallback loader that probes CLI arguments (including raw JSON),
-        S3 candidate paths, local files, and sys.path zip archives.
-        """
+        """Loads Gold configuration dictionary using GoldConfigLoader."""
         effective_env = (env or (params.get('ENV') if params else None) or os.environ.get('ENV') or 'dev').strip().lower()
 
-        import zipfile
-        raw_config = None
+        if config_s3_path and isinstance(config_s3_path, str) and config_s3_path.strip().startswith('{') and config_s3_path.strip().endswith('}'):
+            try:
+                parsed = json.loads(config_s3_path.strip())
+                if GoldConfigLoader:
+                    return GoldConfigLoader.interpolate_env(parsed, effective_env)
+                return parsed
+            except Exception:
+                pass
 
-        # Tier 0: Direct JSON string or dict in params or sys.argv
         if params:
             for k in ('GOLD_CONFIG_JSON', 'gold_config_json', 'GOLD_CONFIG', 'gold_config'):
                 val = params.get(k)
                 if isinstance(val, dict):
-                    raw_config = val
-                    break
+                    return val
                 elif isinstance(val, str) and val.strip().startswith('{') and val.strip().endswith('}'):
                     try:
-                        raw_config = json.loads(val.strip())
-                        break
+                        return json.loads(val.strip())
                     except Exception:
                         pass
-        if raw_config is None and params and isinstance(params.get('ARG_DICT'), dict):
-            for k in ('GOLD_CONFIG_JSON', 'gold_config_json', 'GOLD_CONFIG', 'gold_config'):
-                val = params['ARG_DICT'].get(k)
-                if isinstance(val, dict):
-                    raw_config = val
-                    break
-                elif isinstance(val, str) and val.strip().startswith('{') and val.strip().endswith('}'):
-                    try:
-                        raw_config = json.loads(val.strip())
-                        break
-                    except Exception:
-                        pass
-
-        if raw_config is None:
-            for i, a in enumerate(sys.argv):
-                for flag in ('--GOLD_CONFIG_JSON', '--gold_config_json', '--GOLD_CONFIG', '--gold_config'):
-                    if a == flag and i + 1 < len(sys.argv):
-                        val = sys.argv[i + 1].strip()
-                        if val.startswith('{') and val.endswith('}'):
-                            try:
-                                raw_config = json.loads(val)
-                                break
-                            except Exception:
-                                pass
-                    elif a.startswith(f"{flag}="):
-                        val = a.split('=', 1)[1].strip()
-                        if val.startswith('{') and val.endswith('}'):
-                            try:
-                                raw_config = json.loads(val)
-                                break
-                            except Exception:
-                                pass
-                if raw_config is not None:
-                    break
-
-        # Tier 0b: config_s3_path itself might be a direct JSON string
-        if raw_config is None and config_s3_path and isinstance(config_s3_path, str):
-            clean_p = config_s3_path.strip()
-            if clean_p.startswith('{') and clean_p.endswith('}'):
-                try:
-                    raw_config = json.loads(clean_p)
-                except Exception:
-                    pass
-
-        # Tier 1: Try GoldConfigLoader if imported and no direct JSON was provided
-        if raw_config is None and GoldConfigLoader:
-            try:
-                cfg = GoldConfigLoader.load_config(
-                    config_s3_path=config_s3_path,
-                    s3_client=s3_client,
-                    env=effective_env,
-                    bucket_hint=bucket_name
-                )
-                if cfg and isinstance(cfg, dict) and (cfg.get("source_systems") or cfg.get("sources")):
-                    return cfg
-            except Exception as e:
-                logger.warning(f"[GOLD CONFIG] GoldConfigLoader.load_config encountered error: {e}. Trying direct load...")
-
-        # Tier 1: Check CLI argument for path
-        if raw_config is None and not config_s3_path:
-            for i, a in enumerate(sys.argv):
-                for flag in (
-                    '--GOLD_CONFIG_S3_PATH', '--gold_config_s3_path', '--gold-config-s3-path',
-                    '--GOLD_CONFIG_PATH', '--gold_config_path', '--gold-config-path',
-                    '--GOLD_CONFIG', '--gold_config', '--CONFIG_S3_PATH', '--config_s3_path'
-                ):
-                    if a == flag and i + 1 < len(sys.argv):
-                        val = sys.argv[i + 1].strip()
-                        if not (val.startswith('{') and val.endswith('}')):
-                            config_s3_path = val
-                            break
-                    elif a.startswith(f"{flag}="):
-                        val = a.split('=', 1)[1].strip()
-                        if not (val.startswith('{') and val.endswith('}')):
-                            config_s3_path = val
-                            break
-                if config_s3_path:
-                    break
-
-        if not s3_client and ((config_s3_path and config_s3_path.startswith("s3://")) or bucket_name):
-            try:
-                s3_client = boto3.client('s3')
-            except Exception:
-                pass
-
-        # Tier 2: Load from explicit S3 path
-        if raw_config is None and config_s3_path and config_s3_path.startswith("s3://") and s3_client:
-            try:
-                path_parts = config_s3_path.replace("s3://", "").split("/", 1)
-                b_name, o_key = path_parts[0], path_parts[1]
-                resp = s3_client.get_object(Bucket=b_name, Key=o_key)
-                raw_config = json.loads(resp['Body'].read().decode('utf-8'))
-                logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from '{config_s3_path}'")
-            except Exception as err:
-                logger.warning(f"[GOLD CONFIG] Failed to load from '{config_s3_path}': {err}. Probing alternative S3 locations...")
-
-        # Tier 3: Probe candidate S3 locations
-        if raw_config is None and s3_client:
-            candidate_buckets = []
-            if bucket_name:
-                clean_b = str(bucket_name).replace('{env}', effective_env).replace('{ENV}', effective_env.upper()).strip()
-                if clean_b and clean_b not in candidate_buckets:
-                    candidate_buckets.append(clean_b)
-            for b_env in [
-                os.environ.get('DATA_LAKE_BUCKET'),
-                os.environ.get('GOLD_BUCKET'),
-                os.environ.get('SILVER_BUCKET'),
-                f"uax-datalake-{effective_env}-bucket",
-                f"uax-datalake-dev-bucket"
-            ]:
-                if b_env:
-                    cb = str(b_env).replace('{env}', effective_env).replace('{ENV}', effective_env.upper()).strip()
-                    if cb and cb not in candidate_buckets:
-                        candidate_buckets.append(cb)
-
-            relative_keys = [
-                "gold/script/config/gold_config.json",
-                "gold/config/gold_config.json",
-                "scripts/gold/config/gold_config.json",
-                "scripts/config/gold_config.json",
-                "silver/script/config/gold_config.json",
-                "silver/config/gold_config.json",
-                "config/gold_config.json",
-                "gold_config.json"
-            ]
-
-            for b in candidate_buckets:
-                if raw_config is not None:
-                    break
-                for k in relative_keys:
-                    candidate_url = f"s3://{b}/{k}"
-                    if candidate_url == config_s3_path:
-                        continue
-                    try:
-                        resp = s3_client.get_object(Bucket=b, Key=k)
-                        raw_config = json.loads(resp['Body'].read().decode('utf-8'))
-                        logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from probed S3 path: '{candidate_url}'")
-                        break
-                    except Exception:
-                        pass
-
-        # Tier 4: Local filesystem search
-        if raw_config is None:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            local_paths = [
-                os.path.join(current_dir, "config", "gold_config.json"),
-                os.path.join(current_dir, "gold_config.json"),
-                os.path.join(os.getcwd(), "gold_config.json"),
-                os.path.join(os.getcwd(), "config", "gold_config.json"),
-                os.path.join(os.getcwd(), "gold", "script", "config", "gold_config.json"),
-                "/tmp/gold_config.json",
-                "/tmp/config/gold_config.json",
-                "/tmp/gold/script/config/gold_config.json",
-                "gold_config.json",
-                "gold/script/config/gold_config.json",
-                "scripts/gold/config/gold_config.json"
-            ]
-            for p in local_paths:
-                if os.path.exists(p) and os.path.isfile(p):
-                    try:
-                        with open(p, "r", encoding="utf-8") as f:
-                            raw_config = json.load(f)
-                            logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from local file: '{p}'")
-                            break
-                    except Exception as err:
-                        logger.warning(f"Error reading local file '{p}': {err}")
-
-        # Tier 5: Scan sys.path archives (.zip/.egg)
-        if raw_config is None:
-            for p in sys.path:
-                if p.endswith(('.zip', '.egg')) and os.path.exists(p):
-                    try:
-                        with zipfile.ZipFile(p, 'r') as zf:
-                            for zinfo in zf.namelist():
-                                if zinfo.endswith("gold_config.json"):
-                                    with zf.open(zinfo) as f:
-                                        raw_config = json.load(f)
-                                        logger.info(f"[GOLD CONFIG] Successfully loaded Gold configuration from archive '{p}!/{zinfo}'")
-                                        break
-                    except Exception:
-                        pass
-                if raw_config is not None:
-                    break
-
-        if raw_config is None:
-            logger.warning("[GOLD CONFIG] Gold configuration file 'gold_config.json' could not be loaded from S3, CLI, or local paths.")
-            raw_config = {}
-
-        # Interpolate {env}
-        def _interp(val):
-            if isinstance(val, str):
-                return val.replace('{env}', effective_env).replace('{ENV}', effective_env.upper())
-            elif isinstance(val, dict):
-                return {_interp(k): _interp(v) for k, v in val.items()}
-            elif isinstance(val, list):
-                return [_interp(x) for x in val]
-            return val
-
-        interpolated = _interp(raw_config)
         if GoldConfigLoader:
-            try:
-                GoldConfigLoader.set_loaded_config(interpolated, env=effective_env)
-            except Exception:
-                pass
-        return interpolated
+            return GoldConfigLoader.load_config(
+                config_s3_path=config_s3_path,
+                s3_client=s3_client,
+                env=effective_env,
+                bucket_hint=bucket_name
+            )
+        return {}
 
     @classmethod
     def _resolve_natural_keys(
@@ -316,50 +126,9 @@ class GoldLayerManager:
             except Exception:
                 pks = []
 
-        # 1b. Direct config dictionary traversal if GoldConfigLoader is absent or didn't find key
-        if not pks and isinstance(gold_cfg, dict):
-            sources = gold_cfg.get("source_systems") or gold_cfg.get("sources") or {}
-            clean_src = (source_system or '').strip().lower()
-            source_cfg = {}
-            if isinstance(sources, dict):
-                for k, v in sources.items():
-                    if k.strip().lower() == clean_src and isinstance(v, dict):
-                        source_cfg = v
-                        break
-            if not source_cfg and clean_src in gold_cfg and isinstance(gold_cfg[clean_src], dict):
-                source_cfg = gold_cfg[clean_src]
-
-            table_configs = source_cfg.get("tables") if isinstance(source_cfg.get("tables"), dict) else source_cfg
-            if isinstance(table_configs, dict):
-                clean_tbl = (table_name or '').strip().lower()
-                base_tbl = clean_tbl
-                for prefix in [f"gold_{clean_src}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]:
-                    if base_tbl.startswith(prefix):
-                        base_tbl = base_tbl[len(prefix):]
-                        break
-                candidates = [clean_tbl, base_tbl, base_tbl.replace('-', '_'), base_tbl.replace('_', '-')]
-
-                matched_tbl_cfg = {}
-                for cand in candidates:
-                    for tbl_k, tbl_v in table_configs.items():
-                        if tbl_k.strip().lower() == cand and isinstance(tbl_v, dict):
-                            matched_tbl_cfg = tbl_v
-                            break
-                    if matched_tbl_cfg:
-                        break
-
-                if matched_tbl_cfg:
-                    for key_name in ("nkey", "primary_key", "natural_key", "pk", "natural_keys", "primary_keys"):
-                        pk_val = matched_tbl_cfg.get(key_name)
-                        if isinstance(pk_val, list) and pk_val:
-                            pks = [str(k).strip() for k in pk_val if str(k).strip()]
-                            break
-                        elif isinstance(pk_val, str) and pk_val.strip():
-                            pks = [str(k).strip() for k in pk_val.split(',') if str(k).strip()]
-                            break
-
         # 2. CLI / Lambda override parameters
         if not pks and params:
+            clean_src = (source_system or '').strip().lower()
             clean_tbl = (table_name or '').strip().lower()
             base_tbl = clean_tbl
             for prefix in [f"gold_{clean_src}_", "gold_tbl_", "gold_", "v_", "tbl_", "raw_tbl_"]:
@@ -511,16 +280,35 @@ class GoldLayerManager:
 
         # Target MySQL Schema Resolution
         needs_mysql = any(t in gold_targets for t in ('aurora', 'rds', 'mysql'))
-        gold_schema = params.get('GOLD_SCHEMA')
+        gold_schema = params.get('RDS_GOLD_SCHEMA')
         if needs_mysql and not gold_schema:
             # Check gold_config.json for aurora schema
             src_cfg = GoldConfigLoader.get_source_config(source_system, gold_cfg) if GoldConfigLoader else {}
             first_tbl_cfg = list(src_cfg.get('tables', {}).values())[0] if src_cfg.get('tables') else {}
-            gold_schema = first_tbl_cfg.get('aurora', {}).get('schema') or 'enterprise_reporting'
+            gold_schema = first_tbl_cfg.get('aurora', {}).get('schema')
+            if not gold_schema:
+                raise ValueError(
+                    "CRITICAL CONFIG ERROR: Missing required parameter '--RDS_GOLD_SCHEMA'.\n"
+                    "Aurora/RDS serving requires an explicit target schema. No fallback schema is permitted.\n"
+                    "Please specify: --RDS_GOLD_SCHEMA <schema_name>"
+                )
 
         # Query and Data Paths
-        query_s3_path = params.get('GOLD_QUERY_S3_PATH') or f"s3://{bucket_name}/gold/query/{source_system}"
-        data_s3_path = params.get('GOLD_DATA_S3_PATH') or f"s3://{bucket_name}/gold/data/{source_system}"
+        bucket_name = params.get('DATA_LAKE_BUCKET')
+        query_s3_path = params.get('GOLD_QUERY_S3_PATH') or (f"s3://{bucket_name}/gold/query/{source_system}" if bucket_name else None)
+        if not query_s3_path:
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_QUERY_S3_PATH'.\n"
+                f"Expected: s3://<bucket>/gold/query/{source_system}/\n"
+                "Please specify: --GOLD_QUERY_S3_PATH s3://<bucket>/gold/query/<source_system>"
+            )
+        data_s3_path = params.get('GOLD_DATA_S3_PATH') or (f"s3://{bucket_name}/gold/data/{source_system}" if bucket_name else None)
+        if not data_s3_path:
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_DATA_S3_PATH'.\n"
+                f"Expected: s3://<bucket>/gold/data/{source_system}/\n"
+                "Please specify: --GOLD_DATA_S3_PATH s3://<bucket>/gold/data/<source_system>"
+            )
 
         if not s3_client:
             s3_client = boto3.client('s3')
@@ -939,8 +727,13 @@ class GoldLayerManager:
         else:
             workgroup = str(configured_wg).strip()
 
-        bucket_name = params.get('DATA_LAKE_BUCKET', 'uax-datalake-dev-bucket')
-        output_location = params.get('ATHENA_OUTPUT_LOCATION') or f"s3://{bucket_name}/athena-query-results/"
+        bucket_name = params.get('DATA_LAKE_BUCKET')
+        output_location = params.get('ATHENA_OUTPUT_LOCATION') or (f"s3://{bucket_name}/athena-query-results/" if bucket_name else None)
+        if not output_location:
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: Missing required parameter '--ATHENA_OUTPUT_LOCATION'.\n"
+                "Please specify an S3 path for Athena query results: --ATHENA_OUTPUT_LOCATION s3://<bucket>/athena-query-results/ or pass --DATA_LAKE_BUCKET"
+            )
 
         def _execute_athena_ddl(target_wg: str) -> bool:
             """Submits view DDL to an Athena workgroup, handling enforced workgroup configurations gracefully."""
@@ -1153,7 +946,12 @@ class GoldLayerManager:
             try:
                 # 1. Read authoritative records for MySQL serving directly from Athena Iceberg table
                 # Architecture: Iceberg Gold Table -> Aurora Gold Staging -> Aurora Gold Table (Atomic Swap)
-                glue_db = params.get('GLUE_DATABASE') or 'uax_datalake_db_dev'
+                glue_db = params.get('GLUE_DATABASE')
+                if not glue_db:
+                    raise ValueError(
+                        "CRITICAL CONFIG ERROR: Missing required parameter '--GLUE_DATABASE'.\n"
+                        "Please specify the Glue/Athena database name: --GLUE_DATABASE <glue_database_name>"
+                    )
                 athena_tbl_name = f"`{glue_db}`.`{target_table}`"
 
                 try:
@@ -2769,7 +2567,7 @@ class GoldLayerManager:
     ) -> Dict[str, Any]:
         """
         Resolves MySQL host, port, user, password, and database.
-        Zero fallback schema: requires explicit GOLD_SCHEMA (raises ValueError if missing).
+        Zero fallback schema: requires explicit RDS_GOLD_SCHEMA (raises ValueError if missing).
         Password resolution order:
           1. Manual password: CLI parameter --RDS_PASSWORD or RDS_PASSWORD env var
           2. AWS Secrets Manager: CLI parameter --RDS_SECRET_NAME or --SECRET_NAME
@@ -2777,16 +2575,22 @@ class GoldLayerManager:
         If no password is provided, raises an explicit ValueError guiding the error.
         """
         gold_schema = (
-            params.get('GOLD_SCHEMA')
+            params.get('RDS_GOLD_SCHEMA')
+            or params.get('rds_gold_schema')
+            or params.get('GOLD_SCHEMA')
             or params.get('gold_schema')
             or params.get('RDS_SCHEMA')
             or params.get('rds_schema')
+            or params.get('SCHEMA')
+            or params.get('schema')
+            or params.get('SCHEMA_NAME')
+            or params.get('schema_name')
         )
         if not gold_schema or not str(gold_schema).strip():
             raise ValueError(
-                "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_SCHEMA'.\n"
+                "CRITICAL CONFIG ERROR: Missing required parameter '--RDS_GOLD_SCHEMA'.\n"
                 "In accordance with enterprise shared database policy, no fallback schema is permitted.\n"
-                "Please explicitly specify the target MySQL schema name (e.g. --GOLD_SCHEMA enterprise_reporting)."
+                "Please explicitly specify the target MySQL schema name (e.g. --RDS_GOLD_SCHEMA enterprise_reporting)."
             )
         gold_schema = str(gold_schema).strip()
 
@@ -2795,20 +2599,20 @@ class GoldLayerManager:
             or params.get('rds_host')
             or params.get('RDS_URL')
             or params.get('rds_url')
-            or os.environ.get('RDS_HOST', 'localhost')
+            or os.environ.get('RDS_HOST')
         )
         port = str(
             params.get('RDS_PORT')
             or params.get('rds_port')
-            or os.environ.get('RDS_PORT', '3306')
+            or os.environ.get('RDS_PORT')
+            or '3306'
         )
         user = (
             params.get('RDS_USER')
             or params.get('rds_user')
             or params.get('RDS_USERNAME')
             or params.get('rds_username')
-            or params.get('rds_uaername')
-            or os.environ.get('RDS_USER', 'pipeline_user')
+            or os.environ.get('RDS_USER')
         )
         pwd = (
             params.get('RDS_PASSWORD')
@@ -2934,9 +2738,9 @@ class GoldLayerManager:
             )
 
         return {
-            "host": host,
+            "host": host or os.environ.get('RDS_HOST', 'localhost'),
             "port": int(port) if str(port).isdigit() else 3306,
-            "user": user,
+            "user": user or os.environ.get('RDS_USER', 'pipeline_user'),
             "password": pwd,
             "database": gold_schema
         }
@@ -3019,124 +2823,6 @@ class GoldLayerManager:
         )
         logger.info(summary_card)
 
-
-class GoldInitialLoader:
-    """
-    Handles initial historical data ingestion and column consolidation for Gold tables.
-    Self-contained within gold_layer_manager to guarantee standalone execution in AWS Glue.
-    """
-
-    @classmethod
-    def sanitize_column_name(cls, col_name: str) -> str:
-        if not col_name:
-            return "unnamed_column"
-        clean = re.sub(r'[\s\.\-\/\:\(\)\[\]\{\}\<\>#]+', '_', str(col_name).strip())
-        clean = re.sub(r'[^a-zA-Z0-9_]', '', clean)
-        clean = re.sub(r'_+', '_', clean).strip('_')
-        if not clean:
-            clean = "col"
-        elif clean[0].isdigit():
-            clean = f"col_{clean}"
-        return clean.lower()
-
-    @classmethod
-    def reconcile_schema(
-        cls,
-        df_source: DataFrame,
-        target_schema_fields: Optional[List[Any]] = None
-    ) -> DataFrame:
-        for orig_col in list(df_source.columns):
-            clean_col = cls.sanitize_column_name(orig_col)
-            if clean_col != orig_col:
-                logger.info(f"[COLUMN CLEANSING] Renaming '{orig_col}' -> '{clean_col}'")
-                df_source = df_source.withColumnRenamed(orig_col, clean_col)
-
-        if not target_schema_fields:
-            return df_source
-
-        target_field_map = {}
-        for f in target_schema_fields:
-            norm_name = cls.sanitize_column_name(f.name)
-            target_field_map[norm_name] = (f.name, f.dataType)
-
-        source_cols = {cls.sanitize_column_name(c): c for c in df_source.columns}
-
-        missing_in_source = []
-        for norm_name, (target_name, data_type) in target_field_map.items():
-            if norm_name not in source_cols:
-                missing_in_source.append(target_name)
-                df_source = df_source.withColumn(target_name, lit(None).cast(data_type))
-            else:
-                actual_col = source_cols[norm_name]
-                if actual_col != target_name:
-                    df_source = df_source.withColumnRenamed(actual_col, target_name)
-
-        if missing_in_source:
-            logger.info(f"[SCHEMA CONSOLIDATION] Padding {len(missing_in_source)} missing column(s) with NULL: {missing_in_source}")
-
-        extra_in_source = [source_cols[norm_name] for norm_name in source_cols if norm_name not in target_field_map]
-        if extra_in_source:
-            logger.info(f"[SCHEMA CONSOLIDATION] Preserving {len(extra_in_source)} extra column(s) from CSV for schema evolution: {extra_in_source}")
-
-        return df_source
-
-    @classmethod
-    def _probe_target_schema_from_query(
-        cls,
-        spark: SparkSession,
-        source_system: str,
-        table_name: str,
-        params: Dict[str, Any]
-    ) -> Optional[List[Any]]:
-        sql_text = params.get('GOLD_SQL') or params.get('QUERY_SQL')
-        query_path = params.get('QUERY_PATH')
-        if not sql_text and query_path:
-            if query_path.startswith('s3://'):
-                try:
-                    import boto3
-                    from urllib.parse import urlparse
-                    parsed = urlparse(query_path)
-                    s3 = boto3.client('s3')
-                    resp = s3.get_object(Bucket=parsed.netloc, Key=parsed.path.lstrip('/'))
-                    sql_text = resp['Body'].read().decode('utf-8')
-                    logger.info(f"[QUERY DISCOVERY] Loaded Gold query from '{query_path}'")
-                except Exception as s3_err:
-                    logger.warning(f"Could not load Gold query from S3 '{query_path}': {s3_err}")
-            elif os.path.exists(query_path):
-                with open(query_path, 'r', encoding='utf-8') as f:
-                    sql_text = f.read()
-                logger.info(f"[QUERY DISCOVERY] Loaded Gold query from local path '{query_path}'")
-
-        if not sql_text and params.get('DATA_LAKE_BUCKET'):
-            bucket_name = params.get('DATA_LAKE_BUCKET')
-            for q_name in [f"{table_name}.sql", f"v_{table_name}.sql"]:
-                s3_key = f"gold/query/{source_system}/{q_name}"
-                try:
-                    import boto3
-                    s3 = boto3.client('s3')
-                    resp = s3.get_object(Bucket=bucket_name, Key=s3_key)
-                    sql_text = resp['Body'].read().decode('utf-8')
-                    logger.info(f"[QUERY AUTO-DISCOVERY] Found S3 Gold query file at 's3://{bucket_name}/{s3_key}'")
-                    break
-                except Exception:
-                    pass
-
-        if not sql_text:
-            return None
-
-        clean_sql = re.sub(r'--[^\r\n]*', '', sql_text).strip().rstrip(';')
-        if not clean_sql:
-            return None
-
-        probe_sql = f"SELECT * FROM (\n{clean_sql}\n) AS probe_q WHERE 1=0"
-        try:
-            probe_df = spark.sql(probe_sql)
-            target_fields = probe_df.schema.fields
-            logger.info(f"[QUERY SCHEMA PROBE] Successfully probed schema: found {len(target_fields)} column(s) from Gold query.")
-            return target_fields
-        except Exception as probe_err:
-            logger.warning(f"[QUERY SCHEMA PROBE NOTE] Spark SQL zero-record probe note: {probe_err}. Proceeding with input file schema.")
-            return None
 
     @classmethod
     def run_initial_load(
@@ -3334,7 +3020,12 @@ class GoldInitialLoader:
             logger.info(f"[AURORA EXTENSION] User requested Aurora serving for '{target_table_name}'. Reading from Athena table and serving to Aurora...")
             try:
                 df_athena = spark.table(full_table)
-                gold_schema = params.get('GOLD_SCHEMA') or 'enterprise_reporting'
+                gold_schema = params.get('RDS_GOLD_SCHEMA')
+                if not gold_schema:
+                    raise ValueError(
+                        "CRITICAL CONFIG ERROR: Missing required parameter '--RDS_GOLD_SCHEMA'.\n"
+                        "Aurora serving requires an explicit target schema. Please specify: --RDS_GOLD_SCHEMA <schema_name>"
+                    )
                 GoldLayerManager._serve_to_mysql(
                     spark=spark,
                     queries={table_name: ""},
@@ -3390,7 +3081,7 @@ def main():
         'SECRET_NAME', 'RDS_SECRET_NAME', 'API_SECRET_NAME', 'LLM_SECRET_NAME',
         'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'INCREMENTAL', 'FULL_REFRESH',
         'RDS_HOST', 'RDS_PORT', 'RDS_USER', 'RDS_PASSWORD',
-        'GOLD_SCHEMA', 'GOLD_TARGETS', 'CONNECTION_NAME', 'ENV', 'ENVIRONMENT',
+        'RDS_GOLD_SCHEMA', 'GOLD_TARGETS', 'CONNECTION_NAME', 'ENV', 'ENVIRONMENT',
         'GOLD_CONFIG_S3_PATH', 'ATHENA_WORKGROUP', 'WORKGROUP', 'MART_NAME', 'TABLE_NAME',
         'CSV_PATH', 'INITIAL_LOAD_PATH', 'INPUT_FILE', 'SKIP_INITIAL_LOAD', 'RELOAD_INITIAL', 'DELIMITER', 'HAS_HEADER'
     ]

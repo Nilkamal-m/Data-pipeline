@@ -329,21 +329,32 @@ def parse_spark_arguments() -> dict:
     gold_targets = [t.strip().lower() for t in str(gold_targets_raw).split(',') if t.strip()]
     gold_target = gold_targets[0] if gold_targets else 'aurora'
 
-    gold_schema = get_cli_arg('GOLD_SCHEMA', 'gold_schema', 'RDS_SCHEMA', 'rds_schema')
+    gold_schema = get_cli_arg('RDS_GOLD_SCHEMA', 'rds_gold_schema')
     needs_mysql = any(t in gold_targets for t in ('aurora', 'rds', 'mysql'))
     if process_layer in ('gold', 'both') and needs_mysql and (not gold_schema or not str(gold_schema).strip()):
         raise ValueError(
-            "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_SCHEMA'.\n"
+            "CRITICAL CONFIG ERROR: Missing required parameter '--RDS_GOLD_SCHEMA'.\n"
             "Downstream target includes Aurora/MySQL, where no fallback schema is permitted.\n"
-            "Please explicitly specify the target MySQL schema name (e.g. --GOLD_SCHEMA enterprise_reporting)."
+            "Please explicitly specify the target MySQL schema name (e.g. --RDS_GOLD_SCHEMA enterprise_reporting)."
         )
     if gold_schema:
         gold_schema = str(gold_schema).strip()
 
-    default_gold_query = f"s3://{data_lake_bucket}/gold/query/{source_system_clean}"
-    default_gold_data = f"s3://{data_lake_bucket}/gold/data/{source_system_clean}"
-    gold_query_s3_path = get_cli_arg('GOLD_QUERY_S3_PATH', 'gold_query_s3_path', default=default_gold_query)
-    gold_data_s3_path = get_cli_arg('GOLD_DATA_S3_PATH', 'gold_data_s3_path', default=default_gold_data)
+    gold_query_s3_path = get_cli_arg('GOLD_QUERY_S3_PATH', 'gold_query_s3_path') or (f"s3://{data_lake_bucket}/gold/query/{source_system_clean}" if data_lake_bucket and source_system_clean else None)
+    gold_data_s3_path = get_cli_arg('GOLD_DATA_S3_PATH', 'gold_data_s3_path') or (f"s3://{data_lake_bucket}/gold/data/{source_system_clean}" if data_lake_bucket and source_system_clean else None)
+    if process_layer in ('gold', 'both'):
+        if not gold_query_s3_path:
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_QUERY_S3_PATH'.\n"
+                f"Expected: s3://<bucket>/gold/query/{source_system_clean}/\n"
+                "Please specify: --GOLD_QUERY_S3_PATH s3://<bucket>/gold/query/<source_system>"
+            )
+        if not gold_data_s3_path:
+            raise ValueError(
+                "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_DATA_S3_PATH'.\n"
+                f"Expected: s3://<bucket>/gold/data/{source_system_clean}/\n"
+                "Please specify: --GOLD_DATA_S3_PATH s3://<bucket>/gold/data/<source_system>"
+            )
     connection_name = get_cli_arg('CONNECTION_NAME', 'connection_name', 'GLUE_CONNECTION_NAME', 'glue_connection_name')
     rds_secret_name = get_cli_arg('RDS_SECRET_NAME', 'rds_secret_name', 'SECRET_NAME', 'secret_name', 'DB_SECRET_NAME', 'db_secret_name')
     rds_host = get_cli_arg('RDS_HOST', 'rds_host', 'RDS_URL', 'rds_url', 'HOST', 'host')
@@ -390,7 +401,7 @@ def parse_spark_arguments() -> dict:
         'CRAWLER_NAME': crawler_name,
         'TRIGGER_CRAWLER': trigger_crawler,
         'SILVER_FULL_CONFIG': silver_full_config,
-        'GOLD_SCHEMA': gold_schema,
+        'RDS_GOLD_SCHEMA': gold_schema,
         'GOLD_TARGET': gold_target,
         'GOLD_TARGETS': ','.join(gold_targets),
         'GOLD_CONFIG_S3_PATH': gold_config_s3_path,
