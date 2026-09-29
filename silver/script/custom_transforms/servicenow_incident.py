@@ -14,7 +14,7 @@ Custom transformation logic can define any of:
 
 import logging
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, upper, current_timestamp, lit
+from pyspark.sql.functions import col, upper, current_timestamp, lit, to_timestamp, date_format
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +82,8 @@ def transform(df: DataFrame, spark=None, context: dict = None) -> DataFrame:
         logger.info("[CUSTOM TRANSFORM - API HOOK] Initializing 'api_enrichment_field' with NULL string default value.")
         df = df.withColumn("api_enrichment_field", lit(None).cast("string"))
 
-    # Technical transform timestamp
-    df = df.withColumn("_transformed_at", current_timestamp())
+    # Technical transform timestamp standardized to YYYY-MM-DD HH:MM:SS
+    df = df.withColumn("_transformed_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
 
     new_cols = [c for c in df.columns if c not in initial_cols]
     logger.info(f"[CUSTOM TRANSFORM] Completed. New column(s) added by custom script: {new_cols}")

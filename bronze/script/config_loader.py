@@ -395,7 +395,7 @@ class ConfigLoader:
         effective_ub = (
             str(upper_bound).strip()
             if upper_bound and str(upper_bound).strip()
-            else datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            else datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         )
 
         # For Moveworks OData v4, timestamps in $filter must be ISO-8601 UTC (e.g. 'YYYY-MM-DDTHH:MM:SSZ')
@@ -638,21 +638,6 @@ class ConfigLoader:
             db_str = db_str.replace("{env}", effective_env).replace("{ENV}", effective_env.upper())
         return db_str
 
-    @classmethod
-    def get_crawler_name(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> Optional[str]:
-        """
-        Retrieves the centralized crawler_name configured under glue_catalog.
-        Dynamically interpolates {env} if present.
-        """
-        catalog_cfg = cls.get_glue_catalog_config(config_dict, env=env)
-        crawler = catalog_cfg.get("crawler_name")
-        if not crawler or not str(crawler).strip():
-            return None
-        c_str = str(crawler).strip()
-        if "{env}" in c_str or "{ENV}" in c_str:
-            effective_env = (env or os.environ.get('ENV') or os.environ.get('ENVIRONMENT') or 'dev').strip().lower()
-            c_str = c_str.replace("{env}", effective_env).replace("{ENV}", effective_env.upper())
-        return c_str
 
     @classmethod
     def get_watermark_table_name(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> str:

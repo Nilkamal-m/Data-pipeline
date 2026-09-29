@@ -143,7 +143,7 @@ class MoveworksConnector:
         upper_bound       = (
             str(configured_ub).strip()
             if configured_ub and str(configured_ub).strip()
-            else datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            else datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         )
 
         is_full_initial_load = (

@@ -23,8 +23,6 @@
       "enabled": true,
       "database_name": "uax_datalake_db_{env}",
       "table_prefix": "raw_tbl_",
-      "crawler_name": "uax-datalake-bronze-crawler-{env}",
-      "trigger_crawler": true,
       "sync_watermark_table": true,
       "watermark_table_name": "raw_tbl_watermarks"
     },
@@ -40,7 +38,7 @@
       "max_retries": 5
     },
     "_note_encryption": "Protegrity PII encryption: when enabled=true in pipeline_defaults and table defines encryption_columns, Bronze encrypts those columns before writing to S3 staging.",
-    "_note_env": "Dynamic environment templating: Any string containing '{env}' or '{ENV}' (e.g. database_name, crawler_name, bronze_bucket) is dynamically resolved at runtime from the --ENV / --ENVIRONMENT Glue parameter (defaults to 'dev')."
+    "_note_env": "Dynamic environment templating: Any string containing '{env}' or '{ENV}' (e.g. database_name, bronze_bucket) is dynamically resolved at runtime from the --ENV / --ENVIRONMENT Glue parameter (defaults to 'dev')."
   },
   "source_systems": {
     "servicenow": {

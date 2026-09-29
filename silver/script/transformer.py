@@ -18,7 +18,10 @@ import importlib.util
 import re
 from typing import Dict, Any, Optional
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, expr, lit, when, current_timestamp, upper, coalesce, to_timestamp, regexp_replace
+from pyspark.sql.functions import (
+    col, expr, lit, when, current_timestamp, upper, coalesce,
+    to_timestamp, regexp_replace, date_format
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +168,23 @@ class SilverTransformer:
                 if c not in silver_tech:
                     df = df.withColumn(c, col(c).cast("string"))
 
+        # Standardize timestamp formats across all columns to 'YYYY-MM-DD HH:MM:SS'
+        # Converts any ISO-8601 strings (e.g. '2024-03-01T15:30:00Z', '+00:00', millis) to standardized format
+        silver_tech_set = {'_valid_from', '_valid_to', '_is_current', '_is_deleted', '_inserted_at', '_updated_at'}
+        for c in df.columns:
+            if c not in silver_tech_set:
+                df = df.withColumn(
+                    c,
+                    when(
+                        col(c).rlike(r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}'),
+                        regexp_replace(
+                            col(c),
+                            r'^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)?$',
+                            '$1 $2'
+                        )
+                    ).otherwise(col(c))
+                )
+
         # 4. Clean illegal characters dynamically if expression is configured for this table
         illegal_expr = table_cfg.get('clean_illegal_chars_expression') or table_cfg.get('clean_illegal_chars_pattern')
         if illegal_expr and isinstance(illegal_expr, str) and illegal_expr.strip():
@@ -182,7 +202,10 @@ class SilverTransformer:
         for column_name, target_type in column_casts.items():
             if column_name in df.columns:
                 logger.info(f"Casting column '{column_name}' -> '{target_type}'")
-                df = df.withColumn(column_name, col(column_name).cast(target_type))
+                if str(target_type).strip().lower() in ('timestamp', 'datetime'):
+                    df = df.withColumn(column_name, to_timestamp(col(column_name), "yyyy-MM-dd HH:mm:ss"))
+                else:
+                    df = df.withColumn(column_name, col(column_name).cast(target_type))
 
         # 6. Apply Custom SQL Expressions
         custom_expressions = table_cfg.get('custom_expressions', {})
@@ -299,9 +322,9 @@ class SilverTransformer:
 
         # 1. Effective Validity Window (_valid_from, _valid_to) & Current Flag (_is_current: 'Y'/'N')
         if order_col_name and order_col_name in cols:
-            df = df.withColumn("_valid_from", coalesce(col(order_col_name).cast("timestamp"), current_timestamp()))
+            df = df.withColumn("_valid_from", to_timestamp(date_format(coalesce(col(order_col_name).cast("timestamp"), current_timestamp()), "yyyy-MM-dd HH:mm:ss")))
         elif "_valid_from" not in cols:
-            df = df.withColumn("_valid_from", current_timestamp())
+            df = df.withColumn("_valid_from", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
 
         if "_valid_to" not in cols:
             df = df.withColumn("_valid_to", to_timestamp(lit(high_date_val)))
@@ -341,9 +364,9 @@ class SilverTransformer:
 
         # 3. Technical timestamps (_inserted_at, _updated_at)
         if "_inserted_at" not in cols:
-            df = df.withColumn("_inserted_at", current_timestamp())
+            df = df.withColumn("_inserted_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
 
-        df = df.withColumn("_updated_at", current_timestamp())
+        df = df.withColumn("_updated_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
 
         # 4. Strip any Bronze metadata columns so they never enter Silver tables
         bronze_system_cols = {'_ingested_at', '_source_system', '_table_name', '_execution_id', '_batch_id', '_raw_payload'}

@@ -1319,7 +1319,7 @@ class TestWatermarkExecutionStartTime(unittest.TestCase):
 
     @patch('uax_bronze_load.s3_client')
     def test_update_last_load_date_records_execution_start_time(self, mock_s3):
-        execution_start = "2026-09-18T10:00:00Z"
+        execution_start = "2026-09-18 10:00:00"
         update_last_load_date(
             state_bucket="test-bucket",
             state_key="metadata/bronze/servicenow/incident/watermark.json",
@@ -1339,7 +1339,7 @@ class TestWatermarkExecutionStartTime(unittest.TestCase):
         self.assertEqual(payload["records_ingested"], 150)
         self.assertEqual(payload["last_status"], "SUCCESS")
         self.assertIn("updated_at", payload)
-        self.assertTrue(payload["updated_at"].endswith("Z"))
+        self.assertEqual(payload["updated_at"], execution_start)
 
 
 class TestDynamicEnvironmentInterpolation(unittest.TestCase):
@@ -1374,26 +1374,25 @@ class TestDynamicEnvironmentInterpolation(unittest.TestCase):
         prod_cfg = ConfigLoader.load_config(env="prod")
         catalog_cfg = prod_cfg["pipeline_defaults"]["glue_catalog"]
         self.assertEqual(catalog_cfg["database_name"], "uax_datalake_db_prod")
-        self.assertEqual(catalog_cfg["crawler_name"], "uax-datalake-bronze-crawler-prod")
+        self.assertNotIn("crawler_name", catalog_cfg)
 
         dev_cfg = ConfigLoader.load_config(env="dev")
         dev_catalog = dev_cfg["pipeline_defaults"]["glue_catalog"]
         self.assertEqual(dev_catalog["database_name"], "uax_datalake_db_dev")
-        self.assertEqual(dev_catalog["crawler_name"], "uax-datalake-bronze-crawler-dev")
+        self.assertNotIn("crawler_name", dev_catalog)
 
     def test_get_glue_database_and_crawler_name_env_resolution(self):
         db_qa = ConfigLoader.get_glue_database(env="qa")
         self.assertEqual(db_qa, "uax_datalake_db_qa")
-
-        crawler_qa = ConfigLoader.get_crawler_name(env="qa")
-        self.assertEqual(crawler_qa, "uax-datalake-bronze-crawler-qa")
+        # Crawler functionality intentionally removed per design
+        self.assertFalse(hasattr(ConfigLoader, "get_crawler_name"))
 
     @patch('sys.argv', ['uax_bronze_load.py', '--SOURCE_SYSTEM', 'servicenow', '--SOURCE_TABLE_NAME', 'incident', '--ENV', 'staging', '--BRONZE_BUCKET', 'my-bucket-{env}'])
     def test_parse_arguments_resolves_env_parameter(self):
         params = parse_arguments()
         self.assertEqual(params["ENV"], "staging")
         self.assertEqual(params["GLUE_DATABASE_NAME"], "uax_datalake_db_staging")
-        self.assertEqual(params["BRONZE_CRAWLER_NAME"], "uax-datalake-bronze-crawler-staging")
+        self.assertNotIn("BRONZE_CRAWLER_NAME", params)
         self.assertEqual(params["BRONZE_BUCKET"], "my-bucket-staging")
 
 
@@ -1452,7 +1451,7 @@ class TestUpperBoundSentinelAndTimestampSupport(unittest.TestCase):
         self.assertNotIn("00:00:00'", filter_str)  # No raw space-separated timestamp in quotes
 
     def test_watermark_sentinel_protection(self):
-        current_run_time = "2026-09-20T12:00:00Z"
+        current_run_time = "2026-09-20 12:00:00"
 
         # Case 1: Open-ended sentinel '9999-01-01 00:00:00'
         ub_high = "9999-01-01 00:00:00"
@@ -2833,6 +2832,64 @@ class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
         # Default fallback to GenesysConnector when no type is provided
         conn_cls_default = get_connector("genesys", {})
         self.assertEqual(conn_cls_default, GenesysConnector)
+
+
+class TestTimestampStandardizationAllColumns(unittest.TestCase):
+    """
+    Validates that timestamps across all columns in Bronze, Silver, and Gold layers
+    are strictly standardized to 'YYYY-MM-DD HH:MM:SS'.
+    """
+
+    def test_bronze_standardize_timestamp_value_formats(self):
+        from uax_bronze_load import standardize_timestamp_value
+        from datetime import datetime, date, timezone
+
+        # 1. ISO-8601 strings with 'T' and 'Z'
+        self.assertEqual(standardize_timestamp_value("2024-03-01T15:30:00Z"), "2024-03-01 15:30:00")
+        
+        # 2. ISO-8601 with fractional seconds and Z
+        self.assertEqual(standardize_timestamp_value("2024-03-01T15:30:00.123Z"), "2024-03-01 15:30:00")
+        self.assertEqual(standardize_timestamp_value("2024-03-01T15:30:00.123456Z"), "2024-03-01 15:30:00")
+
+        # 3. ISO-8601 with timezone offsets (+/-HH:MM or +/-HHMM)
+        self.assertEqual(standardize_timestamp_value("2024-03-01T15:30:00+05:30"), "2024-03-01 15:30:00")
+        self.assertEqual(standardize_timestamp_value("2024-03-01T15:30:00-08:00"), "2024-03-01 15:30:00")
+        self.assertEqual(standardize_timestamp_value("2024-03-01T15:30:00+0000"), "2024-03-01 15:30:00")
+
+        # 4. Standard format preserves identically
+        self.assertEqual(standardize_timestamp_value("2024-03-01 15:30:00"), "2024-03-01 15:30:00")
+        self.assertEqual(standardize_timestamp_value("9999-01-01 00:00:00"), "9999-01-01 00:00:00")
+
+        # 5. Python datetime and date objects
+        dt = datetime(2024, 5, 10, 14, 25, 30, tzinfo=timezone.utc)
+        self.assertEqual(standardize_timestamp_value(dt), "2024-05-10 14:25:30")
+        d = date(2024, 5, 10)
+        self.assertEqual(standardize_timestamp_value(d), "2024-05-10 00:00:00")
+
+        # 6. Non-timestamp values are left untouched
+        self.assertEqual(standardize_timestamp_value("ACTIVE"), "ACTIVE")
+        self.assertEqual(standardize_timestamp_value("INC0010023"), "INC0010023")
+        self.assertEqual(standardize_timestamp_value("user@example.com"), "user@example.com")
+        self.assertEqual(standardize_timestamp_value(12345), 12345)
+        self.assertIsNone(standardize_timestamp_value(None))
+
+    def test_bronze_record_enrichment_standardizes_all_columns(self):
+        from uax_bronze_load import standardize_timestamp_value
+
+        record = {
+            "id": "1001",
+            "state": "In Progress",
+            "sys_created_on": "2024-02-15T08:30:00Z",
+            "sys_updated_on": "2024-02-16T12:45:00.000Z",
+            "closed_at": "2024-02-17 18:00:00",
+            "caller": "john.doe"
+        }
+        standardized = {k: standardize_timestamp_value(v) for k, v in record.items()}
+        self.assertEqual(standardized["sys_created_on"], "2024-02-15 08:30:00")
+        self.assertEqual(standardized["sys_updated_on"], "2024-02-16 12:45:00")
+        self.assertEqual(standardized["closed_at"], "2024-02-17 18:00:00")
+        self.assertEqual(standardized["state"], "In Progress")
+        self.assertEqual(standardized["id"], "1001")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, lit, current_timestamp
+from pyspark.sql.functions import col, lit, current_timestamp, to_timestamp, date_format
 
 # Ensure gold script directory is in sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -423,7 +423,7 @@ class GoldInitialLoader:
             f"|  * Natural Keys      : {pks or 'None (Overwrite)'}\n"
             f"|  * Input File Path   : {csv_path}\n"
             f"|  * Glue Database     : {glue_database}\n"
-            f"|  * Execution Time    : {start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"|  * Execution Time    : {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"+================================================================================+"
         )
 
@@ -500,9 +500,9 @@ class GoldInitialLoader:
 
         # 4. Attach Technical Audit Columns
         if "_updated_at" not in df_consolidated.columns:
-            df_consolidated = df_consolidated.withColumn("_updated_at", current_timestamp())
+            df_consolidated = df_consolidated.withColumn("_updated_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
         if "_inserted_at" not in df_consolidated.columns:
-            df_consolidated = df_consolidated.withColumn("_inserted_at", current_timestamp())
+            df_consolidated = df_consolidated.withColumn("_inserted_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
 
         # Ensure row uniqueness by natural keys (nkey) from gold config
         df_consolidated = cls._deduplicate_by_nkey(df_consolidated, pks)

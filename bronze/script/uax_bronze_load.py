@@ -16,9 +16,10 @@ import sys
 import os
 import json
 import logging
+import re
 import boto3
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from botocore.exceptions import ClientError
 
 # ------------------------------------------------------------------------------
@@ -352,7 +353,7 @@ def parse_arguments() -> dict:
     ).strip('/')
 
 
-    # Glue Catalog & Crawler Configuration (Unified Lake Database with raw_tbl_ Table Prefix)
+    # Glue Catalog Configuration (Unified Lake Database with raw_tbl_ Table Prefix)
     catalog_config = pipeline_defaults.get('glue_catalog', {})
     glue_catalog_enabled = (
         get_cli_arg('SYNC_GLUE_CATALOG', 'GLUE_CATALOG_ENABLED', default=str(catalog_config.get('enabled', True)))
@@ -381,16 +382,6 @@ def parse_arguments() -> dict:
             "Please configure 'table_prefix' (e.g. 'raw_tbl_')."
         )
     glue_table_prefix = str(glue_table_prefix).strip()
-
-    raw_crawler_name = (
-        get_cli_arg('BRONZE_CRAWLER_NAME', 'CRAWLER_NAME')
-        or catalog_config.get('crawler_name')
-    )
-    bronze_crawler_name = str(raw_crawler_name).replace('{env}', env).replace('{ENV}', env.upper()).strip() if raw_crawler_name else ''
-
-    trigger_crawler = (
-        get_cli_arg('TRIGGER_CRAWLER', default=str(catalog_config.get('trigger_crawler', True)))
-    ).lower() == 'true'
 
     sync_watermark_table = (
         get_cli_arg('SYNC_WATERMARK_TABLE', default=str(catalog_config.get('sync_watermark_table', True)))
@@ -430,8 +421,6 @@ def parse_arguments() -> dict:
         'GLUE_CATALOG_ENABLED': glue_catalog_enabled,
         'GLUE_DATABASE_NAME': glue_database_name,
         'GLUE_TABLE_PREFIX': glue_table_prefix,
-        'BRONZE_CRAWLER_NAME': bronze_crawler_name,
-        'TRIGGER_CRAWLER': trigger_crawler,
         'SYNC_WATERMARK_TABLE': sync_watermark_table,
         'WATERMARK_TABLE_NAME': watermark_table_name,
         'SOURCE_CONFIG': source_config,
@@ -445,6 +434,27 @@ def parse_arguments() -> dict:
 # ---------------------------------------------------------
 # Helper Functions, Serialization & CloudWatch Metrics
 # ---------------------------------------------------------
+def standardize_timestamp_value(val: Any) -> Any:
+    """
+    Standardizes timestamp values across all columns to 'YYYY-MM-DD HH:MM:SS'.
+    Handles Python datetime/date objects and ISO-8601 formatted timestamp strings.
+    Leaves non-timestamp values unchanged.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (datetime, date)):
+        if isinstance(val, datetime):
+            return val.strftime('%Y-%m-%d %H:%M:%S')
+        return f"{val.strftime('%Y-%m-%d')} 00:00:00"
+    if isinstance(val, str):
+        s = val.strip()
+        # ISO-8601 regex pattern: YYYY-MM-DD[T ]HH:MM:SS followed by optional decimals, Z or timezone offsets
+        iso_match = re.match(r'^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)?$', s)
+        if iso_match:
+            return f"{iso_match.group(1)} {iso_match.group(2)}"
+    return val
+
+
 def flatten_and_expand_record(record: dict, parent_key: str = '', sep: str = '_') -> list:
     """
     Recursively flattens nested dictionaries and explodes arrays of objects into multiple individual rows.
@@ -853,7 +863,7 @@ def save_execution_log(
 
 
 # ------------------------------------------------------------------------------
-# AWS Glue Data Catalog & Crawler Management
+# AWS Glue Data Catalog Management
 # ------------------------------------------------------------------------------
 def infer_glue_column_type(val: Any) -> str:
     """Infers AWS Glue Data Catalog column type from a sample Python data value."""
@@ -926,7 +936,7 @@ def sync_bronze_catalog_table(
             s3_folder_name = s3_folder_name[len(p):]
     table_location = f"s3://{bronze_bucket}/{bronze_data_prefix}/{source_system}/{s3_folder_name}/"
     
-    ingested_at_str = ingested_at or partition_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+    ingested_at_str = ingested_at or partition_date.strftime('%Y-%m-%d %H:%M:%S')
     partition_location = f"{table_location}_ingested_at={ingested_at_str}/"
 
     is_parquet = (output_format.lower() == 'parquet')
@@ -1251,27 +1261,6 @@ def sync_watermark_catalog_table(
     return f"{database_name}.{watermark_table_name}"
 
 
-def trigger_glue_crawler(crawler_name: str) -> None:
-    """
-    Triggers AWS Glue Crawler if configured. Handles already-running crawler gracefully.
-    """
-    if not crawler_name or not crawler_name.strip():
-        return
-
-    c_name = crawler_name.strip()
-    try:
-        glue_client.start_crawler(Name=c_name)
-        logger.info(f"Triggered AWS Glue Crawler '{c_name}' to crawl latest table partitions.")
-    except ClientError as ce:
-        err_code = ce.response.get('Error', {}).get('Code')
-        if err_code == 'CrawlerRunningException':
-            logger.info(f"Glue Crawler '{c_name}' is already RUNNING. Latest data will be cataloged.")
-        elif err_code in ('EntityNotFoundException', 'NoSuchEntityException'):
-            logger.info(f"Glue Crawler '{c_name}' not yet provisioned. Table & partition are already synced via Glue Catalog API.")
-        else:
-            logger.warning(f"Could not trigger Glue Crawler '{c_name}': {ce}")
-
-
 # ---------------------------------------------------------
 # Main Execution Handler
 # ---------------------------------------------------------
@@ -1297,16 +1286,14 @@ def main():
     upper_bound_cli = params.get('UPPER_BOUND_CLI')
     
     execution_start_utc = datetime.now(timezone.utc)
-    current_run_time = execution_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    current_run_time = execution_start_utc.strftime('%Y-%m-%d %H:%M:%S')
     execution_id = execution_start_utc.strftime('%Y%m%d_%H%M%S')
     partition_prefix = f"_ingested_at={current_run_time}"
 
-    # Glue Catalog & Crawler Configuration (Unified Lake Database with raw_tbl_ Table Prefix)
+    # Glue Catalog Configuration (Unified Lake Database with raw_tbl_ Table Prefix)
     glue_catalog_enabled = params.get('GLUE_CATALOG_ENABLED', True)
     glue_database_name = params.get('GLUE_DATABASE_NAME')
     glue_table_prefix = params['GLUE_TABLE_PREFIX']
-    bronze_crawler_name = params.get('BRONZE_CRAWLER_NAME')
-    trigger_crawler = params.get('TRIGGER_CRAWLER', True)
     sync_watermark_table = params.get('SYNC_WATERMARK_TABLE', True)
     watermark_table_name = params.get('WATERMARK_TABLE_NAME')
 
@@ -1330,7 +1317,6 @@ def main():
         f"|  Upper Bound        : {ub_display:<57}|\n"
         f"|  Glue Database      : {glue_database_name:<57}|\n"
         f"|  Catalog Prefix     : {glue_table_prefix:<57}|\n"
-        f"|  Bronze Crawler     : {bronze_crawler_name if bronze_crawler_name else 'N/A':<57}|\n"
         f"|  Watermark Athena   : {watermark_table_name:<57}|\n"
         f"|  Start Time (UTC)   : {current_run_time:<57}|\n"
         "+================================================================================+"
@@ -1452,7 +1438,7 @@ def main():
             f"| >>> [{table_idx}/{len(table_list)}] PROCESSING TABLE: {api_table_name.upper()} (Lake Table: {display_lake_table})\n"
             f"|     Execution ID       : {execution_id}\n"
             f"|     Upper Bound        : {ub_table_display}\n"
-            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             "+--------------------------------------------------------------------------------+"
         )
         logger.info(table_header)
@@ -1474,11 +1460,14 @@ def main():
             flatten_sep = source_config.get('flatten_separator', '_')
 
             processed_chunk = []
-            # Flatten nested JSON and enrich with Audit Metadata
+            # Flatten nested JSON, standardize timestamps for all columns, and enrich with Audit Metadata
             for record in records_chunk:
                 if isinstance(record, dict):
                     expanded_recs = flatten_and_expand_record(record, sep=flatten_sep) if flatten_enabled else [record]
                     for rec in expanded_recs:
+                        # Standardize all timestamp columns and values across the record
+                        for col_k, col_v in list(rec.items()):
+                            rec[col_k] = standardize_timestamp_value(col_v)
                         rec['_source_system'] = source_system
                         rec['_table_name'] = clean_table_name
                         rec['_execution_id'] = execution_id
@@ -1570,9 +1559,6 @@ def main():
                         output_format=output_format,
                         ingested_at=current_run_time
                     )
-                    # Trigger Glue Crawler if configured to crawl latest table folder
-                    if trigger_crawler and bronze_crawler_name:
-                        trigger_glue_crawler(bronze_crawler_name)
             else:
                 logger.info(f"Table '{clean_table_name}' extraction completed cleanly with 0 new records since {last_load_date}.")
                 cleanup_failed_staging(bronze_bucket, staging_prefix)
@@ -1616,7 +1602,7 @@ def main():
             })
 
             # High-visibility table extraction summary block in CloudWatch logs
-            table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             catalog_table_display = f"{glue_database_name}.{glue_table_prefix}{clean_table_name}" if glue_catalog_enabled else "N/A"
             summary_card = (
                 f"[TABLE SUMMARY] {clean_table_name} | SUCCESS | Records: {total_table_records:,} | Chunks: {parts_written} | Duration: {duration_sec:.2f}s | Range: {last_load_date} -> {effective_watermark}\n"
@@ -1631,7 +1617,7 @@ def main():
                 f"|  * Records Ingested : {total_table_records:,}\n"
                 f"|  * Chunks Written   : {parts_written}\n"
                 f"|  * Table Duration   : {duration_sec:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"|  * End Time (UTC)   : {table_end_time_str}\n"
                 f"|  * Catalog Table    : {catalog_table_display}\n"
                 f"|  * Watermark S3 Key : {state_key}\n"
@@ -1672,7 +1658,7 @@ def main():
                 "error_message": str(table_err)
             })
 
-            failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             failed_card = (
                 f"[TABLE FAILED] {clean_table_name} | FAILED | Duration: {duration_sec:.2f}s | Error: {str(table_err)[:60]}\n"
                 "+================================================================================+\n"
@@ -1685,7 +1671,7 @@ def main():
                 f"|  * Extraction Range : {last_load_date if 'last_load_date' in locals() else 'N/A'}  -->  {current_run_time}\n"
                 f"|  * Error Details    : {table_err}\n"
                 f"|  * Table Duration   : {duration_sec:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"|  * Failed At (UTC)  : {failed_time_str}\n"
                 "+================================================================================+"
             )
@@ -1710,7 +1696,7 @@ def main():
                     "source_system": source_system,
                     "status": "FAILED",
                     "start_time": current_run_time,
-                    "end_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    "end_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
                     "duration_seconds": round((datetime.now(timezone.utc) - execution_start_utc).total_seconds(), 2),
                     "total_records_ingested": sum(t.get('records_fetched', 0) for t in table_stats),
                     "tables_count": len(table_list),
@@ -1736,7 +1722,7 @@ def main():
         "source_system": source_system,
         "status": overall_status,
         "start_time": current_run_time,
-        "end_time": execution_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        "end_time": execution_end_utc.strftime('%Y-%m-%d %H:%M:%S'),
         "duration_seconds": round(total_job_duration, 2),
         "total_records_ingested": total_records_all,
         "tables_count": len(table_list),
@@ -1787,7 +1773,7 @@ def main():
         f"|  Total Tables          : {len(table_list)} (Succeeded: {len(table_list) - len(failed_tables)}, Failed: {len(failed_tables)})\n"
         f"|  Total Records Ingested: {total_records_all:,}\n"
         f"|  Start Time (UTC)      : {current_run_time}\n"
-        f"|  End Time (UTC)        : {execution_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        f"|  End Time (UTC)        : {execution_end_utc.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"|  Total Job Duration    : {total_job_duration:.2f}s\n"
         "+--------------------------------------------------------------------------------+\n"
         "|  TABLE EXECUTION BREAKDOWN:\n"
@@ -1804,7 +1790,6 @@ def main():
         f"|  * Glue Database       : {glue_database_name}\n"
         f"|  * Catalog Tables      : {glue_database_name}.{glue_table_prefix}<tablename>\n"
         f"|  * Watermark Athena Tbl: {glue_database_name}.{watermark_table_name}\n"
-        f"|  * Bronze Crawler      : {bronze_crawler_name if bronze_crawler_name else 'N/A'}\n"
         "+================================================================================+"
     )
     logger.info(overall_card)

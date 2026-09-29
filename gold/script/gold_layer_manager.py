@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 import boto3
 from botocore.exceptions import ClientError
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import current_timestamp, lit, col
+from pyspark.sql.functions import current_timestamp, lit, col, to_timestamp, date_format
 
 # Ensure gold script directory is in sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -537,7 +537,7 @@ class GoldLayerManager:
             f"|  * Query Path        : {query_s3_path}\n"
             f"|  * Data S3 Path      : {data_s3_path}\n"
             f"|  * Data Lake Bucket  : {bucket_name}\n"
-            f"|  * Execution Time    : {execution_start.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"|  * Execution Time    : {execution_start.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"+================================================================================+"
         )
 
@@ -755,9 +755,9 @@ class GoldLayerManager:
 
                 # 5. Technical audit columns (_updated_at, _inserted_at)
                 if "_updated_at" not in df_mart.columns:
-                    df_mart = df_mart.withColumn("_updated_at", current_timestamp())
+                    df_mart = df_mart.withColumn("_updated_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
                 if "_inserted_at" not in df_mart.columns:
-                    df_mart = df_mart.withColumn("_inserted_at", current_timestamp())
+                    df_mart = df_mart.withColumn("_inserted_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
 
                 # Ensure row uniqueness by natural keys (nkey) from gold config
                 df_mart = cls._deduplicate_by_nkey(df_mart, pks)
@@ -2839,7 +2839,7 @@ class GoldLayerManager:
         unique_targets = list(dict.fromkeys(target_tables))
 
         for target in unique_targets:
-            pat = rf'(?:[`\w]+\.)?`?{target}`?\b'
+            pat = rf'(?<![\w])(?:[`\w]+\.)?`?{target}`?\b'
             if re.search(pat, clean_sql, re.IGNORECASE):
                 return True
 
@@ -3236,7 +3236,7 @@ class GoldLayerManager:
         safe_host = conn_info.get('host') if conn_info else "N/A"
         safe_user = conn_info.get('user') if conn_info else "N/A"
         safe_db = conn_info.get('database') if conn_info else "N/A"
-        failed_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        failed_at = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
         return (
             f"\n+================================================================================+\n"
@@ -3286,8 +3286,8 @@ class GoldLayerManager:
             f"+================================================================================+\n"
             f"|  Overall Status        : {overall_status}\n"
             f"|  Total Marts Evaluated : {len(stats)} (Succeeded: {len(stats) - failed_count}, Failed: {failed_count})\n"
-            f"|  Start Time (UTC)      : {start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
-            f"|  End Time (UTC)        : {end_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"|  Start Time (UTC)      : {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"|  End Time (UTC)        : {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"|  Total Duration        : {total_duration:.2f}s\n"
             f"+--------------------------------------------------------------------------------+\n"
             f"|  MART EXECUTION BREAKDOWN:\n"
@@ -3508,7 +3508,7 @@ class GoldInitialLoader:
             f"|  * Natural Keys      : {pks or 'None (Overwrite)'}\n"
             f"|  * Input File Path   : {csv_path}\n"
             f"|  * Glue Database     : {glue_database}\n"
-            f"|  * Execution Time    : {start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"|  * Execution Time    : {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"+================================================================================+"
         )
 
@@ -3553,9 +3553,9 @@ class GoldInitialLoader:
         df_consolidated = cls.reconcile_schema(df_raw, target_fields)
 
         if "_updated_at" not in df_consolidated.columns:
-            df_consolidated = df_consolidated.withColumn("_updated_at", current_timestamp())
+            df_consolidated = df_consolidated.withColumn("_updated_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
         if "_inserted_at" not in df_consolidated.columns:
-            df_consolidated = df_consolidated.withColumn("_inserted_at", current_timestamp())
+            df_consolidated = df_consolidated.withColumn("_inserted_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))
 
         # Ensure row uniqueness by natural keys (nkey) from gold config
         df_consolidated = GoldLayerManager._deduplicate_by_nkey(df_consolidated, pks)

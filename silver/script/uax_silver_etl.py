@@ -1286,7 +1286,7 @@ def main():
     glue_client = boto3.client('glue')
 
     execution_start_utc = datetime.now(timezone.utc)
-    current_run_time = execution_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    current_run_time = execution_start_utc.strftime('%Y-%m-%d %H:%M:%S')
 
     process_layer = params.get('PROCESS_LAYER', 'silver')
     if process_layer == 'gold':
@@ -1394,7 +1394,7 @@ def main():
             f"|     Silver Location    : {silver_location}\n"
             f"|     Watermark State Key: {state_key if watermark_enabled else 'DISABLED'}\n"
             f"|     Last Watermark     : {last_load_date or ('INITIAL_FULL_LOAD' if watermark_enabled else 'DISABLED')}\n"
-            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"|     Table Start (UTC)  : {table_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             "+--------------------------------------------------------------------------------+"
         )
         logger.info(table_header)
@@ -1524,7 +1524,7 @@ def main():
 
             if batch_count == 0:
                 table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
-                table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
                 table_stats.append({
                     "table_name": target_table_name,
                     "status": "SKIPPED_UP_TO_DATE",
@@ -1848,7 +1848,7 @@ def main():
                     )
 
             table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
-            table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            table_end_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             table_stats.append({
                 "table_name": target_table_name,
                 "status": "SUCCESS",
@@ -1876,7 +1876,7 @@ def main():
                 f"|  * New Watermark    : {new_watermark if watermark_enabled else 'DISABLED'}\n"
                 f"|  * Watermark S3 Key : {state_key if watermark_enabled else 'DISABLED'}\n"
                 f"|  * Table Duration   : {table_duration:.2f}s\n"
-                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"|  * Start Time (UTC) : {table_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"|  * End Time (UTC)   : {table_end_time_str}\n"
                 f"|  * Silver Location  : {silver_location}\n"
                 f"+================================================================================+"
@@ -1885,7 +1885,7 @@ def main():
 
         except Exception as err:
             table_duration = (datetime.now(timezone.utc) - table_start_time).total_seconds()
-            failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            failed_time_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             tb = traceback.format_exc()
             table_stats.append({
                 "table_name": target_table_name,
@@ -1975,7 +1975,7 @@ def main():
         f"|  Total Tables          : {len(table_list)} (Succeeded: {len(table_list) - len(failed_tables)}, Failed: {len(failed_tables)})\n"
         f"|  Glue Database         : {glue_database}\n"
         f"|  Start Time (UTC)      : {current_run_time}\n"
-        f"|  End Time (UTC)        : {execution_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        f"|  End Time (UTC)        : {execution_end_utc.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"|  Total Job Duration    : {total_job_duration:.2f}s\n"
         "+--------------------------------------------------------------------------------+\n"
         "|  TABLE EXECUTION BREAKDOWN:\n"
