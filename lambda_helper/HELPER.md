@@ -595,7 +595,7 @@ Passes `"wait_until_completion": true` to have Lambda wait and return final stat
         "log_group": "/aws-glue/jobs/output"
       },
       "gold": {
-        "job_name": "uax-datalake-silver-etl-dev",
+        "job_name": "uax-datalake-gold-marts-dev",
         "job_run_id": "jr_gold_003",
         "status": "SUCCEEDED",
         "execution_time_seconds": 23,

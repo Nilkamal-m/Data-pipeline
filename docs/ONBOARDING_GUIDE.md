@@ -14,8 +14,9 @@ The entire data pipeline infrastructure, storage, security, and execution runtim
 > * **Storage**: Amazon S3 Data Lake buckets (`bronze`, `silver`, `gold`, `state`) with lifecycle and partitioning rules.
 > * **Security & IAM**: Least-privilege IAM service roles and AWS Secrets Manager credential definitions.
 > * **Catalogs & Metastore**: AWS Glue Data Catalog databases, table definitions, and operational crawlers.
-> * **Serverless Compute**: AWS Glue Job execution environments pre-configured with Spark 3.3, PyArrow, Iceberg runtimes, and external Python library dependencies.
+> * **Serverless Compute**: AWS Glue Job execution environments pre-configured with Spark, PyArrow, Iceberg runtimes, and external Python library dependencies.
 > * **Query Engine**: Amazon Athena workgroups with isolated query result storage.
+> * **Orchestration & Alerting**: AWS Glue Workflows and Amazon SNS alert topics for automated success and failure messaging.
 
 Once the Terraform scripts are executed for your target environment, the platform is immediately ready for job runs and table onboarding.
 
@@ -87,13 +88,42 @@ Every secret follows the enterprise naming format:
 
 ---
 
-## 3. AWS Glue Job Execution & Arguments Reference
+## 3. Pipeline Execution: AWS Glue Workflow & Job Arguments
 
-Each pipeline layer runs as an **AWS Glue Job** orchestrated by AWS Step Functions or triggered via `aws glue start-job-run`. Parameters follow a strict hierarchy: **Glue Job Arguments (`--KEY value`) take top priority; if omitted, the job resolves parameters from its JSON configuration.**
+The primary operational mechanism is an **AWS Glue Workflow** that runs the **3 Glue jobs sequentially, one by one**. After completion, an automated messaging step sends an **Amazon SNS Success Notification** with run statistics or an **Amazon SNS Failure Alert** with complete diagnostics.
+
+### 3.1 Orchestrating the End-to-End Pipeline via AWS Glue Workflow
+
+```bash
+aws glue start-workflow-run \
+  --name "uax-datalake-moveworks-workflow-dev" \
+  --run-properties '{
+    "ENV": "dev",
+    "SOURCE_SYSTEM": "moveworks"
+  }'
+```
+
+```
+AWS Glue Workflow: uax-datalake-{source}-workflow-{env}
+        │
+        ▼
+[Job 1: Bronze Ingestion]      ──► uax_bronze_load.py (uax-datalake-bronze-ingestion-{env})
+        │ SUCCESS
+        ▼
+[Job 2: Silver Conformance]    ──► uax_silver_etl.py (uax-datalake-silver-etl-{env})
+        │ SUCCESS
+        ▼
+[Job 3: Gold Marts & Serving]  ──► gold_layer_manager.py (uax-datalake-gold-marts-{env})
+        │ SUCCESS
+        ▼
+[Notification: Pipeline Success] ──► Amazon SNS Success Notification (records, durations)
+        │
+        └── ANY JOB FAILURE     ──► Amazon SNS Failure Alert + Structured Diagnostic Card
+```
 
 ---
 
-### 3.1 Bronze Layer Glue Job Arguments (`uax_bronze_load.py`)
+### 3.2 Bronze Layer Glue Job Arguments (`uax_bronze_load.py`)
 
 ```bash
 aws glue start-job-run \
@@ -127,7 +157,7 @@ aws glue start-job-run \
 
 ---
 
-### 3.2 Silver Layer Glue Job Arguments (`uax_silver_etl.py`)
+### 3.3 Silver Layer Glue Job Arguments (`uax_silver_etl.py`)
 
 ```bash
 aws glue start-job-run \
@@ -148,7 +178,7 @@ aws glue start-job-run \
 | `--ENV` | Optional | `dev` | Target environment (`dev`, `stage`, `prod`). |
 | `--CONFIG_S3_PATH` | Optional | `s3://{data_lake_bucket}/silver/script/config/silver_config.json` | S3 URI to `silver_config.json`. |
 | `--SOURCE_TABLE_NAME` | Optional | All tables configured under `source_systems.<source>.tables` | Specific Silver Iceberg table name to process. |
-| `--PROCESS_LAYER` | Optional | `silver` | Pipeline stage: `silver`, `gold`, or `both`. |
+| `--PROCESS_LAYER` | Optional | `silver` | Pipeline stage: `silver` (Gold processing runs via standalone `gold_layer_manager.py`). |
 | `--DATA_LAKE_BUCKET` | Optional | `pipeline_defaults.data_lake_bucket` in config | S3 bucket containing Bronze data and Silver Iceberg tables. |
 | `--GLUE_DATABASE` | Optional | `pipeline_defaults.glue_database` or `uax_datalake_db_{env}` | AWS Glue Data Catalog database name. |
 | `--TABLE_PREFIX` | Optional | `pipeline_defaults.table_prefix` or `tbl_` | Standard prefix for conformed Silver tables. |
@@ -157,7 +187,7 @@ aws glue start-job-run \
 
 ---
 
-### 3.3 Gold Layer Glue Job Arguments (`gold_layer_manager.py`)
+### 3.4 Gold Layer Glue Job Arguments (`gold_layer_manager.py`)
 
 ```bash
 aws glue start-job-run \
@@ -184,9 +214,10 @@ aws glue start-job-run \
 | `--TABLE_NAME` | Optional | All marts configured under `source_systems.<source>.tables` | Specific Gold mart table to transform and serve. |
 | `--DATA_LAKE_BUCKET` / `--GOLD_BUCKET` | Optional | `pipeline_defaults.gold_bucket` in config | S3 bucket holding Gold Iceberg data and initial CSV drops. |
 | `--GLUE_DATABASE` | Optional | `pipeline_defaults.glue_database` or `uax_datalake_db_{env}` | AWS Glue Data Catalog database name. |
-| `--GOLD_TARGETS` | Optional | `source_config.target_engines` in config | Comma-separated serving targets (e.g. `aurora,athena,databricks,redshift`). |
+| `--GOLD_TARGETS` | Optional | `source_config.target_engines` in config | Comma-separated serving targets (`athena,aurora`). |
 | `--FULL_REFRESH` | Optional | `false` | Forces complete rebuild of Gold marts from Silver tables. |
 | `--INCREMENTAL` | Optional | `true` | Toggles incremental delta evaluation. |
+| `--RELOAD_INITIAL` | Optional | `false` | Forces re-ingestion of historical initial CSV export. |
 
 ---
 
@@ -235,7 +266,7 @@ Follow this recipe to onboard an entity from source extraction to business servi
    * Iceberg data lands at: `s3://{silver_bucket}/silver/data/acme_crm/tbl_customers/`
    * Watermark state lands at: `s3://{state_bucket}/metadata/silver/acme_crm_tbl_customers_watermark.json`
 
-### Step 3: Gold Dimensional Mart & Multi-Target Serving
+### Step 3: Gold Dimensional Mart & Aurora MySQL Serving
 1. Create SQL transformation query `gold/query/acme_crm/customers.sql`:
    ```sql
    SELECT
@@ -245,7 +276,7 @@ Follow this recipe to onboard an entity from source extraction to business servi
        c.created_at,
        c.updated_at AS _updated_at
    FROM
-       uax_datalake_db_{env}.tbl_customers c
+       tbl_customers c
    WHERE
        c.is_active = 'true'
    ```
@@ -265,4 +296,4 @@ Follow this recipe to onboard an entity from source extraction to business servi
      }
    }
    ```
-3. Run the Gold manager to build the Athena Iceberg mart and sync downstream to Aurora MySQL via zero-downtime PK UPSERT.
+3. Run the Gold manager (`gold_layer_manager.py`) to build the physical Athena Iceberg mart and sync downstream to Amazon Aurora MySQL (`enterprise_reporting.*`) via zero-downtime atomic staging swap.

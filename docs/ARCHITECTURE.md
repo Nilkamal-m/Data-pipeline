@@ -1,8 +1,9 @@
 # UAX DataLake — End-to-End Architecture
 
 > **Project:** UAX DataLake  
-> **Pattern:** Medallion (Multi-Hop) Architecture — Bronze → Silver → Gold → Consumer  
-> **Orchestration:** Amazon EventBridge → AWS Step Functions → AWS Glue Spark Jobs
+> **Pattern:** Medallion (Multi-Hop) Lakehouse Architecture — Bronze → Silver → Gold → Consumer  
+> **Orchestration:** AWS Glue Workflow (with Step Functions / EventBridge / Lambda options)  
+> **Notification:** Amazon SNS Success / Failure Alert Messaging  
 
 ---
 
@@ -10,14 +11,14 @@
 
 UAX DataLake ingests operational data from multiple enterprise source systems, refines it through three isolated processing layers, and serves business-ready data marts to downstream analytics and BI tools.
 
-Each layer runs as an independent AWS Glue PySpark job. Step Functions coordinates the sequential execution order. EventBridge triggers the entire pipeline on a schedule or on an S3 arrival event.
+Each layer runs as an independent AWS Glue job. An **AWS Glue Workflow** orchestrates the end-to-end execution, triggering all **three Glue jobs sequentially, one by one**. After completion, an automated messaging step sends a **Success Notification** with execution metrics or a **Failure Alert** with full diagnostic details.
 
 ```mermaid
 flowchart TD
-    subgraph Orchestration["Pipeline Orchestration"]
-        EB["Amazon EventBridge\n(Scheduled Rule / S3 Event)"]
-        SF["AWS Step Functions\n(State Machine)"]
-        EB -->|Trigger| SF
+    subgraph Orchestration["Pipeline Orchestration & Messaging"]
+        GWF["AWS Glue Workflow / Step Functions\n(uax-datalake-{source}-workflow-{env})"]
+        SNS_SUCCESS["Amazon SNS Success Notification\n(Duration, rows processed, health status)"]
+        SNS_FAIL["Amazon SNS Failure Alert\n(Diagnostic card, error logs, stack trace)"]
     end
 
     subgraph Sources["Source Systems"]
@@ -26,34 +27,41 @@ flowchart TD
         S3SRC["S3 File Drops\n(CSV / JSON / Parquet)"]
     end
 
-    subgraph Bronze["Bronze Layer — Raw Ingestion"]
-        BJ["uax_bronze_load.py\n(AWS Glue Job)"]
+    subgraph Bronze["1. Bronze Layer — Raw Ingestion"]
+        BJ["uax_bronze_load.py\n(Glue Python Shell / Spark Job)"]
         BS3[("S3 Raw Parquet\nbronze/data/{source}/{table}/\n_ingested_at=YYYY-MM-DDTHH:MM:SSZ/")]
-        BWMK[("S3 State\nmetadata/bronze/{source}/{table}/watermark.json")]
+        BWMK[("S3 State Watermark\nmetadata/bronze/{source}/{table}/watermark.json")]
     end
 
-    subgraph Silver["Silver Layer — Conformed Iceberg"]
-        SJ["uax_silver_etl.py\n(AWS Glue Job)"]
-        SICEBERG[("Apache Iceberg Tables\nsilver/data/{source}/{table}/")]
-        SWMK[("S3 State\nmetadata/silver/{source}_{table}_watermark.json")]
+    subgraph Silver["2. Silver Layer — Conformed Iceberg"]
+        SJ["uax_silver_etl.py\n(Glue PySpark Job)"]
+        SICEBERG[("Apache Iceberg Tables\nsilver/data/{source}/{table}/\ntbl_{table}")]
+        SWMK[("S3 State Watermark\nmetadata/silver/{source}_{table}_watermark.json")]
     end
 
-    subgraph Gold["Gold Layer — Business Marts"]
-        GJ["gold_layer_manager.py\n(AWS Glue Job)"]
-        GICEBERG[("Athena Iceberg Marts\ngold/data/{source}/{table}/")]
+    subgraph Gold["3. Gold Layer — Business Marts"]
+        GJ["gold_layer_manager.py\n(Standalone Glue PySpark Job)"]
+        GICEBERG[("Physical Iceberg Mart Tables\ngold/data/{source}/{table}/\ngold_{source}_{table}")]
     end
 
-    subgraph Consumer["Consumer Layer — Serving"]
-        AURORA[("Amazon Aurora MySQL\nenterprise_reporting.*\ngold_* reporting tables")]
-        ATHENA["Amazon Athena\n(Direct Iceberg Query)"]
-        BI["Power BI / Tableau\n(via Aurora MySQL)"]
-        RS["Redshift Spectrum\n(External Table)"]
+    subgraph Consumer["4. Consumer Serving Layer"]
+        AURORA[("Amazon Aurora MySQL\nenterprise_reporting.*\n(Zero-Downtime Atomic Staging Swap)")]
+        ATHENA["Amazon Athena\n(Direct Iceberg Ad-Hoc Query)"]
+        BI["Power BI / Tableau / Metabase\n(Direct MySQL / JDBC)"]
     end
 
-    SF -->|Step 1| BJ
-    SF -->|Step 2| SJ
-    SF -->|Step 3| GJ
+    %% Workflow Sequential Triggers
+    GWF -->|Step 1: Ingest| BJ
+    BJ -->|On Step 1 Success → Step 2: Conform| SJ
+    SJ -->|On Step 2 Success → Step 3: Serve| GJ
+    GJ -->|Pipeline Succeeded| SNS_SUCCESS
 
+    %% Failure Alerts
+    BJ -.->|On Failure| SNS_FAIL
+    SJ -.->|On Failure| SNS_FAIL
+    GJ -.->|On Failure| SNS_FAIL
+
+    %% Data Flow
     REST --> BJ
     DB --> BJ
     S3SRC --> BJ
@@ -65,64 +73,73 @@ flowchart TD
     SJ --> SICEBERG
     SJ <--> SWMK
 
-    SICEBERG --> GJ
+    %% Cross-layer SQL query capabilities in Gold
+    BS3 -.->|Direct Bronze Query raw_tbl_*| GJ
+    SICEBERG -->|Direct Silver Query tbl_*| GJ
     GJ --> GICEBERG
 
     GICEBERG -->|Athena Direct Query| ATHENA
-    GICEBERG -->|Staging Swap Sync| AURORA
-    GICEBERG -->|External Table| RS
-    AURORA -->|JDBC / Direct Connect| BI
+    GICEBERG -->|Staging Swap Write| AURORA
+    AURORA -->|JDBC Low-Latency Query| BI
 ```
 
 ---
 
-## 2. Orchestration: EventBridge → Step Functions
+## 2. Orchestration & Alerting: AWS Glue Workflow
 
-### 2.1 Trigger
+### 2.1 Sequential 3-Job Pipeline Execution
 
-An **Amazon EventBridge rule** fires on a cron schedule (e.g., `cron(0 6 * * ? *)` for daily at 06:00 UTC) or on an S3 event (new file dropped in a vendor bucket). EventBridge invokes the Step Functions state machine as its target.
-
-### 2.2 Step Functions State Machine
-
-The state machine runs the three Glue jobs **sequentially** using `GlueStartJobRun` and `GlueStartJobRunSync` task states. Each step waits for job completion before the next one starts.
+The pipeline is organized as a directed acyclic graph (DAG) inside an **AWS Glue Workflow** (`uax-datalake-{source}-workflow-{env}`):
 
 ```
-EventBridge Trigger
+AWS Glue Workflow Trigger
         │
         ▼
-[State: Run Bronze Job]    ──► GlueStartJobRunSync(uax_bronze_load)
+[Job 1: Bronze Ingestion]      ──► uax_bronze_load.py (uax-datalake-bronze-ingestion-{env})
         │ SUCCESS
         ▼
-[State: Run Silver Job]    ──► GlueStartJobRunSync(uax_silver_etl)
+[Job 2: Silver Conformance]    ──► uax_silver_etl.py (uax-datalake-silver-etl-{env})
         │ SUCCESS
         ▼
-[State: Run Gold Job]      ──► GlueStartJobRunSync(gold_layer_manager)
+[Job 3: Gold Marts & Serving]  ──► gold_layer_manager.py (uax-datalake-gold-marts-{env})
         │ SUCCESS
         ▼
-[State: Pipeline Complete] ──► SNS Notification (optional)
-        │ ANY FAILURE
-        ▼
-[State: Error Handler]     ──► SNS Alert + CloudWatch Alarm
+[Notification: Pipeline Success] ──► Amazon SNS Success Notification (Email / Teams / Slack)
+        │
+        └── ANY JOB FAILURE     ──► Amazon SNS Failure Alert + Structured Diagnostic Card
 ```
 
-### 2.3 Why Sequential, Not Parallel?
+### 2.2 Why Sequential (One by One) Execution?
 
-| Concern | Reasoning |
+| Architectural Factor | Benefit & Guarantees |
 |---|---|
-| **Data dependency** | Silver reads Bronze output. Gold reads Silver Iceberg. The order enforces availability. |
-| **Watermark integrity** | Each layer commits its watermark only after a successful write. Parallel execution would break state boundaries. |
-| **Failure isolation** | Step Functions retries the failed Glue job independently before failing the pipeline. |
+| **Data Dependency** | Silver requires completed Bronze Parquet batches. Gold requires conformed Silver Iceberg tables. Enforcing sequential execution guarantees data completeness. |
+| **Watermark Integrity** | Each layer commits its watermark state to S3 only upon successful write completion. |
+| **Cross-Layer SQL Support** | Gold queries can query across any layer (`raw_tbl_*`, `tbl_*`, `gold_*`). Ensuring upstream jobs complete first prevents reading stale partitions. |
+| **Failure Isolation & Cost Control** | If Bronze fails, Silver and Gold do not run, preventing unnecessary compute costs and downstream corruption. |
+
+### 2.3 Post-Execution Messaging: Success & Failure Notifications
+
+At the conclusion of the workflow run:
+1. **Success Notification**: Emits an Amazon SNS message containing:
+   - Pipeline run status (`SUCCESS`)
+   - Source system and execution environment
+   - Total records ingested, conformed, and served across all tables
+   - Execution duration breakdown for each of the 3 jobs
+2. **Failure Alert**: If any of the 3 Glue jobs fail:
+   - Emits a high-priority SNS alert to the on-call data engineering distribution list
+   - Includes the structured Error Diagnostic Card: failing layer, step name, error class, error message, and direct CloudWatch log URI.
 
 ---
 
 ## 3. Layer Summary
 
-| Layer | Job Script | Input | Output | Storage |
+| Layer | Job Script | Input | Output | Storage & Catalog |
 |---|---|---|---|---|
-| **Bronze** | `uax_bronze_load.py` | APIs / DBs / S3 Files | Append-only Parquet — single `_ingested_at` ISO timestamp partition per run | S3 `bronze/data/` |
-| **Silver** | `uax_silver_etl.py` | Bronze Parquet (incremental) | Apache Iceberg v2 (ACID upsert / SCD) | S3 `silver/data/` + Glue Catalog |
-| **Gold** | `gold_layer_manager.py` | Silver Iceberg (incremental delta) | Athena Iceberg Mart (source of truth) | S3 `gold/data/` |
-| **Consumer** | _(Gold job — last phase)_ | Gold Iceberg Mart | Aurora MySQL reporting tables + Athena + Redshift | Aurora `enterprise_reporting.*` |
+| **Bronze** | `uax_bronze_load.py` | REST APIs / DBs / S3 Files | Append-only Parquet — single `_ingested_at` ISO timestamp partition per run | S3 `bronze/data/` |
+| **Silver** | `uax_silver_etl.py` | Bronze Parquet (incremental) | Apache Iceberg v2 tables (`tbl_<name>`) (ACID upsert / SCD1 / SCD2) | S3 `silver/data/` + Glue Catalog |
+| **Gold** | `gold_layer_manager.py` | Silver Iceberg (`tbl_*`), Bronze (`raw_tbl_*`), Gold (`gold_*`) | Physical Iceberg Marts (`gold_<source>_<name>`) (Authoritative Source of Truth) | S3 `gold/data/` + Glue Catalog |
+| **Consumer** | _(Gold job — serving phase)_ | Gold Iceberg Marts | Aurora MySQL reporting tables (`gold_*`) via zero-downtime atomic swap | Amazon Aurora MySQL `enterprise_reporting.*` |
 
 ---
 
@@ -131,36 +148,40 @@ EventBridge Trigger
 ```mermaid
 sequenceDiagram
     autonumber
-    participant EB as EventBridge
-    participant SF as Step Functions
-    participant BZ as Bronze Job
-    participant SV as Silver Job
-    participant GD as Gold Job
+    participant GWF as Glue Workflow
+    participant BZ as Bronze Job (uax_bronze_load)
+    participant SV as Silver Job (uax_silver_etl)
+    participant GD as Gold Job (gold_layer_manager)
     participant S3B as S3 Bronze
     participant S3S as S3 Silver Iceberg
     participant S3G as S3 Gold Iceberg
     participant AURORA as Aurora MySQL
+    participant SNS as Amazon SNS Alerts
 
-    EB->>SF: Trigger State Machine
-    SF->>BZ: GlueStartJobRun (uax_bronze_load)
+    GWF->>BZ: Trigger Job 1: Ingestion
     BZ->>BZ: Resolve watermark from S3 state file
-    BZ->>BZ: Authenticate source (OAuth2 / Basic / IAM)
-    BZ->>BZ: Extract and flatten records
+    BZ->>BZ: Extract, paginate & flatten records
     BZ->>S3B: Write Snappy Parquet (_ingested_at=ISO_TIMESTAMP/ partition)
-    BZ->>BZ: Commit new watermark to S3
+    BZ->>BZ: Commit updated watermark to S3
+    BZ-->>GWF: Job 1 Succeeded
 
-    SF->>SV: GlueStartJobRun (uax_silver_etl)
+    GWF->>SV: Trigger Job 2: Conformance
     SV->>SV: Read Silver watermark from S3
     SV->>S3B: Scan Bronze Parquet (_ingested_at > watermark)
     SV->>SV: Deduplicate by nkey, apply transforms
-    SV->>S3S: MERGE INTO Iceberg table (SCD1 or SCD2)
+    SV->>S3S: MERGE INTO Iceberg table tbl_{table} (SCD1 / SCD2)
     SV->>SV: Update Silver watermark
+    SV-->>GWF: Job 2 Succeeded
 
-    SF->>GD: GlueStartJobRun (gold_layer_manager)
-    GD->>GD: Execute mart SQL over Silver Iceberg
-    GD->>GD: Filter delta (_updated_at > max Gold _updated_at)
-    GD->>S3G: MERGE INTO Gold Iceberg mart table
-    GD->>AURORA: Read Gold Table → staging swap to reporting table
+    GWF->>GD: Trigger Job 3: Gold Marts & Serving
+    GD->>GD: Check for historical export CSV & recover ghost Iceberg tables if any
+    GD->>GD: Execute mart SQL (joining tbl_*, raw_tbl_*, or gold_*)
+    GD->>GD: Filter incremental delta (only changed/new records)
+    GD->>S3G: MERGE INTO Gold Iceberg table gold_{source}_{table}
+    GD->>AURORA: Write staging table & perform atomic swap to gold_{source}_{table}
+    GD-->>GWF: Job 3 Succeeded
+
+    GWF->>SNS: Publish Pipeline Success Notification (record counts, durations)
 ```
 
 ---
@@ -579,178 +600,101 @@ update_silver_watermark(
 
 ### 5.3 Gold — Business Marts (`gold_layer_manager.py`)
 
-The Gold layer runs as an independent, standalone Glue job (via `gold_layer_manager.py`). It reads Silver Iceberg, executes mart SQL, materialises results into authoritative Gold Iceberg tables, and routes the conformed data to downstream reporting tables and consumer engines.
+The Gold layer runs as an independent, standalone AWS Glue PySpark job (entrypoint: `gold_layer_manager.py`). It discovers mart queries, resolves inter-mart DAG dependencies, executes complex analytical joins across any medallion layer, persists authoritative physical Iceberg tables in the AWS Glue Data Catalog, and synchronizes conformed data to Amazon Aurora MySQL with zero downtime.
 
-#### 5.3.1 Mart SQL Loading — Modular, Source-Scoped Queries
+#### 5.3.1 Cross-Layer SQL Querying — Seamless Bronze, Silver & Gold Joins
 
-Each mart is backed by a dedicated SQL file:
+Each mart is defined by a dedicated SQL query file:
 
 ```
-gold/query/<source>/<table>.sql
+gold/query/<source>/<table>.sql (or v_<table>.sql)
 ```
 
-The file is loaded at runtime from S3 or the local filesystem:
+Gold queries are not restricted to Silver alone. The execution engine dynamically introspects SQL query text and pre-registers in-session temporary views for all referenced tables across any layer:
+* **Bronze Layer**: `raw_tbl_<name>` (raw ingested data)
+* **Silver Layer**: `tbl_<name>` (conformed dimensional and factual Iceberg entities)
+* **Gold Layer**: `gold_<source>_<name>`, `gold_tbl_<name>`, `v_<name>`, or direct `<name>` (upstream dependent marts)
 
 ```python
-sql_path = f"s3://{data_lake_bucket}/gold/query/{source}/{table}.sql"
-mart_sql  = load_sql_from_s3_or_local(sql_path)
+# _ensure_dependency_views_registered introspects clean_sql for table tokens,
+# scans AWS Glue Data Catalog (glue_catalog.<db>.<tbl>), and registers Spark temp views:
+GoldLayerManager._ensure_dependency_views_registered(
+    spark=spark,
+    sql_text=sql_text,
+    source_system=source_system,
+    glue_database=glue_database,
+    gold_cfg=gold_cfg
+)
 ```
 
-The SQL uses a `{watermark}` placeholder that the job substitutes at runtime with the incremental delta boundary:
+This guarantees that analytical marts can join Silver tables (e.g. `tbl_conversations`) with upstream Bronze tables or dependent Gold marts without manual view creation.
+
+#### 5.3.2 Mart Dependency Resolution & Topological Ordering
+
+Marts with cross-mart dependencies (for example, `feedbacks.sql` reading from `gold_moveworks_interactions`) are automatically sorted into a topological execution order. Prerequisite marts are evaluated and materialized first, and their conformed Iceberg records are registered as in-session temp views before downstream marts run.
+
+#### 5.3.3 Ghost Iceberg Table Auto-Remediation & Initial Load
+
+If historical export data (CSV or Parquet) is found in `gold/initial_exports/<source>/`, `GoldInitialLoader` reconciles the schema against the target SQL definition, normalizes column names, and populates the initial Iceberg table.
+
+If an Iceberg table exists in the AWS Glue Data Catalog but its metadata JSON file was deleted from S3 (a "ghost table" causing `NoSuchKeyException: 404 Not Found`), `gold_layer_manager.py` automatically detects the corruption:
+1. Deletes the broken table reference from the AWS Glue Data Catalog via the Glue API (`boto3.client('glue').delete_table()`).
+2. Purges any remaining orphan objects under the S3 prefix.
+3. Re-initializes a fresh, healthy Iceberg table cleanly.
+
+#### 5.3.4 Physical Iceberg Table as the Authoritative Single Source of Truth
+
+The Gold layer materializes a physical Apache Iceberg table (`gold_<source>_<table_name>`) directly in the AWS Glue Data Catalog. Rather than generating multiple redundant catalog views that create catalog clutter, the physical Iceberg table acts as the definitive source of truth.
+
+Upserts into the Gold Iceberg table use Spark SQL `MERGE INTO` governed strictly by natural keys (`nkey`) configured in `gold_config.json`:
 
 ```sql
--- gold/query/moveworks/v_feedbacks.sql
-WITH sequences AS (
-    SELECT *,
-           ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY created_at) AS seq
-    FROM glue_catalog.silver_db.tbl_conversations
-    WHERE _updated_at > '{watermark}'
-),
-enriched AS (
-    SELECT s.*,
-           LEAD(s.message, 1) OVER (PARTITION BY s.conversation_id ORDER BY s.seq) AS next_comment,
-           LAG(s.message,  1) OVER (PARTITION BY s.conversation_id ORDER BY s.seq) AS prev_bot_prompt
-    FROM sequences s
-    WHERE s.actor_type = 'USER'
-)
-SELECT * FROM enriched
+MERGE INTO glue_catalog.gold_db.gold_genesys_conversations AS target
+USING incoming_gold_conversations AS source
+ON target.conversation_id = source.conversation_id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
 ```
 
-#### 5.3.2 Incremental Delta Processing
+#### 5.3.5 Incremental Delta Filtering (LLM & API Cost Protection)
 
-For incremental marts, the Gold job avoids reprocessing the entire Silver dataset by computing its own delta boundary:
+For incremental marts, `filter_incremental_delta()` anti-joins incoming Silver records against the authoritative Gold Iceberg table to isolate:
+1. **Brand-new records** (natural key not yet in Gold).
+2. **Updated records** (`_updated_at > target._updated_at`).
+3. **Unenriched records** (where enrichment columns like sentiment scores or LLM summaries are NULL).
 
-```python
-# Find the latest row already in the Gold mart
-result   = spark.sql(f"SELECT MAX(_updated_at) FROM glue_catalog.gold_db.{mart_table}").collect()
-max_gold_ts = result[0][0] if result else None
+This guarantees that expensive downstream custom transform scripts (such as Bedrock LLM calls or external REST APIs) only process delta records.
 
-# Substitute into mart SQL — only Silver records newer than max_gold_ts flow through
-watermark_str   = str(max_gold_ts) if max_gold_ts else '1900-01-01'
-incremental_df  = spark.sql(mart_sql.replace('{watermark}', watermark_str))
-```
+#### 5.3.6 Naming Guardrails & Shared Database Safety
 
-For tables marked `full_refresh: true` in `gold_config.json` (typically small dimensions), the watermark is set to `1900-01-01` to force a complete Silver scan on every run.
-
-#### 5.3.3 Gold Iceberg MERGE
-
-```python
-incremental_df.createOrReplaceTempView("incoming")
-spark.sql(f"""
-    MERGE INTO glue_catalog.gold_db.{mart_table} AS target
-    USING incoming AS source
-    ON target.{primary_key} = source.{primary_key}
-    WHEN MATCHED THEN UPDATE SET *
-    WHEN NOT MATCHED THEN INSERT *
-""")
-```
-
-#### 5.3.4 Mandatory Gold Table — Authoritative Mart & Reporting Table Contract
-
-The Gold layer creates and maintains a physical, authoritative Iceberg table for every business mart in AWS Glue Data Catalog. Rather than relying on transient views, this physical Gold table acts as the authoritative contract and single source of truth (`spark.table(f'{glue_db}.{target_table}')`) for all conformed business metrics.
-
-From this authoritative Gold table, data is reliably routed to downstream reporting tables (such as Amazon Aurora MySQL `enterprise_reporting` tables):
-
-```python
-# Step 1: Query the authoritative, conformed Gold Iceberg table
-gold_df = spark.table(f"glue_catalog.{gold_db}.{mart_table}")
-
-# If sourcing from an SCD2 dimensional entity, filter strictly to current active records
-if "_is_current" in gold_df.columns:
-    reporting_df = gold_df.filter(col("_is_current") == "Y")
-else:
-    reporting_df = gold_df
-
-# Step 2: Stream into the downstream reporting staging table before zero-downtime swap
-reporting_df.write \
-    .format("jdbc") \
-    .option("url", jdbc_url) \
-    .option("dbtable", f"{reporting_schema}.{mart_table}_staging") \
-    .mode("overwrite") \
-    .save()
-```
-
-#### 5.3.5 Schema Introspection and Evolution Alerting
-
-Before writing to Aurora, the job compares incoming column names against the existing Aurora table schema. New columns trigger a warning log, giving DBAs advance notice before the next cycle:
-
-```python
-existing_cols = set(get_mysql_columns(cursor, schema, table_name))
-incoming_cols = set(df.columns)
-new_cols      = incoming_cols - existing_cols
-if new_cols:
-    logger.warning(
-        f"[SCHEMA EVOLUTION] New columns detected for '{table_name}': {new_cols}. "
-        f"Review and apply DDL before next cycle."
-    )
-```
-
-#### 5.3.6 Naming Guardrails — Shared Database Safety
-
-All Aurora reporting object names are validated before any DDL or DML is issued. The Gold job is strictly allowed to operate on tables that carry the `gold_` prefix, and dropping is confined solely to temporary staging or backup tables:
-
-```python
-ALLOWED_TABLE_PREFIX = "gold_"
-
-def _validate_gold_table_name(table_name: str) -> None:
-    if not isinstance(table_name, str) or not table_name.startswith(ALLOWED_TABLE_PREFIX):
-        raise AssertionError(f"Safety Error: Gold table name '{table_name}' must start with '{ALLOWED_TABLE_PREFIX}'")
-
-def _validate_droppable_table_name(table_name: str) -> None:
-    _validate_gold_table_name(table_name)
-    if not (table_name.endswith("_staging") or table_name.endswith("_old")):
-        raise AssertionError(
-            f"Blocked: Non-temporary table '{table_name}' cannot be dropped. "
-            f"Gold job may only drop temporary staging/backup tables (*_staging, *_old)."
-        )
-```
+All database write operations strictly enforce enterprise safety guardrails:
+* All Gold tables must start with the `gold_` prefix.
+* The pipeline never executes `CREATE DATABASE` or `CREATE SCHEMA`.
+* Table dropping is strictly confined to temporary staging and backup tables ending in `_staging` or `_old`. Production tables are never dropped.
 
 ---
 
-### 5.4 Consumer Layer — Aurora MySQL + Athena Serving
+### 5.4 Consumer Layer — Aurora MySQL Zero-Downtime Serving
 
-The Consumer layer executes as the last phase of the Gold job. Its responsibility is to take the authoritative Gold Iceberg data and deliver it to low-latency BI consumers with zero downtime.
+The Consumer serving phase delivers the authoritative Gold Iceberg data to low-latency BI tools (Power BI, Tableau) through Amazon Aurora MySQL.
 
-#### 5.4.1 Aurora MySQL — Atomic Staging Swap
+#### 5.4.1 Zero-Downtime Atomic Staging Table Swap
 
-Power BI and Tableau query Aurora MySQL directly. The pipeline must never expose a partially loaded table. The atomic staging swap pattern guarantees this:
-
-```python
-# 1. Verify the target schema exists before touching anything
-#    SHOW DATABASES requires no elevated privilege
-cursor.execute("SHOW DATABASES LIKE 'enterprise_reporting'")
-if not cursor.fetchone():
-    raise RuntimeError("Schema 'enterprise_reporting' is missing. Aborting to prevent data loss.")
-
-# 2. Read the authoritative Gold Iceberg dataset
-gold_df = spark.read.format("iceberg") \
-    .load(f"glue_catalog.gold_db.{mart_table}")
-
-# 3. Write to a staging table — BI traffic never touches staging
-gold_df.write \
-    .format("jdbc") \
-    .option("url",     aurora_jdbc_url) \
-    .option("dbtable", f"enterprise_reporting.gold_{mart_table}_staging") \
-    .option("driver",  "com.mysql.cj.jdbc.Driver") \
-    .mode("overwrite") \
-    .save()
-
-# 4. Atomic three-table rename — no instant where the live table is absent
-#    MySQL RENAME TABLE is a single atomic DDL operation
-cursor.execute(f"""
-    RENAME TABLE
-        enterprise_reporting.gold_{mart_table}         TO enterprise_reporting.gold_{mart_table}_old,
-        enterprise_reporting.gold_{mart_table}_staging TO enterprise_reporting.gold_{mart_table}
-""")
-cursor.execute(f"DROP TABLE IF EXISTS enterprise_reporting.gold_{mart_table}_old")
-connection.commit()
-```
+To ensure business users and dashboards never query a table undergoing refresh:
+1. **Staging Write**: Full conformed data from the authoritative Gold Iceberg table is written to a transient staging table:
+   `enterprise_reporting.gold_<source>_<table_name>_staging`
+2. **Atomic Swap**: A single atomic MySQL `RENAME TABLE` instantly swaps the staging table into production:
+   ```sql
+   RENAME TABLE
+       enterprise_reporting.gold_genesys_conversations         TO enterprise_reporting.gold_genesys_conversations_old,
+       enterprise_reporting.gold_genesys_conversations_staging TO enterprise_reporting.gold_genesys_conversations;
+   ```
+3. **Index Creation**: Automatically ensures query performance indexes on natural keys (`_ensure_mysql_index`) for high-throughput dashboard querying.
+4. **Cleanup**: Drops the previous `_old` table version safely.
 
 #### 5.4.2 Aurora MySQL Secrets Manager Credentials Contract
 
-To connect to Amazon Aurora MySQL without hardcoding database passwords, `GoldLayerManager._resolve_mysql_connection_info()` retrieves credentials from AWS Secrets Manager using `--RDS_SECRET_NAME` (or the configured `secret_name` under `source_systems.<source>` in `gold_config.json`).
-
-The secret stored in AWS Secrets Manager must adhere to the following JSON structure:
+Database credentials are dynamically resolved from AWS Secrets Manager using `--RDS_SECRET_NAME` (or `--RDS_PASSWORD` for manual overrides):
 
 ```json
 {
@@ -762,21 +706,13 @@ The secret stored in AWS Secrets Manager must adhere to the following JSON struc
 }
 ```
 
-##### Field Resolution & Enterprise Validation Rules:
-* **`host`** (or `HOST`, `RDS_HOST`): The Aurora MySQL cluster writer endpoint URL.
-* **`port`** (or `PORT`): Connection port (defaults to `3306`).
-* **`username`** (or `user`, `USERNAME`): Dedicated database user with DDL/DML permissions within the target reporting schema.
-* **`password`** (or `PASSWORD`, `pwd`, `db_password`): Database password. If missing from the secret JSON, the job immediately raises a critical auth `ValueError`.
-* **`gold_schema`** (Target Database Schema): Passed explicitly via `--GOLD_SCHEMA` Glue argument or `aurora.schema` in `gold_config.json` (e.g., `enterprise_reporting`). **In accordance with enterprise shared database policy, zero fallback schema is permitted.**
-
 #### 5.4.3 Consumer Routing Matrix
 
-| Consumer | Data Source | Access Method | Typical Latency |
+| Consumer | Data Store | Serving Strategy | Query Latency |
 |---|---|---|---|
-| Power BI / Tableau | Aurora MySQL `enterprise_reporting.*` | JDBC / AWS Direct Connect | < 100 ms |
-| Amazon Athena | Gold Iceberg `glue_catalog.gold_db.*` | Iceberg table scan via S3 | 2 – 30 s |
-| Redshift Spectrum | Gold Iceberg (External Table) | S3 + Glue Catalog | 5 – 60 s |
-| Custom Applications | Aurora MySQL | JDBC / RDS Proxy | < 100 ms |
+| **Power BI / Tableau / Metabase** | Amazon Aurora MySQL `enterprise_reporting.*` | Direct MySQL JDBC (Atomic Swapped Gold Tables) | < 100 ms |
+| **Amazon Athena (Ad-Hoc / ML)** | S3 Data Lake (`glue_catalog.uax_datalake_db_*`) | Direct Apache Iceberg Table Scan | 2 – 15 s |
+| **Custom Microservices & APIs** | Amazon Aurora MySQL | Read Replica / RDS Proxy Connection Pool | < 50 ms |
 
 ---
 

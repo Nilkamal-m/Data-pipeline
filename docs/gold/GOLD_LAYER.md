@@ -1,73 +1,87 @@
-# Gold Layer — Enterprise Analytics Marts & Multi-Target Serving Engine
+# Gold Layer — Enterprise Analytics Marts & Serving Engine
 
 ## 1. Executive Summary & Purpose
 
-The **Gold Layer** is the business presentation and consumption layer of the Medallion Data Lakehouse architecture. It transforms conformed Silver Iceberg entities into high-value, dimensional business data marts and synchronizes them across a multi-target enterprise serving ecosystem.
+The **Gold Layer** is the business presentation and consumption layer of the Medallion Data Lakehouse architecture. It transforms conformed Silver Iceberg entities into high-value, dimensional business data marts and synchronizes them to downstream serving stores.
+
+In the end-to-end data pipeline, the Gold job runs as **Job 3 of the 3-job sequential AWS Glue Workflow** (`Bronze` $\to$ `Silver` $\to$ `Gold`). Once Gold succeeds, the pipeline triggers an automated **Amazon SNS Success Notification** with comprehensive execution metrics. If any job in the pipeline fails, an immediate **Amazon SNS Failure Alert** is dispatched with structured diagnostic information.
 
 ### Core Architectural Responsibilities
-* **Declarative SQL Business Marts**: Executes modular SQL queries (`gold/query/<source>/*.sql`) joining and aggregating Silver Iceberg tables.
+* **Standalone AWS Glue PySpark Job**: Executes independently via [gold_layer_manager.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/gold/script/gold_layer_manager.py) with its own entrypoint, GlueContext, and CLI argument parsing.
+* **Cross-Layer SQL Business Marts**: Executes modular SQL queries ([gold/query/<source>/*.sql](file:///Users/nilkamalmahato/Documents/Data-pipeline/gold/query)) capable of querying across **any medallion layer**:
+  - **Bronze Layer**: `raw_tbl_<name>` (raw ingested data)
+  - **Silver Layer**: `tbl_<name>` (conformed dimensional and factual Iceberg entities)
+  - **Gold Layer**: `gold_<source>_<name>`, `gold_tbl_<name>`, `v_<name>`, or `<name>` (dependent upstream marts)
+* **Authoritative Physical Iceberg Tables**: Materializes conformed marts as physical Apache Iceberg tables (`gold_<source>_<table_name>`) directly in the AWS Glue Data Catalog. The physical Iceberg table is the single source of truth for all business analytics.
+* **Ghost Table Auto-Remediation**: Automatically detects when an Iceberg table exists in the Glue Catalog but its underlying S3 metadata JSON was deleted (preventing `NoSuchKeyException: 404 Not Found`), purges the orphan catalog entry via Glue API, and cleanly re-initializes the table.
+* **Zero-Downtime Aurora MySQL Serving**: Reads back conformed records from the authoritative Gold Iceberg table, stages them in an isolated temporary table (`{table}_staging`), performs a microsecond atomic DDL swap (`RENAME TABLE target TO old, staging TO target`), and ensures index performance on natural keys (`_ensure_mysql_index`).
 * **Pluggable Python Business Transforms**: Provides script hooks (`gold/script/custom_transforms/*.py`) for machine learning enrichment, advanced KPI calculation, and unstructured text parsing.
-* **Primary Athena Iceberg Marts**: Persists physical Iceberg tables registered in the AWS Glue Data Catalog with dynamic schema padding and zero hardcoded column definitions.
-* **Multi-Target Serving Synchronizer**: Synchronizes transformed marts into operational data stores and data warehouses:
-  - **Amazon Aurora MySQL**: High-performance operational serving with isolated staging tables and record-level PK UPSERT (`ON DUPLICATE KEY UPDATE`).
-  - **Amazon Redshift Spectrum**: Direct external Iceberg catalog querying.
-  - **Snowflake**: External tables over Lakehouse Iceberg metadata.
-  - **Databricks**: Unity Catalog foreign Iceberg integration.
 * **Historical Data Migration & Archival**: Ingests historical reporting CSV exports (`gold/initial_exports/`), parses complex multiline records, dedupes against incoming telemetry, and automatically archives processed source files to S3 `_archived/` directories.
 
 ---
 
 ## 2. Low-Level Execution Lifecycle
 
-The following Mermaid diagram illustrates the Gold Layer transformation, initial load, and serving workflow:
+The following diagram illustrates the complete execution lifecycle within the AWS Glue Workflow context:
 
 ```mermaid
 flowchart TD
-    subgraph Trigger ["1. Trigger & Config Resolution"]
-        Start(["Trigger: Silver Completion or CLI Run"]) --> InitManager["GoldLayerManager.run()"]
-        InitManager --> LoadConfig["GoldConfigLoader.load_config()\nInterpolate {env} Variables"]
+    subgraph WorkflowContext ["1. AWS Glue Workflow Context"]
+        GWF["AWS Glue Workflow\n(uax-datalake-{source}-workflow-{env})"]
+        BJob["Job 1: Bronze Ingestion\n(uax_bronze_load.py)"]
+        SJob["Job 2: Silver Conformance\n(uax_silver_etl.py)"]
+        GJob["Job 3: Gold Marts & Serving\n(gold_layer_manager.py)"]
+        SNS_OK["Amazon SNS Success Notification"]
+        SNS_ERR["Amazon SNS Failure Alert"]
+
+        GWF --> BJob
+        BJob -->|On Success| SJob
+        SJob -->|On Success| GJob
+        GJob -->|On Success| SNS_OK
+
+        BJob -.->|On Failure| SNS_ERR
+        SJob -.->|On Failure| SNS_ERR
+        GJob -.->|On Failure| SNS_ERR
     end
 
-    subgraph InitialLoadCheck ["2. Historical Load & S3 Archival"]
-        LoadConfig --> CheckInitial{"Initial CSV Exists\nin gold/initial_exports/?"}
-        CheckInitial -- Yes --> ParseCSV["GoldInitialLoader.load():\nRead CSV with multiLine and escape options"]
+    subgraph GoldInit ["2. Gold Initial Load & Ghost Table Recovery"]
+        GJob --> LoadConfig["GoldConfigLoader.load_config()\nInterpolate {env} Variables"]
+        LoadConfig --> CheckGhost{"Ghost Table Check:\nS3 metadata exists for catalog table?"}
+        CheckGhost -- Missing S3 Metadata --> PurgeGhost["Purge Orphan Glue Catalog Table\nvia boto3 glue.delete_table()"]
+        CheckGhost -- Healthy / New --> CheckInitial
+        PurgeGhost --> CheckInitial{"Historical CSV Exists\nin gold/initial_exports/?"}
+        CheckInitial -- Yes --> ParseCSV["GoldInitialLoader.load():\nRead CSV with multiLine, escape & quote"]
         ParseCSV --> DedupeCSV["Deduplicate by nkey\nOrdered by _updated_at DESC"]
         DedupeCSV --> ArchiveS3["Move CSV to S3 _archived/:\ns3://.../gold/initial_exports/{source}/_archived/"]
-        ArchiveS3 --> InitAthena["Write Initial Baseline to Athena Iceberg"]
-        CheckInitial -- No --> TransformPhase
-        InitAthena --> TransformPhase
+        ArchiveS3 --> InitIceberg["Bootstrap Initial Gold Iceberg Table"]
+        CheckInitial -- No --> MartPlanning
+        InitIceberg --> MartPlanning
     end
 
-    subgraph TransformationPhase ["3. Mart Execution & Business Logic"]
-        TransformPhase["Execute Business SQL Query:\ngold/query/{source}/{table}.sql"] --> CheckCustom{"Custom Transform\nScript Configured?"}
-        CheckCustom -- Yes --> ExecCustomScript["Execute custom_transforms/{source}_{table}.py\n(e.g., Genesys transcript & metric parsing)"]
-        CheckCustom -- No --> AlignSchema["Dynamic Schema Alignment & Padding\n(Zero Hardcoded Columns)"]
-        ExecCustomScript --> AlignSchema
+    subgraph MartExecution ["3. Cross-Layer Dependency Resolution & Execution"]
+        MartPlanning["Discover Mart Queries:\ngold/query/{source}/*.sql"] --> BuildDAG["Build Dependency Graph & Topological Sort\n(Detect prerequisite marts)"]
+        BuildDAG --> PreRegisterViews["_ensure_dependency_views_registered:\nScan clean_sql for table tokens & register Spark temp views\n(raw_tbl_* from Bronze, tbl_* from Silver, gold_* from Gold)"]
+        PreRegisterViews --> RunSQL["Execute Mart SQL Query"]
+        RunSQL --> CheckCustom{"Custom Transform\nScript Configured?"}
+        CheckCustom -- Yes --> ExecCustom["Execute custom_transforms/{source}_{table}.py\n(e.g., Genesys transcript & metric parsing)"]
+        CheckCustom -- No --> FilterDelta
+        ExecCustom --> FilterDelta["filter_incremental_delta():\nAnti-join against existing Gold Iceberg table\n(Isolate new, updated, and unenriched records)"]
     end
 
-    subgraph TargetOne ["4. Target 1: Authoritative Athena Iceberg Upsert"]
-        AlignSchema --> FetchIcebergSchema["Inspect Target Iceberg Schema in Glue"]
-        FetchIcebergSchema --> PadColumns["Pad Missing Columns as NULL\nReorder Columns to Match Iceberg Catalog"]
-        PadColumns --> IcebergMerge["Spark SQL MERGE INTO target AS t USING source AS s\nON t.nkey = s.nkey\nWHEN MATCHED THEN UPDATE SET *\nWHEN NOT MATCHED THEN INSERT *"]
-        IcebergMerge --> IcebergComplete["Iceberg Gold Table Complete & Authoritative\nRefreshes in-session temp views for downstream marts"]
+    subgraph IcebergTarget ["4. Authoritative Iceberg Mart Upsert"]
+        FilterDelta --> AlignSchema["Dynamic Schema Alignment & Padding\n(Pad missing columns as NULL, reorder)"]
+        AlignSchema --> IcebergMerge["Spark SQL MERGE INTO target AS t USING source AS s\nON t.nkey = s.nkey\nWHEN MATCHED THEN UPDATE SET *\nWHEN NOT MATCHED THEN INSERT *"]
+        IcebergMerge --> IcebergDone["Physical Iceberg Table Updated\n(Authoritative Single Source of Truth)"]
     end
 
-    subgraph MultiTargetServing ["5. Multi-Target Serving Synchronization"]
-        IcebergComplete --> CheckTargets{"Evaluate target_engines\n(Configured per table)"}
-        CheckTargets -- "Aurora MySQL" --> ReadIceberg["Read Authoritative Athena Iceberg Table\n(Directly after Iceberg completion)"]
-        ReadIceberg --> AuroraStaging["Write Full Conformed DataFrame\nto Aurora Staging Table: {table}_staging"]
-        AuroraStaging --> AuroraSwap["Execute Zero-Downtime Atomic Swap:\nRENAME TABLE target TO old, staging TO target\nDROP TABLE old"]
-        AuroraSwap --> AuroraComplete["Aurora Gold Table Live\n(Operational query & dashboard serving)"]
-        CheckTargets -- "Redshift Spectrum" --> RedshiftSync["Update External Schema Mapping"]
-        CheckTargets -- "Snowflake" --> SnowflakeSync["Refresh External Stage / Iceberg Table"]
-        CheckTargets -- "Databricks" --> DatabricksSync["Sync Unity Catalog Iceberg Reference"]
-    end
-
-    subgraph Complete ["6. Completion"]
-        AuroraComplete --> Success(["Job Complete: Marts Updated Across All Engines"])
-        RedshiftSync --> Success
-        SnowflakeSync --> Success
-        DatabricksSync --> Success
+    subgraph AuroraServing ["5. Downstream Serving: Aurora MySQL Staging Swap"]
+        IcebergDone --> CheckAurora{"'aurora' in target_engines?"}
+        CheckAurora -- Yes --> ReadIceberg["Read Authoritative Conformed Iceberg Table\n(spark.table(glue_catalog.gold_db.gold_table))"]
+        ReadIceberg --> WriteStaging["Write Conformed DataFrame to\nenterprise_reporting.{gold_table}_staging"]
+        WriteStaging --> AtomicSwap["Execute Zero-Downtime Atomic Swap:\nRENAME TABLE gold_table TO gold_table_old,\ngold_table_staging TO gold_table\nDROP TABLE gold_table_old"]
+        AtomicSwap --> EnsureIndex["_ensure_mysql_index():\nVerify/create indexes on natural keys for BI query acceleration"]
+        EnsureIndex --> ServingDone["Aurora MySQL Table Live (<100ms BI Queries)"]
+        CheckAurora -- No --> ServingDone
     end
 ```
 
@@ -78,19 +92,23 @@ flowchart TD
 ```
 gold/
 ├── script/
-│   ├── gold_layer_manager.py           # Master Gold orchestration engine & standalone Glue job entrypoint
+│   ├── gold_layer_manager.py           # Master Gold orchestrator & standalone Glue job entrypoint
 │   ├── gold_config_loader.py           # Configuration loader & {env} interpolator
-│   ├── gold_initial_load.py            # Historical CSV loader, parser & auto-archiver
+│   ├── gold_initial_load.py            # Historical CSV loader, schema reconciler & auto-archiver
+│   ├── protegrity_encryption.py        # Protegrity PII tokenization via PySpark mapInPandas
 │   ├── config/
-│   │   └── gold_config.json            # Multi-target configuration blueprint
+│   │   └── gold_config.json            # Gold serving configuration blueprint
 │   └── custom_transforms/              # Domain-specific PySpark transformation hooks
 │       ├── genesys_conversations.py    # Custom Genesys transcript & metric parsing
 │       └── moveworks_interactions.py   # Custom Moveworks conversation aggregations
 ├── query/                              # Business SQL queries
 │   ├── genesys/
 │   │   └── conversations.sql           # Dimensional conversation mart SQL
-│   └── moveworks/
-│       └── interactions.sql            # Interaction and session analytics mart SQL
+│   ├── moveworks/
+│   │   ├── interactions.sql            # Interaction and session analytics mart SQL
+│   │   └── feedbacks.sql               # Feedback mart (depends on interactions mart)
+│   └── servicenow/
+│       └── incident_kpi.sql            # Incident KPI aggregation mart SQL
 └── initial_exports/                    # Historical data drop location
     ├── genesys/
     │   └── conversations.csv
@@ -98,31 +116,82 @@ gold/
         └── interactions.csv
 ```
 
-### Why Standalone Python Modules?
-1. **Inline Target Routing (`gold_layer_manager.py`)**: All downstream serving targets (Aurora MySQL, Databricks, Redshift Spectrum, Snowflake) are handled via dedicated private `@classmethod` methods on `GoldLayerManager`. Each target has its own isolated method, so a failure or timeout in one target does not affect the others.
-2. **Zero-Hardcoding Resilience**: Schema alignment dynamically queries the Glue Catalog at runtime. When upstream business queries add a column, the Gold engine automatically reconciles the schema without requiring code changes.
-3. **Dedicated Migration Mechanics (`gold_initial_load.py`)**: One-time historical ingestion logic is separated from recurring delta pipelines, keeping daily jobs lean while preserving disaster recovery reload capabilities (`--RELOAD_INITIAL=true`).
+### Architectural Highlights
+1. **Fully Standalone Entrypoint**: [gold_layer_manager.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/gold/script/gold_layer_manager.py) contains `main()`, `GlueContext`, and `Job.init(args['JOB_NAME'], args)`. It runs completely independently from the Silver job.
+2. **Cross-Layer SQL Support**: SQL queries can freely join tables across Bronze (`raw_tbl_*`), Silver (`tbl_*`), and Gold (`gold_*`). The engine inspects tokens in the query and pre-loads them as temporary views.
+3. **Physical Iceberg Single Source of Truth**: Data is merged directly into physical Iceberg tables registered in the AWS Glue Data Catalog. No redundant Athena catalog views (`v_*`) are created.
+4. **Aurora MySQL Zero-Downtime Atomic Staging Swap**: The downstream MySQL database (`enterprise_reporting.*`) is updated via a single atomic `RENAME TABLE` statement. Dashboard users and BI queries never encounter locks or partial loads.
 
 ---
 
-## 4. Primary Target: Athena Iceberg Engine Mechanics
+## 4. Cross-Layer SQL Querying Mechanics
 
-Athena Iceberg serves as the **single source of truth** for all business data marts.
+In enterprise analytics, a business mart often needs data from multiple layers simultaneously (e.g. conformed Silver conversations joined with raw telemetry payloads from Bronze, or secondary marts joined with primary Gold marts).
 
-### 4.1 Dynamic Schema Alignment (Zero Hardcoding)
-In production, schema drift between source SQL queries and target Iceberg tables must be handled gracefully. `_upsert_iceberg_table` executes the following algorithm:
-1. **Catalog Inspection**: Queries `spark.table(f"iceberg_catalog.{db}.{target_table}").schema` to retrieve the current physical table schema.
-2. **Column Padding**: Any column existing in the target table but missing from the source DataFrame is injected with `lit(None).cast(target_col_type)`.
-3. **Column Reordering**: The DataFrame columns are reordered to match the exact ordinal positions in the target Iceberg catalog.
-4. **Atomic Merge**: Spark SQL executes `MERGE INTO`, updating modified records and inserting new ones without full table rewrites.
+### Automatic Temporary View Registration
+Before executing any `.sql` file, `GoldLayerManager._ensure_dependency_views_registered()` parses the SQL statement using token boundary detection:
+
+```python
+# Introspects SQL tokens and checks against the AWS Glue Data Catalog:
+# 1. raw_tbl_*  -> Reads from Bronze / Catalog table (raw_tbl_<name>)
+# 2. tbl_*      -> Reads from Silver Iceberg table (tbl_<name>)
+# 3. gold_*     -> Reads from existing Gold Iceberg table (gold_<source>_<name>)
+```
+
+For every referenced table found in the catalog, Spark registers an in-session temporary view:
+```python
+spark.table(f"glue_catalog.{glue_database}.{catalog_table}").createOrReplaceTempView(token)
+```
+
+This eliminates manual view boilerplate and allows SQL writers to use natural table names:
+```sql
+SELECT
+    s.conversation_id,
+    s.agent_id,
+    s.duration_seconds,
+    b.raw_payload_json,
+    s.sys_updated_on AS _updated_at
+FROM
+    tbl_conversations s
+LEFT JOIN
+    raw_tbl_telemetry b ON s.conversation_id = b.conversation_id
+```
 
 ---
 
-## 5. Downstream Serving: Amazon Aurora MySQL Adapter
+## 5. Primary Target: Athena Iceberg Engine Mechanics
+
+The physical Apache Iceberg table (`gold_<source>_<table_name>`) serves as the definitive source of truth.
+
+### 5.1 Dynamic Schema Alignment (Zero Hardcoding)
+In production, schema evolution occurs naturally as upstream sources introduce new columns. `_upsert_iceberg_table` guarantees stability through runtime introspection:
+1. **Catalog Inspection**: Queries `spark.table(f"glue_catalog.{db}.{target_table}").schema` to retrieve current physical table column types.
+2. **Column Padding**: Any column existing in the physical table but missing from the current incoming DataFrame is injected with `lit(None).cast(target_col_type)`.
+3. **Column Reordering**: The DataFrame columns are reordered to match the exact ordinal positions of the Iceberg catalog table.
+4. **Atomic Merge**: Spark SQL executes `MERGE INTO`, updating modified records and inserting new ones without full table rewrites:
+   ```sql
+   MERGE INTO glue_catalog.{db}.{target_table} AS target
+   USING incoming_delta AS source
+   ON target.{nkey} = source.{nkey}
+   WHEN MATCHED THEN UPDATE SET *
+   WHEN NOT MATCHED THEN INSERT *
+   ```
+
+### 5.2 Ghost Iceberg Table Auto-Remediation
+If an Iceberg table exists in the AWS Glue Data Catalog but its underlying metadata JSON file in S3 was deleted or corrupted, any standard query will fail with `NoSuchKeyException: 404 Not Found`.
+
+`GoldLayerManager` automatically checks the metadata pointer before writing. If corrupted:
+1. Calls AWS Glue API `delete_table(DatabaseName=db, Name=tbl)` to remove the broken catalog pointer.
+2. Cleans up any orphaned objects under the S3 prefix.
+3. Automatically re-provisions a fresh, healthy Iceberg table.
+
+---
+
+## 6. Downstream Serving: Amazon Aurora MySQL Adapter
 
 The Aurora MySQL adapter serves operational web applications and real-time dashboards (Power BI, Tableau) requiring sub-second query performance.
 
-### 5.1 Architecture: Iceberg Gold Table $\to$ Aurora Gold Staging $\to$ Aurora Gold Table
+### 6.1 Architecture: Iceberg Gold Table $\to$ Aurora Gold Staging $\to$ Aurora Gold Table
 
 To eliminate duplicate record accumulation and maintain exact parity with the authoritative Athena Iceberg mart, the platform enforces the **Atomic Table Swap Strategy**:
 
@@ -137,7 +206,7 @@ To eliminate duplicate record accumulation and maintain exact parity with the au
 ```
 
 #### Detailed Execution Sequence:
-1. **Authoritative Ingestion**: `GoldLayerManager` queries the fully merged, deduplicated physical Athena Iceberg table directly (`spark.table(f"{glue_db}.{target_table}")`), ensuring the complete conformed dataset (initial loads + all delta increments) is processed.
+1. **Authoritative Ingestion**: `GoldLayerManager` queries the fully merged, deduplicated physical Athena Iceberg table directly (`spark.table(f"glue_catalog.{glue_db}.{target_table}")`), ensuring the complete conformed dataset is processed.
 2. **Staging Materialization**: The complete conformed dataset is streamed into an isolated staging table: `{target_table}_staging`.
 3. **Atomic Table Swap**: MySQL executes a single, microsecond DDL statement:
    ```sql
@@ -145,17 +214,15 @@ To eliminate duplicate record accumulation and maintain exact parity with the au
        `enterprise_reporting`.`gold_moveworks_interactions` TO `enterprise_reporting`.`gold_moveworks_interactions_old`,
        `enterprise_reporting`.`gold_moveworks_interactions_staging` TO `enterprise_reporting`.`gold_moveworks_interactions`;
    ```
-4. **Instant Cleanup & Indexing**: The previous table version (`_old`) is safely dropped, and query performance indexes are verified on the natural keys (`pks`).
+4. **Instant Cleanup & Indexing**: The previous table version (`_old`) is safely dropped, and query performance indexes are verified on the natural keys via `_ensure_mysql_index`.
 
 #### Key Advantages:
 * **Zero Downtime**: Power BI and BI analysts querying `{target_table}` experience continuous availability without locking or missing-table exceptions.
-* **Guaranteed Parity**: Aurora record counts always match Athena Iceberg record counts exactly (e.g. 5,477 rows in Athena $\equiv$ 5,477 rows in Aurora), preventing runaway duplicate counts on recurring runs.
+* **Guaranteed Parity**: Aurora record counts always match Athena Iceberg record counts exactly, preventing runaway duplicate counts on recurring runs.
 
-### 5.2 Aurora MySQL Secrets Manager Contract & Key-Value Specification
+### 6.2 Aurora MySQL Secrets Manager Contract
+Credentials for Aurora MySQL are dynamically fetched from AWS Secrets Manager using `--RDS_SECRET_NAME` (or configured under `source_systems.<source>.secret_name` in `gold_config.json`).
 
-To securely connect to Amazon Aurora MySQL (or Amazon RDS) without embedding credentials into scripts or configuration files, `GoldLayerManager._resolve_mysql_connection_info()` fetches credentials from AWS Secrets Manager using the secret specified via `--RDS_SECRET_NAME` (or configured under `source_systems.<source>.secret_name` in `gold_config.json`).
-
-#### Required Secret JSON Structure:
 ```json
 {
   "host": "aurora-mysql-cluster.cluster-xyz.us-east-1.rds.amazonaws.com",
@@ -166,13 +233,12 @@ To securely connect to Amazon Aurora MySQL (or Amazon RDS) without embedding cre
 }
 ```
 
-#### Key Resolution Reference:
 | Secret JSON Key | Permitted Aliases | Code Usage & Description |
 | :--- | :--- | :--- |
 | `host` | `HOST` | Cluster writer endpoint URL for the Aurora MySQL or RDS database instance. |
 | `port` | `PORT` | Network port for MySQL connectivity (defaults to `3306` if omitted). |
 | `username` | `user`, `USERNAME` | Database application username with DDL and DML privileges on the target reporting schema. |
-| `password` | `PASSWORD`, `pwd`, `db_password` | Database user password. If absent from the secret JSON, the job raises an explicit `ValueError`. |
+| `password` | `PASSWORD`, `pwd`, `db_password`, `rds_passwords` | Database user password. If absent, the job raises an explicit `ValueError`. |
 | `engine` | `db_type` | Database engine type (`mysql`). |
 
 > [!IMPORTANT]
@@ -180,7 +246,7 @@ To securely connect to Amazon Aurora MySQL (or Amazon RDS) without embedding cre
 
 ---
 
-## 6. Historical Data Migration & S3 Auto-Archival
+## 7. Historical Data Migration & S3 Auto-Archival
 
 When migrating historical analytics data from legacy data warehouses or vendor export dumps:
 
@@ -202,7 +268,7 @@ When migrating historical analytics data from legacy data warehouses or vendor e
 
 ---
 
-## 7. Developer Onboarding: Adding a New Gold Mart
+## 8. Developer Onboarding: Adding a New Gold Mart
 
 ### Step 1: Write Business SQL Query
 Create `gold/query/<source>/<mart_name>.sql`:
@@ -254,14 +320,14 @@ aws glue start-job-run \
   * `--SOURCE_SYSTEM`: Target business source identifier (e.g. `servicenow`, `moveworks`, `genesys`).
 * **Required for Aurora MySQL Serving:**
   * `--GOLD_SCHEMA`: Target relational schema name (e.g. `enterprise_reporting`). Zero fallback schema is permitted by enterprise policy.
-  * `--RDS_SECRET_NAME`: AWS Secrets Manager secret holding Aurora MySQL credentials (fallback: `source_systems.<source>.secret_name`).
+  * `--RDS_SECRET_NAME`: AWS Secrets Manager secret holding Aurora MySQL credentials.
 * **Optional Glue Arguments (Fallback to `gold_config.json` if omitted):**
   * `--ENV`: Target deployment environment (`dev`, `stage`, `prod`; default: `dev`).
   * `--GOLD_CONFIG_S3_PATH`: S3 path to `gold_config.json`.
   * `--TABLE_NAME`: Specific mart to process (processes all source marts if omitted).
   * `--DATA_LAKE_BUCKET` / `--GOLD_BUCKET`: Target S3 bucket for Gold Iceberg marts.
   * `--GLUE_DATABASE`: AWS Glue Data Catalog database name.
-  * `--GOLD_TARGETS`: Comma-separated list of serving engines (e.g. `aurora,athena,databricks,redshift`).
+  * `--GOLD_TARGETS`: Comma-separated list of serving engines (`athena,aurora`).
   * `--FULL_REFRESH`: Forces full re-aggregation from Silver tables (`true`/`false`).
   * `--INCREMENTAL`: Toggles incremental watermark filtering (`true`/`false`).
 
@@ -271,6 +337,6 @@ Verify Athena and Aurora:
 
 ---
 
-## 8. Developer Enhancement Reference
+## 9. Developer Enhancement Reference
 
-For information on how the Gold codebase is structured for contributors — adding marts, custom transforms, new downstream target engines, or modifying incremental behavior — see [ENHANCEMENT_GUIDE.md](ENHANCEMENT_GUIDE.md).
+For details on extending the Gold codebase — adding custom transforms, configuring incremental behavior, or inspecting method implementations — see [ENHANCEMENT_GUIDE.md](ENHANCEMENT_GUIDE.md) and [REFERENCE_INDEX.md](REFERENCE_INDEX.md).

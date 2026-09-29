@@ -8,7 +8,7 @@ This document provides the definitive configuration blueprint for `gold_config.j
 
 ```json
 {
-  "_comment": "Gold Layer Multi-Target Transformation & Serving Blueprint",
+  "_comment": "Gold Layer Transformation & Serving Blueprint",
   "pipeline_defaults": {
     "gold_bucket": "uax-datalake-gold-{env}",
     "gold_data_prefix": "gold/data",
@@ -24,7 +24,8 @@ This document provides the definitive configuration blueprint for `gold_config.j
       "updated_at_column": "_updated_at"
     },
     "default_target_engines": [
-      "athena"
+      "athena",
+      "aurora"
     ],
     "initial_load": {
       "template": "s3://{bucket}/gold/initial_exports/{source}/{table}.csv",
@@ -49,6 +50,7 @@ This document provides the definitive configuration blueprint for `gold_config.j
         "athena",
         "aurora"
       ],
+      "secret_name": "uax-datalake/aurora-credentials-{env}",
       "tables": {
         "conversations": {
           "nkey": [
@@ -70,20 +72,35 @@ This document provides the definitive configuration blueprint for `gold_config.j
           "aurora": {
             "schema": "enterprise_reporting",
             "table_name": "gold_genesys_conversations"
-          },
-          "redshift": {
-            "schema": "gold_spectrum_schema",
-            "table_name": "gold_genesys_conversations"
-          },
-          "snowflake": {
-            "database": "UAX_ANALYTICS_DB",
-            "schema": "GOLD_MARTS",
-            "table_name": "gold_genesys_conversations"
-          },
-          "databricks": {
-            "catalog": "main",
-            "schema": "gold",
-            "table_name": "gold_genesys_conversations"
+          }
+        }
+      }
+    },
+    "moveworks": {
+      "target_engines": [
+        "athena",
+        "aurora"
+      ],
+      "secret_name": "uax-datalake/aurora-credentials-{env}",
+      "tables": {
+        "interactions": {
+          "nkey": [
+            "interaction_id"
+          ],
+          "incremental": true,
+          "aurora": {
+            "schema": "enterprise_reporting",
+            "table_name": "gold_moveworks_interactions"
+          }
+        },
+        "feedbacks": {
+          "nkey": [
+            "feedback_id"
+          ],
+          "incremental": true,
+          "aurora": {
+            "schema": "enterprise_reporting",
+            "table_name": "gold_moveworks_feedbacks"
           }
         }
       }
@@ -100,7 +117,7 @@ This document provides the definitive configuration blueprint for `gold_config.j
 
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
-| `gold_bucket` | string | **Required** (Config or Glue Argument) | *Used in `GoldLayerManager.run()`*: Target S3 bucket for Gold Iceberg marts and metadata storage. |
+| `gold_bucket` | string | **Required** (Config or Glue Argument) | *Used in `GoldLayerManager.run()`*: Target S3 bucket for Gold Iceberg data files and metadata. |
 | `gold_data_prefix` | string | Optional (Default: `gold/data`) | *Used in Iceberg table location*: S3 prefix where Gold Iceberg data files are written. |
 | `target_format` | string | Optional (Default: `iceberg`) | *Used in Spark DDL generation*: Target storage format for primary marts (`iceberg`). |
 | `table_prefix` | string | Optional (Default: `gold_{source}_`) | *Used in table naming convention*: Uniform prefix prepended across all serving engines. |
@@ -109,7 +126,7 @@ This document provides the definitive configuration blueprint for `gold_config.j
 | `glue_catalog.database_name` | string | Optional | *Used in Spark catalog queries*: Glue Database name for marts (e.g., `uax_datalake_db_{env}`). |
 | `technical_columns.inserted_at_column` | string | Optional (Default: `_inserted_at`) | *Used in DataFrame enrichment*: Column name tracking record insertion timestamp. |
 | `technical_columns.updated_at_column` | string | Optional (Default: `_updated_at`) | *Used in DataFrame enrichment*: Column name tracking record modification timestamp. |
-| `default_target_engines` | array | Optional (Default: `["athena"]`) | *Used in serving router*: Fallback list of downstream engines when not specified at source/table level. |
+| `default_target_engines` | array | Optional (Default: `["athena", "aurora"]`) | *Used in serving router*: Fallback list of downstream engines when not specified at source/table level. |
 | `initial_load.template` | string | Optional | *Used in `GoldInitialLoader`*: Default S3 URI template for historical data imports (`s3://{bucket}/...`). |
 | `initial_load.format` | string | Optional (Default: `csv`) | *Used in Spark CSV reader*: Historical export file format (`csv`). |
 | `initial_load.delimiter` | string | Optional (Default: `,`) | *Used in Spark CSV reader*: Delimiter character for parsing historical files. |
@@ -130,6 +147,7 @@ This document provides the definitive configuration blueprint for `gold_config.j
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
 | `target_engines` | array | Optional | *Used in `GoldLayerManager.run()`*: List of serving targets for all tables under this source (e.g., `["athena", "aurora"]`). |
+| `secret_name` | string | Optional | *Used in `_resolve_mysql_connection_info`*: AWS Secrets Manager secret holding Aurora MySQL credentials. |
 
 ---
 
@@ -151,17 +169,16 @@ This document provides the definitive configuration blueprint for `gold_config.j
 
 ---
 
-### 2.4 Multi-Target Serving Engine Blocks
+### 2.4 Serving Engine: Amazon Aurora MySQL (`aurora`)
 
-The config keys below tell `gold_layer_manager.py` **where** to write for each downstream engine. All serving is handled by inline routing methods inside `GoldLayerManager` — see [ENHANCEMENT_GUIDE.md § 10](ENHANCEMENT_GUIDE.md#10-adding-a-new-downstream-target-engine) for how to add a new target.
+The `aurora` block configures downstream serving to Amazon Aurora MySQL:
 
-#### Amazon Aurora MySQL (`aurora`)
 | Parameter | Type | Required / Optional | Code Usage & Description |
 | :--- | :--- | :--- | :--- |
 | `schema` | string | **Required** | *Used in `_serve_to_mysql()`*: Target MySQL database/schema name (e.g., `enterprise_reporting`). Mandatory per zero-fallback policy. |
-| `table_name` | string | **Required** | *Used in `_serve_to_mysql()`*: Target physical MySQL table name (e.g., `gold_moveworks_interactions`). |
+| `table_name` | string | **Required** | *Used in `_serve_to_mysql()`*: Target physical MySQL table name (e.g., `gold_genesys_conversations`). |
 
-##### AWS Secrets Manager Credentials Contract:
+#### AWS Secrets Manager Credentials Contract:
 Credentials for Aurora MySQL are fetched via the secret referenced by `--RDS_SECRET_NAME` (or `secret_name` in config). The secret JSON payload must provide:
 
 | Secret Key | Permitted Aliases | Description |
@@ -169,30 +186,10 @@ Credentials for Aurora MySQL are fetched via the secret referenced by `--RDS_SEC
 | `host` | `HOST` | Cluster writer endpoint URL for Aurora MySQL or RDS instance. |
 | `port` | `PORT` | MySQL connection port (`3306` default). |
 | `username` | `user`, `USERNAME` | Database application username with DDL/DML privileges. |
-| `password` | `PASSWORD`, `pwd`, `db_password` | Database password (raises `ValueError` if missing). |
+| `password` | `PASSWORD`, `pwd`, `db_password`, `rds_passwords` | Database password (raises `ValueError` if missing). |
 | `engine` | `db_type` | Database engine type (`mysql`). |
 
-> **Flow:** Gold Glue job materializes the Iceberg mart first, then reads it back via `spark.table()` and writes to Aurora using a staging-swap pattern. Aurora is **downstream of Iceberg**, not a parallel write target.
-
-#### Amazon Redshift Spectrum (`redshift`)
-| Parameter | Type | Required / Optional | Code Usage & Description |
-| :--- | :--- | :--- | :--- |
-| `schema` | string | **Required** | *Used in Redshift sync routing*: Redshift external schema name referencing the Glue Data Catalog. |
-| `table_name` | string | **Required** | *Used in Redshift sync routing*: Physical external table name exposed to BI queries. |
-
-#### Snowflake (`snowflake`)
-| Parameter | Type | Required / Optional | Code Usage & Description |
-| :--- | :--- | :--- | :--- |
-| `database` | string | **Required** | *Used in Snowflake sync routing*: Target Snowflake database name. |
-| `schema` | string | **Required** | *Used in Snowflake sync routing*: Target Snowflake schema name. |
-| `table_name` | string | **Required** | *Used in Snowflake sync routing*: Snowflake external Iceberg table identifier. |
-
-#### Databricks (`databricks`)
-| Parameter | Type | Required / Optional | Code Usage & Description |
-| :--- | :--- | :--- | :--- |
-| `catalog` | string | **Required** | *Used in Databricks sync routing*: Databricks Unity Catalog name. |
-| `schema` | string | **Required** | *Used in Databricks sync routing*: Databricks schema name. |
-| `table_name` | string | **Required** | *Used in Databricks sync routing*: Unity Catalog registered table name. |
+> **Flow:** The Gold Glue job materializes the Iceberg mart first, then reads it back via `spark.table()` and writes to Aurora using a staging-swap pattern. Aurora is **downstream of Iceberg**, not a parallel write target.
 
 ---
 
@@ -225,32 +222,19 @@ When defining marts under `source_systems.<source>.tables` or passing `--TABLE_N
   ```
 
 #### 2. Automatic Prefix Deduplication Guarantee:
-* The standardized enterprise convention across all serving targets (Athena, Aurora, Redshift, Snowflake, Databricks) is **`gold_<source>_<tablename>`**.
+* The standardized enterprise convention across all serving targets is **`gold_<source>_<tablename>`**.
 * If a table key or engine override is configured as `"gold_genesys_conversations"`, the Gold engine detects the existing prefix and will **never create** duplicate prefixes like `gold_genesys_gold_genesys_conversations`.
 * `GoldConfigLoader` seamlessly resolves configuration whether the table is looked up by its clean name (`"conversations"`), full name (`"gold_genesys_conversations"`), or view name (`"v_conversations"`).
 
-#### 3. Query Resolution Rules in Gold SQL (`.sql` files & Spark SQL):
+#### 3. Cross-Layer Query Resolution Rules in Gold SQL (`.sql` files):
 When writing SQL queries for Gold marts (e.g., in `gold/query/<source>/<file>.sql`):
 
-* **Writing `gold_<source>_<tablename>` in the query**:
-  If your SQL explicitly references the full enterprise name:
-  ```sql
-  SELECT * FROM gold_moveworks_interactions
-  ```
-  The Gold engine **directly goes with it**. It recognizes `gold_moveworks_interactions` as the target table without adding another `gold_<source>_` prefix, pre-registers the view in Spark SQL, and executes the query directly.
-
-* **Writing only the Table Name in the query**:
-  If your SQL references only the bare table name or view name:
-  ```sql
-  SELECT * FROM interactions
-  -- OR
-  SELECT * FROM v_interactions
-  ```
-  The Gold engine automatically **adds the `gold_<source>_` prefix** (resolving to `gold_moveworks_interactions`), pre-loads the physical Iceberg table from the Glue Data Catalog, and creates in-session Spark temporary views for both `interactions` and `v_interactions`. The query executes seamlessly without requiring manual table prefixing or manual view registration.
-
-* **Mart Query File Discovery**:
-  Mart query files can be stored under `gold/query/<source>/` or `s3://<bucket>/gold/query/<source>/` using any convention:
-  * `interactions.sql`
-  * `v_interactions.sql`
-  * `gold_moveworks_interactions.sql`
-  The engine automatically normalizes the file base name, discovers the query, and binds it to the uniform `gold_<source>_<tablename>` physical mart.
+* **Cross-Layer Pre-Registration**:
+  The Gold engine automatically scans SQL text for table tokens:
+  - `raw_tbl_*` $\to$ pre-registered as in-session temp views from Bronze.
+  - `tbl_*` $\to$ pre-registered as in-session temp views from Silver Iceberg.
+  - `gold_*` $\to$ pre-registered as in-session temp views from existing Gold Iceberg tables.
+* **Bare Table Names in Queries**:
+  If your SQL references only a bare table name or view name (e.g. `interactions` or `v_interactions`), the engine resolves it to the underlying `gold_<source>_<tablename>` physical mart and registers the alias.
+* **Topological Ordering**:
+  If Mart B references Mart A, the DAG scheduler ensures Mart A executes and materializes into Iceberg before Mart B runs.
