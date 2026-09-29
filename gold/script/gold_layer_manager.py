@@ -620,7 +620,9 @@ class GoldLayerManager:
                     primary_keys=pks,
                     s3_location=mart_s3_dest,
                     clean_base_name=clean_base_name,
-                    params=params
+                    params=params,
+                    glue_client=glue_client,
+                    s3_client=s3_client
                 )
 
                 # Cache authoritative DataFrame and register single uniform physical table in session
@@ -1181,6 +1183,41 @@ class GoldLayerManager:
         return False
 
     @classmethod
+    def _purge_s3_prefix(cls, s3_client, s3_uri: str) -> int:
+        """
+        Safely deletes orphaned or corrupted metadata/data files under an S3 URI when an Iceberg table is corrupt.
+        Requires at least 3 path segments to avoid deleting shallow prefixes.
+        """
+        if not s3_client or not s3_uri or not s3_uri.startswith("s3://"):
+            return 0
+        try:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(s3_uri)
+            bucket = parsed.netloc
+            prefix = parsed.path.lstrip('/')
+            if not prefix.endswith('/'):
+                prefix += '/'
+            parts = [p for p in prefix.strip('/').split('/') if p]
+            if len(parts) < 3:
+                logger.warning(f"Refusing to purge suspiciously shallow S3 prefix: '{prefix}'")
+                return 0
+
+            paginator = s3_client.get_paginator('list_objects_v2')
+            total_deleted = 0
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                objects = page.get('Contents', [])
+                if objects:
+                    delete_keys = [{'Key': obj['Key']} for obj in objects]
+                    s3_client.delete_objects(Bucket=bucket, Delete={'Objects': delete_keys})
+                    total_deleted += len(delete_keys)
+            if total_deleted > 0:
+                logger.info(f"Purged {total_deleted} corrupted/orphaned S3 object(s) under '{s3_uri}'.")
+            return total_deleted
+        except Exception as e:
+            logger.warning(f"Could not purge S3 prefix '{s3_uri}': {e}")
+            return 0
+
+    @classmethod
     def _check_and_run_initial_load(
         cls,
         spark: SparkSession,
@@ -1372,37 +1409,105 @@ class GoldLayerManager:
         primary_keys: List[str],
         s3_location: str,
         clean_base_name: str,
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        glue_client: Optional[Any] = None,
+        s3_client: Optional[Any] = None
     ) -> int:
         """
         Step 1: Materializes/Upserts the physical Iceberg table in AWS Athena / Glue Data Catalog.
         Ensures idempotent loads via Spark SQL MERGE INTO when primary key exists.
+        Guarantees automatic recovery from ghost tables (catalog entries pointing to missing S3 metadata).
         """
+        if glue_client is None:
+            try:
+                import boto3
+                glue_client = boto3.client('glue')
+            except Exception:
+                pass
+        if s3_client is None:
+            try:
+                import boto3
+                s3_client = boto3.client('s3')
+            except Exception:
+                pass
+
         full_table = f"`{glue_database}`.`{target_table_name}`"
         if primary_keys:
             df_mart = cls._deduplicate_by_nkey(df_mart, primary_keys)
         row_count = df_mart.count()
+
         # Dual-check table existence and metadata health
         table_exists = False
-        try:
-            spark.sql(f"DESCRIBE TABLE {full_table}")
-            # Verify Iceberg metadata is intact and table is readable
-            spark.table(f"{glue_database}.{target_table_name}").limit(1).collect()
-            table_exists = True
-        except Exception as table_err:
-            err_msg = str(table_err).lower()
-            if any(k in err_msg for k in ("iceberg", "nosuchkey", "metadata", "not found", "cannot find", "404")):
+        table_found_in_glue = False
+
+        if glue_client:
+            try:
+                resp = glue_client.get_table(DatabaseName=glue_database, Name=target_table_name)
+                tbl_info = resp.get('Table', {})
+                table_found_in_glue = True
+                tbl_params = tbl_info.get('Parameters', {})
+                table_type = tbl_params.get('table_type', '').upper()
+                glue_metadata_location = tbl_params.get('metadata_location')
+
+                # Check if it is a non-Iceberg table or missing metadata_location
+                if table_type != 'ICEBERG' or not glue_metadata_location:
+                    logger.warning(
+                        f"[NON-ICEBERG/CORRUPT CATALOG TABLE] Table `{glue_database}`.`{target_table_name}` in Glue Catalog "
+                        f"has table_type='{table_type}', metadata_location={glue_metadata_location}. "
+                        f"Dropping stale Glue Catalog registration so Iceberg can recreate it cleanly..."
+                    )
+                    try:
+                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                        logger.info(f"Successfully dropped stale catalog table `{glue_database}`.`{target_table_name}`.")
+                    except Exception as del_err:
+                        logger.warning(f"Could not delete stale table from Glue Catalog: {del_err}")
+                    table_found_in_glue = False
+
+                # Verify whether the S3 metadata_location file actually exists
+                elif glue_metadata_location and s3_client and glue_metadata_location.startswith('s3://'):
+                    import urllib.parse
+                    parsed = urllib.parse.urlparse(glue_metadata_location)
+                    b = parsed.netloc
+                    k = parsed.path.lstrip('/')
+                    try:
+                        s3_client.head_object(Bucket=b, Key=k)
+                    except Exception as ce:
+                        logger.warning(
+                            f"[GHOST TABLE DETECTED] Glue Catalog table `{glue_database}`.`{target_table_name}` points to "
+                            f"non-existent S3 metadata '{glue_metadata_location}' (404 NoSuchKey). "
+                            f"Dropping stale Glue Catalog entry and purging S3 path to allow clean recreation..."
+                        )
+                        try:
+                            glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                            logger.info(f"Successfully dropped ghost table `{glue_database}`.`{target_table_name}` from Glue Catalog.")
+                        except Exception as del_err:
+                            logger.warning(f"Failed to delete ghost table from Glue: {del_err}")
+                        cls._purge_s3_prefix(s3_client, s3_location)
+                        table_found_in_glue = False
+            except Exception:
+                table_found_in_glue = False
+
+        if table_found_in_glue:
+            try:
+                spark.sql(f"DESCRIBE TABLE {full_table}")
+                spark.table(f"{glue_database}.{target_table_name}").limit(1).collect()
+                table_exists = True
+            except Exception as probe_err:
+                err_msg = str(probe_err).lower()
                 logger.warning(
-                    f"[ATHENA/ICEBERG RECOVERY] Table '{full_table}' has corrupted or missing Iceberg metadata: {table_err}. "
-                    f"Dropping broken table reference to re-initialize cleanly and fix ICEBERG_MISSING_METADATA..."
+                    f"[ATHENA/ICEBERG RECOVERY] Spark probe for Iceberg table '{full_table}' failed ({probe_err}). "
+                    f"Deleting stale catalog table via Glue API and purging S3 path to allow clean recreation..."
                 )
-                try:
-                    spark.sql(f"DROP TABLE IF EXISTS {full_table}")
-                except Exception as drop_err:
-                    logger.warning(f"Could not drop broken table {full_table}: {drop_err}")
+                if glue_client:
+                    try:
+                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                        logger.info(f"Successfully dropped stale table `{glue_database}`.`{target_table_name}` via Glue API.")
+                    except Exception as del_err:
+                        logger.warning(f"Could not drop table from Glue Catalog: {del_err}")
+                cls._purge_s3_prefix(s3_client, s3_location)
                 table_exists = False
-            else:
-                table_exists = False
+        else:
+            table_exists = False
 
         if table_exists:
             # 1. Dynamically evolve Iceberg schema if new columns are present
@@ -1440,17 +1545,45 @@ class GoldLayerManager:
                 try:
                     spark.sql(merge_sql)
                 except Exception as merge_err:
-                    logger.warning(
-                        f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). "
-                        f"Falling back to Iceberg insertInto on '{full_table}'..."
-                    )
-                    try:
-                        df_mart.write.format("iceberg").mode("append").insertInto(f"{glue_database}.{target_table_name}")
-                    except Exception as ice_fallback_err:
-                        logger.error(f"[ATHENA/ICEBERG UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
-                        raise
+                    err_m_str = str(merge_err)
+                    if any(x in err_m_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
+                        logger.warning(
+                            f"[ATHENA/ICEBERG MERGE RECOVERY] Iceberg MERGE hit NoSuchKey ({merge_err}). "
+                            f"Metadata is missing in S3. Dropping Glue Catalog table and re-initializing cleanly..."
+                        )
+                        if glue_client:
+                            try:
+                                glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                            except Exception:
+                                pass
+                        cls._purge_s3_prefix(s3_client, s3_location)
+                        df_mart.write \
+                            .format("iceberg") \
+                            .mode("overwrite") \
+                            .option("path", s3_location) \
+                            .saveAsTable(f"{glue_database}.{target_table_name}")
+                    else:
+                        logger.warning(
+                            f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). "
+                            f"Falling back to Iceberg insertInto on '{full_table}'..."
+                        )
+                        try:
+                            df_mart.write.format("iceberg").mode("append").insertInto(f"{glue_database}.{target_table_name}")
+                        except Exception as ice_fallback_err:
+                            logger.error(f"[ATHENA/ICEBERG UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
+                            raise
         else:
             logger.info(f"[ATHENA/ICEBERG WRITE] Initializing clean Gold Iceberg table {full_table} at '{s3_location}'...")
+            # If the table still exists in Glue Catalog as a ghost/broken table, delete it via Glue API first!
+            if glue_client:
+                try:
+                    glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                    logger.info(f"[CLEANUP] Deleted preexisting Glue Catalog registration for '{target_table_name}' before recreation.")
+                except Exception:
+                    pass
+            # Also purge any corrupted/broken metadata files in s3_location to prevent NoSuchKeyException on version-hint.text
+            cls._purge_s3_prefix(s3_client, f"{s3_location.rstrip('/')}/metadata")
+
             try:
                 df_mart.write \
                     .format("iceberg") \
@@ -1458,8 +1591,25 @@ class GoldLayerManager:
                     .option("path", s3_location) \
                     .saveAsTable(f"{glue_database}.{target_table_name}")
             except Exception as ice_err:
-                logger.warning(f"[ATHENA/ICEBERG WRITE] Direct Iceberg saveAsTable exception: {ice_err}")
-                df_mart.write.format("iceberg").mode("overwrite").saveAsTable(f"{glue_database}.{target_table_name}")
+                err_text = str(ice_err)
+                if any(x in err_text for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
+                    logger.warning(
+                        f"[ATHENA/ICEBERG WRITE RETRY] Iceberg saveAsTable hit NoSuchKey ({ice_err}). "
+                        f"Purging Glue Catalog entry and entire S3 table location '{s3_location}' then retrying fresh creation..."
+                    )
+                    if glue_client:
+                        try:
+                            glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                        except Exception:
+                            pass
+                    cls._purge_s3_prefix(s3_client, s3_location)
+                    df_mart.write \
+                        .format("iceberg") \
+                        .mode("overwrite") \
+                        .option("path", s3_location) \
+                        .saveAsTable(f"{glue_database}.{target_table_name}")
+                else:
+                    raise
 
         total_count = row_count
         try:

@@ -833,6 +833,46 @@ class TestDynamicEnvInterpolationAcrossAllLayers(unittest.TestCase):
                 mock_mat.assert_called_once()
                 self.assertEqual(mock_mat.call_args[1]["glue_database"], "uax_datalake_db_qa")
 
+    def test_materialize_athena_table_recovers_from_ghost_table_nosuchkey(self):
+        """_materialize_athena_table deletes ghost table from Glue catalog when S3 metadata does not exist."""
+        mock_spark = MagicMock()
+        mock_df = MagicMock()
+        mock_df.count.return_value = 50
+        mock_df.columns = ["interaction_id"]
+
+        mock_glue = MagicMock()
+        mock_glue.get_table.return_value = {
+            "Table": {
+                "Parameters": {
+                    "table_type": "ICEBERG",
+                    "metadata_location": "s3://test-bucket/gold/data/moveworks/interactions/metadata/missing.metadata.json"
+                }
+            }
+        }
+        mock_s3 = MagicMock()
+        mock_s3.head_object.side_effect = Exception("NoSuchKey: The specified key does not exist.")
+
+        GoldLayerManager._materialize_athena_table(
+            spark=mock_spark,
+            df_mart=mock_df,
+            glue_database="uax_datalake_db_dev",
+            target_table_name="gold_moveworks_interactions",
+            primary_keys=[],
+            s3_location="s3://test-bucket/gold/data/moveworks/interactions",
+            clean_base_name="interactions",
+            params={},
+            glue_client=mock_glue,
+            s3_client=mock_s3
+        )
+
+        # Assert ghost table was deleted from Glue Catalog
+        mock_glue.delete_table.assert_called_with(
+            DatabaseName="uax_datalake_db_dev",
+            Name="gold_moveworks_interactions"
+        )
+        # Assert clean write was attempted
+        mock_df.write.format.assert_called_with("iceberg")
+
     def test_gold_initial_load_resolves_env_dynamically(self):
         mock_spark = MagicMock()
         mock_raw_df = MagicMock()
