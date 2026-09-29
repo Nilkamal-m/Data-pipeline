@@ -2891,8 +2891,57 @@ class TestTimestampStandardizationAllColumns(unittest.TestCase):
         self.assertEqual(standardized["state"], "In Progress")
         self.assertEqual(standardized["id"], "1001")
 
+    def test_bronze_resolve_table_names_production(self):
+        from uax_bronze_load import resolve_table_names
+        mock_source_config = {
+            "tables": {
+                "incident": {},
+                "plugin-calls": {},
+                "chat_sessions": {}
+            }
+        }
+        # 1. Direct standard table
+        api_name, lake_name = resolve_table_names("incident", "raw_tbl_", mock_source_config)
+        self.assertEqual(api_name, "incident")
+        self.assertEqual(lake_name, "incident")
+
+        # 2. Prefixed raw_tbl_ table
+        api_name, lake_name = resolve_table_names("raw_tbl_incident", "raw_tbl_", mock_source_config)
+        self.assertEqual(api_name, "incident")
+        self.assertEqual(lake_name, "incident")
+
+        # 3. Table with hyphen entity name (API uses hyphens, lake uses underscores)
+        api_name, lake_name = resolve_table_names("raw_tbl_plugin_calls", "raw_tbl_", mock_source_config)
+        self.assertEqual(api_name, "plugin-calls")
+        self.assertEqual(lake_name, "plugin_calls")
+
+        # 4. Table passed directly with hyphens
+        api_name, lake_name = resolve_table_names("plugin-calls", "raw_tbl_", mock_source_config)
+        self.assertEqual(api_name, "plugin-calls")
+        self.assertEqual(lake_name, "plugin_calls")
+
+    def test_bronze_get_secret_production_behavior(self):
+        from uax_bronze_load import get_secret
+        # 1. No secret configured returns empty dict (no fake dummy strings)
+        self.assertEqual(get_secret(None), {})
+        self.assertEqual(get_secret(""), {})
+        self.assertEqual(get_secret("   "), {})
+
+        # 2. Secret configured fetches from Secrets Manager
+        with patch('boto3.client') as mock_boto:
+            mock_sm = MagicMock()
+            mock_sm.get_secret_value.return_value = {
+                'SecretString': json.dumps({'client_id': 'prod_client_123', 'client_secret': 'prod_secret_abc'})
+            }
+            mock_boto.return_value = mock_sm
+            sec = get_secret("prod/uax/moveworks")
+            self.assertEqual(sec.get('client_id'), 'prod_client_123')
+            self.assertEqual(sec.get('client_secret'), 'prod_secret_abc')
+            self.assertNotIn("YOUR_MOVEWORKS_CLIENT_ID_HERE", sec.values())
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

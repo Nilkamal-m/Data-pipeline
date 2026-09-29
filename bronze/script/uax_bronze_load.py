@@ -135,41 +135,32 @@ s3_client = boto3.client('s3')
 glue_client = boto3.client('glue')
 
 
-def get_secret(secret_name: str) -> dict:
+def get_secret(secret_name: Optional[str]) -> dict:
     """
     Fetches API credential secret payload from AWS Secrets Manager.
-    Returns dictionary with optional manual hardcoded fallbacks using .get('key', 'default_val').
+    Returns parsed dictionary from secret string, or empty dict if secret_name is not configured.
     """
-    sec_payload: dict = {}
-    if secret_name and secret_name.strip():
-        logger.info(f"Fetching secret payload for '{secret_name}' from AWS Secrets Manager...")
-        try:
-            resp = boto3.client('secretsmanager').get_secret_value(SecretId=secret_name.strip())
-            secret_str = resp.get('SecretString')
-            if secret_str:
-                sec_payload = json.loads(secret_str)
-                logger.info(f"Loaded secret '{secret_name}' from Secrets Manager ({len(sec_payload)} keys).")
-        except ClientError as err:
-            logger.warning(f"Could not fetch secret '{secret_name}' ({err}). Proceeding with manual fallbacks.")
+    if not secret_name or not str(secret_name).strip():
+        logger.info("No Secrets Manager secret configured. Proceeding without external credentials.")
+        return {}
 
-    def _val(key: str, default: str) -> str:
-        v = sec_payload.get(key)
-        if v and str(v).strip() and not str(v).startswith("CHANGE_ME") and not str(v).startswith("YOUR_"):
-            return str(v).strip()
-        return default
-
-    return {
-        **sec_payload,
-        "auth_type": _val('auth_type', "oauth2"),
-        "grant_type": _val('grant_type', "client_credentials"),
-        "client_id": _val('client_id', "YOUR_MOVEWORKS_CLIENT_ID_HERE"),
-        "client_secret": _val('client_secret', "YOUR_MOVEWORKS_CLIENT_SECRET_HERE"),
-        "token_url": _val('token_url', "https://api.moveworks.ai/oauth/v1/token"),
-        "assistant_name": _val('assistant_name', 'acmecorp-conversations-rest-api'),
-        "scope": _val('scope', 'export:read'),
-        "username": _val('username', ''),
-        "password": _val('password', '')
-    }
+    clean_name = str(secret_name).strip()
+    logger.info(f"Fetching secret payload for '{clean_name}' from AWS Secrets Manager...")
+    try:
+        sm_client = boto3.client('secretsmanager')
+        resp = sm_client.get_secret_value(SecretId=clean_name)
+        secret_str = resp.get('SecretString')
+        if secret_str:
+            sec_payload = json.loads(secret_str)
+            logger.info(f"Loaded secret '{clean_name}' from Secrets Manager ({len(sec_payload)} keys).")
+            return sec_payload
+        return {}
+    except ClientError as err:
+        logger.error(f"Failed to fetch secret '{clean_name}' from AWS Secrets Manager: {err}")
+        raise
+    except Exception as err:
+        logger.error(f"Unexpected error retrieving secret '{clean_name}': {err}")
+        raise
 
 
 def parse_arguments() -> dict:
@@ -244,17 +235,14 @@ def parse_arguments() -> dict:
     # STRICT 3-TIER PARAMETER PRECEDENCE (CLI > Config > Code Default)
     # -------------------------------------------------------------
 
-    # Table list: CLI > Config tables > Config default_tables > Config legacy table_initial_load_dates > error
+    # Table list: CLI > Config tables
     cli_tables = get_cli_arg('SOURCE_TABLE_NAME')
     if cli_tables:
         table_list = [t.strip() for t in cli_tables.split(',') if t.strip()]
-    elif source_config.get('tables'):
-        table_list = list(source_config['tables'].keys())
-    elif source_config.get('default_tables'):
-        table_list = list(source_config['default_tables'])
-    elif source_config.get('table_initial_load_dates'):
-        table_list = list(source_config['table_initial_load_dates'].keys())
     else:
+        table_list = ConfigLoader.get_source_tables(source_system_clean, source_config)
+
+    if not table_list:
         raise ValueError(
             f"No tables configured for source '{source_system_clean}' in bronze_config.json "
             f"and was not provided via --SOURCE_TABLE_NAME."
@@ -643,6 +631,55 @@ def emit_cloudwatch_metrics(
         cw_client.put_metric_data(Namespace=namespace, MetricData=metric_data)
     except Exception as err:
         logger.warning(f"Failed to emit CloudWatch metrics: {err}")
+
+
+def resolve_table_names(
+    raw_table_name: str,
+    table_prefix: str,
+    source_config: Dict[str, Any]
+) -> tuple:
+    """
+    Resolves the exact API entity name and the sanitized lake table name.
+    Strips table prefixes (such as raw_tbl_), checks against configured table keys (including hyphen/underscore
+    variants), and outputs:
+      - api_table_name: Exact entity name used for API endpoints (e.g. 'plugin-calls')
+      - clean_table_name: Sanitized table name for S3, Glue Catalog, and downstream lake queries (e.g. 'plugin_calls')
+    """
+    clean_name = raw_table_name.strip()
+    for p in (table_prefix, "raw_tbl_"):
+        if p:
+            while clean_name.startswith(p):
+                clean_name = clean_name[len(p):]
+
+    configured_tables = []
+    if isinstance(source_config.get("tables"), dict):
+        configured_tables.extend(source_config["tables"].keys())
+    if isinstance(source_config.get("default_tables"), list):
+        configured_tables.extend(source_config["default_tables"])
+    for extra_k in ("table_initial_load_dates", "custom_table_endpoints", "table_query_overrides"):
+        extra_m = source_config.get(extra_k, {})
+        if isinstance(extra_m, dict):
+            configured_tables.extend(extra_m.keys())
+
+    clean_cfg_map = {}
+    for ct in configured_tables:
+        ct_stripped = ct.strip()
+        for p in (table_prefix, "raw_tbl_"):
+            if p and ct_stripped.startswith(p):
+                ct_stripped = ct_stripped[len(p):]
+        clean_cfg_map[ct_stripped] = ct_stripped
+        clean_cfg_map[ct_stripped.replace('_', '-')] = ct_stripped
+        clean_cfg_map[ct_stripped.replace('-', '_')] = ct_stripped
+
+    if clean_name.replace('_', '-') in clean_cfg_map:
+        api_table_name = clean_cfg_map[clean_name.replace('_', '-')]
+    elif clean_name in clean_cfg_map:
+        api_table_name = clean_cfg_map[clean_name]
+    else:
+        api_table_name = clean_name
+
+    clean_table_name = api_table_name.replace('-', '_')
+    return api_table_name, clean_table_name
 
 
 def get_table_state_key(source_system: str, table_name: str) -> str:
@@ -1348,43 +1385,7 @@ def main():
 
     # Loop through each requested table dynamically
     for table_idx, raw_table_name in enumerate(table_list, start=1):
-        raw_clean = raw_table_name.strip()
-        for p in (glue_table_prefix, "raw_tbl_"):
-            if p:
-                while raw_clean.startswith(p):
-                    raw_clean = raw_clean[len(p):]
-
-        configured_tables = list(source_config.get("default_tables", []))
-        if isinstance(source_config.get("tables"), dict):
-            configured_tables.extend(source_config["tables"].keys())
-        for extra_k in ("table_initial_load_dates", "custom_table_endpoints", "table_query_overrides"):
-            extra_m = source_config.get(extra_k, {})
-            if isinstance(extra_m, dict):
-                configured_tables.extend(extra_m.keys())
-
-        # Determine API Table Name (exact entity name with hyphens for API endpoint calls)
-        api_table_name = raw_clean
-        clean_cfg_map = {}
-        for ct in configured_tables:
-            ct_stripped = ct.strip()
-            for p in (glue_table_prefix, "raw_tbl_"):
-                if p and ct_stripped.startswith(p):
-                    ct_stripped = ct_stripped[len(p):]
-            clean_cfg_map[ct_stripped] = ct
-            clean_cfg_map[ct_stripped.replace('_', '-')] = ct
-
-        if raw_clean.replace('_', '-') in clean_cfg_map:
-            matched_key = clean_cfg_map[raw_clean.replace('_', '-')]
-            matched_key_clean = matched_key
-            for p in (glue_table_prefix, "raw_tbl_"):
-                if p and matched_key_clean.startswith(p):
-                    matched_key_clean = matched_key_clean[len(p):]
-            api_table_name = matched_key_clean
-        elif raw_clean not in configured_tables and raw_clean.replace('_', '-') in configured_tables:
-            api_table_name = raw_clean.replace('_', '-')
-
-        # Determine Clean Lake Table Name (sanitizes hyphens to underscores for S3, Glue Catalog, Iceberg, and MySQL)
-        clean_table_name = api_table_name.replace('-', '_')
+        api_table_name, clean_table_name = resolve_table_names(raw_table_name, glue_table_prefix, source_config)
 
         table_start_time = datetime.now(timezone.utc)
         state_key = get_table_state_key(source_system, clean_table_name)

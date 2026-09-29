@@ -116,22 +116,16 @@ class ConfigLoader:
                 except Exception as err:
                     logger.warning(f"Failed to load config from S3 path '{target_s3_path}': {err}. Falling back to local config search.")
 
-        # 4. Search exhaustive local paths
+        # 4. Search canonical local paths
         if raw_config is None:
             current_dir = os.path.dirname(os.path.abspath(__file__))
             cwd = os.getcwd()
             possible_paths = [
                 os.path.join(current_dir, "config", "bronze_config.json"),
+                os.path.join(cwd, "bronze", "script", "config", "bronze_config.json"),
+                os.path.join(cwd, "config", "bronze_config.json"),
                 os.path.join(current_dir, "bronze_config.json"),
                 os.path.join(cwd, "bronze_config.json"),
-                os.path.join(cwd, "config", "bronze_config.json"),
-                os.path.join(cwd, "bronze", "script", "config", "bronze_config.json"),
-                os.path.join("/tmp", "bronze_config.json"),
-                os.path.join("/tmp", "config", "bronze_config.json"),
-                "bronze/script/config/bronze_config.json",
-                "glue_jobs/bronze/config/bronze_config.json",
-                "config/bronze_config.json",
-                "bronze_config.json"
             ]
 
             for path in possible_paths:
