@@ -70,11 +70,13 @@ except Exception:
 
 # Terminal status codes for AWS Glue Job Runs
 TERMINAL_STATES = {'SUCCEEDED', 'FAILED', 'STOPPED', 'TIMEOUT'}
+WORKFLOW_TERMINAL_STATES = {'COMPLETED', 'STOPPED', 'ERROR'}
 
 DEFAULT_BRONZE_JOB = os.environ.get('DEFAULT_BRONZE_JOB', 'uax-datalake-bronze-ingestion-dev')
 DEFAULT_SILVER_JOB = os.environ.get('DEFAULT_SILVER_JOB', 'uax-datalake-silver-etl-dev')
 DEFAULT_GOLD_JOB = os.environ.get('DEFAULT_GOLD_JOB', DEFAULT_SILVER_JOB)
 DEFAULT_CRAWLER_NAME = os.environ.get('DEFAULT_CRAWLER_NAME', 'uax-datalake-bronze-crawler-dev')
+DEFAULT_WORKFLOW_NAME = os.environ.get('DEFAULT_WORKFLOW_NAME', os.environ.get('GLUE_WORKFLOW_NAME', ''))
 
 DEFAULT_ATHENA_DATABASE = os.environ.get('DEFAULT_ATHENA_DATABASE', 'uax_datalake_db_dev')
 DEFAULT_ATHENA_WORKGROUP = os.environ.get('DEFAULT_ATHENA_WORKGROUP', 'uax-datalake-workgroup-dev')
@@ -581,6 +583,162 @@ def trigger_and_monitor_crawler(event: Dict[str, Any], context: Any) -> Dict[str
     }
 
     status_code = 200 if is_success else 500
+    return {
+        'statusCode': status_code,
+        'body': json.dumps(response_payload, default=str)
+    }
+
+
+def is_workflow_event(event: Dict[str, Any]) -> bool:
+    """
+    Detects if the incoming Lambda payload is intended for AWS Glue Workflow execution.
+    Recognizes:
+      - 'action': 'workflow', 'glue_workflow', 'start_workflow', 'trigger_workflow', 'run_workflow'
+      - 'layer': 'workflow', 'glue_workflow', 'workflows'
+      - Presence of 'workflow_name', 'WORKFLOW_NAME', 'glue_workflow_name'
+    Excludes multi-stage pipelines (e.g. layers: [...] or layer='all').
+    """
+    if isinstance(event.get('layers'), list):
+        return False
+    layer = str(event.get('layer', '')).strip().lower()
+    if layer in ('all', 'pipeline', 'e2e', 'full'):
+        return False
+    action = str(event.get('action', '')).strip().lower()
+    if action in ('run_all', 'pipeline', 'e2e', 'all'):
+        return False
+
+    if action in ('workflow', 'glue_workflow', 'start_workflow', 'trigger_workflow', 'run_workflow'):
+        return True
+    if layer in ('workflow', 'glue_workflow', 'workflows'):
+        return True
+    if event.get('workflow_name') or event.get('WORKFLOW_NAME') or event.get('glue_workflow_name'):
+        if layer not in ('bronze', 'silver', 'gold', 'athena', 'crawler'):
+            return True
+        if action in ('workflow', 'glue_workflow', 'start_workflow', 'trigger_workflow', 'run_workflow'):
+            return True
+    return False
+
+
+def resolve_workflow_name(event: Dict[str, Any]) -> str:
+    """
+    Resolves the AWS Glue Workflow name from event payload or environment fallback.
+    """
+    wf_name = (
+        event.get('workflow_name')
+        or event.get('WORKFLOW_NAME')
+        or event.get('glue_workflow_name')
+        or event.get('name')
+    )
+    if wf_name and str(wf_name).strip():
+        return str(wf_name).strip()
+
+    source_system = event.get('source_system') or event.get('SOURCE_SYSTEM')
+    env = event.get('env') or event.get('ENV') or os.environ.get('ENVIRONMENT', 'dev')
+
+    if source_system:
+        return f"uax-datalake-{source_system}-workflow-{env}"
+    if DEFAULT_WORKFLOW_NAME:
+        return DEFAULT_WORKFLOW_NAME
+    return f"uax-datalake-pipeline-workflow-{env}"
+
+
+def poll_glue_workflow_run(workflow_name: str, run_id: str, poll_interval: int = 10, timeout_seconds: int = 900) -> Dict[str, Any]:
+    """
+    Synchronously polls AWS Glue Workflow run status until it reaches a terminal state (COMPLETED, STOPPED, ERROR)
+    or timeout is reached.
+    """
+    logger.info(f"Polling Glue Workflow '{workflow_name}' (RunID: {run_id}) every {poll_interval}s (timeout: {timeout_seconds}s)...")
+    start_time = time.time()
+
+    while True:
+        elapsed = int(time.time() - start_time)
+        if elapsed > timeout_seconds:
+            raise TimeoutError(
+                f"Glue Workflow '{workflow_name}' run '{run_id}' exceeded timeout limit of {timeout_seconds}s. "
+                f"Workflow is still running in AWS Glue."
+            )
+
+        response = glue_client.get_workflow_run(Name=workflow_name, RunId=run_id, IncludeGraph=False)
+        run_obj = response.get('Run', {})
+        status = run_obj.get('Status', 'UNKNOWN')
+        error_msg = run_obj.get('ErrorMessage')
+        stats = run_obj.get('Statistics', {})
+
+        logger.info(f"[{elapsed}s] Workflow '{workflow_name}' status: {status} | Stats: {json.dumps(stats)}")
+
+        if status in WORKFLOW_TERMINAL_STATES:
+            return {
+                'Status': status,
+                'ExecutionTimeSeconds': elapsed,
+                'ErrorMessage': error_msg,
+                'Statistics': stats,
+                'StartedOn': str(run_obj.get('StartedOn', '')),
+                'CompletedOn': str(run_obj.get('CompletedOn', ''))
+            }
+
+        time.sleep(poll_interval)
+
+
+def trigger_and_monitor_workflow(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Triggers an AWS Glue Workflow and optionally monitors it until completion.
+    Supports asynchronous trigger (202 Accepted) or synchronous polling with detailed run metrics.
+    """
+    workflow_name = resolve_workflow_name(event)
+    logger.info(f"Starting AWS Glue Workflow: '{workflow_name}'")
+
+    run_kwargs: Dict[str, Any] = {'Name': workflow_name}
+    run_props = event.get('run_properties') or event.get('RunProperties') or event.get('workflow_run_properties')
+    if run_props and isinstance(run_props, dict):
+        run_kwargs['RunProperties'] = {k: str(v) for k, v in run_props.items()}
+
+    run_response = glue_client.start_workflow_run(**run_kwargs)
+    run_id = run_response.get('RunId')
+    logger.info(f"Successfully triggered Glue Workflow '{workflow_name}' with RunId: {run_id}")
+
+    wait_until_completion = event.get('wait_until_completion', True)
+    if isinstance(wait_until_completion, str):
+        wait_until_completion = wait_until_completion.strip().lower() in ('true', '1', 'yes')
+
+    poll_interval = int(event.get('poll_interval_seconds', 10))
+    timeout_seconds = int(event.get('timeout_seconds', 900))
+
+    if not wait_until_completion:
+        logger.info("Asynchronous mode selected for Glue Workflow. Returning 202 Accepted.")
+        return {
+            'statusCode': 202,
+            'body': json.dumps({
+                'message': f"Glue Workflow '{workflow_name}' started asynchronously.",
+                'workflow_name': workflow_name,
+                'workflow_run_id': run_id,
+                'status': 'RUNNING',
+                'run_properties': run_kwargs.get('RunProperties', {})
+            })
+        }
+
+    # Synchronous polling loop
+    wf_res = poll_glue_workflow_run(
+        workflow_name=workflow_name,
+        run_id=run_id,
+        poll_interval=poll_interval,
+        timeout_seconds=timeout_seconds
+    )
+
+    status = wf_res.get('Status')
+    is_success = (status == 'COMPLETED')
+    status_code = 200 if is_success else 500
+
+    response_payload = {
+        'workflow_name': workflow_name,
+        'workflow_run_id': run_id,
+        'status': status,
+        'execution_time_seconds': wf_res.get('ExecutionTimeSeconds', 0),
+        'statistics': wf_res.get('Statistics', {}),
+        'started_on': wf_res.get('StartedOn'),
+        'completed_on': wf_res.get('CompletedOn'),
+        'error_message': wf_res.get('ErrorMessage')
+    }
+
     return {
         'statusCode': status_code,
         'body': json.dumps(response_payload, default=str)
@@ -1769,6 +1927,11 @@ def lambda_handler(event: Any, context: Any) -> Dict[str, Any]:
                 'statusCode': 200,
                 'body': json.dumps(res)
             }
+
+        # Route 0.4: AWS Glue Workflow Execution
+        if is_workflow_event(event):
+            logger.info("Glue Workflow request detected in payload. Routing to trigger_and_monitor_workflow...")
+            return trigger_and_monitor_workflow(event, context)
 
         # Route 0.5: AWS Step Functions State Machine Execution
         if is_step_function_event(event):

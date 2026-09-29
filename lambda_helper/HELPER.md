@@ -22,6 +22,7 @@ The Helper Lambda function provides a unified control plane and execution interf
 | **Gold Serving Marts** | `"layer": "gold"` | Glue PySpark 4.0 | Runs source-specific SQL marts (`bucket/gold/query/<source>/v_*.sql`) and publishes to shared MySQL with atomic swap. |
 | **End-to-End Pipeline** | `"layer": "all"` or `"layers": [...]` | Multi-Stage Sequential | Sequentially executes stages (e.g. `Bronze -> Crawler -> Silver -> Gold`), failing fast if any stage fails. |
 | **Step Functions Orchestrator** | `"action": "step_function"` or `"state_machine_arn"` | AWS Step Functions | Triggers and optionally monitors full 3-stage pipeline state machine (`uax-pipeline-orchestrator-{env}`). |
+| **Glue Workflow** | `"action": "workflow"` or `"workflow_name"` | AWS Glue Workflow | Triggers and monitors multi-job DAG workflows (Bronze -> Silver -> Gold) with run properties. |
 
 ---
 
@@ -109,6 +110,33 @@ All pipeline configurations, task definitions, and Glue job arguments are encaps
 | `poll_interval_seconds` | integer | Optional | `10` | Polling interval in seconds when `wait_until_completion: true`. |
 | `timeout_seconds` | integer | Optional | `540` | Polling timeout in seconds. |
 | *(Any extra keys)* | any | Optional | Pass-through | Any optional override parameters (e.g. `source_table_name`, `env`) will be passed directly into the Step Function's input JSON. |
+
+---
+
+### 2.5 AWS Glue Workflow Parameters
+
+To trigger an AWS Glue Workflow (e.g. an end-to-end DAG orchestrating Bronze, Silver, Crawler, and Gold triggers):
+
+| Parameter | Type | Required / Optional | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `action` / `layer` | string | Optional | - | Set to `"workflow"`, `"glue_workflow"`, or `"start_workflow"`. |
+| `workflow_name` | string | **Required** | Resolved from source/env | Name of the AWS Glue Workflow (e.g. `"uax-datalake-moveworks-workflow-dev"`). |
+| `run_properties` | object | Optional | `{}` | Key-value dictionary of workflow execution properties passed to all jobs in the DAG via Glue API `start_workflow_run`. |
+| `wait_until_completion` | boolean | Optional | `true` | If `true`, polls until terminal status (`COMPLETED`, `STOPPED`, `ERROR`). If `false`, returns HTTP 202 with `RunId` immediately. |
+| `poll_interval_seconds` | integer | Optional | `10` | Polling interval in seconds when monitoring synchronously. |
+| `timeout_seconds` | integer | Optional | `900` | Maximum wait duration in seconds before Lambda timeout (Default: 15 minutes). |
+
+```json
+{
+  "action": "workflow",
+  "workflow_name": "uax-datalake-moveworks-workflow-dev",
+  "wait_until_completion": true,
+  "run_properties": {
+    "ENV": "dev",
+    "SOURCE_SYSTEM": "moveworks"
+  }
+}
+```
 
 ---
 

@@ -252,7 +252,7 @@ Used when `"type": "s3_file"` is set in config. Key behaviors:
     "batch_size": 500,
     "tables": {
       "orders": {
-        "initial_load_date": "2025-01-01 00:00:00"
+        "initial_load_date": "1900-01-01 00:00:00"
       }
     }
   }
@@ -295,7 +295,7 @@ Secret name: `uax-datalake/my-new-api-credentials-{env}`
     "fetch_mode": "latest",
     "tables": {
       "employees": {
-        "initial_load_date": "2025-01-01 00:00:00",
+        "initial_load_date": "1900-01-01 00:00:00",
         "file_path": "hr/daily/employees/",
         "fetch_mode": "latest"
       }

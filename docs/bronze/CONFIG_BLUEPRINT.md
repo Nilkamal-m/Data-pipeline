@@ -23,7 +23,7 @@ This document provides the definitive configuration blueprint for `bronze_config
     "flatten_separator": "_",
     "error_handling_mode": "CONTINUE_ON_ERROR",
     "upper_bound": "",
-    "default_initial_load_date": "2024-01-01 00:00:00",
+    "default_initial_load_date": "1900-01-01 00:00:00",
     "glue_catalog": {
       "enabled": true,
       "database_name": "uax_datalake_db_{env}",
@@ -53,7 +53,7 @@ This document provides the definitive configuration blueprint for `bronze_config
       "batch_size": 1000,
       "tables": {
         "incident": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": "",
           "query_override": "active=true^sys_updated_on>={last_load_date}",
           "encryption_columns": {
@@ -71,7 +71,7 @@ This document provides the definitive configuration blueprint for `bronze_config
       "batch_size": 100,
       "tables": {
         "conversations": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": ""
         }
       }
@@ -106,7 +106,7 @@ This document provides the definitive configuration blueprint for `bronze_config
       "fetch_size": 10000,
       "tables": {
         "orders": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": "",
           "query_override": "status = 'COMPLETED' AND updated_at >= '{last_load_date}'"
         }
@@ -123,7 +123,7 @@ This document provides the definitive configuration blueprint for `bronze_config
       "fetch_mode": "all",
       "tables": {
         "employee_feed": {
-          "initial_load_date": "2024-01-01 00:00:00",
+          "initial_load_date": "1900-01-01 00:00:00",
           "upper_bound": "",
           "file_path": "drops/employees/",
           "fetch_mode": "latest"

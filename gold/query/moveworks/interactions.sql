@@ -223,7 +223,7 @@ SELECT
 FROM tbl_interactions ui
 
 -- Join conversation domain from conversations table (active records only)
-LEFT JOIN tbl_conversations c ON ui.conversation_id = c.id
+LEFT JOIN tbl_conversations c ON ui.conversation_id = c.conversation_id
 AND c._is_current = 'Y'
 AND c._is_deleted = 'N'
 

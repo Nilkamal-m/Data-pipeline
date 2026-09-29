@@ -2527,19 +2527,26 @@ class GoldLayerManager:
                 base_cand = raw_name
                 full_gold_name = f"{prefix_g}{base_cand}"
 
-            candidates_to_try = [
-                f"{glue_database}.{full_gold_name}",
-                full_gold_name,
-                f"{glue_database}.{raw_name}",
-                raw_name,
-                f"{glue_database}.gold_{base_cand}",
-                f"{glue_database}.v_{base_cand}"
-            ]
-            if GoldConfigLoader and src:
-                tgt = GoldConfigLoader.get_target_table_name(src, base_cand, 'athena', gold_cfg)
-                if tgt and tgt not in candidates_to_try:
-                    candidates_to_try.insert(0, f"{glue_database}.{tgt}")
-                    candidates_to_try.insert(1, tgt)
+            if raw_name.startswith(("tbl_", "raw_tbl_", "silver_")):
+                candidates_to_try = [
+                    f"{glue_database}.{raw_name}",
+                    raw_name
+                ]
+                full_gold_name = raw_name
+            else:
+                candidates_to_try = [
+                    f"{glue_database}.{full_gold_name}",
+                    full_gold_name,
+                    f"{glue_database}.{raw_name}",
+                    raw_name,
+                    f"{glue_database}.gold_{base_cand}",
+                    f"{glue_database}.v_{base_cand}"
+                ]
+                if GoldConfigLoader and src:
+                    tgt = GoldConfigLoader.get_target_table_name(src, base_cand, 'athena', gold_cfg)
+                    if tgt and tgt not in candidates_to_try:
+                        candidates_to_try.insert(0, f"{glue_database}.{tgt}")
+                        candidates_to_try.insert(1, tgt)
 
             for full_cand in list(dict.fromkeys(candidates_to_try)):
                 try:

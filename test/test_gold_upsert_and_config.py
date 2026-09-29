@@ -897,7 +897,7 @@ class TestGoldMartDependencyAndOmittedColumns(unittest.TestCase):
             ui.conversation_id AS conversation_id,
             c.primary_domain AS conversation_domain
         FROM tbl_interactions ui
-        LEFT JOIN tbl_conversations c ON ui.conversation_id = c.id
+        LEFT JOIN tbl_conversations c ON ui.conversation_id = c.conversation_id
         """
 
         conversations_sql = """
@@ -1234,9 +1234,73 @@ class TestGoldInitialLoadIntegration(unittest.TestCase):
         self.assertIn("--GOLD_CONFIG_S3_PATH", args)
         self.assertTrue(args["--GOLD_CONFIG_S3_PATH"].endswith("gold/script/config/gold_config.json"))
 
+    def test_lambda_glue_workflow_detection_and_resolution(self):
+        """Lambda helper accurately detects workflow events and resolves workflow names."""
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda_helper"))
+        from lambda_function import is_workflow_event, resolve_workflow_name
+
+        self.assertTrue(is_workflow_event({"action": "workflow", "workflow_name": "wf-test"}))
+        self.assertTrue(is_workflow_event({"action": "start_workflow"}))
+        self.assertTrue(is_workflow_event({"layer": "workflow"}))
+        self.assertTrue(is_workflow_event({"workflow_name": "uax-datalake-moveworks-workflow-dev"}))
+
+        # Regular layer events without workflow action are not workflow events
+        self.assertFalse(is_workflow_event({"layer": "gold", "source_system": "moveworks"}))
+        self.assertFalse(is_workflow_event({"layer": "all", "action": "run_all"}))
+
+        # Resolution
+        name1 = resolve_workflow_name({"workflow_name": "custom-wf"})
+        self.assertEqual(name1, "custom-wf")
+
+        name2 = resolve_workflow_name({"source_system": "moveworks", "env": "prod"})
+        self.assertEqual(name2, "uax-datalake-moveworks-workflow-prod")
+
+    def test_lambda_glue_workflow_trigger_and_monitor(self):
+        """Lambda helper triggers Glue workflow and handles both async and sync execution modes."""
+        import sys
+        from unittest.mock import MagicMock, patch
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda_helper"))
+        import lambda_function
+
+        # 1. Asynchronous trigger
+        with patch.object(lambda_function.glue_client, 'start_workflow_run', return_value={'RunId': 'wr_12345'}):
+            event = {
+                "workflow_name": "test-pipeline-wf",
+                "wait_until_completion": False,
+                "run_properties": {"ENV": "dev", "SOURCE": "moveworks"}
+            }
+            res = lambda_function.trigger_and_monitor_workflow(event, None)
+            self.assertEqual(res['statusCode'], 202)
+            body = json.loads(res['body'])
+            self.assertEqual(body['workflow_run_id'], 'wr_12345')
+            self.assertEqual(body['status'], 'RUNNING')
+
+        # 2. Synchronous trigger with completion
+        with patch.object(lambda_function.glue_client, 'start_workflow_run', return_value={'RunId': 'wr_67890'}), \
+             patch.object(lambda_function.glue_client, 'get_workflow_run', return_value={
+                 'Run': {
+                     'Status': 'COMPLETED',
+                     'Statistics': {'TotalActions': 4, 'SucceededActions': 4},
+                     'StartedOn': '2026-09-29T10:00:00Z',
+                     'CompletedOn': '2026-09-29T10:05:00Z'
+                 }
+             }):
+            event = {
+                "workflow_name": "test-pipeline-wf",
+                "wait_until_completion": True,
+                "poll_interval_seconds": 0
+            }
+            res = lambda_function.trigger_and_monitor_workflow(event, None)
+            self.assertEqual(res['statusCode'], 200)
+            body = json.loads(res['body'])
+            self.assertEqual(body['status'], 'COMPLETED')
+            self.assertEqual(body['workflow_run_id'], 'wr_67890')
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

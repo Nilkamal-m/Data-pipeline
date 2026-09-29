@@ -370,7 +370,7 @@ Add the new source block under `source_systems` or append a table under an exist
     "batch_size": 500,
     "tables": {
       "audit_events": {
-        "initial_load_date": "2026-01-01 00:00:00",
+        "initial_load_date": "1900-01-01 00:00:00",
         "upper_bound": ""
       }
     }

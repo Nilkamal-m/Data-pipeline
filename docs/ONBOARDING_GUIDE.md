@@ -203,7 +203,7 @@ Follow this recipe to onboard an entity from source extraction to business servi
      "api_endpoint_template": "/v1/{table_name}",
      "tables": {
        "customers": {
-         "initial_load_date": "2024-01-01 00:00:00"
+         "initial_load_date": "1900-01-01 00:00:00"
        }
      }
    }
