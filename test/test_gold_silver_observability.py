@@ -2655,6 +2655,127 @@ class TestCleanIllegalCharsAndDefaultString(unittest.TestCase):
             self.assertIsNotNone(res)
 
 
+class TestSilverProductionHardening(unittest.TestCase):
+    """Verifies production hardening, strict config precedence, and table resolution in Silver."""
+
+    def test_normalize_base_name(self):
+        from silver_config_loader import SilverConfigLoader
+        self.assertEqual(SilverConfigLoader.normalize_base_name("raw_tbl_incident"), "incident")
+        self.assertEqual(SilverConfigLoader.normalize_base_name("tbl_incident"), "incident")
+        self.assertEqual(SilverConfigLoader.normalize_base_name("incident"), "incident")
+        self.assertEqual(SilverConfigLoader.normalize_base_name("raw_tbl_change-request"), "change_request")
+        self.assertEqual(SilverConfigLoader.normalize_base_name("tbl_order_items"), "order_items")
+        self.assertEqual(SilverConfigLoader.normalize_base_name(""), "")
+
+    def test_resolve_table_identifiers_standard(self):
+        from uax_silver_etl import resolve_table_identifiers
+        config = {
+            "source_systems": {
+                "servicenow": {
+                    "tables": {
+                        "tbl_incident": {
+                            "nkey": "sys_id",
+                            "order_by": "sys_updated_on"
+                        }
+                    }
+                }
+            }
+        }
+        res = resolve_table_identifiers(
+            table_name="raw_tbl_incident",
+            source_system="servicenow",
+            silver_full_config=config,
+            table_prefix="tbl_",
+            glue_database="uax_datalake_db_dev",
+            bucket_name="uax-datalake-dev-bucket",
+            bronze_data_prefix="bronze/data",
+            silver_data_prefix="silver/data"
+        )
+        self.assertEqual(res["table_clean"], "raw_tbl_incident")
+        self.assertEqual(res["base_table_name"], "incident")
+        self.assertEqual(res["bronze_table_name"], "raw_tbl_incident")
+        self.assertEqual(res["target_table_name"], "tbl_incident")
+        self.assertEqual(res["silver_table_name"], "glue_catalog.uax_datalake_db_dev.tbl_incident")
+        self.assertEqual(res["bronze_path"], "s3://uax-datalake-dev-bucket/bronze/data/servicenow/incident/")
+        self.assertEqual(res["silver_location"], "s3://uax-datalake-dev-bucket/silver/data/servicenow/incident/")
+
+    def test_resolve_table_identifiers_with_custom_target(self):
+        from uax_silver_etl import resolve_table_identifiers
+        config = {
+            "source_systems": {
+                "servicenow": {
+                    "tables": {
+                        "tbl_custom_inc": {
+                            "source_table_name": "raw_tbl_incident",
+                            "target_table_name": "tbl_custom_incident"
+                        }
+                    }
+                }
+            }
+        }
+        res = resolve_table_identifiers(
+            table_name="tbl_custom_inc",
+            source_system="servicenow",
+            silver_full_config=config,
+            table_prefix="tbl_",
+            glue_database="uax_datalake_db_dev",
+            bucket_name="uax-datalake-dev-bucket"
+        )
+        self.assertEqual(res["bronze_table_name"], "raw_tbl_incident")
+        self.assertEqual(res["target_table_name"], "tbl_custom_incident")
+        self.assertEqual(res["silver_table_name"], "glue_catalog.uax_datalake_db_dev.tbl_custom_incident")
+
+    def test_resolve_key_columns_cli_override(self):
+        from uax_silver_etl import resolve_key_columns
+        available = ["sys_id", "number", "updated_at"]
+        res = resolve_key_columns(
+            cli_override="number",
+            config_keys=["sys_id"],
+            available_columns=available,
+            key_label="nkey",
+            table_name="raw_tbl_incident"
+        )
+        self.assertEqual(res, ["number"])
+
+    def test_resolve_key_columns_config_list(self):
+        from uax_silver_etl import resolve_key_columns
+        available = ["id", "interaction_id", "created_at"]
+        res = resolve_key_columns(
+            cli_override=None,
+            config_keys=["id", "interaction_id"],
+            available_columns=available,
+            key_label="nkey",
+            table_name="raw_tbl_interactions"
+        )
+        self.assertEqual(res, ["id", "interaction_id"])
+
+    def test_resolve_key_columns_missing_in_df_raises_error(self):
+        from uax_silver_etl import resolve_key_columns
+        available = ["id", "val"]
+        with self.assertRaises(ValueError) as ctx:
+            resolve_key_columns(
+                cli_override=None,
+                config_keys=["missing_key"],
+                available_columns=available,
+                key_label="nkey",
+                table_name="raw_tbl_test"
+            )
+        self.assertIn("Configured nkey", str(ctx.exception))
+        self.assertIn("does not match any column", str(ctx.exception))
+
+    def test_resolve_key_columns_none_configured_raises_error(self):
+        from uax_silver_etl import resolve_key_columns
+        with self.assertRaises(ValueError) as ctx:
+            resolve_key_columns(
+                cli_override=None,
+                config_keys=None,
+                available_columns=["col1"],
+                key_label="nkey",
+                table_name="raw_tbl_test"
+            )
+        self.assertIn("is missing for table 'raw_tbl_test'", str(ctx.exception))
+
+
 class TestGoldTriggerAndAthenaQuerySanitization(unittest.TestCase):
     """Unit tests validating Gold layer invocation payloads and Athena statement sanitization."""
 

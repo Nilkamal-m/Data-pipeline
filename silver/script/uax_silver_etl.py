@@ -20,7 +20,7 @@ from botocore.exceptions import ClientError
 from urllib.parse import urlparse
 import traceback
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any, Dict, List, Tuple
 from pyspark.context import SparkContext
 from pyspark.conf import SparkConf
 from awsglue.context import GlueContext
@@ -345,20 +345,11 @@ def parse_spark_arguments() -> dict:
     gold_query_s3_path = get_cli_arg('GOLD_QUERY_S3_PATH', 'gold_query_s3_path', default=default_gold_query)
     gold_data_s3_path = get_cli_arg('GOLD_DATA_S3_PATH', 'gold_data_s3_path', default=default_gold_data)
     connection_name = get_cli_arg('CONNECTION_NAME', 'connection_name', 'GLUE_CONNECTION_NAME', 'glue_connection_name')
-    rds_secret_name = get_cli_arg('RDS_SECRET_NAME', 'rds_secret_name', 'SECRET_NAME', 'secret_name', 'DB_SECRET_NAME', 'db_secret_name', 'DB_SECRET', 'db_secret')
+    rds_secret_name = get_cli_arg('RDS_SECRET_NAME', 'rds_secret_name', 'SECRET_NAME', 'secret_name', 'DB_SECRET_NAME', 'db_secret_name')
     rds_host = get_cli_arg('RDS_HOST', 'rds_host', 'RDS_URL', 'rds_url', 'HOST', 'host')
     rds_port = get_cli_arg('RDS_PORT', 'rds_port', 'PORT', 'port', default='3306')
     rds_user = get_cli_arg('RDS_USER', 'rds_user', 'RDS_USERNAME', 'rds_username', 'USER', 'user')
-    rds_password = get_cli_arg(
-        'RDS_PASSWORD', 'rds_password',
-        'RDS_PASSWORDS', 'rds_passwords',
-        'PASSWORD', 'password',
-        'PASSWORDS', 'passwords',
-        'DB_PASSWORD', 'db_password',
-        'DB_PASSWORDS', 'db_passwords',
-        'RDS_PWD', 'rds_pwd',
-        'PWD', 'pwd'
-    )
+    rds_password = get_cli_arg('RDS_PASSWORD', 'rds_password', 'PASSWORD', 'password', 'DB_PASSWORD', 'db_password')
 
     # Athena Workgroup: CLI > Env > Default (uax-datalake-workgroup-{env})
     default_athena_wg = os.environ.get('ATHENA_WORKGROUP') or f"uax-datalake-workgroup-{env}"
@@ -1226,6 +1217,111 @@ def execute_iceberg_scd2(spark, glue_client, database_name: str, target_table_na
                 raise
 
 
+def resolve_table_identifiers(
+    table_name: str,
+    source_system: str,
+    silver_full_config: dict,
+    table_prefix: str,
+    glue_database: str,
+    bucket_name: str,
+    bronze_data_prefix: str = "bronze/data",
+    silver_data_prefix: str = "silver/data",
+    glue_client=None
+) -> dict:
+    """
+    Standardized resolution of Bronze and Silver table identifiers, catalog names, and S3 paths.
+    Eliminates repetitive string slicing and guarantees consistency.
+    """
+    table_clean = table_name.strip().lower()
+    base_table_name = SilverConfigLoader.normalize_base_name(table_clean)
+    table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
+
+    # Bronze table name: configured source_table_name or raw_tbl_<base>
+    raw_bronze = table_cfg.get('source_table_name') or f"raw_tbl_{base_table_name}"
+    bronze_base = SilverConfigLoader.normalize_base_name(raw_bronze)
+    bronze_table_name = f"raw_tbl_{bronze_base}"
+
+    # Target Silver table name: configured target_table_name or <prefix><base>
+    prefix = table_prefix.strip()
+    cfg_target = table_cfg.get('target_table_name')
+    if cfg_target:
+        target_base = SilverConfigLoader.normalize_base_name(cfg_target)
+        target_table_name = f"{prefix}{target_base}"
+    else:
+        target_table_name = f"{prefix}{base_table_name}"
+    while target_table_name.startswith(f"{prefix}{prefix}"):
+        target_table_name = target_table_name[len(prefix):]
+
+    silver_table_name = f"glue_catalog.{glue_database}.{target_table_name}"
+    bronze_path = f"s3://{bucket_name}/{bronze_data_prefix.strip('/')}/{source_system}/{base_table_name}/"
+    silver_location = f"s3://{bucket_name}/{silver_data_prefix.strip('/')}/{source_system}/{base_table_name}/"
+
+    if glue_client:
+        try:
+            tbl_desc = glue_client.get_table(DatabaseName=glue_database, Name=target_table_name).get('Table', {})
+            existing_loc = tbl_desc.get('StorageDescriptor', {}).get('Location')
+            if existing_loc and existing_loc.startswith('s3://'):
+                silver_location = existing_loc if existing_loc.endswith('/') else f"{existing_loc}/"
+        except Exception:
+            pass
+
+    return {
+        "table_clean": table_clean,
+        "base_table_name": base_table_name,
+        "table_cfg": table_cfg,
+        "bronze_table_name": bronze_table_name,
+        "target_table_name": target_table_name,
+        "silver_table_name": silver_table_name,
+        "bronze_path": bronze_path,
+        "silver_location": silver_location
+    }
+
+
+def resolve_key_columns(
+    cli_override: Optional[str],
+    config_keys: Any,
+    available_columns: list,
+    key_label: str,
+    table_name: str
+) -> list:
+    """
+    Resolves key columns (such as natural keys or deduplication order-by columns).
+    Enforces strict precedence: CLI Override > Table Config JSON > Fail Fast.
+    Validates that resolved columns actually exist in the incoming DataFrame.
+    """
+    if cli_override and str(cli_override).strip():
+        raw_keys = [k.strip() for k in str(cli_override).split(',') if k.strip()]
+        matched = [k for k in raw_keys if k in available_columns]
+        if not matched:
+            raise ValueError(
+                f"CRITICAL CONFIG ERROR: CLI parameter override for {key_label} '{cli_override}' "
+                f"does not match any column in table '{table_name}'. Available columns: {available_columns}"
+            )
+        logger.info(f"CLI Parameter Override applied for '{key_label}': {matched}")
+        return matched
+
+    if not config_keys:
+        raise ValueError(
+            f"CRITICAL CONFIG ERROR: '{key_label}' is missing for table '{table_name}' in silver_config.json. "
+            f"Please specify the column in silver_config.json or pass via CLI parameter."
+        )
+
+    if isinstance(config_keys, list):
+        raw_keys = [str(k).strip() for k in config_keys if str(k).strip()]
+    elif isinstance(config_keys, str) and ',' in config_keys:
+        raw_keys = [k.strip() for k in config_keys.split(',') if k.strip()]
+    else:
+        raw_keys = [str(config_keys).strip()]
+
+    matched = [k for k in raw_keys if k in available_columns]
+    if not matched:
+        raise ValueError(
+            f"CRITICAL CONFIG ERROR: Configured {key_label} '{raw_keys}' does not match any column "
+            f"in Bronze table '{table_name}'. Available columns: {available_columns}"
+        )
+    return matched
+
+
 def main():
     params = parse_spark_arguments()
     job_name = params['JOB_NAME']
@@ -1333,45 +1429,29 @@ def main():
     schemas_evolved = 0
 
     for table_idx, table_name in enumerate(table_list, start=1):
-        table_clean = table_name.strip().lower()
-        raw_base_name = table_clean
-        while raw_base_name.startswith("raw_tbl_"):
-            raw_base_name = raw_base_name[len("raw_tbl_"):]
-        while raw_base_name.startswith("tbl_"):
-            raw_base_name = raw_base_name[len("tbl_"):]
-        base_table_name = raw_base_name.replace("-", "_")
-
-        table_cfg = SilverConfigLoader.get_table_config(source_system, table_clean, silver_full_config)
-        bronze_table_name = (table_cfg.get('source_table_name') or f"raw_tbl_{base_table_name}").strip().replace("-", "_")
-        while bronze_table_name.startswith("raw_tbl_raw_tbl_"):
-            bronze_table_name = bronze_table_name[len("raw_tbl_"):]
         table_start_time = datetime.now(timezone.utc)
+        resolved = resolve_table_identifiers(
+            table_name=table_name,
+            source_system=source_system,
+            silver_full_config=silver_full_config,
+            table_prefix=table_prefix,
+            glue_database=glue_database,
+            bucket_name=bucket_name,
+            bronze_data_prefix=bronze_data_prefix,
+            silver_data_prefix=silver_data_prefix,
+            glue_client=glue_client
+        )
+        table_clean = resolved["table_clean"]
+        base_table_name = resolved["base_table_name"]
+        table_cfg = resolved["table_cfg"]
+        bronze_table_name = resolved["bronze_table_name"]
+        target_table_name = resolved["target_table_name"]
+        silver_table_name = resolved["silver_table_name"]
+        bronze_path = resolved["bronze_path"]
+        silver_location = resolved["silver_location"]
 
         defaults_cfg = SilverConfigLoader.get_defaults(silver_full_config)
         scd2_cfg = defaults_cfg.get('scd_type2_config', {})
-
-        raw_target = (table_cfg.get('target_table_name') or f"{table_prefix}{base_table_name}").strip().replace("-", "_")
-        prefix = table_prefix.strip()
-        if prefix and raw_target.startswith(prefix):
-            target_table_name = raw_target
-        else:
-            target_table_name = f"{prefix}{raw_target}"
-        if prefix:
-            while target_table_name.startswith(f"{prefix}{prefix}"):
-                target_table_name = target_table_name[len(prefix):]
-        while target_table_name.startswith("tbl_tbl_"):
-            target_table_name = target_table_name[len("tbl_"):]
-        silver_table_name = f"glue_catalog.{glue_database}.{target_table_name}"
-        bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
-        silver_location = f"s3://{bucket_name}/{silver_data_prefix}/{source_system}/{base_table_name}/"
-        if glue_client:
-            try:
-                tbl_desc = glue_client.get_table(DatabaseName=glue_database, Name=target_table_name).get('Table', {})
-                existing_loc = tbl_desc.get('StorageDescriptor', {}).get('Location')
-                if existing_loc and existing_loc.startswith('s3://'):
-                    silver_location = existing_loc if existing_loc.endswith('/') else f"{existing_loc}/"
-            except Exception:
-                pass
 
         # Resolve High-Water Mark state key & last load date
         state_key = get_silver_watermark_key(source_system, base_table_name, metadata_prefix)
@@ -1416,8 +1496,7 @@ def main():
             batch_count = 0
 
             # 1. Primary: Read Bronze Hive/Parquet table via GlueContext native catalog reader with resolveChoice
-            # (bypasses Iceberg SparkCatalog so it never raises 'Input Glue table is not an Iceberg table',
-            # and resolves any type conflicts across Parquet parts like DOUBLE vs String to string)
+            # (bypasses Iceberg SparkCatalog and resolves heterogeneous types like DOUBLE vs String across partitions)
             if glueContext:
                 try:
                     logger.info(f"Attempting to load Bronze data from Glue Catalog table `{glue_database}`.`{bronze_table_name}` via GlueContext...")
@@ -1438,22 +1517,24 @@ def main():
                 except Exception as cat_err:
                     logger.warning(
                         f"Glue Catalog table `{glue_database}`.`{bronze_table_name}` read/count failed ({cat_err}). "
-                        f"Falling back to direct S3 DynamicFrame reader from '{bronze_path}' with resolveChoice..."
+                        f"Falling back to direct S3 Parquet reader from '{bronze_path}'..."
                     )
                     df_bronze = None
 
-            # 2. Fallback: Read directly from S3 using Glue DynamicFrame with resolveChoice(choice='cast:string')
-            # Handles heterogeneous Parquet files across partitions where types differ (e.g. DOUBLE vs String)
-            if df_bronze is None and glueContext:
+            # 2. Fallback: Read directly from S3 Parquet location (handles cases where crawler has not yet run)
+            if df_bronze is None:
                 try:
-                    logger.info(f"Attempting direct S3 DynamicFrame load from '{bronze_path}' with resolveChoice...")
-                    dyn_frame = glueContext.create_dynamic_frame.from_options(
-                        connection_type="s3",
-                        connection_options={"paths": [bronze_path], "recurse": True},
-                        format="parquet"
-                    )
-                    dyn_frame = dyn_frame.resolveChoice(choice='cast:string')
-                    temp_df = dyn_frame.toDF()
+                    logger.info(f"Attempting direct S3 Parquet load from '{bronze_path}'...")
+                    if glueContext:
+                        dyn_frame = glueContext.create_dynamic_frame.from_options(
+                            connection_type="s3",
+                            connection_options={"paths": [bronze_path], "recurse": True},
+                            format="parquet"
+                        )
+                        dyn_frame = dyn_frame.resolveChoice(choice='cast:string')
+                        temp_df = dyn_frame.toDF()
+                    else:
+                        temp_df = spark.read.option("mergeSchema", "false").parquet(bronze_path)
 
                     if last_load_date and watermark_enabled and not full_refresh and watermark_column in temp_df.columns:
                         logger.info(f"Applying Silver Watermark filter: `{watermark_column}` > '{last_load_date}' for table '{target_table_name}'...")
@@ -1461,45 +1542,10 @@ def main():
 
                     batch_count = temp_df.count()
                     df_bronze = temp_df
-                    logger.info(f"Successfully loaded {batch_count} Bronze record(s) from S3 via DynamicFrame.")
+                    logger.info(f"Successfully loaded {batch_count} Bronze record(s) from S3 Parquet reader.")
                 except Exception as s3_dyn_err:
-                    logger.warning(f"S3 DynamicFrame read from '{bronze_path}' failed ({s3_dyn_err}). Trying Spark DataFrame reader...")
+                    logger.warning(f"Direct S3 Parquet read from '{bronze_path}' failed ({s3_dyn_err}).")
                     df_bronze = None
-
-            # 3. Fallback: Standard Spark DataFrame Parquet read
-            if df_bronze is None:
-                try:
-                    logger.info(f"Attempting Spark Parquet read from '{bronze_path}'...")
-                    temp_df = spark.read.option("mergeSchema", "false").parquet(bronze_path)
-                    if last_load_date and watermark_enabled and not full_refresh and watermark_column in temp_df.columns:
-                        logger.info(f"Applying Silver Watermark filter: `{watermark_column}` > '{last_load_date}' for table '{target_table_name}'...")
-                        temp_df = temp_df.filter(col(watermark_column) > lit(last_load_date))
-                    batch_count = temp_df.count()
-                    df_bronze = temp_df
-                    logger.info(f"Successfully loaded {batch_count} Bronze record(s) via Spark Parquet reader.")
-                except Exception as spark_parquet_err:
-                    logger.warning(f"Spark Parquet read from '{bronze_path}' failed ({spark_parquet_err}). Trying alternate paths / formats...")
-
-            # 4. Fallback: Alternate directory paths & JSON fallback
-            if df_bronze is None:
-                alt_bronze_path = f"s3://{bucket_name}/{bronze_data_prefix}/{source_system}/{base_table_name}/"
-                for candidate_path in [bronze_path, alt_bronze_path]:
-                    if df_bronze is not None:
-                        break
-                    for read_fn in [
-                        lambda p: spark.read.option("mergeSchema", "true").parquet(p),
-                        lambda p: spark.read.json(p)
-                    ]:
-                        try:
-                            temp_df = read_fn(candidate_path)
-                            if last_load_date and watermark_enabled and not full_refresh and watermark_column in temp_df.columns:
-                                temp_df = temp_df.filter(col(watermark_column) > lit(last_load_date))
-                            batch_count = temp_df.count()
-                            df_bronze = temp_df
-                            logger.info(f"Successfully loaded {batch_count} Bronze record(s) from '{candidate_path}'.")
-                            break
-                        except Exception:
-                            continue
 
             # If all readers fail or directory is empty, skip table
             if df_bronze is None:
@@ -1555,71 +1601,20 @@ def main():
             cli_args = params.get('ARG_DICT', {})
             merge_strategy = (cli_args.get('MERGE_STRATEGY') or table_cfg.get('merge_strategy') or defaults_cfg.get('merge_strategy', 'upsert')).lower()
             scd_type = (cli_args.get('SCD_TYPE') or table_cfg.get('scd_type') or defaults_cfg.get('scd_type', 'scd1')).lower()
-            scd2_cfg = table_cfg.get('scd2_config') or defaults_cfg.get('scd2_defaults', {})
+            scd2_cfg = table_cfg.get('scd2_config') or defaults_cfg.get('scd2_defaults', {}) or defaults_cfg.get('scd_type2_config', {})
             dedup_strategy = (cli_args.get('DEDUPLICATION_STRATEGY') or table_cfg.get('deduplication_strategy') or defaults_cfg.get('deduplication', {}).get('strategy', 'latest_by_order_column')).lower()
 
             columns = df_bronze.columns
 
-            # Dynamically resolve Natural Key (Nkey) from CLI override -> config (fallback to primary_key)
+            # Dynamically resolve Natural Key (Nkey) from CLI override -> config (CLI > Config > Fail Fast)
             cli_nkey = cli_args.get('NKEY') or cli_args.get('NKEYS') or cli_args.get('DEDUPLICATION_KEYS') or cli_args.get('PRIMARY_KEY')
-            if cli_nkey:
-                raw_nkeys = [k.strip() for k in cli_nkey.split(',')] if ',' in cli_nkey else [cli_nkey.strip()]
-                nkeys = [k for k in raw_nkeys if k in columns]
-                if not nkeys:
-                    raise ValueError(
-                        f"CRITICAL CONFIG ERROR: CLI parameter override for nkey '{cli_nkey}' does not match any column in table '{bronze_table_name}'. "
-                        f"Available columns: {columns}"
-                    )
-                logger.info(f"CLI Parameter Override: 'nkey' -> {nkeys}")
-            else:
-                cfg_nkey = table_cfg.get('nkey') or table_cfg.get('deduplication_keys') or table_cfg.get('primary_key')
-                if not cfg_nkey:
-                    raise ValueError(
-                        f"CRITICAL CONFIG ERROR: 'nkey' (natural/deduplication key) is missing for table '{bronze_table_name}' in silver_config.json "
-                        f"(source_systems.{source_system}.table_configs.{table_clean}.nkey). "
-                        f"Please specify the key column in silver_config.json or pass --NKEY via CLI."
-                    )
-                if isinstance(cfg_nkey, list):
-                    raw_nkeys = [str(k).strip() for k in cfg_nkey if str(k).strip()]
-                elif isinstance(cfg_nkey, str) and ',' in cfg_nkey:
-                    raw_nkeys = [k.strip() for k in cfg_nkey.split(',') if k.strip()]
-                else:
-                    raw_nkeys = [str(cfg_nkey).strip()]
-                nkeys = [k for k in raw_nkeys if k in columns]
-                if not nkeys:
-                    raise ValueError(
-                        f"CRITICAL CONFIG ERROR: Configured nkey '{raw_nkeys}' does not match any column in Bronze table '{bronze_table_name}'. "
-                        f"Check silver_config.json (source_systems.{source_system}.table_configs.{table_clean}.nkey). "
-                        f"Available columns: {columns}"
-                    )
+            cfg_nkey = table_cfg.get('nkey') or table_cfg.get('deduplication_keys') or table_cfg.get('primary_key')
+            nkeys = resolve_key_columns(cli_nkey, cfg_nkey, columns, 'nkey', bronze_table_name)
 
-            # Dynamically resolve Deduplication Order-By Columns from CLI override -> config
+            # Dynamically resolve Deduplication Order-By Columns from CLI override -> config (CLI > Config > Fail Fast)
             cli_order = cli_args.get('DEDUPLICATION_ORDER_BY') or cli_args.get('ORDER_BY')
-            if cli_order:
-                raw_orders = [c.strip() for c in cli_order.split(',')] if ',' in cli_order else [cli_order.strip()]
-                order_cols = [c for c in raw_orders if c in columns]
-                if not order_cols:
-                    raise ValueError(
-                        f"CRITICAL CONFIG ERROR: CLI parameter override for deduplication_order_by '{cli_order}' does not match any column in table '{bronze_table_name}'. "
-                        f"Available columns: {columns}"
-                    )
-                logger.info(f"CLI Parameter Override: 'deduplication_order_by' -> {order_cols}")
-            else:
-                cfg_order = table_cfg.get('deduplication_order_by') or table_cfg.get('order_by')
-                if not cfg_order:
-                    raise ValueError(
-                        f"CRITICAL CONFIG ERROR: 'deduplication_order_by' is missing for table '{bronze_table_name}' in silver_config.json "
-                        f"(source_systems.{source_system}.table_configs.{table_clean}.deduplication_order_by). "
-                        f"Please specify the ordering column in silver_config.json or pass --DEDUPLICATION_ORDER_BY via CLI."
-                    )
-                raw_orders = cfg_order if isinstance(cfg_order, list) else [cfg_order]
-                order_cols = [c for c in raw_orders if c in columns]
-                if not order_cols:
-                    raise ValueError(
-                        f"CRITICAL CONFIG ERROR: Configured deduplication_order_by '{raw_orders}' does not match any column in Bronze table '{bronze_table_name}'. "
-                        f"Check silver_config.json (source_systems.{source_system}.table_configs.{table_clean}.deduplication_order_by). "
-                        f"Available columns: {columns}"
-                    )
+            cfg_order = table_cfg.get('deduplication_order_by') or table_cfg.get('order_by')
+            order_cols = resolve_key_columns(cli_order, cfg_order, columns, 'deduplication_order_by', bronze_table_name)
 
             logger.info(f"Deduplicating table '{table_clean}': Nkey={nkeys}, OrderBy={order_cols}, Strategy='{dedup_strategy}'")
 

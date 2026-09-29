@@ -107,8 +107,8 @@ class SilverConfigLoader:
             current_dir = os.path.dirname(os.path.abspath(__file__))
             possible_paths = [
                 os.path.join(current_dir, "config", "silver_config.json"),
-                "silver/script/config/silver_config.json",
-                "glue_jobs/silver/config/silver_config.json"
+                os.path.join(os.getcwd(), "silver", "script", "config", "silver_config.json"),
+                os.path.join(current_dir, "silver_config.json")
             ]
 
             for path in possible_paths:
@@ -126,6 +126,22 @@ class SilverConfigLoader:
         cls._config_cache[effective_env] = interpolated
         cls._latest_config = interpolated
         return interpolated
+
+    @classmethod
+    def normalize_base_name(cls, table_name: str) -> str:
+        """
+        Extracts the canonical base table name by stripping 'raw_tbl_' and 'tbl_' prefixes.
+        Converts hyphens to underscores.
+        Example: 'raw_tbl_change-request' -> 'change_request'
+        """
+        if not table_name:
+            return ""
+        clean = table_name.strip().lower()
+        while clean.startswith("raw_tbl_"):
+            clean = clean[len("raw_tbl_"):]
+        while clean.startswith("tbl_"):
+            clean = clean[len("tbl_"):]
+        return clean.replace("-", "_")
 
     @classmethod
     def get_defaults(cls, config_dict: Optional[Dict[str, Any]] = None, env: Optional[str] = None) -> Dict[str, Any]:
@@ -167,12 +183,7 @@ class SilverConfigLoader:
         source_cfg = cls.get_source_config(source_system, config_dict)
         table_configs = source_cfg.get("tables") or source_cfg.get("table_configs", {})
         clean = table_name.strip().lower()
-
-        base = clean
-        while base.startswith("raw_tbl_"):
-            base = base[len("raw_tbl_"):]
-        while base.startswith("tbl_"):
-            base = base[len("tbl_"):]
+        base = cls.normalize_base_name(clean)
 
         candidates = [
             clean,
@@ -359,16 +370,10 @@ class SilverConfigLoader:
         prefix = table_prefix or cls.get_table_prefix(config_dict)
         db = glue_database or cls.get_glue_database(config_dict)
         table_cfg = cls.get_table_config(source_system, table_name, config_dict)
-        table_clean = table_name.strip().lower()
-
-        base_name = table_clean
-        if base_name.startswith("raw_tbl_"):
-            base_name = base_name[len("raw_tbl_"):]
-        elif base_name.startswith("tbl_"):
-            base_name = base_name[len("tbl_"):]
-        base_name = base_name.replace("-", "_")
-
+        base_name = cls.normalize_base_name(table_name)
         target_name = (table_cfg.get("target_table_name") or f"{prefix}{base_name}").replace("-", "_")
+        while target_name.startswith("tbl_tbl_"):
+            target_name = target_name[len("tbl_"):]
         return f"{db}.{target_name}"
 
     @classmethod

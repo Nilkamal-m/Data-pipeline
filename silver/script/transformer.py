@@ -147,7 +147,7 @@ class SilverTransformer:
             if cfg_order:
                 order_col_name = cfg_order[0] if isinstance(cfg_order, list) else cfg_order
 
-        # 1. Drop Bronze System Metadata Columns
+        # 2. Drop Bronze System Metadata Columns
         drops = bronze_metadata_cols or [
             '_raw_data', '_ingest_timestamp', '_extracted_at', '_batch_id',
             '_source_system', '_source_table', '_file_name', '_file_path', '_row_num',
@@ -168,7 +168,7 @@ class SilverTransformer:
                 if c not in silver_tech:
                     df = df.withColumn(c, col(c).cast("string"))
 
-        # Standardize timestamp formats across all columns to 'YYYY-MM-DD HH:MM:SS'
+        # 4. Standardize timestamp formats across all columns to 'YYYY-MM-DD HH:MM:SS'
         # Converts any ISO-8601 strings (e.g. '2024-03-01T15:30:00Z', '+00:00', millis) to standardized format
         silver_tech_set = {'_valid_from', '_valid_to', '_is_current', '_is_deleted', '_inserted_at', '_updated_at'}
         for c in df.columns:
@@ -185,13 +185,13 @@ class SilverTransformer:
                     ).otherwise(col(c))
                 )
 
-        # 4. Clean illegal characters dynamically if expression is configured for this table
+        # 5. Clean illegal characters dynamically if expression is configured for this table
         illegal_expr = table_cfg.get('clean_illegal_chars_expression') or table_cfg.get('clean_illegal_chars_pattern')
         if illegal_expr and isinstance(illegal_expr, str) and illegal_expr.strip():
             logger.info(f"Dynamically cleaning illegal characters for '{source_system}.{table_name}' using config expression: '{illegal_expr}'...")
             df = cls.clean_illegal_chars(df, pattern=illegal_expr)
 
-        # 5. Apply Filter Expression if specified
+        # 6. Apply Filter Expression if specified
         filter_expr = table_cfg.get('filter_expression')
         if filter_expr and isinstance(filter_expr, str) and filter_expr.strip():
             logger.info(f"Applying filter expression: '{filter_expr}'")
@@ -207,20 +207,20 @@ class SilverTransformer:
                 else:
                     df = df.withColumn(column_name, col(column_name).cast(target_type))
 
-        # 6. Apply Custom SQL Expressions
+        # 8. Apply Custom SQL Expressions
         custom_expressions = table_cfg.get('custom_expressions', {})
         for new_col, sql_expr in custom_expressions.items():
             logger.info(f"Adding derived column '{new_col}' = expr('{sql_expr}')")
             df = df.withColumn(new_col, expr(sql_expr))
 
-        # 7. Apply Column Renames
+        # 9. Apply Column Renames
         column_renames = table_cfg.get('column_renames', {})
         for old_name, new_name in column_renames.items():
             if old_name in df.columns:
                 logger.info(f"Renaming column '{old_name}' -> '{new_name}'")
                 df = df.withColumnRenamed(old_name, new_name)
 
-        # 8. Exclude Columns if configured in silver_config.json (protecting key columns and technical audit columns)
+        # 10. Exclude Columns if configured in silver_config.json (protecting key columns and technical audit columns)
         exclude_cfg = table_cfg.get('exclude_columns') or table_cfg.get('drop_columns') or []
         if isinstance(exclude_cfg, str):
             exclude_cfg = [c.strip() for c in exclude_cfg.split(',') if c.strip()]
@@ -254,19 +254,19 @@ class SilverTransformer:
                 f"These columns are required for natural key identification and deduplication."
             )
 
-        # 9. Apply Custom External Transformation File if configured (can query other tables via spark & context)
+        # 11. Apply Custom External Transformation File if configured (can query other tables via spark & context)
         custom_script_path = table_cfg.get('custom_transform_script') or table_cfg.get('custom_transform_file')
         if custom_script_path:
             df = cls._apply_custom_script(df, custom_script_path, spark=spark, context=context)
 
-        # 10. Apply Extensible External Columns Hook (initializes configured external_columns to NULL string default)
+        # 12. Apply Extensible External Columns Hook (initializes configured external_columns to NULL string default)
         df = cls._apply_external_columns(df, table_cfg)
 
-        # 11. Enrich Technical Audit Columns & Place them at the very end
+        # 13. Enrich Technical Audit Columns & Place them at the very end
         high_date_val = table_cfg.get('high_date_value', '9999-01-01 00:00:00')
         df = cls._enrich_technical_columns(df, order_col_name=order_col_name, high_date_val=high_date_val)
 
-        # 12. Log final transformed schema introspection
+        # 14. Log final transformed schema introspection
         cls.log_schema_introspection(df, f"Final Transformed Silver Schema: '{source_system}.{table_name}'")
 
         return df
