@@ -188,8 +188,8 @@ The config file is fetched once from S3 via `ConfigLoader.load_config()`, with a
 | Layer | Mandatory Glue Arguments | Optional Glue Arguments (Fallback to Config) |
 |---|---|---|
 | **Bronze** (`uax_bronze_load.py`) | `--JOB_NAME`<br>`--SOURCE_SYSTEM` | `--ENV` (default: `dev`), `--CONFIG_S3_PATH`, `--SOURCE_TABLE_NAME` (all tables under source if omitted), `--BRONZE_BUCKET`, `--STATE_BUCKET`, `--SECRET_NAME`, `--BATCH_SIZE`, `--INITIAL_LOAD_DATE`, `--UPPER_BOUND`, `--FLATTEN_NESTED_JSON`, `--ERROR_HANDLING_MODE` |
-| **Silver** (`uax_silver_etl.py`) | `--JOB_NAME`<br>`--SOURCE_SYSTEM` | `--ENV` (default: `dev`), `--CONFIG_S3_PATH`, `--SOURCE_TABLE_NAME` (all tables under source if omitted), `--PROCESS_LAYER` (`silver`, `gold`, or `both`), `--DATA_LAKE_BUCKET`, `--GLUE_DATABASE`, `--TABLE_PREFIX`, `--BRONZE_DATA_PREFIX`, `--SILVER_DATA_PREFIX`, `--FULL_REFRESH`, `--INCREMENTAL` |
-| **Gold** (`gold_layer_manager.py`) | `--JOB_NAME`<br>`--SOURCE_SYSTEM` | `--ENV` (default: `dev`), `--GOLD_CONFIG_S3_PATH`, `--TABLE_NAME`, `--GOLD_SCHEMA` (or `aurora.schema` in config — **mandatory for RDS/Aurora**), `--RDS_SECRET_NAME`, `--DATA_LAKE_BUCKET`, `--GLUE_DATABASE`, `--GOLD_TARGETS`, `--FULL_REFRESH`, `--INCREMENTAL` |
+| **Silver** (`uax_silver_etl.py`) | `--JOB_NAME`<br>`--SOURCE_SYSTEM` | `--ENV` (default: `dev`), `--CONFIG_S3_PATH`, `--SOURCE_TABLE_NAME` (all tables under source if omitted), `--PROCESS_LAYER` (`silver`), `--DATA_LAKE_BUCKET`, `--GLUE_DATABASE`, `--TABLE_PREFIX`, `--BRONZE_DATA_PREFIX`, `--SILVER_DATA_PREFIX`, `--FULL_REFRESH`, `--INCREMENTAL` |
+| **Gold** (`gold_layer_manager.py`) | `--JOB_NAME`<br>`--SOURCE_SYSTEM` | `--ENV` (default: `dev`), `--GOLD_CONFIG_S3_PATH`, `--TABLE_NAME`, `--RDS_GOLD_SCHEMA` (or `--GOLD_SCHEMA` — **mandatory for RDS/Aurora**), `--CONNECTION_NAME`, `--DATA_LAKE_BUCKET`, `--GLUE_DATABASE`, `--GOLD_TARGETS`, `--FULL_REFRESH`, `--INCREMENTAL` |
 
 #### 5.1.2 Watermark State — Incremental Load Guard
 
@@ -579,7 +579,7 @@ update_silver_watermark(
 
 ### 5.3 Gold — Business Marts (`gold_layer_manager.py`)
 
-The Gold layer runs as the final phase inside the Silver PySpark job (via `GoldLayerManager`) or as an independent Glue job. It reads Silver Iceberg, executes mart SQL, materialises results into authoritative Gold Iceberg tables, and routes the conformed data to downstream reporting tables and consumer engines.
+The Gold layer runs as an independent, standalone Glue job (via `gold_layer_manager.py`). It reads Silver Iceberg, executes mart SQL, materialises results into authoritative Gold Iceberg tables, and routes the conformed data to downstream reporting tables and consumer engines.
 
 #### 5.3.1 Mart SQL Loading — Modular, Source-Scoped Queries
 

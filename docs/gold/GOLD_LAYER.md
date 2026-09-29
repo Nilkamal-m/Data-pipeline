@@ -78,7 +78,7 @@ flowchart TD
 ```
 gold/
 ├── script/
-│   ├── gold_layer_manager.py           # Master Gold orchestration engine
+│   ├── gold_layer_manager.py           # Master Gold orchestration engine & standalone Glue job entrypoint
 │   ├── gold_config_loader.py           # Configuration loader & {env} interpolator
 │   ├── gold_initial_load.py            # Historical CSV loader, parser & auto-archiver
 │   ├── config/

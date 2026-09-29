@@ -68,7 +68,7 @@ from uax_bronze_load import get_table_state_key, update_last_load_date, parse_ar
 
 
 class TestProcessLayerOptions(unittest.TestCase):
-    """Verifies that --PROCESS_LAYER strictly accepts only 'silver' or 'gold'."""
+    """Verifies that --PROCESS_LAYER strictly isolates Silver and Gold processing."""
 
     def test_invalid_process_layer_all(self):
         """Passing --PROCESS_LAYER=all must raise an explicit ValueError."""
@@ -81,7 +81,7 @@ class TestProcessLayerOptions(unittest.TestCase):
             from uax_silver_etl import parse_spark_arguments
             with self.assertRaises(ValueError) as ctx:
                 parse_spark_arguments()
-            self.assertIn("Strictly 2 options are supported", str(ctx.exception))
+            self.assertIn("Silver ETL strictly supports '--PROCESS_LAYER=silver'", str(ctx.exception))
 
     def test_invalid_process_layer_custom(self):
         """Passing an unknown layer must raise an explicit ValueError."""
@@ -94,7 +94,20 @@ class TestProcessLayerOptions(unittest.TestCase):
             from uax_silver_etl import parse_spark_arguments
             with self.assertRaises(ValueError) as ctx:
                 parse_spark_arguments()
-            self.assertIn("Strictly 2 options are supported", str(ctx.exception))
+            self.assertIn("Silver ETL strictly supports '--PROCESS_LAYER=silver'", str(ctx.exception))
+
+    def test_silver_rejects_gold_process_layer(self):
+        """Passing --PROCESS_LAYER=gold to Silver ETL must raise an explicit redirect ValueError."""
+        test_args = [
+            "uax_silver_etl.py",
+            "--PROCESS_LAYER", "gold",
+            "--SOURCE_SYSTEM", "servicenow"
+        ]
+        with patch.object(sys, 'argv', test_args):
+            from uax_silver_etl import parse_spark_arguments
+            with self.assertRaises(ValueError) as ctx:
+                parse_spark_arguments()
+            self.assertIn("Gold layer processing has moved to the standalone Glue job 'gold_layer_manager.py'", str(ctx.exception))
 
     def test_valid_process_layer_silver(self):
         """Passing --PROCESS_LAYER=silver succeeds and parses correctly."""
@@ -114,9 +127,9 @@ class TestProcessLayerOptions(unittest.TestCase):
             self.assertEqual(params['SOURCE_SYSTEM'], 'servicenow')
 
     def test_valid_process_layer_gold(self):
-        """Passing --PROCESS_LAYER=gold succeeds and parses gold parameters."""
+        """Passing --PROCESS_LAYER=gold to gold_layer_manager succeeds and parses gold parameters."""
         test_args = [
-            "uax_silver_etl.py",
+            "gold_layer_manager.py",
             "--PROCESS_LAYER", "gold",
             "--SOURCE_SYSTEM", "servicenow",
             "--RDS_GOLD_SCHEMA", "gold_marts",
@@ -126,7 +139,7 @@ class TestProcessLayerOptions(unittest.TestCase):
             "--TABLE_PREFIX", "tbl_"
         ]
         with patch.object(sys, 'argv', test_args):
-            from uax_silver_etl import parse_spark_arguments
+            from gold_layer_manager import parse_spark_arguments
             params = parse_spark_arguments()
             self.assertEqual(params['PROCESS_LAYER'], 'gold')
             self.assertEqual(params['SOURCE_SYSTEM'], 'servicenow')
@@ -134,30 +147,30 @@ class TestProcessLayerOptions(unittest.TestCase):
             self.assertEqual(params['GOLD_TARGET'], 'aurora')
 
     def test_gold_layer_missing_schema_raises_value_error(self):
-        """Omitting --RDS_GOLD_SCHEMA when --PROCESS_LAYER=gold must raise a guiding ValueError."""
+        """Omitting --RDS_GOLD_SCHEMA when running gold_layer_manager must raise a guiding ValueError."""
         test_args = [
-            "uax_silver_etl.py",
+            "gold_layer_manager.py",
             "--PROCESS_LAYER", "gold",
             "--SOURCE_SYSTEM", "servicenow",
             "--DATA_LAKE_BUCKET", "test-bucket"
         ]
         with patch.object(sys, 'argv', test_args):
-            from uax_silver_etl import parse_spark_arguments
+            from gold_layer_manager import parse_spark_arguments
             with self.assertRaises(ValueError) as ctx:
                 parse_spark_arguments()
             self.assertIn("Missing required parameter '--RDS_GOLD_SCHEMA'", str(ctx.exception))
             self.assertIn("no fallback schema is permitted", str(ctx.exception))
 
     def test_gold_layer_missing_source_system_raises_value_error(self):
-        """Omitting --SOURCE_SYSTEM when --PROCESS_LAYER=gold must raise a guiding ValueError."""
+        """Omitting --SOURCE_SYSTEM when running gold_layer_manager must raise a guiding ValueError."""
         test_args = [
-            "uax_silver_etl.py",
+            "gold_layer_manager.py",
             "--PROCESS_LAYER", "gold",
             "--RDS_GOLD_SCHEMA", "my_mart",
             "--DATA_LAKE_BUCKET", "test-bucket"
         ]
         with patch.object(sys, 'argv', test_args):
-            from uax_silver_etl import parse_spark_arguments
+            from gold_layer_manager import parse_spark_arguments
             with self.assertRaises(ValueError) as ctx:
                 parse_spark_arguments()
             self.assertIn("Missing required parameter '--SOURCE_SYSTEM'", str(ctx.exception))
@@ -583,10 +596,10 @@ class TestCustomTransformsAndApiEnrichment(unittest.TestCase):
 
     def test_gold_source_specific_path_resolution(self):
         """Tests that query_s3_path and data_s3_path automatically append source_system."""
-        from uax_silver_etl import parse_spark_arguments
+        from gold_layer_manager import parse_spark_arguments
 
         test_args = [
-            "script_name",
+            "gold_layer_manager.py",
             "--PROCESS_LAYER", "gold",
             "--SOURCE_SYSTEM", "servicenow",
             "--DATA_LAKE_BUCKET", "my-test-bucket",

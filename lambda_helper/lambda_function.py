@@ -74,7 +74,7 @@ WORKFLOW_TERMINAL_STATES = {'COMPLETED', 'STOPPED', 'ERROR'}
 
 DEFAULT_BRONZE_JOB = os.environ.get('DEFAULT_BRONZE_JOB', 'uax-datalake-bronze-ingestion-dev')
 DEFAULT_SILVER_JOB = os.environ.get('DEFAULT_SILVER_JOB', 'uax-datalake-silver-etl-dev')
-DEFAULT_GOLD_JOB = os.environ.get('DEFAULT_GOLD_JOB', DEFAULT_SILVER_JOB)
+DEFAULT_GOLD_JOB = os.environ.get('DEFAULT_GOLD_JOB', 'uax-datalake-gold-marts-dev')
 DEFAULT_CRAWLER_NAME = os.environ.get('DEFAULT_CRAWLER_NAME', 'uax-datalake-bronze-crawler-dev')
 DEFAULT_WORKFLOW_NAME = os.environ.get('DEFAULT_WORKFLOW_NAME', os.environ.get('GLUE_WORKFLOW_NAME', ''))
 

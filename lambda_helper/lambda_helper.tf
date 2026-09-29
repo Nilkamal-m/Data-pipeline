@@ -205,7 +205,7 @@ resource "aws_lambda_function" "glue_trigger_lambda" {
     variables = {
       DEFAULT_BRONZE_JOB   = "${var.app_name}-bronze-ingestion-${var.environment}"
       DEFAULT_SILVER_JOB   = "${var.app_name}-silver-etl-${var.environment}"
-      DEFAULT_GOLD_JOB     = "${var.app_name}-silver-etl-${var.environment}"
+      DEFAULT_GOLD_JOB     = "${var.app_name}-gold-marts-${var.environment}"
       DEFAULT_CRAWLER_NAME = "${var.app_name}-bronze-crawler-${var.environment}"
       ENVIRONMENT          = var.environment
     }

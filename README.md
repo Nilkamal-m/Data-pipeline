@@ -124,7 +124,7 @@ Data-pipeline/
 │       │   └── genesys_conversations.py
 │       ├── gold_config_loader.py       # Gold configuration loader & cache manager
 │       ├── gold_initial_load.py        # Gold initial load & PySpark distributed encryptor
-│       ├── gold_layer_manager.py       # Master Gold orchestration engine
+│       ├── gold_layer_manager.py       # Master Gold orchestration engine & standalone Glue job entrypoint
 │       └── protegrity_encryption.py    # Protegrity PII tokenization & PySpark mapInPandas batch encryptor
 ├── docs/                               # Enterprise Documentation Suite
 │   ├── ARCHITECTURE.md                 # System-wide architectural blueprint

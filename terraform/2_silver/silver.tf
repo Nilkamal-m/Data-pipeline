@@ -40,26 +40,6 @@ variable "use_existing_glue_database" {
   description = "If true, skips creating Glue database and reuses existing database."
 }
 
-# ------------------------------------------------------------------------------
-# RDS MySQL Network Variables (Injected via tfvars or pipeline parameters)
-# ------------------------------------------------------------------------------
-variable "rds_security_group_id" {
-  type        = string
-  default     = ""
-  description = "Security Group ID of the target RDS MySQL instance."
-}
-
-variable "rds_subnet_id" {
-  type        = string
-  default     = ""
-  description = "Private Subnet ID where Glue ENI will be deployed."
-}
-
-variable "rds_availability_zone" {
-  type        = string
-  default     = ""
-  description = "Availability Zone of the target RDS MySQL instance."
-}
 
 
 locals {
@@ -113,39 +93,17 @@ module "silver_iceberg_crawler" {
 }
 
 # ------------------------------------------------------------------------------
-# 3. AWS Glue Connection for Private RDS MySQL (Anthem Private Registry Module)
-# ------------------------------------------------------------------------------
-module "glue_connection" {
-  source = "cps-terraform.anthem.com/DIG/terraform-aws-glue-connection/aws"
-
-  create_new_connection = true
-  name                  = "${var.app_name}-rds-connection-${var.environment}"
-  description           = "AWS Glue connection for RDS MySQL serving layer"
-
-  physical_connection_requirements = [
-    {
-      availability_zone      = var.rds_availability_zone
-      subnet_id              = var.rds_subnet_id
-      security_group_id_list = [var.rds_security_group_id]
-    }
-  ]
-}
-
-# ------------------------------------------------------------------------------
-# 4. AWS Glue PySpark Apache Iceberg & Gold ETL Job
+# 3. AWS Glue PySpark Apache Iceberg ETL Job
 # ------------------------------------------------------------------------------
 module "silver_iceberg_job" {
   source = "glue/aws//modules/job"
 
   name              = "${var.app_name}-silver-etl-${var.environment}"
-  description       = "AWS Glue PySpark ETL Job transforming Bronze raw data into Silver Apache Iceberg tables and Gold marts."
+  description       = "AWS Glue PySpark ETL Job transforming Bronze raw data into Silver Apache Iceberg tables."
   role_arn          = local.glue_role_arn
   glue_version      = "4.0"
   number_of_workers = 2
   worker_type       = "G.1X"
-
-  # Attach Glue VPC Connection for RDS MySQL access
-  connections = [module.glue_connection.name]
 
   command = {
     name            = "glueetl"
@@ -187,10 +145,6 @@ output "glue_silver_iceberg_crawler_name" {
   description = "AWS Glue Silver Iceberg Crawler Name."
 }
 
-output "glue_connection_name" {
-  value       = module.glue_connection.name
-  description = "AWS Glue Connection Name for RDS MySQL."
-}
 
 output "glue_silver_iceberg_job_name" {
   value       = "${var.app_name}-silver-etl-${var.environment}"

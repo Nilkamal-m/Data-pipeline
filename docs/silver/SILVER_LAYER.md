@@ -238,7 +238,7 @@ aws glue start-job-run \
   * `--ENV`: Target deployment environment (`dev`, `stage`, `prod`; default: `dev`).
   * `--CONFIG_S3_PATH`: S3 path to `silver_config.json`.
   * `--SOURCE_TABLE_NAME`: Target table name to process (processes all source tables if omitted).
-  * `--PROCESS_LAYER`: Pipeline target layer (`silver`, `gold`, or `both`; default: `silver`).
+  * `--PROCESS_LAYER`: Target layer (`silver`; default: `silver`. Gold processing runs via standalone `gold_layer_manager.py`).
   * `--DATA_LAKE_BUCKET`: Target S3 bucket for Iceberg data and watermarks.
   * `--GLUE_DATABASE`: AWS Glue Data Catalog database name.
   * `--TABLE_PREFIX`: Prefix for conformed Silver tables (`tbl_`).

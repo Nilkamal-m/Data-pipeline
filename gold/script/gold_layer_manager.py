@@ -53,7 +53,59 @@ except ImportError:
     except ImportError:
         GoldInitialLoader = None
 
-logger = logging.getLogger(__name__)
+# ------------------------------------------------------------------------------
+# High-Performance, Non-Duplicating CloudWatch Log Configuration
+# ------------------------------------------------------------------------------
+class FlushStreamHandler(logging.StreamHandler):
+    """Guarantees immediate line flush to avoid AWS Glue / CloudWatch line interleaving."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
+class CleanLogFormatter(logging.Formatter):
+    """
+    Clean, modern log formatter optimized for AWS CloudWatch console viewing.
+    - Eliminates duplicate handlers & line collisions.
+    - Standardized timestamp [YYYY-MM-DD HH:MM:SS UTC] and 5-char aligned severity.
+    """
+    def format(self, record):
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        level = record.levelname.ljust(5)
+        msg = record.getMessage()
+
+        if "\n" in msg:
+            lines = msg.split("\n")
+            first_line = f"{ts} | {level} | {lines[0]}"
+            rest = "\n".join(lines[1:])
+            return f"{first_line}\n{rest}"
+
+        return f"{ts} | {level} | {msg}"
+
+
+def setup_gold_logging():
+    """Configures root logger with CleanLogFormatter and FlushStreamHandler."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for h in list(root_logger.handlers):
+        root_logger.removeHandler(h)
+
+    stdout_handler = FlushStreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.setFormatter(CleanLogFormatter())
+    root_logger.addHandler(stdout_handler)
+
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+
+
+logger = logging.getLogger("GoldServingETL")
+logger.setLevel(logging.INFO)
+logger.propagate = True
+
 
 
 class GoldLayerManager:
@@ -294,7 +346,7 @@ class GoldLayerManager:
                 )
 
         # Query and Data Paths
-        bucket_name = params.get('DATA_LAKE_BUCKET')
+        bucket_name = params.get('DATA_LAKE_BUCKET') or bucket_name
         query_s3_path = params.get('GOLD_QUERY_S3_PATH') or (f"s3://{bucket_name}/gold/query/{source_system}" if bucket_name else None)
         if not query_s3_path:
             raise ValueError(
@@ -2832,33 +2884,336 @@ class GoldLayerManager:
         return loader.reconcile_schema(df_raw, target_fields)
 
 
-def main():
-    """Glue entrypoint when executed as an AWS Glue Job."""
-    from pyspark.context import SparkContext
-    from awsglue.context import GlueContext
-    from awsglue.utils import getResolvedOptions
+    @classmethod
+    def parse_spark_arguments(cls, argv: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Parses CLI arguments for Gold Layer execution."""
+        return parse_spark_arguments(argv=argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    @classmethod
+    def run_standalone_glue_job(cls, argv: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Executes Gold Layer Manager as a standalone AWS Glue Job."""
+        return main(argv=argv)
 
-    sc = SparkContext.getOrCreate()
-    glueContext = GlueContext(sc)
-    spark = glueContext.spark_session
 
-    expected_args = ['JOB_NAME', 'SOURCE_SYSTEM']
-    optional_args = [
-        'SECRET_NAME', 'RDS_SECRET_NAME', 'API_SECRET_NAME', 'LLM_SECRET_NAME',
-        'GLUE_DATABASE', 'DATA_LAKE_BUCKET', 'INCREMENTAL', 'FULL_REFRESH',
-        'RDS_HOST', 'RDS_PORT', 'RDS_USER', 'RDS_PASSWORD',
-        'RDS_GOLD_SCHEMA', 'GOLD_TARGETS', 'CONNECTION_NAME', 'ENV', 'ENVIRONMENT',
-        'GOLD_CONFIG_S3_PATH', 'ATHENA_WORKGROUP', 'WORKGROUP', 'MART_NAME', 'TABLE_NAME',
-        'CSV_PATH', 'INITIAL_LOAD_PATH', 'INPUT_FILE', 'SKIP_INITIAL_LOAD', 'RELOAD_INITIAL', 'DELIMITER', 'HAS_HEADER'
-    ]
+def parse_spark_arguments(argv: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Parses CLI arguments passed by Step Functions, Lambda, or AWS Glue Job Run dynamically for Gold Layer.
+    Enforces 3-tier precedence: 1. Glue CLI Argument -> 2. Config File -> 3. Code Default
+    """
+    raw_args = list(argv if argv is not None else sys.argv)
+    arg_dict = {}
+    i = 1 if (raw_args and not raw_args[0].startswith('--')) else 0
+    while i < len(raw_args):
+        arg = raw_args[i]
+        if arg.startswith('--'):
+            arg_content = arg[2:]
+            if '=' in arg_content:
+                key, val = arg_content.split('=', 1)
+                arg_dict[key.strip()] = val.strip()
+                i += 1
+            elif i + 1 < len(raw_args) and not raw_args[i + 1].startswith('--'):
+                arg_dict[arg_content.strip()] = raw_args[i + 1].strip()
+                i += 2
+            else:
+                arg_dict[arg_content.strip()] = ''
+                i += 1
+        else:
+            i += 1
 
-    args_to_check = expected_args + [a for a in optional_args if f"--{a}" in sys.argv or f"--{a.lower()}" in sys.argv]
-    resolved = getResolvedOptions(sys.argv, args_to_check)
+    def get_cli_arg(*names, default=None):
+        for name in names:
+            norm_name = str(name).lower().replace('-', '_')
+            for k, v in arg_dict.items():
+                if str(k).lower().replace('-', '_') == norm_name and v is not None and str(v).strip() != '':
+                    return str(v).strip()
+        return default
 
-    GoldLayerManager.run_gold_pipeline(spark, resolved)
+    # Target Deployment Environment: CLI (--ENV or --ENVIRONMENT) > Env Var > Default ('dev')
+    env = (
+        get_cli_arg('ENV', 'env', 'ENVIRONMENT', 'environment')
+        or os.environ.get('ENV')
+        or os.environ.get('ENVIRONMENT')
+        or 'dev'
+    ).strip().lower()
+    logger.info(f"Target deployment environment resolved: '{env}'")
+
+    # Source System (Mandatory)
+    source_system = get_cli_arg('SOURCE_SYSTEM', 'source_system')
+    if not source_system or not str(source_system).strip():
+        logger.error("Missing required parameter '--SOURCE_SYSTEM'. Example: --SOURCE_SYSTEM servicenow")
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: Missing required parameter '--SOURCE_SYSTEM'.\n"
+            "The ultimate Gold query path is 's3://<bucket>/gold/query/<source>/<table_name>.sql'.\n"
+            "Please explicitly specify the source system (e.g. --SOURCE_SYSTEM servicenow)."
+        )
+    source_system_clean = str(source_system).strip().lower()
+
+    # Process Layer (defaults to 'gold')
+    process_layer = (get_cli_arg('PROCESS_LAYER', 'process_layer', default='gold')).lower().strip()
+
+    # Data Lake / Gold Bucket: CLI > Env > Default ('uax-datalake-{env}-bucket')
+    raw_bucket = get_cli_arg(
+        'DATA_LAKE_BUCKET', 'data_lake_bucket',
+        'GOLD_BUCKET', 'gold_bucket',
+        'SILVER_BUCKET', 'silver_bucket'
+    ) or os.environ.get('DATA_LAKE_BUCKET', f'uax-datalake-{env}-bucket')
+    data_lake_bucket = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+    # Gold Config S3 Path / JSON
+    gold_config_json = get_cli_arg('GOLD_CONFIG_JSON', 'gold_config_json')
+    gold_config_s3_path = get_cli_arg(
+        'GOLD_CONFIG_S3_PATH', 'gold_config_s3_path',
+        'GOLD_CONFIG_PATH', 'gold_config_path',
+        'GOLD_CONFIG', 'gold_config',
+        'CONFIG_S3_PATH', 'config_s3_path'
+    )
+    if gold_config_s3_path and gold_config_s3_path.strip().startswith('{') and gold_config_s3_path.strip().endswith('}'):
+        gold_config_json = gold_config_s3_path.strip()
+        gold_config_s3_path = None
+
+    if not gold_config_s3_path and not gold_config_json:
+        gold_config_s3_path = f"s3://{data_lake_bucket}/gold/script/config/gold_config.json"
+
+    # Pre-load gold_config if available to resolve defaults
+    gold_cfg = None
+    if GoldConfigLoader:
+        try:
+            s3_client = boto3.client('s3') if gold_config_s3_path and not gold_config_json else None
+            gold_cfg = GoldLayerManager._load_gold_config(
+                config_s3_path=gold_config_s3_path,
+                s3_client=s3_client,
+                env=env,
+                bucket_name=data_lake_bucket,
+                params={'GOLD_CONFIG_JSON': gold_config_json, 'ENV': env}
+            )
+        except Exception as e:
+            logger.warning(f"Could not pre-load gold_config.json in argument parsing: {e}")
+            gold_cfg = {}
+
+    defaults_cfg = GoldConfigLoader.get_defaults(gold_cfg, env=env) if (GoldConfigLoader and gold_cfg) else {}
+    if defaults_cfg.get('gold_bucket') and not get_cli_arg('DATA_LAKE_BUCKET', 'data_lake_bucket', 'GOLD_BUCKET', 'gold_bucket'):
+        data_lake_bucket = str(defaults_cfg['gold_bucket']).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+    # Glue Database
+    raw_glue_database = (
+        get_cli_arg('GLUE_DATABASE', 'glue_database', 'GLUE_DB_NAME', 'glue_db_name')
+        or defaults_cfg.get('glue_database')
+        or defaults_cfg.get('glue_catalog', {}).get('database_name')
+        or f"uax_datalake_db_{env}"
+    )
+    glue_database = str(raw_glue_database).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+    # Table Prefix
+    table_prefix = (
+        get_cli_arg('TABLE_PREFIX', 'table_prefix', 'GOLD_TABLE_PREFIX', 'gold_table_prefix')
+        or defaults_cfg.get('table_prefix', f"gold_{source_system_clean}_")
+    )
+
+    # Gold Serving Target Engines
+    gold_targets_raw = get_cli_arg('GOLD_TARGETS', 'gold_targets', 'GOLD_TARGET', 'gold_target')
+    if gold_targets_raw:
+        gold_targets = [t.strip().lower() for t in str(gold_targets_raw).split(',') if t.strip()]
+    elif GoldConfigLoader and gold_cfg:
+        gold_targets = GoldConfigLoader.get_target_engines(source_system_clean, "", config_dict=gold_cfg)
+    else:
+        gold_targets = ['aurora']
+    if not gold_targets:
+        gold_targets = ['aurora']
+    gold_target = gold_targets[0]
+
+    # RDS Gold Schema (Enterprise Shared DB Policy - Zero Fallback)
+    gold_schema = get_cli_arg('RDS_GOLD_SCHEMA', 'rds_gold_schema', 'GOLD_SCHEMA', 'gold_schema', 'RDS_SCHEMA', 'rds_schema')
+    needs_mysql = any(t in gold_targets for t in ('aurora', 'rds', 'mysql'))
+    if needs_mysql and (not gold_schema or not str(gold_schema).strip()):
+        raise ValueError(
+            "CRITICAL CONFIG ERROR: Missing required parameter '--RDS_GOLD_SCHEMA'.\n"
+            "Downstream target includes Aurora/MySQL, where no fallback schema is permitted.\n"
+            "Please explicitly specify the target MySQL schema name (e.g. --RDS_GOLD_SCHEMA enterprise_reporting)."
+        )
+    if gold_schema:
+        gold_schema = str(gold_schema).strip()
+
+    # Query & Data S3 Paths
+    gold_query_s3_path = get_cli_arg('GOLD_QUERY_S3_PATH', 'gold_query_s3_path') or f"s3://{data_lake_bucket}/gold/query/{source_system_clean}"
+    gold_data_s3_path = get_cli_arg('GOLD_DATA_S3_PATH', 'gold_data_s3_path') or f"s3://{data_lake_bucket}/gold/data/{source_system_clean}"
+
+    # Target table override (optional)
+    raw_tables = get_cli_arg(
+        'TABLE_NAME', 'table_name',
+        'MART_NAME', 'mart_name',
+        'SOURCE_TABLE_NAME', 'source_table_name',
+        'TABLES', 'tables',
+        'TABLE_NAMES', 'table_names'
+    )
+    table_list = [t.strip() for t in raw_tables.split(',') if t.strip()] if raw_tables else []
+
+    # Connection and Credentials
+    connection_name = get_cli_arg('CONNECTION_NAME', 'connection_name', 'GLUE_CONNECTION_NAME', 'glue_connection_name')
+    rds_secret_name = get_cli_arg('RDS_SECRET_NAME', 'rds_secret_name', 'SECRET_NAME', 'secret_name', 'DB_SECRET_NAME', 'db_secret_name')
+    rds_host = get_cli_arg('RDS_HOST', 'rds_host', 'RDS_URL', 'rds_url', 'HOST', 'host')
+    rds_port = get_cli_arg('RDS_PORT', 'rds_port', 'PORT', 'port', default='3306')
+    rds_user = get_cli_arg('RDS_USER', 'rds_user', 'RDS_USERNAME', 'rds_username', 'USER', 'user')
+    rds_password = get_cli_arg('RDS_PASSWORD', 'rds_password', 'PASSWORD', 'password', 'DB_PASSWORD', 'db_password')
+
+    # Athena Workgroup
+    default_athena_wg = os.environ.get('ATHENA_WORKGROUP') or f"uax-datalake-workgroup-{env}"
+    athena_workgroup = get_cli_arg('ATHENA_WORKGROUP', 'athena_workgroup', 'WORKGROUP', 'workgroup', default=default_athena_wg)
+    if athena_workgroup and str(athena_workgroup).strip().lower() == 'primary':
+        athena_workgroup = default_athena_wg
+
+    # External DW: Redshift & Snowflake
+    redshift_schema = get_cli_arg('REDSHIFT_SCHEMA', 'redshift_schema', default='gold_spectrum_schema')
+    redshift_iam_role = get_cli_arg('REDSHIFT_IAM_ROLE', 'redshift_iam_role')
+    redshift_secret_name = get_cli_arg('REDSHIFT_SECRET_NAME', 'redshift_secret_name')
+    snowflake_database = get_cli_arg('SNOWFLAKE_DATABASE', 'snowflake_database', default='UAX_ANALYTICS_DB')
+    snowflake_schema = get_cli_arg('SNOWFLAKE_SCHEMA', 'snowflake_schema', default='GOLD_MARTS')
+    snowflake_external_volume = get_cli_arg('SNOWFLAKE_EXTERNAL_VOLUME', 'snowflake_external_volume', default='UAX_S3_ICEBERG_VOLUME')
+    snowflake_secret_name = get_cli_arg('SNOWFLAKE_SECRET_NAME', 'snowflake_secret_name')
+
+    # Watermark and refresh flags
+    cli_full_refresh = get_cli_arg('FULL_REFRESH', 'full_refresh')
+    full_refresh = str(cli_full_refresh).strip().lower() in ('true', '1', 'yes') if cli_full_refresh is not None else False
+
+    cli_incremental = get_cli_arg('INCREMENTAL', 'incremental')
+    incremental = str(cli_incremental).strip().lower() in ('true', '1', 'yes') if cli_incremental is not None else not full_refresh
+
+    reload_initial = get_cli_arg('RELOAD_INITIAL', 'reload_initial')
+    reload_initial_flag = str(reload_initial).strip().lower() in ('true', '1', 'yes') if reload_initial is not None else False
+
+    skip_initial = get_cli_arg('SKIP_INITIAL_LOAD', 'skip_initial_load')
+    skip_initial_flag = str(skip_initial).strip().lower() in ('true', '1', 'yes') if skip_initial is not None else False
+
+    job_name = get_cli_arg('JOB_NAME', 'job_name', default=f"glue-gold-{source_system_clean}-{env}")
+
+    return {
+        'ENV': env,
+        'PROCESS_LAYER': process_layer,
+        'JOB_NAME': job_name,
+        'SOURCE_SYSTEM': source_system_clean,
+        'TABLE_NAME': ','.join(table_list) if table_list else None,
+        'TABLE_LIST': table_list,
+        'DATA_LAKE_BUCKET': data_lake_bucket,
+        'GOLD_BUCKET': data_lake_bucket,
+        'GLUE_DATABASE': glue_database,
+        'TABLE_PREFIX': table_prefix,
+        'GOLD_CONFIG_S3_PATH': gold_config_s3_path,
+        'GOLD_CONFIG_JSON': gold_config_json,
+        'GOLD_TARGET': gold_target,
+        'GOLD_TARGETS': ','.join(gold_targets),
+        'RDS_GOLD_SCHEMA': gold_schema,
+        'GOLD_SCHEMA': gold_schema,
+        'GOLD_QUERY_S3_PATH': gold_query_s3_path,
+        'GOLD_DATA_S3_PATH': gold_data_s3_path,
+        'CONNECTION_NAME': connection_name,
+        'RDS_SECRET_NAME': rds_secret_name,
+        'RDS_HOST': rds_host,
+        'RDS_PORT': rds_port,
+        'RDS_USER': rds_user,
+        'RDS_PASSWORD': rds_password,
+        'ATHENA_WORKGROUP': athena_workgroup,
+        'WORKGROUP': athena_workgroup,
+        'REDSHIFT_SCHEMA': redshift_schema,
+        'REDSHIFT_IAM_ROLE': redshift_iam_role,
+        'REDSHIFT_SECRET_NAME': redshift_secret_name,
+        'SNOWFLAKE_DATABASE': snowflake_database,
+        'SNOWFLAKE_SCHEMA': snowflake_schema,
+        'SNOWFLAKE_EXTERNAL_VOLUME': snowflake_external_volume,
+        'SNOWFLAKE_SECRET_NAME': snowflake_secret_name,
+        'FULL_REFRESH': full_refresh,
+        'INCREMENTAL': incremental,
+        'RELOAD_INITIAL': reload_initial_flag,
+        'SKIP_INITIAL_LOAD': skip_initial_flag,
+        'CSV_PATH': get_cli_arg('CSV_PATH', 'csv_path', 'INITIAL_LOAD_PATH', 'initial_load_path', 'INPUT_FILE', 'input_file'),
+        'INITIAL_LOAD_PATH': get_cli_arg('INITIAL_LOAD_PATH', 'initial_load_path', 'CSV_PATH', 'csv_path'),
+        'DELIMITER': get_cli_arg('DELIMITER', 'delimiter', default=','),
+        'HAS_HEADER': get_cli_arg('HAS_HEADER', 'has_header', default='true'),
+        'NKEY': get_cli_arg('NKEY', 'nkey', 'NKEYS', 'nkeys', 'PRIMARY_KEY', 'primary_key', 'NATURAL_KEY', 'natural_key', 'PK', 'pk'),
+        'PRIMARY_KEY': get_cli_arg('PRIMARY_KEY', 'primary_key', 'PRIMARY_KEYS', 'primary_keys', 'NKEY', 'nkey', 'NATURAL_KEY', 'natural_key', 'PK', 'pk'),
+        'ARG_DICT': arg_dict
+    }
+
+
+def main(argv: Optional[List[str]] = None):
+    """
+    AWS Glue PySpark entry point for standalone Gold Layer Job execution.
+    Initializes Glue context and job tracker, executes mart transformations,
+    and commits job status.
+    """
+    setup_gold_logging()
+    params = parse_spark_arguments(argv=argv)
+
+    source_system = params['SOURCE_SYSTEM']
+    job_name = params['JOB_NAME']
+    data_lake_bucket = params['DATA_LAKE_BUCKET']
+    glue_database = params['GLUE_DATABASE']
+    gold_targets = params['GOLD_TARGETS']
+    rds_gold_schema = params.get('RDS_GOLD_SCHEMA')
+    table_name = params.get('TABLE_NAME') or "ALL_CONFIGURED"
+
+    execution_start_utc = datetime.now(timezone.utc)
+    current_run_time = execution_start_utc.strftime('%Y-%m-%d %H:%M:%S')
+
+    start_banner = (
+        f"[JOB START] GOLD SERVING ETL | Source: {source_system.upper()} | Targets: {gold_targets.upper()}\n"
+        "+================================================================================+\n"
+        "|                 UAX DATA LAKE - GOLD SERVING ENGINE                            |\n"
+        "+================================================================================+\n"
+        f"|  Job Name           : {job_name:<57}|\n"
+        f"|  Source System      : {source_system.upper():<57}|\n"
+        f"|  Target Mart(s)     : {table_name:<57}|\n"
+        f"|  Data Lake Bucket   : {f's3://{data_lake_bucket}/':<57}|\n"
+        f"|  Glue Database      : {glue_database:<57}|\n"
+        f"|  Serving Targets    : {gold_targets:<57}|\n"
+        f"|  MySQL Schema       : {str(rds_gold_schema):<57}|\n"
+        f"|  Start Time (UTC)   : {current_run_time:<57}|\n"
+        "+================================================================================+"
+    )
+    logger.info(start_banner)
+
+    glue_job = None
+    try:
+        from pyspark.context import SparkContext
+        from awsglue.context import GlueContext
+        from awsglue.job import Job
+
+        sc = SparkContext.getOrCreate()
+        glueContext = GlueContext(sc)
+        spark = glueContext.spark_session
+
+        glue_job = Job(glueContext)
+        glue_job.init(job_name, params['ARG_DICT'])
+    except ImportError:
+        logger.info("awsglue library not available, initializing standard SparkSession...")
+        spark = SparkSession.builder.appName(job_name).getOrCreate()
+
+    # Iceberg & Parquet optimization configurations
+    spark.conf.set("spark.sql.parquet.enableVectorizedReader", "false")
+    spark.conf.set("spark.sql.parquet.recordLevelFilter.enabled", "false")
+    spark.conf.set("spark.sql.parquet.mergeSchema", "false")
+
+    s3_client = boto3.client('s3')
+    glue_client = boto3.client('glue')
+
+    results = GoldLayerManager.run_gold_pipeline(
+        spark=spark,
+        params=params,
+        glue_client=glue_client,
+        s3_client=s3_client
+    )
+
+    failed_marts = [m for m in results if m.get('status') == 'FAILED']
+    if failed_marts:
+        err_msg = f"Gold Serving Layer execution completed with {len(failed_marts)} failure(s)."
+        logger.error(err_msg)
+        raise RuntimeError(err_msg)
+
+    if glue_job:
+        glue_job.commit()
+
+    logger.info("All Gold serving layer operations completed successfully.")
+    return results
 
 
 if __name__ == "__main__":
     main()
+

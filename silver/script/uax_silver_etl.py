@@ -32,16 +32,15 @@ from pyspark.sql.functions import (
     to_timestamp, sha2, concat_ws, when, upper, max as spark_max
 )
 
-# Ensure script directories are on sys.path for Silver & Gold imports
+# Ensure script directory is on sys.path for Silver imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
-gold_dir = os.path.join(os.path.dirname(script_dir), "gold", "script")
-for path in [script_dir, gold_dir, os.getcwd(), "/tmp/extraPython"]:
+for path in [script_dir, os.getcwd(), "/tmp/extraPython"]:
     if os.path.exists(path) and path not in sys.path:
         sys.path.insert(0, path)
 
 from silver_config_loader import SilverConfigLoader
 from transformer import SilverTransformer
-from gold_layer_manager import GoldLayerManager
+
 
 
 # ------------------------------------------------------------------------------
@@ -142,33 +141,24 @@ def parse_spark_arguments() -> dict:
         clean_bucket = bucket_hint.replace('{env}', env).replace('{ENV}', env.upper())
         config_s3_path = f"s3://{clean_bucket}/silver/script/config/silver_config.json"
 
-    gold_config_json = get_cli_arg('GOLD_CONFIG_JSON', 'gold_config_json')
-    gold_config_s3_path = get_cli_arg(
-        'GOLD_CONFIG_S3_PATH', 'gold_config_s3_path',
-        'GOLD_CONFIG_PATH', 'gold_config_path',
-        'GOLD_CONFIG', 'gold_config'
-    )
-    if gold_config_s3_path and gold_config_s3_path.strip().startswith('{') and gold_config_s3_path.strip().endswith('}'):
-        gold_config_json = gold_config_s3_path.strip()
-        gold_config_s3_path = None
-
-    if not gold_config_s3_path and not gold_config_json:
-        bucket_hint = get_cli_arg('DATA_LAKE_BUCKET', 'data_lake_bucket', 'GOLD_BUCKET', 'gold_bucket') or f"uax-datalake-{env}-bucket"
-        clean_bucket = bucket_hint.replace('{env}', env).replace('{ENV}', env.upper())
-        gold_config_s3_path = f"s3://{clean_bucket}/gold/script/config/gold_config.json"
-
     # Load Silver centralized configuration file with dynamic {env} interpolation
     s3_client = boto3.client('s3') if config_s3_path else None
     silver_full_config = SilverConfigLoader.load_config(config_s3_path=config_s3_path, s3_client=s3_client, env=env)
     SilverConfigLoader.set_loaded_config(silver_full_config, env=env)
     defaults_cfg = SilverConfigLoader.get_defaults(silver_full_config, env=env)
 
-    # Process Layer Routing: Supports 'silver', 'gold', or 'both'
+    # Process Layer: Silver layer execution (Gold is executed via standalone gold_layer_manager.py)
     process_layer = (get_cli_arg('PROCESS_LAYER', 'process_layer', default='silver')).lower().strip()
-    if process_layer not in ('silver', 'gold', 'both'):
+    if process_layer != 'silver':
+        if process_layer in ('gold', 'both'):
+            raise ValueError(
+                f"Invalid --PROCESS_LAYER value '{process_layer}' for Silver ETL. "
+                "Gold layer processing has moved to the standalone Glue job 'gold_layer_manager.py'. "
+                "Please run 'gold_layer_manager.py' directly."
+            )
         raise ValueError(
             f"Invalid --PROCESS_LAYER value '{process_layer}'. "
-            f"Strictly 2 options are supported: '--PROCESS_LAYER=silver' or '--PROCESS_LAYER=gold' (or '--PROCESS_LAYER=both')."
+            "Silver ETL strictly supports '--PROCESS_LAYER=silver'."
         )
 
     source_system = get_cli_arg('SOURCE_SYSTEM', 'source_system')
@@ -176,9 +166,9 @@ def parse_spark_arguments() -> dict:
         logger.error("Missing required parameter '--SOURCE_SYSTEM'. Example: --SOURCE_SYSTEM servicenow")
         raise ValueError(
             "CRITICAL CONFIG ERROR: Missing required parameter '--SOURCE_SYSTEM'.\n"
-            "The ultimate Gold query path is 's3://<bucket>/gold/query/<source>/<table_name>.sql'.\n"
             "Please explicitly specify the source system (e.g. --SOURCE_SYSTEM servicenow)."
         )
+
 
     source_system_clean = source_system.strip().lower()
 
@@ -244,9 +234,6 @@ def parse_spark_arguments() -> dict:
     if raw_tables:
         table_list = [t.strip() for t in raw_tables.split(',') if t.strip()]
         logger.info(f"Using CLI parameter table override: {table_list}")
-    elif process_layer == 'gold':
-        table_list = []
-        logger.info("Process layer is 'gold'. Bypassing Silver table_list resolution.")
     else:
         table_list = SilverConfigLoader.get_default_tables(source_system_clean, silver_full_config)
         if not table_list:
@@ -305,63 +292,6 @@ def parse_spark_arguments() -> dict:
     # Metadata Prefix: Config > 'metadata/silver'
     metadata_prefix = watermark_cfg.get('metadata_prefix', 'metadata/silver').strip('/')
 
-    # Gold Serving Layer Parameters
-    gold_targets_raw = get_cli_arg('GOLD_TARGETS', 'gold_targets', 'GOLD_TARGET', 'gold_target', default='aurora')
-    gold_targets = [t.strip().lower() for t in str(gold_targets_raw).split(',') if t.strip()]
-    gold_target = gold_targets[0] if gold_targets else 'aurora'
-
-    gold_schema = get_cli_arg('RDS_GOLD_SCHEMA', 'rds_gold_schema')
-    needs_mysql = any(t in gold_targets for t in ('aurora', 'rds', 'mysql'))
-    if process_layer in ('gold', 'both') and needs_mysql and (not gold_schema or not str(gold_schema).strip()):
-        raise ValueError(
-            "CRITICAL CONFIG ERROR: Missing required parameter '--RDS_GOLD_SCHEMA'.\n"
-            "Downstream target includes Aurora/MySQL, where no fallback schema is permitted.\n"
-            "Please explicitly specify the target MySQL schema name (e.g. --RDS_GOLD_SCHEMA enterprise_reporting)."
-        )
-    if gold_schema:
-        gold_schema = str(gold_schema).strip()
-
-    gold_query_s3_path = get_cli_arg('GOLD_QUERY_S3_PATH', 'gold_query_s3_path') or (f"s3://{data_lake_bucket}/gold/query/{source_system_clean}" if data_lake_bucket and source_system_clean else None)
-    gold_data_s3_path = get_cli_arg('GOLD_DATA_S3_PATH', 'gold_data_s3_path') or (f"s3://{data_lake_bucket}/gold/data/{source_system_clean}" if data_lake_bucket and source_system_clean else None)
-    if process_layer in ('gold', 'both'):
-        if not gold_query_s3_path:
-            raise ValueError(
-                "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_QUERY_S3_PATH'.\n"
-                f"Expected: s3://<bucket>/gold/query/{source_system_clean}/\n"
-                "Please specify: --GOLD_QUERY_S3_PATH s3://<bucket>/gold/query/<source_system>"
-            )
-        if not gold_data_s3_path:
-            raise ValueError(
-                "CRITICAL CONFIG ERROR: Missing required parameter '--GOLD_DATA_S3_PATH'.\n"
-                f"Expected: s3://<bucket>/gold/data/{source_system_clean}/\n"
-                "Please specify: --GOLD_DATA_S3_PATH s3://<bucket>/gold/data/<source_system>"
-            )
-    connection_name = get_cli_arg('CONNECTION_NAME', 'connection_name', 'GLUE_CONNECTION_NAME', 'glue_connection_name')
-    rds_secret_name = get_cli_arg('RDS_SECRET_NAME', 'rds_secret_name', 'SECRET_NAME', 'secret_name', 'DB_SECRET_NAME', 'db_secret_name')
-    rds_host = get_cli_arg('RDS_HOST', 'rds_host', 'RDS_URL', 'rds_url', 'HOST', 'host')
-    rds_port = get_cli_arg('RDS_PORT', 'rds_port', 'PORT', 'port', default='3306')
-    rds_user = get_cli_arg('RDS_USER', 'rds_user', 'RDS_USERNAME', 'rds_username', 'USER', 'user')
-    rds_password = get_cli_arg('RDS_PASSWORD', 'rds_password', 'PASSWORD', 'password', 'DB_PASSWORD', 'db_password')
-
-    # Athena Workgroup: CLI > Env > Default (uax-datalake-workgroup-{env})
-    default_athena_wg = os.environ.get('ATHENA_WORKGROUP') or f"uax-datalake-workgroup-{env}"
-    athena_workgroup = get_cli_arg(
-        'ATHENA_WORKGROUP', 'athena_workgroup',
-        'WORKGROUP', 'workgroup',
-        default=default_athena_wg
-    )
-    if athena_workgroup and str(athena_workgroup).strip().lower() == 'primary':
-        athena_workgroup = default_athena_wg
-
-    # External DW: Redshift & Snowflake parameters
-    redshift_schema = get_cli_arg('REDSHIFT_SCHEMA', 'redshift_schema', default='gold_spectrum_schema')
-    redshift_iam_role = get_cli_arg('REDSHIFT_IAM_ROLE', 'redshift_iam_role')
-    redshift_secret_name = get_cli_arg('REDSHIFT_SECRET_NAME', 'redshift_secret_name')
-    snowflake_database = get_cli_arg('SNOWFLAKE_DATABASE', 'snowflake_database', default='UAX_ANALYTICS_DB')
-    snowflake_schema = get_cli_arg('SNOWFLAKE_SCHEMA', 'snowflake_schema', default='GOLD_MARTS')
-    snowflake_external_volume = get_cli_arg('SNOWFLAKE_EXTERNAL_VOLUME', 'snowflake_external_volume', default='UAX_S3_ICEBERG_VOLUME')
-    snowflake_secret_name = get_cli_arg('SNOWFLAKE_SECRET_NAME', 'snowflake_secret_name')
-
     return {
         'ENV': env,
         'PROCESS_LAYER': process_layer,
@@ -380,28 +310,6 @@ def parse_spark_arguments() -> dict:
         'WATERMARK_TABLE_NAME': watermark_table_name,
         'METADATA_PREFIX': metadata_prefix,
         'SILVER_FULL_CONFIG': silver_full_config,
-        'RDS_GOLD_SCHEMA': gold_schema,
-        'GOLD_TARGET': gold_target,
-        'GOLD_TARGETS': ','.join(gold_targets),
-        'GOLD_CONFIG_S3_PATH': gold_config_s3_path,
-        'GOLD_CONFIG_JSON': gold_config_json,
-        'GOLD_QUERY_S3_PATH': gold_query_s3_path,
-        'GOLD_DATA_S3_PATH': gold_data_s3_path,
-        'CONNECTION_NAME': connection_name,
-        'RDS_SECRET_NAME': rds_secret_name,
-        'RDS_HOST': rds_host,
-        'RDS_PORT': rds_port,
-        'RDS_USER': rds_user,
-        'RDS_PASSWORD': rds_password,
-        'ATHENA_WORKGROUP': athena_workgroup,
-        'WORKGROUP': athena_workgroup,
-        'REDSHIFT_SCHEMA': redshift_schema,
-        'REDSHIFT_IAM_ROLE': redshift_iam_role,
-        'REDSHIFT_SECRET_NAME': redshift_secret_name,
-        'SNOWFLAKE_DATABASE': snowflake_database,
-        'SNOWFLAKE_SCHEMA': snowflake_schema,
-        'SNOWFLAKE_EXTERNAL_VOLUME': snowflake_external_volume,
-        'SNOWFLAKE_SECRET_NAME': snowflake_secret_name,
         'NKEY': get_cli_arg('NKEY', 'nkey', 'NKEYS', 'nkeys', 'PRIMARY_KEY', 'primary_key', 'NATURAL_KEY', 'natural_key', 'PK', 'pk'),
         'PRIMARY_KEY': get_cli_arg('PRIMARY_KEY', 'primary_key', 'PRIMARY_KEYS', 'primary_keys', 'NKEY', 'nkey', 'NATURAL_KEY', 'natural_key', 'PK', 'pk'),
         'ARG_DICT': arg_dict
@@ -1349,22 +1257,6 @@ def main():
     execution_start_utc = datetime.now(timezone.utc)
     current_run_time = execution_start_utc.strftime('%Y-%m-%d %H:%M:%S')
 
-    process_layer = params.get('PROCESS_LAYER', 'silver')
-    if process_layer == 'gold':
-        logger.info(
-            f"\n+================================================================================+\n"
-            f"|  ROUTING TO GOLD SERVING ENGINE: --PROCESS_LAYER=gold                           |\n"
-            f"+================================================================================+"
-        )
-        GoldLayerManager.run_gold_pipeline(
-            spark=spark,
-            params=params,
-            glue_client=glue_client,
-            s3_client=s3_client
-        )
-        job.commit()
-        logger.info("All Gold serving layer operations completed successfully.")
-        return
 
     start_banner = (
         f"[JOB START] SILVER ICEBERG ETL | Source: {source_system.upper()} | Tables: {', '.join(table_list)}\n"
@@ -1878,20 +1770,6 @@ def main():
 
     logger.info("All Silver Apache Iceberg ETL transformations completed successfully.")
 
-    # Process Layer Chaining: When --PROCESS_LAYER=both, seamlessly execute Gold after successful Silver
-    if process_layer == 'both':
-        logger.info(
-            f"\n+================================================================================+\n"
-            f"|  CHAINING EXECUTION: SILVER SUCCEEDED -> NOW RUNNING GOLD SERVING ENGINE       |\n"
-            f"+================================================================================+"
-        )
-        GoldLayerManager.run_gold_pipeline(
-            spark=spark,
-            params=params,
-            glue_client=glue_client,
-            s3_client=s3_client
-        )
-        logger.info("All Gold serving layer operations completed successfully.")
 
 
 if __name__ == "__main__":
