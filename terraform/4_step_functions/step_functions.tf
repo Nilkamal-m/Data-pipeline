@@ -309,6 +309,7 @@ module "servicenow_state_machine" {
           Arguments = {
             "--SOURCE_SYSTEM"        = "servicenow"
             "--GOLD_CONFIG_S3_PATH" = "s3://${local.bucket_name}/gold/script/config/gold_config.json"
+            "--AWS_REGION"           = var.aws_region
           }
         }
         Catch = [
@@ -412,6 +413,7 @@ module "moveworks_state_machine" {
           Arguments = {
             "--SOURCE_SYSTEM"        = "moveworks"
             "--GOLD_CONFIG_S3_PATH" = "s3://${local.bucket_name}/gold/script/config/gold_config.json"
+            "--AWS_REGION"           = var.aws_region
           }
         }
         Catch = [
@@ -515,6 +517,7 @@ module "genesys_state_machine" {
           Arguments = {
             "--SOURCE_SYSTEM"        = "genesys"
             "--GOLD_CONFIG_S3_PATH" = "s3://${local.bucket_name}/gold/script/config/gold_config.json"
+            "--AWS_REGION"           = var.aws_region
           }
         }
         Catch = [

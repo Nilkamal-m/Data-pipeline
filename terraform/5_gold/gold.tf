@@ -113,6 +113,7 @@ module "gold_marts_job" {
     "--CONNECTION_NAME"       = "${var.app_name}-rds-connection-${var.environment}"
     "--ATHENA_WORKGROUP"      = "primary"
     "--FULL_REFRESH"          = "false"
+    "--AWS_REGION"            = var.aws_region
     "--job-language"          = "python"
   }
 

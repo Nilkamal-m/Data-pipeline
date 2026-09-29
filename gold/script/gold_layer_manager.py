@@ -452,6 +452,197 @@ class GoldLayerManager:
             return 0
 
     @classmethod
+    def _resolve_aws_region(cls, params: Optional[Dict[str, Any]] = None, bucket_name: Optional[str] = None) -> str:
+        """
+        Dynamically resolves the AWS region from CLI parameters, environment variables,
+        active boto3 session, or S3 bucket location constraint. Prevents hardcoded 'us-east-1'
+        from breaking deployments in other regions (e.g. us-east-2).
+        """
+        params = params or {}
+        r = (
+            params.get('AWS_REGION')
+            or params.get('AWS_DEFAULT_REGION')
+            or params.get('REGION')
+            or os.environ.get('AWS_REGION')
+            or os.environ.get('AWS_DEFAULT_REGION')
+        )
+        if r and str(r).strip():
+            return str(r).strip()
+        try:
+            sess_region = boto3.Session().region_name
+            if sess_region and str(sess_region).strip():
+                return str(sess_region).strip()
+        except Exception:
+            pass
+
+        # Try to resolve region from S3 bucket location if bucket name is available
+        b = bucket_name or params.get('DATA_LAKE_BUCKET') or params.get('BUCKET_NAME')
+        if b:
+            clean_b = str(b).replace("s3://", "").split("/")[0].strip()
+            if clean_b and not clean_b.startswith("{"):
+                try:
+                    s3_c = params.get('_s3_client') or boto3.client('s3')
+                    loc = s3_c.get_bucket_location(Bucket=clean_b).get('LocationConstraint')
+                    if loc:
+                        return 'eu-west-1' if loc == 'EU' else loc
+                    if loc == '':
+                        return 'us-east-1'
+                except Exception:
+                    pass
+
+        return 'us-east-1'
+
+    @classmethod
+    def _purge_table_registration(
+        cls,
+        spark: SparkSession,
+        glue_database: str,
+        target_table_name: str,
+        s3_location: str,
+        glue_client=None,
+        s3_client=None
+    ) -> None:
+        """
+        Completely and cleanly purges an Iceberg table registration across:
+        1. Spark SQL (DROP TABLE IF EXISTS ... PURGE across catalog qualified and direct names)
+        2. Spark catalog cache (clearCache)
+        3. AWS Glue Data Catalog API (delete_table)
+        4. S3 storage files and metadata prefix (_purge_s3_prefix)
+        Ensures zero ghost table state and prevents NoSuchKeyException (404).
+        """
+        logger.info(f"[TABLE PURGE] Initiating complete purge for `{glue_database}`.`{target_table_name}` at '{s3_location}'...")
+
+        # 1. Drop via Spark SQL with PURGE
+        for ident in [
+            f"`glue_catalog`.`{glue_database}`.`{target_table_name}`",
+            f"`{glue_database}`.`{target_table_name}`",
+            f"glue_catalog.{glue_database}.{target_table_name}",
+            f"{glue_database}.{target_table_name}",
+            target_table_name
+        ]:
+            try:
+                spark.sql(f"DROP TABLE IF EXISTS {ident} PURGE")
+            except Exception as e:
+                logger.debug(f"Spark DROP TABLE {ident} note: {e}")
+
+        # 2. Invalidate Spark catalog cache
+        try:
+            spark.catalog.clearCache()
+        except Exception:
+            pass
+
+        # 3. Direct Glue Catalog deletion via boto3
+        if glue_client:
+            try:
+                glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
+                logger.info(f"[GLUE API] Dropped catalog table `{glue_database}`.`{target_table_name}`.")
+            except Exception as e:
+                logger.debug(f"[GLUE API] delete_table note for `{target_table_name}`: {e}")
+
+        # 4. Purge S3 files and metadata only AFTER catalog entry is dropped
+        if s3_client and s3_location:
+            cls._purge_s3_prefix(s3_client, s3_location)
+            cls._purge_s3_prefix(s3_client, f"{s3_location.rstrip('/')}/metadata")
+
+        # 5. Clear cache again
+        try:
+            spark.catalog.clearCache()
+        except Exception:
+            pass
+
+    @classmethod
+    def _create_iceberg_table_from_df(
+        cls,
+        spark: SparkSession,
+        df: DataFrame,
+        glue_database: str,
+        target_table_name: str,
+        s3_location: str,
+        clean_base_name: str,
+        glue_client=None,
+        s3_client=None
+    ) -> None:
+        """
+        Creates or recreates a clean Iceberg table from a DataFrame.
+        Attempts DataFrameWriter saveAsTable first. If NoSuchKeyException (404) or catalog conflict occurs,
+        automatically purges the ghost table and recreates cleanly via Spark SQL DDL.
+        """
+        full_table = f"`{glue_database}`.`{target_table_name}`"
+        temp_view = f"init_create_{clean_base_name}"
+        try:
+            df.createOrReplaceTempView(temp_view)
+        except Exception:
+            pass
+
+        try:
+            try:
+                df.write \
+                    .format("iceberg") \
+                    .mode("overwrite") \
+                    .option("path", s3_location) \
+                    .saveAsTable(f"{glue_database}.{target_table_name}")
+                logger.info(f"[ATHENA/ICEBERG WRITE] Successfully saved Iceberg table {full_table} via saveAsTable.")
+                return
+            except Exception as ice_err:
+                err_text = str(ice_err)
+                if any(x in err_text for x in (
+                    "NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404",
+                    "already exists", "TableAlreadyExistsException", "Cannot create table"
+                )):
+                    logger.warning(
+                        f"[ATHENA/ICEBERG WRITE RECOVERY] Iceberg saveAsTable hit ({ice_err}). "
+                        f"Purging Glue Catalog entry, invalidating cache, and creating table fresh via Spark SQL DDL..."
+                    )
+                    cls._purge_table_registration(
+                        spark=spark,
+                        glue_database=glue_database,
+                        target_table_name=target_table_name,
+                        s3_location=s3_location,
+                        glue_client=glue_client,
+                        s3_client=s3_client
+                    )
+                    df.createOrReplaceTempView(temp_view)
+
+                    create_sql_catalog = (
+                        f"CREATE TABLE glue_catalog.{glue_database}.{target_table_name} "
+                        f"USING iceberg "
+                        f"LOCATION '{s3_location}' "
+                        f"AS SELECT * FROM {temp_view}"
+                    )
+                    create_sql_direct = (
+                        f"CREATE TABLE `{glue_database}`.`{target_table_name}` "
+                        f"USING iceberg "
+                        f"LOCATION '{s3_location}' "
+                        f"AS SELECT * FROM {temp_view}"
+                    )
+
+                    try:
+                        logger.info(f"[ATHENA/ICEBERG WRITE DDL] Executing:\n{create_sql_catalog}")
+                        spark.sql(create_sql_catalog)
+                        logger.info(f"[ATHENA/ICEBERG WRITE DDL] Successfully created Iceberg table glue_catalog.{glue_database}.{target_table_name} via Spark SQL DDL.")
+                    except Exception as ddl_cat_err:
+                        logger.warning(f"[ATHENA/ICEBERG WRITE DDL NOTE] Catalog DDL note ({ddl_cat_err}). Trying database-qualified DDL...")
+                        try:
+                            logger.info(f"[ATHENA/ICEBERG WRITE DDL] Executing:\n{create_sql_direct}")
+                            spark.sql(create_sql_direct)
+                            logger.info(f"[ATHENA/ICEBERG WRITE DDL] Successfully created Iceberg table {full_table} via Spark SQL DDL.")
+                        except Exception as ddl_dir_err:
+                            logger.warning(f"[ATHENA/ICEBERG WRITE DDL NOTE] Database DDL note ({ddl_dir_err}). Retrying saveAsTable on purged location...")
+                            df.write \
+                                .format("iceberg") \
+                                .mode("overwrite") \
+                                .option("path", s3_location) \
+                                .saveAsTable(f"{glue_database}.{target_table_name}")
+                            logger.info(f"[ATHENA/ICEBERG WRITE] Successfully saved Iceberg table {full_table} via saveAsTable after purge.")
+                else:
+                    raise
+        finally:
+            try:
+                spark.catalog.dropTempView(temp_view)
+            except Exception:
+                pass
+
+    @classmethod
     def run_gold_pipeline(
         cls,
         spark: SparkSession,
@@ -482,14 +673,16 @@ class GoldLayerManager:
         ).strip().lower()
         logger.info(f"Target deployment environment resolved: '{env}'")
 
-        # Initialize AWS clients early if not provided
-        region = (
-            params.get('AWS_REGION')
-            or params.get('AWS_DEFAULT_REGION')
-            or os.environ.get('AWS_REGION')
-            or os.environ.get('AWS_DEFAULT_REGION')
-            or 'us-east-1'
+        # Resolve Data Lake Bucket
+        raw_bucket = (
+            params.get('DATA_LAKE_BUCKET')
+            or os.environ.get('DATA_LAKE_BUCKET')
+            or f"uax-datalake-{env}-bucket"
         )
+        bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
+
+        # Initialize AWS clients early if not provided with dynamic region resolution
+        region = cls._resolve_aws_region(params, bucket_name=bucket_name)
         if not s3_client:
             try:
                 s3_client = boto3.client('s3', region_name=region)
@@ -500,14 +693,6 @@ class GoldLayerManager:
                 glue_client = boto3.client('glue', region_name=region)
             except Exception as e:
                 logger.warning(f"Could not initialize Glue client: {e}")
-
-        # Resolve Data Lake Bucket
-        raw_bucket = (
-            params.get('DATA_LAKE_BUCKET')
-            or os.environ.get('DATA_LAKE_BUCKET')
-            or f"uax-datalake-{env}-bucket"
-        )
-        bucket_name = str(raw_bucket).replace('{env}', env).replace('{ENV}', env.upper()).strip()
 
         # Auto-discover and load Gold configuration with robust multi-path probing
         config_s3_path = (
@@ -543,6 +728,8 @@ class GoldLayerManager:
                 ("spark.sql.catalog.glue_catalog.warehouse", warehouse_uri),
                 ("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog"),
                 ("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO"),
+                ("spark.sql.catalog.glue_catalog.client.region", region),
+                ("spark.sql.catalog.glue_catalog.glue.region", region),
                 ("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true"),
                 ("spark.sql.catalog.glue_catalog.skip-name-validation", "true"),
                 ("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true"),
@@ -1173,20 +1360,32 @@ class GoldLayerManager:
                     f"Iceberg does not support in-place type changes for these columns.\n"
                     f"Purging stale Glue Catalog entry and S3 metadata to recreate table cleanly with conformed string schema..."
                 )
-                if glue_client:
-                    try:
-                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                        logger.info(f"Deleted stale Glue Catalog table '{glue_database}.{target_table_name}'.")
-                    except Exception as del_err:
-                        logger.warning(f"Note deleting table from Glue: {del_err}")
-                try:
-                    spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
-                except Exception:
-                    pass
-                cls._purge_s3_prefix(s3_client, s3_location)
+                cls._purge_table_registration(
+                    spark=spark,
+                    glue_database=glue_database,
+                    target_table_name=target_table_name,
+                    s3_location=s3_location,
+                    glue_client=glue_client,
+                    s3_client=s3_client
+                )
                 return True
             return False
         except Exception as err:
+            err_str = str(err)
+            if any(x in err_str for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
+                logger.warning(
+                    f"[GHOST TABLE DETECTED IN COMPATIBILITY CHECK] Table '{full_table}' hit {err}. "
+                    f"Purging ghost table registration to allow clean recreation..."
+                )
+                cls._purge_table_registration(
+                    spark=spark,
+                    glue_database=glue_database,
+                    target_table_name=target_table_name,
+                    s3_location=s3_location,
+                    glue_client=glue_client,
+                    s3_client=s3_client
+                )
+                return True
             logger.debug(f"[SCHEMA COMPATIBILITY CHECK] Note checking table '{full_table}': {err}")
             return False
 
@@ -1444,7 +1643,7 @@ class GoldLayerManager:
 
         if not s3_client or not glue_client:
             try:
-                region = params.get('AWS_REGION') or os.environ.get('AWS_REGION', 'us-east-1')
+                region = cls._resolve_aws_region(params)
                 if not glue_client:
                     glue_client = boto3.client('glue', region_name=region)
                 if not s3_client:
@@ -1476,12 +1675,14 @@ class GoldLayerManager:
                         f"non-existent S3 metadata '{glue_metadata_location}' (404 NoSuchKey). "
                         f"Dropping stale Glue Catalog entry and purging S3 path to allow clean recreation..."
                     )
-                    try:
-                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                        logger.info(f"Successfully dropped ghost table `{glue_database}`.`{target_table_name}` from Glue Catalog.")
-                    except Exception as del_err:
-                        logger.warning(f"Failed to delete ghost table from Glue: {del_err}")
-                    cls._purge_s3_prefix(s3_client, s3_location)
+                    cls._purge_table_registration(
+                        spark=spark,
+                        glue_database=glue_database,
+                        target_table_name=target_table_name,
+                        s3_location=s3_location,
+                        glue_client=glue_client,
+                        s3_client=s3_client
+                    )
                     table_found_in_glue = False
             except Exception:
                 table_found_in_glue = False
@@ -1497,13 +1698,14 @@ class GoldLayerManager:
                     f"[ATHENA/ICEBERG RECOVERY] Spark probe for Iceberg table '{full_table}' failed ({probe_err}). "
                     f"Deleting stale catalog table via Glue API and purging S3 path to allow clean recreation..."
                 )
-                if glue_client:
-                    try:
-                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                        logger.info(f"Successfully dropped stale table `{glue_database}`.`{target_table_name}` via Glue API.")
-                    except Exception as del_err:
-                        logger.warning(f"Could not drop table from Glue Catalog: {del_err}")
-                cls._purge_s3_prefix(s3_client, s3_location)
+                cls._purge_table_registration(
+                    spark=spark,
+                    glue_database=glue_database,
+                    target_table_name=target_table_name,
+                    s3_location=s3_location,
+                    glue_client=glue_client,
+                    s3_client=s3_client
+                )
                 table_exists = False
         else:
             table_exists = False
@@ -1563,21 +1765,16 @@ class GoldLayerManager:
                             f"[ATHENA/ICEBERG MERGE RECOVERY] Iceberg MERGE hit {merge_err}. "
                             f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
                         )
-                        if glue_client:
-                            try:
-                                glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                            except Exception:
-                                pass
-                        try:
-                            spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
-                        except Exception:
-                            pass
-                        cls._purge_s3_prefix(s3_client, s3_location)
-                        df_mart.write \
-                            .format("iceberg") \
-                            .mode("overwrite") \
-                            .option("path", s3_location) \
-                            .saveAsTable(f"{glue_database}.{target_table_name}")
+                        cls._create_iceberg_table_from_df(
+                            spark=spark,
+                            df=df_mart,
+                            glue_database=glue_database,
+                            target_table_name=target_table_name,
+                            s3_location=s3_location,
+                            clean_base_name=clean_base_name,
+                            glue_client=glue_client,
+                            s3_client=s3_client
+                        )
                     else:
                         logger.warning(
                             f"[ATHENA/ICEBERG UPSERT] Spark SQL MERGE failed ({merge_err}). "
@@ -1594,60 +1791,31 @@ class GoldLayerManager:
                                     f"[ATHENA/ICEBERG RECOVERY] Fallback hit incompatible schema ({ice_fallback_err}). "
                                     f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
                                 )
-                                if glue_client:
-                                    try:
-                                        glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                                    except Exception:
-                                        pass
-                                try:
-                                    spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
-                                except Exception:
-                                    pass
-                                cls._purge_s3_prefix(s3_client, s3_location)
-                                df_mart.write \
-                                    .format("iceberg") \
-                                    .mode("overwrite") \
-                                    .option("path", s3_location) \
-                                    .saveAsTable(f"{glue_database}.{target_table_name}")
+                                cls._create_iceberg_table_from_df(
+                                    spark=spark,
+                                    df=df_mart,
+                                    glue_database=glue_database,
+                                    target_table_name=target_table_name,
+                                    s3_location=s3_location,
+                                    clean_base_name=clean_base_name,
+                                    glue_client=glue_client,
+                                    s3_client=s3_client
+                                )
                             else:
                                 logger.error(f"[ATHENA/ICEBERG UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
                                 raise
         else:
             logger.info(f"[ATHENA/ICEBERG WRITE] Initializing clean Gold Iceberg table {full_table} at '{s3_location}'...")
-            if glue_client:
-                try:
-                    glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                    logger.info(f"[CLEANUP] Deleted preexisting Glue Catalog registration for '{target_table_name}' before recreation.")
-                except Exception:
-                    pass
-            cls._purge_s3_prefix(s3_client, f"{s3_location.rstrip('/')}/metadata")
-
-            try:
-                df_mart.write \
-                    .format("iceberg") \
-                    .mode("overwrite") \
-                    .option("path", s3_location) \
-                    .saveAsTable(f"{glue_database}.{target_table_name}")
-            except Exception as ice_err:
-                err_text = str(ice_err)
-                if any(x in err_text for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
-                    logger.warning(
-                        f"[ATHENA/ICEBERG WRITE RETRY] Iceberg saveAsTable hit NoSuchKey ({ice_err}). "
-                        f"Purging Glue Catalog entry and entire S3 table location '{s3_location}' then retrying fresh creation..."
-                    )
-                    if glue_client:
-                        try:
-                            glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                        except Exception:
-                            pass
-                    cls._purge_s3_prefix(s3_client, s3_location)
-                    df_mart.write \
-                        .format("iceberg") \
-                        .mode("overwrite") \
-                        .option("path", s3_location) \
-                        .saveAsTable(f"{glue_database}.{target_table_name}")
-                else:
-                    raise
+            cls._create_iceberg_table_from_df(
+                spark=spark,
+                df=df_mart,
+                glue_database=glue_database,
+                target_table_name=target_table_name,
+                s3_location=s3_location,
+                clean_base_name=clean_base_name,
+                glue_client=glue_client,
+                s3_client=s3_client
+            )
 
         total_count = row_count
         try:
@@ -3166,7 +3334,7 @@ class GoldInitialLoader:
         s3_client = params.get('_s3_client')
         if glue_client is None or s3_client is None:
             try:
-                region = params.get('AWS_REGION') or os.environ.get('AWS_REGION', 'us-east-1')
+                region = cls._resolve_aws_region(params)
                 if glue_client is None:
                     glue_client = boto3.client('glue', region_name=region)
                 if s3_client is None:
@@ -3342,21 +3510,16 @@ class GoldInitialLoader:
                         f"[INITIAL LOAD MERGE RECOVERY] Iceberg MERGE hit {merge_err}. "
                         f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
                     )
-                    if glue_client:
-                        try:
-                            glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                        except Exception:
-                            pass
-                    try:
-                        spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
-                    except Exception:
-                        pass
-                    cls._purge_s3_prefix(s3_client, s3_location)
-                    df_consolidated.write \
-                        .format("iceberg") \
-                        .mode("overwrite") \
-                        .option("path", s3_location) \
-                        .saveAsTable(f"{glue_database}.{target_table_name}")
+                    GoldLayerManager._create_iceberg_table_from_df(
+                        spark=spark,
+                        df=df_consolidated,
+                        glue_database=glue_database,
+                        target_table_name=target_table_name,
+                        s3_location=s3_location,
+                        clean_base_name=table_name,
+                        glue_client=glue_client,
+                        s3_client=s3_client
+                    )
                 else:
                     logger.warning(f"[INITIAL LOAD UPSERT] Spark SQL MERGE failed ({merge_err}). Falling back to Iceberg insertInto on '{full_table}'...")
                     try:
@@ -3370,60 +3533,31 @@ class GoldInitialLoader:
                                 f"[INITIAL LOAD RECOVERY] Fallback hit incompatible schema ({ice_fallback_err}). "
                                 f"Purging stale Glue Catalog table and S3 location '{s3_location}' to re-initialize cleanly..."
                             )
-                            if glue_client:
-                                try:
-                                    glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                                except Exception:
-                                    pass
-                            try:
-                                spark.sql(f"DROP TABLE IF EXISTS `{glue_database}`.`{target_table_name}`")
-                            except Exception:
-                                pass
-                            cls._purge_s3_prefix(s3_client, s3_location)
-                            df_consolidated.write \
-                                .format("iceberg") \
-                                .mode("overwrite") \
-                                .option("path", s3_location) \
-                                .saveAsTable(f"{glue_database}.{target_table_name}")
+                            GoldLayerManager._create_iceberg_table_from_df(
+                                spark=spark,
+                                df=df_consolidated,
+                                glue_database=glue_database,
+                                target_table_name=target_table_name,
+                                s3_location=s3_location,
+                                clean_base_name=table_name,
+                                glue_client=glue_client,
+                                s3_client=s3_client
+                            )
                         else:
                             logger.error(f"[INITIAL LOAD UPSERT ERROR] Iceberg append fallback also failed: {ice_fallback_err}")
                             raise
         else:
             logger.info(f"[INITIAL LOAD WRITE] Initializing clean Gold Iceberg table {full_table} at '{s3_location}'...")
-            if glue_client:
-                try:
-                    glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                    logger.info(f"[CLEANUP] Deleted preexisting Glue Catalog registration for '{target_table_name}' before recreation.")
-                except Exception:
-                    pass
-            cls._purge_s3_prefix(s3_client, f"{s3_location.rstrip('/')}/metadata")
-
-            try:
-                df_consolidated.write \
-                    .format("iceberg") \
-                    .mode("overwrite") \
-                    .option("path", s3_location) \
-                    .saveAsTable(f"{glue_database}.{target_table_name}")
-            except Exception as ice_err:
-                err_text = str(ice_err)
-                if any(x in err_text for x in ("NoSuchKey", "The specified key does not exist", "NoSuchKeyException", "404")):
-                    logger.warning(
-                        f"[INITIAL LOAD WRITE RETRY] Iceberg saveAsTable hit NoSuchKey ({ice_err}). "
-                        f"Purging Glue Catalog entry and entire S3 table location '{s3_location}' then retrying fresh creation..."
-                    )
-                    if glue_client:
-                        try:
-                            glue_client.delete_table(DatabaseName=glue_database, Name=target_table_name)
-                        except Exception:
-                            pass
-                    cls._purge_s3_prefix(s3_client, s3_location)
-                    df_consolidated.write \
-                        .format("iceberg") \
-                        .mode("overwrite") \
-                        .option("path", s3_location) \
-                        .saveAsTable(f"{glue_database}.{target_table_name}")
-                else:
-                    raise
+            GoldLayerManager._create_iceberg_table_from_df(
+                spark=spark,
+                df=df_consolidated,
+                glue_database=glue_database,
+                target_table_name=target_table_name,
+                s3_location=s3_location,
+                clean_base_name=table_name,
+                glue_client=glue_client,
+                s3_client=s3_client
+            )
 
         target_engines = []
         if params.get('GOLD_TARGETS') or params.get('TARGET_ENGINES'):
@@ -3564,12 +3698,16 @@ def main():
     env_val = resolved.get('ENV') or 'dev'
     clean_bucket = str(bucket_name).replace('{env}', env_val).strip()
 
+    region_val = GoldLayerManager._resolve_aws_region(resolved, bucket_name=clean_bucket)
+
     conf = SparkConf()
     conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
     conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
     conf.set("spark.sql.catalog.glue_catalog.warehouse", f"s3://{clean_bucket}/gold/data/")
     conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
     conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    conf.set("spark.sql.catalog.glue_catalog.client.region", region_val)
+    conf.set("spark.sql.catalog.glue_catalog.glue.region", region_val)
     conf.set("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true")
     conf.set("spark.sql.catalog.glue_catalog.skip-name-validation", "true")
     conf.set("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true")
@@ -3587,6 +3725,8 @@ def main():
         ("spark.sql.catalog.glue_catalog.warehouse", f"s3://{clean_bucket}/gold/data/"),
         ("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog"),
         ("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO"),
+        ("spark.sql.catalog.glue_catalog.client.region", region_val),
+        ("spark.sql.catalog.glue_catalog.glue.region", region_val),
         ("spark.sql.catalog.glue_catalog.glue.skip-name-validation", "true"),
         ("spark.sql.catalog.glue_catalog.skip-name-validation", "true"),
         ("spark.sql.catalog.glue_catalog.aws.glue.skip-name-validation", "true"),
