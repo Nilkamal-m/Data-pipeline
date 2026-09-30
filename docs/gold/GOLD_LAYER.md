@@ -7,14 +7,18 @@ The **Gold Layer** is the business presentation and consumption layer of the Med
 In the end-to-end data pipeline, the Gold job runs as **Job 3 of the 3-job sequential AWS Glue Workflow** (`Bronze` $\to$ `Silver` $\to$ `Gold`). Once Gold succeeds, the pipeline triggers an automated **Amazon SNS Success Notification** with comprehensive execution metrics. If any job in the pipeline fails, an immediate **Amazon SNS Failure Alert** is dispatched with structured diagnostic information.
 
 ### Core Architectural Responsibilities
-* **Standalone AWS Glue PySpark Job**: Executes independently via [gold_layer_manager.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/gold/script/gold_layer_manager.py) with its own entrypoint, GlueContext, and CLI argument parsing.
-* **Cross-Layer SQL Business Marts**: Executes modular SQL queries ([gold/query/<source>/*.sql](file:///Users/nilkamalmahato/Documents/Data-pipeline/gold/query)) capable of querying across **any medallion layer**:
+* **Standalone AWS Glue PySpark Job**: Executes independently via [`gold_layer_manager.py`](../../gold/script/gold_layer_manager.py) with its own entrypoint, GlueContext, and CLI argument parsing.
+* **Cross-Layer SQL Business Marts**: Executes modular SQL queries ([`gold/query/<source>/*.sql`](../../gold/query)) capable of querying across **any medallion layer**:
   - **Bronze Layer**: `raw_tbl_<name>` (raw ingested data)
   - **Silver Layer**: `tbl_<name>` (conformed dimensional and factual Iceberg entities)
   - **Gold Layer**: `gold_<source>_<name>`, `gold_tbl_<name>`, `v_<name>`, or `<name>` (dependent upstream marts)
+* **Timestamp Standardization**: All business timestamp columns are automatically detected and converted to a uniform `YYYY-MM-DD HH:MM:SS` string format. Technical audit columns (`_updated_at`, `_inserted_at`, `_data_as_of`) remain as `TimestampType` to preserve precision for watermark filtering.
+* **Uniform String Schema Enforcement**: All non-timestamp business columns are cast to `StringType` to ensure consistent schema across Iceberg, Athena, and Aurora MySQL serving targets.
 * **Authoritative Physical Iceberg Tables**: Materializes conformed marts as physical Apache Iceberg tables (`gold_<source>_<table_name>`) directly in the AWS Glue Data Catalog. The physical Iceberg table is the single source of truth for all business analytics.
 * **Ghost Table Auto-Remediation**: Automatically detects when an Iceberg table exists in the Glue Catalog but its underlying S3 metadata JSON was deleted (preventing `NoSuchKeyException: 404 Not Found`), purges the orphan catalog entry via Glue API, and cleanly re-initializes the table.
+* **Iceberg Schema Incompatibility Auto-Resolution**: Detects when existing table column types conflict with incoming data (e.g., `bigint` → `string`) and automatically purges and recreates the table with the corrected schema.
 * **Zero-Downtime Aurora MySQL Serving**: Reads back conformed records from the authoritative Gold Iceberg table, stages them in an isolated temporary table (`{table}_staging`), performs a microsecond atomic DDL swap (`RENAME TABLE target TO old, staging TO target`), and ensures index performance on natural keys (`_ensure_mysql_index`).
+* **Protegrity PII Encryption**: Supports Protegrity PII tokenization for historical initial load data via `ProtegrityEncryptionManager` with guarded activation — encryption is invoked only when `encryption_columns` is configured and a valid `lambda_arn` is available.
 * **Pluggable Python Business Transforms**: Provides script hooks (`gold/script/custom_transforms/*.py`) for machine learning enrichment, advanced KPI calculation, and unstructured text parsing.
 * **Historical Data Migration & Archival**: Ingests historical reporting CSV exports (`gold/initial_exports/`), parses complex multiline records, dedupes against incoming telemetry, and automatically archives processed source files to S3 `_archived/` directories.
 
@@ -51,25 +55,32 @@ flowchart TD
         CheckGhost -- Healthy / New --> CheckInitial
         PurgeGhost --> CheckInitial{"Historical CSV Exists\nin gold/initial_exports/?"}
         CheckInitial -- Yes --> ParseCSV["GoldInitialLoader.load():\nRead CSV with multiLine, escape & quote"]
-        ParseCSV --> DedupeCSV["Deduplicate by nkey\nOrdered by _updated_at DESC"]
+        ParseCSV --> EncryptPII{"Protegrity Encryption\nColumns Configured?"}
+        EncryptPII -- Yes --> RunEncrypt["ProtegrityEncryptionManager.encrypt_spark_dataframe()\nGuarded: validates lambda_arn before invocation"]
+        EncryptPII -- No --> DedupeCSV
+        RunEncrypt --> DedupeCSV["Deduplicate by nkey\nOrdered by _updated_at DESC"]
         DedupeCSV --> ArchiveS3["Move CSV to S3 _archived/:\ns3://.../gold/initial_exports/{source}/_archived/"]
         ArchiveS3 --> InitIceberg["Bootstrap Initial Gold Iceberg Table"]
         CheckInitial -- No --> MartPlanning
         InitIceberg --> MartPlanning
     end
 
-    subgraph MartExecution ["3. Cross-Layer Dependency Resolution & Execution"]
+    subgraph SchemaReconciliation ["3. Schema Reconciliation & Timestamp Standardization"]
         MartPlanning["Discover Mart Queries:\ngold/query/{source}/*.sql"] --> BuildDAG["Build Dependency Graph & Topological Sort\n(Detect prerequisite marts)"]
         BuildDAG --> PreRegisterViews["_ensure_dependency_views_registered:\nScan clean_sql for table tokens & register Spark temp views\n(raw_tbl_* from Bronze, tbl_* from Silver, gold_* from Gold)"]
         PreRegisterViews --> RunSQL["Execute Mart SQL Query"]
-        RunSQL --> CheckCustom{"Custom Transform\nScript Configured?"}
+        RunSQL --> ReconcileSchema["reconcile_schema():\n1. Sanitize column names\n2. Detect timestamp columns by name/type heuristic\n3. Convert timestamps to YYYY-MM-DD HH:MM:SS string\n4. Cast all other business columns to StringType\n5. Preserve _updated_at, _inserted_at, _data_as_of as TimestampType"]
+        ReconcileSchema --> CheckCustom{"Custom Transform\nScript Configured?"}
         CheckCustom -- Yes --> ExecCustom["Execute custom_transforms/{source}_{table}.py\n(e.g., Genesys transcript & metric parsing)"]
         CheckCustom -- No --> FilterDelta
         ExecCustom --> FilterDelta["filter_incremental_delta():\nAnti-join against existing Gold Iceberg table\n(Isolate new, updated, and unenriched records)"]
     end
 
     subgraph IcebergTarget ["4. Authoritative Iceberg Mart Upsert"]
-        FilterDelta --> AlignSchema["Dynamic Schema Alignment & Padding\n(Pad missing columns as NULL, reorder)"]
+        FilterDelta --> CheckCompat{"Iceberg Schema\nCompatible?"}
+        CheckCompat -- Incompatible Types --> AutoPurge["_check_and_resolve_iceberg_incompatibilities():\nPurge stale table & recreate with conformed schema"]
+        CheckCompat -- Compatible --> AlignSchema
+        AutoPurge --> AlignSchema["Dynamic Schema Alignment & Padding\n(Pad missing columns as NULL, reorder)"]
         AlignSchema --> IcebergMerge["Spark SQL MERGE INTO target AS t USING source AS s\nON t.nkey = s.nkey\nWHEN MATCHED THEN UPDATE SET *\nWHEN NOT MATCHED THEN INSERT *"]
         IcebergMerge --> IcebergDone["Physical Iceberg Table Updated\n(Authoritative Single Source of Truth)"]
     end
@@ -117,10 +128,11 @@ gold/
 ```
 
 ### Architectural Highlights
-1. **Fully Standalone Entrypoint**: [gold_layer_manager.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/gold/script/gold_layer_manager.py) contains `main()`, `GlueContext`, and `Job.init(args['JOB_NAME'], args)`. It runs completely independently from the Silver job.
+1. **Fully Standalone Entrypoint**: [`gold_layer_manager.py`](../../gold/script/gold_layer_manager.py) contains `main()`, `GlueContext`, and `Job.init(args['JOB_NAME'], args)`. It runs completely independently from the Silver job.
 2. **Cross-Layer SQL Support**: SQL queries can freely join tables across Bronze (`raw_tbl_*`), Silver (`tbl_*`), and Gold (`gold_*`). The engine inspects tokens in the query and pre-loads them as temporary views.
 3. **Physical Iceberg Single Source of Truth**: Data is merged directly into physical Iceberg tables registered in the AWS Glue Data Catalog. No redundant Athena catalog views (`v_*`) are created.
 4. **Aurora MySQL Zero-Downtime Atomic Staging Swap**: The downstream MySQL database (`enterprise_reporting.*`) is updated via a single atomic `RENAME TABLE` statement. Dashboard users and BI queries never encounter locks or partial loads.
+5. **Synchronized Schema Logic**: `reconcile_schema()` is implemented identically in both `GoldInitialLoader` and `GoldLayerManager`, ensuring consistent timestamp standardization and string enforcement across initial load and incremental pipelines.
 
 ---
 
@@ -159,11 +171,50 @@ LEFT JOIN
 
 ---
 
-## 5. Primary Target: Athena Iceberg Engine Mechanics
+## 5. Schema Reconciliation & Timestamp Standardization
+
+### 5.1 Timestamp Detection Heuristics
+
+The `_is_timestamp_column()` method determines whether a column should be treated as a timestamp using a multi-layered approach:
+
+1. **Data Type Inspection**: Checks if the source or target PySpark data type is `TimestampType`, `DateType`, or `TimestampNTZType`.
+2. **Exact Name Matching**: Columns named `timestamp`, `datetime`, `date`, `time`, `created_at`, `updated_at`, `closed_at`, `resolved_at`, etc.
+3. **Suffix Matching**: Column names ending in `_timestamp`, `_ts`, `_datetime`, `_at`, `_time`, `_date`, `_dt`, `_on`, `_start`, `_end`.
+4. **Prefix Matching**: Column names starting with `timestamp_`, `datetime_`, `date_`, `time_`.
+5. **Compound Phrases**: Column names containing `conversation_start`, `event_time`, `sys_created`, `sys_updated`, etc.
+
+**Exclusion Rule**: Technical audit columns `_updated_at`, `_inserted_at`, and `_data_as_of` are always excluded from timestamp standardization. They remain as `TimestampType` to preserve precision for watermark filtering and delta detection.
+
+### 5.2 Timestamp Conversion (`_conform_timestamp_to_string`)
+
+Once a column is identified as a timestamp, `_conform_timestamp_to_string()` converts it to the uniform `YYYY-MM-DD HH:MM:SS` string format. It handles:
+
+| Input Type / Format | Conversion Strategy |
+|---|---|
+| Native `TimestampType` / `DateType` | `date_format(col, "yyyy-MM-dd HH:mm:ss")` |
+| Numeric epoch (10 digits = seconds) | `from_unixtime(col)` → `date_format` |
+| Numeric epoch (13 digits = milliseconds) | `from_unixtime(col / 1000)` → `date_format` |
+| ISO 8601 strings (`2024-09-24T11:00:00Z`) | `to_timestamp()` with format pattern → `date_format` |
+| Space-separated strings (`2024-09-24 11:00:00.123`) | `to_timestamp()` with format pattern → `date_format` |
+| Slash-delimited strings (`2024/09/24`, `09/24/2024`) | `to_timestamp()` with format pattern → `date_format` |
+| Date-only strings (`2024-09-24`) | `to_timestamp()` with format pattern → `date_format` |
+| `NULL`, empty, `"null"`, `"none"`, `"nan"` | Cast to `NULL` string |
+
+### 5.3 Query Schema Probing
+
+When a Gold table doesn't yet exist in the catalog, `_probe_target_schema_from_query()` automatically discovers the target schema by:
+1. Locating the corresponding SQL query file (local or S3).
+2. Executing a zero-record probe query: `SELECT * FROM (<sql>) WHERE 1=0`.
+3. Extracting the schema fields and data types in milliseconds without reading actual data.
+4. Passing the probed schema into `reconcile_schema()` for type-aware timestamp detection.
+
+---
+
+## 6. Primary Target: Athena Iceberg Engine Mechanics
 
 The physical Apache Iceberg table (`gold_<source>_<table_name>`) serves as the definitive source of truth.
 
-### 5.1 Dynamic Schema Alignment (Zero Hardcoding)
+### 6.1 Dynamic Schema Alignment (Zero Hardcoding)
 In production, schema evolution occurs naturally as upstream sources introduce new columns. `_upsert_iceberg_table` guarantees stability through runtime introspection:
 1. **Catalog Inspection**: Queries `spark.table(f"glue_catalog.{db}.{target_table}").schema` to retrieve current physical table column types.
 2. **Column Padding**: Any column existing in the physical table but missing from the current incoming DataFrame is injected with `lit(None).cast(target_col_type)`.
@@ -177,7 +228,7 @@ In production, schema evolution occurs naturally as upstream sources introduce n
    WHEN NOT MATCHED THEN INSERT *
    ```
 
-### 5.2 Ghost Iceberg Table Auto-Remediation
+### 6.2 Ghost Iceberg Table Auto-Remediation
 If an Iceberg table exists in the AWS Glue Data Catalog but its underlying metadata JSON file in S3 was deleted or corrupted, any standard query will fail with `NoSuchKeyException: 404 Not Found`.
 
 `GoldLayerManager` automatically checks the metadata pointer before writing. If corrupted:
@@ -185,13 +236,20 @@ If an Iceberg table exists in the AWS Glue Data Catalog but its underlying metad
 2. Cleans up any orphaned objects under the S3 prefix.
 3. Automatically re-provisions a fresh, healthy Iceberg table.
 
+### 6.3 Iceberg Schema Incompatibility Auto-Resolution
+`_check_and_resolve_iceberg_incompatibilities()` inspects each incoming column against the existing Iceberg table schema. If data type mismatches are found (e.g., the Gold table has `bigint` columns but the incoming DataFrame has `string` after schema reconciliation), the method:
+1. Logs all incompatible columns with their old and new types.
+2. Purges the stale Glue Catalog entry via `_purge_table_registration()`.
+3. Removes orphaned S3 metadata and data files.
+4. Returns `True`, signaling the caller to create a fresh Iceberg table with the new schema.
+
 ---
 
-## 6. Downstream Serving: Amazon Aurora MySQL Adapter
+## 7. Downstream Serving: Amazon Aurora MySQL Adapter
 
 The Aurora MySQL adapter serves operational web applications and real-time dashboards (Power BI, Tableau) requiring sub-second query performance.
 
-### 6.1 Architecture: Iceberg Gold Table $\to$ Aurora Gold Staging $\to$ Aurora Gold Table
+### 7.1 Architecture: Iceberg Gold Table $\to$ Aurora Gold Staging $\to$ Aurora Gold Table
 
 To eliminate duplicate record accumulation and maintain exact parity with the authoritative Athena Iceberg mart, the platform enforces the **Atomic Table Swap Strategy**:
 
@@ -220,7 +278,7 @@ To eliminate duplicate record accumulation and maintain exact parity with the au
 * **Zero Downtime**: Power BI and BI analysts querying `{target_table}` experience continuous availability without locking or missing-table exceptions.
 * **Guaranteed Parity**: Aurora record counts always match Athena Iceberg record counts exactly, preventing runaway duplicate counts on recurring runs.
 
-### 6.2 Aurora MySQL Secrets Manager Contract
+### 7.2 Aurora MySQL Secrets Manager Contract
 Credentials for Aurora MySQL are dynamically fetched from AWS Secrets Manager using `--RDS_SECRET_NAME` (or configured under `source_systems.<source>.secret_name` in `gold_config.json`).
 
 ```json
@@ -246,7 +304,29 @@ Credentials for Aurora MySQL are dynamically fetched from AWS Secrets Manager us
 
 ---
 
-## 7. Historical Data Migration & S3 Auto-Archival
+## 8. Protegrity PII Encryption
+
+### 8.1 Encryption Architecture
+
+Protegrity PII tokenization is supported in both Bronze and Gold layers via the shared `ProtegrityEncryptionManager` class. The module is located at:
+- **Bronze**: [`bronze/script/protegrity_encryption.py`](../../bronze/script/protegrity_encryption.py)
+- **Gold**: [`gold/script/protegrity_encryption.py`](../../gold/script/protegrity_encryption.py)
+
+### 8.2 Key Behaviors
+
+| Feature | Description |
+|---|---|
+| **Guarded Activation** | Encryption is invoked **only** when `encryption_columns` is defined for the table and is non-empty. If omitted, no `lambda_arn` validation occurs and the entire encryption subsystem is skipped. |
+| **`lambda_arn` Validation** | If `encryption_columns` are configured but `lambda_arn` is missing or empty, a `ValueError` is raised immediately to prevent silent failures. |
+| **Lazy Import** | `ProtegrityEncryptionManager` is dynamically imported using try/except to prevent circular import issues and runtime failures when the module is unavailable. |
+| **Shared `_clean_key()`** | Both Bronze and Gold modules use an identical static `_clean_key()` method: `re.sub(r'[^a-zA-Z0-9_]', '', re.sub(r'[\s\.\-]+', '_', str(k).strip())).lower()`. This ensures consistent column name resolution during encryption across layers. |
+| **Bronze Processing** | Uses `encrypt_record_chunk()` for in-memory Python dictionary batches (list of dicts). |
+| **Gold Processing** | Uses `encrypt_spark_dataframe()` for PySpark DataFrame distributed encryption via `mapInPandas` with 500-record micro-batches. |
+| **Retry Strategy** | Exponential jitter backoff with up to 5 retries for transient Lambda invocation failures. |
+
+---
+
+## 9. Historical Data Migration & S3 Auto-Archival
 
 When migrating historical analytics data from legacy data warehouses or vendor export dumps:
 
@@ -259,16 +339,18 @@ When migrating historical analytics data from legacy data warehouses or vendor e
        .option("escape", '"') \
        .option("quote", '"')
    ```
-3. **Automatic S3 Archival**: Upon successful ingestion into Iceberg, `_archive_s3_file` moves the CSV to:
+3. **Schema Reconciliation**: The input CSV is reconciled against the target schema using `reconcile_schema()` — sanitizing column names, standardizing timestamps, enforcing string types, and padding missing columns.
+4. **Protegrity Encryption**: If `encryption_columns` is configured for the table, PII columns in the historical CSV are encrypted via `ProtegrityEncryptionManager` before Iceberg ingestion.
+5. **Automatic S3 Archival**: Upon successful ingestion into Iceberg, `_archive_s3_file` moves the CSV to:
    `s3://{gold_bucket}/gold/initial_exports/{source}/_archived/{table}_{timestamp}.csv`
    This guarantees that subsequent daily incremental runs will not re-parse the multi-gigabyte historical export.
-4. **Disaster Recovery Overrides**:
+6. **Disaster Recovery Overrides**:
    - `--RELOAD_INITIAL=true`: Forces the engine to scan and re-ingest archived historical exports.
    - `--FULL_REFRESH=true`: Re-evaluates all Silver data and re-seeds downstream target engines.
 
 ---
 
-## 8. Developer Onboarding: Adding a New Gold Mart
+## 10. Developer Onboarding: Adding a New Gold Mart
 
 ### Step 1: Write Business SQL Query
 Create `gold/query/<source>/<mart_name>.sql`:
@@ -337,6 +419,6 @@ Verify Athena and Aurora:
 
 ---
 
-## 9. Developer Enhancement Reference
+## 11. Developer Enhancement Reference
 
 For details on extending the Gold codebase — adding custom transforms, configuring incremental behavior, or inspecting method implementations — see [ENHANCEMENT_GUIDE.md](ENHANCEMENT_GUIDE.md) and [REFERENCE_INDEX.md](REFERENCE_INDEX.md).

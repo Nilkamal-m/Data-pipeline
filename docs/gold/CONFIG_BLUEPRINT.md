@@ -124,16 +124,16 @@ This document provides the definitive configuration blueprint for `gold_config.j
 | `merge_strategy` | string | Optional (Default: `upsert`) | *Used in `_upsert_iceberg_table`*: Default merge strategy (`upsert`, `append`, `overwrite`). |
 | `glue_catalog.enabled` | boolean | Optional (Default: `true`) | *Used in Glue client*: Whether to register/synchronize the mart table in AWS Glue Data Catalog. |
 | `glue_catalog.database_name` | string | Optional | *Used in Spark catalog queries*: Glue Database name for marts (e.g., `uax_datalake_db_{env}`). |
-| `technical_columns.inserted_at_column` | string | Optional (Default: `_inserted_at`) | *Used in DataFrame enrichment*: Column name tracking record insertion timestamp. |
-| `technical_columns.updated_at_column` | string | Optional (Default: `_updated_at`) | *Used in DataFrame enrichment*: Column name tracking record modification timestamp. |
+| `technical_columns.inserted_at_column` | string | Optional (Default: `_inserted_at`) | *Used in DataFrame enrichment*: Column name tracking record insertion timestamp. **Remains as `TimestampType`** — exempt from string casting. |
+| `technical_columns.updated_at_column` | string | Optional (Default: `_updated_at`) | *Used in DataFrame enrichment*: Column name tracking record modification timestamp. **Remains as `TimestampType`** — exempt from string casting. |
 | `default_target_engines` | array | Optional (Default: `["athena", "aurora"]`) | *Used in serving router*: Fallback list of downstream engines when not specified at source/table level. |
 | `initial_load.template` | string | Optional | *Used in `GoldInitialLoader`*: Default S3 URI template for historical data imports (`s3://{bucket}/...`). |
 | `initial_load.format` | string | Optional (Default: `csv`) | *Used in Spark CSV reader*: Historical export file format (`csv`). |
 | `initial_load.delimiter` | string | Optional (Default: `,`) | *Used in Spark CSV reader*: Delimiter character for parsing historical files. |
 | `initial_load.has_header` | boolean | Optional (Default: `true`) | *Used in Spark CSV reader*: Flag indicating if the CSV contains a header row. |
-| `encryption.enabled` | boolean | Optional (Default: `false`) | Master switch for Protegrity PII tokenization during historical export cold-start ingestion. |
-| `encryption.lambda_arn` | string | **Mandatory if encryption used** | ARN of the Protegrity Protector Lambda service. Throws `ValueError` if empty when encryption columns are present. |
-| `encryption.batch_size` | integer | Optional (Default: `500`) | Number of records per synchronous Lambda invocation to stay well below the 6MB limit. |
+| `encryption.enabled` | boolean | Optional (Default: `false`) | Master switch for Protegrity PII tokenization. **Note**: Even if set to `true`, encryption is only invoked when `encryption_columns` is non-empty for a table. If `encryption_columns` is empty/omitted, no encryption occurs regardless of this flag. |
+| `encryption.lambda_arn` | string | **Mandatory if encryption columns are present** | ARN of the Protegrity Protector Lambda service. A `ValueError` is raised if `encryption_columns` are configured but `lambda_arn` is empty. If `encryption_columns` is empty, this field is not validated. |
+| `encryption.batch_size` | integer | Optional (Default: `500`) | Number of records per synchronous Lambda invocation to stay well under the 6MB limit. |
 | `encryption.secret_name` | string | Optional | AWS Secrets Manager secret storing Protegrity user identity credentials. |
 | `encryption.user_secret_key` | string | Optional (Default: `protegrity_user_secret`) | Key inside Secrets Manager secret JSON containing the authorization GUID. |
 | `encryption.default_data_element` | string | Optional (Default: `AES256`) | Fallback Protegrity protection policy if not specified per column. |
@@ -161,10 +161,10 @@ This document provides the definitive configuration blueprint for `gold_config.j
 | `custom_transform_script` | string | Optional | *Used in `GoldLayerManager`*: Relative path to Python transformation script extending business logic. |
 | `api_secret_name` | string | Optional | *Used in custom transforms*: Secrets Manager key name for third-party APIs (e.g. LLM scoring endpoints). |
 | `initial_load.path` | string | Optional | *Used in `GoldInitialLoader`*: Specific S3 URI pointing to the historical CSV file for this table. |
-| `encryption_columns` | object / array | Optional | Defines sensitive columns to encrypt and their Protegrity data element (e.g. `{"customer_name": "EMP_MEMBERNAME_ALPHANUM_LP", "customer_email": "EMP_MEMBER_EMAIL_LP"}`). Used in `gold_initial_load.py` for cold-start CSV exports. |
+| `encryption_columns` | object / array | Optional | Defines sensitive columns to encrypt and their Protegrity data element (e.g. `{"customer_name": "EMP_MEMBERNAME_ALPHANUM_LP", "customer_email": "EMP_MEMBER_EMAIL_LP"}`). Used in `gold_initial_load.py` for cold-start CSV exports. Column names are matched using the shared `_clean_key()` normalizer. |
 
 > [!TIP]
-> **Immediate Short-Circuit Rule for Encryption**:
+> **Guarded Activation Rule for Encryption**:
 > If `encryption_columns` is omitted or empty on a table, the Gold initial load engine (`gold_initial_load.py`) **immediately skips** all encryption processing. It does not check `encryption.enabled: true` and does not check or validate `lambda_arn`. Only when `encryption_columns` contains one or more non-empty column mappings does it validate `lambda_arn` (raising an explicit `ValueError` if missing) and encrypt the raw historical DataFrame via `mapInPandas` micro-batches.
 
 ---
@@ -238,3 +238,21 @@ When writing SQL queries for Gold marts (e.g., in `gold/query/<source>/<file>.sq
   If your SQL references only a bare table name or view name (e.g. `interactions` or `v_interactions`), the engine resolves it to the underlying `gold_<source>_<tablename>` physical mart and registers the alias.
 * **Topological Ordering**:
   If Mart B references Mart A, the DAG scheduler ensures Mart A executes and materializes into Iceberg before Mart B runs.
+
+---
+
+### 2.6 Schema & Data Type Contract
+
+#### Business Columns
+All business columns in the Gold layer are enforced as `StringType`. This eliminates Parquet/Iceberg schema mismatch issues across CSV imports, Silver Iceberg reads, and cross-layer SQL joins.
+
+#### Timestamp Columns
+Business columns identified as timestamps (by naming convention or PySpark data type inspection) are standardized to `YYYY-MM-DD HH:MM:SS` string format before being stored as `StringType`.
+
+#### Technical Audit Columns
+The following columns are **exempt** from string conversion and remain as `TimestampType`:
+- `_updated_at` — tracks the last merge timestamp for delta filtering
+- `_inserted_at` — tracks the initial insertion timestamp
+- `_data_as_of` — tracks the data currency timestamp
+
+This contract is enforced by `reconcile_schema()` in both `GoldInitialLoader` and `GoldLayerManager`.

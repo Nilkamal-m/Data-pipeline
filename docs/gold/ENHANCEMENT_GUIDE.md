@@ -10,7 +10,7 @@ This guide explains how the Gold layer code is structured and how to safely exte
 gold/script/
 ├── gold_layer_manager.py      # Main entry point, standalone Glue job & orchestration engine
 ├── gold_config_loader.py      # Config reader, {env} interpolation & cache manager
-├── gold_initial_load.py       # Historical CSV backfill & schema reconciliation logic
+├── gold_initial_load.py       # Historical CSV backfill, schema reconciliation & encryption
 ├── protegrity_encryption.py   # Distributed PySpark PII tokenization via mapInPandas
 ├── config/
 │   └── gold_config.json       # Mart definitions, nkeys, target engine routing
@@ -38,7 +38,11 @@ parse_spark_arguments()
         └─► [Cold-Start / Recovery Phase]
             _check_and_run_initial_load()
                 ├─► Ghost Table Check: boto3 glue.delete_table() if S3 metadata missing
-                └─► GoldInitialLoader.load() if initial CSV exists in gold/initial_exports/
+                ├─► Iceberg Incompatibility Check: _check_and_resolve_iceberg_incompatibilities()
+                │     └─► Purge & recreate if existing column types conflict with incoming schema
+                └─► GoldInitialLoader.run_initial_load() if initial CSV exists in gold/initial_exports/
+                      ├─► Protegrity encryption (if encryption_columns configured & lambda_arn available)
+                      └─► reconcile_schema() → timestamp standardization + string enforcement
         └─► [Mart Discovery & DAG Phase]
             _discover_queries()
             _sort_queries_by_dependency()     # Topological sort for inter-mart DAG
@@ -46,6 +50,7 @@ parse_spark_arguments()
                     _ensure_dependency_views_registered()
                         # Pre-loads raw_tbl_* (Bronze), tbl_* (Silver), gold_* (Gold) as Spark temp views
                     execute_mart_sql(query_file)
+                    └─► reconcile_schema()          # Timestamp standardization + string enforcement
                     └─► run_custom_transform()        # If custom_transform_script configured
                     └─► filter_incremental_delta()    # If incremental=true: delta anti-join
                     └─► _align_schema()               # Pad missing cols as NULL, reorder to catalog
@@ -55,7 +60,47 @@ parse_spark_arguments()
 
 ---
 
-## 3. Incremental vs. Full Refresh
+## 3. Schema Reconciliation & Timestamp Standardization
+
+### How `reconcile_schema()` Works
+
+Both `GoldInitialLoader` and `GoldLayerManager` contain identical `reconcile_schema()` implementations that enforce the Gold layer data contract:
+
+```python
+# Step 1: Sanitize column names (spaces, dots, hyphens → underscores, lowercase)
+# Step 2: For each column:
+#   - Skip _updated_at, _inserted_at, _data_as_of (keep as TimestampType)
+#   - If _is_timestamp_column() returns True → _conform_timestamp_to_string()
+#   - Otherwise → cast to StringType
+# Step 3: Pad missing target columns with NULL
+# Step 4: Retain extra columns for schema evolution
+```
+
+### Timestamp Detection (`_is_timestamp_column()`)
+
+A column is identified as a timestamp if:
+1. Its PySpark data type is `TimestampType`, `DateType`, or `TimestampNTZType`.
+2. Its name exactly matches: `timestamp`, `datetime`, `date`, `created_at`, `updated_at`, etc.
+3. Its name ends with: `_timestamp`, `_ts`, `_at`, `_time`, `_date`, `_on`, `_start`, `_end`.
+4. Its name starts with: `timestamp_`, `datetime_`, `date_`, `time_`.
+5. Its name contains: `conversation_start`, `event_time`, `sys_created`, etc.
+
+**Exclusion**: `_updated_at`, `_inserted_at`, `_data_as_of` are always excluded and remain as `TimestampType`.
+
+### Timestamp Conversion (`_conform_timestamp_to_string()`)
+
+Converts timestamps to `YYYY-MM-DD HH:MM:SS` string format. Handles:
+- Native PySpark timestamp/date types
+- Epoch seconds (10 digits) and epoch milliseconds (13 digits)
+- ISO 8601 strings with timezone (`2024-09-24T11:00:00Z`, `+00:00`)
+- Space-separated strings (`2024-09-24 11:00:00.123`)
+- Slash-delimited strings (`2024/09/24`, `09/24/2024`, `dd/MM/yyyy`)
+- Date-only strings (`2024-09-24`)
+- Null / empty / `"null"` / `"none"` / `"nan"` → `NULL`
+
+---
+
+## 4. Incremental vs. Full Refresh
 
 ### Incremental Mode (`"incremental": true`)
 
@@ -83,7 +128,7 @@ aws glue start-job-run \
 
 ---
 
-## 4. Dynamic Schema Alignment (Zero Hardcoding)
+## 5. Dynamic Schema Alignment (Zero Hardcoding)
 
 Before every Iceberg merge, the engine aligns the incoming DataFrame to the physical Iceberg table schema:
 
@@ -103,7 +148,19 @@ This means:
 
 ---
 
-## 5. Athena Iceberg Merge (`_materialize_athena_table`)
+## 6. Iceberg Schema Incompatibility Auto-Resolution
+
+When the existing Gold Iceberg table has column types that conflict with the incoming DataFrame (e.g., existing `bigint` vs incoming `string` after reconciliation), `_check_and_resolve_iceberg_incompatibilities()`:
+
+1. Compares each incoming column's type against the existing table's type.
+2. If mismatches are found, purges the stale Glue Catalog entry and S3 metadata.
+3. Returns `True` to signal fresh table creation with the corrected schema.
+
+This happens automatically — no manual intervention is required when upstream schema changes cause type conflicts.
+
+---
+
+## 7. Athena Iceberg Merge (`_materialize_athena_table`)
 
 ```sql
 MERGE INTO glue_catalog.{database}.{target_table} AS t
@@ -117,7 +174,7 @@ WHEN NOT MATCHED THEN INSERT *
 
 ---
 
-## 6. Aurora MySQL Adapter — Atomic Staging Swap
+## 8. Aurora MySQL Adapter — Atomic Staging Swap
 
 The Aurora adapter never performs in-place row updates. It uses a full staging-swap to guarantee exact parity with Athena Iceberg:
 
@@ -135,12 +192,50 @@ The Aurora adapter never performs in-place row updates. It uses a full staging-s
 
 ---
 
-## 7. Historical Initial Load & Ghost Table Auto-Remediation
+## 9. Protegrity PII Encryption
+
+### When Encryption is Activated
+
+Encryption is activated for initial load data **only** when:
+1. `encryption_columns` is configured for the table in `gold_config.json` (non-empty dict or array).
+2. A valid `lambda_arn` is available (from config or CLI).
+3. Encryption is not explicitly disabled via `--ENABLE_ENCRYPTION=false`.
+
+If `encryption_columns` is empty or omitted, the entire encryption subsystem is skipped — no `lambda_arn` validation occurs.
+
+### Column Name Resolution
+
+Both Bronze and Gold layers use the same `_clean_key()` method for column matching:
+```python
+@staticmethod
+def _clean_key(k: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9_]', '', re.sub(r'[\s\.\-]+', '_', str(k).strip())).lower()
+```
+
+This ensures that column names like `Customer Name`, `customer-name`, and `customer_name` all resolve to the same key.
+
+### Configuration Example
+```json
+"conversations": {
+  "encryption_columns": {
+    "customer_name": "EMP_MEMBERNAME_ALPHANUM_LP",
+    "customer_email": "EMP_MEMBER_EMAIL_LP"
+  }
+}
+```
+
+---
+
+## 10. Historical Initial Load & Ghost Table Auto-Remediation
 
 On the **first run** for a table:
 1. **Ghost Table Check**: `GoldLayerManager` checks if the Iceberg table exists in Glue Catalog. If it exists but its underlying S3 metadata was deleted (causing `404 Not Found`), the engine deletes the broken catalog entry via `boto3 glue.delete_table()` and re-provisions cleanly.
-2. **Initial CSV Ingestion**: If historical CSV exists at `initial_load.path`:
-   - `GoldInitialLoader` reads the CSV with `multiLine=true` and `escape="\"` options.
+2. **Iceberg Incompatibility Check**: If the table exists but column types conflict with incoming data, the table is purged and recreated with the corrected schema.
+3. **Initial CSV Ingestion**: If historical CSV exists at `initial_load.path`:
+   - `GoldInitialLoader` reads the CSV with `multiLine=true` and `escape="\\"` options.
+   - Cleanses column names via `sanitize_column_name()`.
+   - Encrypts PII columns via `ProtegrityEncryptionManager` (if `encryption_columns` configured).
+   - Reconciles schema with `reconcile_schema()` (timestamp standardization + string enforcement).
    - Deduplicates by `nkey` ordered by `_updated_at DESC`.
    - Writes to the Gold Iceberg table as the baseline.
    - Archives the CSV to `s3://.../gold/initial_exports/{source}/_archived/{table}_{timestamp}.csv`.
@@ -156,7 +251,7 @@ aws glue start-job-run \
 
 ---
 
-## 8. Custom Transform Hooks
+## 11. Custom Transform Hooks
 
 For enrichment logic beyond SQL (API calls, ML scoring, aggregations):
 
@@ -185,7 +280,7 @@ The transform runs **after** the mart SQL executes and **before** schema alignme
 
 ---
 
-## 9. Adding a New Gold Mart
+## 12. Adding a New Gold Mart
 
 ### Step 1 — Write the mart SQL
 File: `gold/query/<source>/<mart_name>.sql`
@@ -242,9 +337,9 @@ Both counts should match.
 
 ---
 
-## 10. Adding a New Downstream Target Engine
+## 13. Adding a New Downstream Target Engine
 
-All downstream serving targets are handled via private `@classmethod` methods on `GoldLayerManager` in [gold_layer_manager.py](file:///Users/nilkamalmahato/Documents/Data-pipeline/gold/script/gold_layer_manager.py).
+All downstream serving targets are handled via private `@classmethod` methods on `GoldLayerManager` in [`gold_layer_manager.py`](../../gold/script/gold_layer_manager.py).
 
 To add an additional custom target engine (e.g. a specialized API or document store):
 

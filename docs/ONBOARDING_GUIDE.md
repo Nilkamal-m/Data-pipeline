@@ -297,3 +297,6 @@ Follow this recipe to onboard an entity from source extraction to business servi
    }
    ```
 3. Run the Gold manager (`gold_layer_manager.py`) to build the physical Athena Iceberg mart and sync downstream to Amazon Aurora MySQL (`enterprise_reporting.*`) via zero-downtime atomic staging swap.
+   - **Schema Reconciliation**: During processing, `reconcile_schema()` automatically sanitizes column names, identifies business timestamp columns by naming convention and data type inspection, and converts them to a uniform `YYYY-MM-DD HH:MM:SS` string format. All other business columns are cast to `StringType`. Technical audit columns (`_updated_at`, `_inserted_at`, `_data_as_of`) remain as `TimestampType`.
+   - **Protegrity Encryption**: If `encryption_columns` is configured for the table in `gold_config.json`, PII columns in historical CSV exports are encrypted via `ProtegrityEncryptionManager` before Iceberg ingestion. Encryption is guarded — it only activates when columns are explicitly configured and a valid `lambda_arn` is available.
+

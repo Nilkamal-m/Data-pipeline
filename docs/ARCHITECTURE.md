@@ -176,6 +176,7 @@ sequenceDiagram
     GWF->>GD: Trigger Job 3: Gold Marts & Serving
     GD->>GD: Check for historical export CSV & recover ghost Iceberg tables if any
     GD->>GD: Execute mart SQL (joining tbl_*, raw_tbl_*, or gold_*)
+    GD->>GD: Reconcile schema: timestamp standardization & string enforcement
     GD->>GD: Filter incremental delta (only changed/new records)
     GD->>S3G: MERGE INTO Gold Iceberg table gold_{source}_{table}
     GD->>AURORA: Write staging table & perform atomic swap to gold_{source}_{table}
@@ -318,7 +319,11 @@ API payloads often return deeply nested JSON. The `flatten_and_expand_record()` 
 
 The separator character and enable/disable flag are both configurable per source in `bronze_config.json`.
 
-#### 5.1.6 Glue Data Catalog Sync — Direct API Registration
+#### 5.1.6 Protegrity PII Encryption — Bronze Layer
+
+The Bronze layer supports **Protegrity PII tokenization** for sensitive columns during ingestion via the shared `ProtegrityEncryptionManager`. Encryption is invoked through `encrypt_record_chunk()` for in-memory Python dictionaries (list of dicts). Column name matching uses the static `_clean_key()` method, which sanitizes column names by replacing spaces, dots, and hyphens with underscores and converting to lowercase. This method is shared identically between the Bronze and Gold encryption modules, ensuring consistent column resolution across layers.
+
+#### 5.1.7 Glue Data Catalog Sync — Direct API Registration
 
 After staging promotion, `sync_bronze_catalog_table()` registers the table and the new partition directly in the AWS Glue Data Catalog using API calls. No crawler is involved in this step:
 
@@ -360,7 +365,7 @@ glue_client.create_partition(
 
 Athena can query the table immediately after this step — no crawler run is needed to make the data available.
 
-#### 5.1.7 Elimination of AWS Glue Crawlers — Production Architecture Justification
+#### 5.1.8 Elimination of AWS Glue Crawlers — Production Architecture Justification
 
 AWS Glue Crawlers have been completely eliminated from the architecture across all layers. The pipeline operates entirely on deterministic, API-driven and engine-native catalog synchronization:
 
@@ -376,7 +381,7 @@ AWS Glue Crawlers have been completely eliminated from the architecture across a
 2. **Silver Layer**: Apache Iceberg natively registers snapshots, manifest lists, and schemas directly in the AWS Glue Data Catalog via `org.apache.iceberg.spark.SparkCatalog`.
 3. **Gold Layer**: Materializes physical Apache Iceberg tables directly via `SparkCatalog` and executes zero-downtime atomic swap to Amazon Aurora MySQL. Zero views (`v_*`) are published to the catalog.
 
-#### 5.1.8 Watermark Commit — Final Step, Atomicity Guarantee
+#### 5.1.9 Watermark Commit — Final Step, Atomicity Guarantee
 
 The watermark is written to S3 **after** staging promotion and Catalog registration succeed. This ordering is the atomicity guarantee: if the job crashes after writing data but before advancing the watermark, the next run re-processes the same window and overwrites the same `_ingested_at` folder — no data is skipped, no data is lost.
 
@@ -390,7 +395,7 @@ effective_watermark = current_run_time if (not table_upper_bound or is_sentinel)
 update_last_load_date(state_bucket, state_key, ..., effective_watermark)
 ```
 
-#### 5.1.9 Audit Columns & Schema Contract
+#### 5.1.10 Audit Columns & Schema Contract
 
 | Column | In Parquet file | In Glue Catalog | Description |
 |---|---|---|---|
@@ -616,7 +621,27 @@ This guarantees that analytical marts can join Silver tables (e.g. `tbl_conversa
 
 Marts with cross-mart dependencies (for example, `feedbacks.sql` reading from `gold_moveworks_interactions`) are automatically sorted into a topological execution order. Prerequisite marts are evaluated and materialized first, and their conformed Iceberg records are registered as in-session temp views before downstream marts run.
 
-#### 5.3.3 Ghost Iceberg Table Auto-Remediation & Initial Load
+#### 5.3.3 Schema Reconciliation — Timestamp Standardization & Uniform String Schema
+
+Before merging into the Gold Iceberg table, `reconcile_schema()` enforces the Gold layer data contract:
+
+1. **Column Name Sanitization**: All column names are sanitized via `sanitize_column_name()` — converting spaces, dots, hyphens, slashes, brackets, and special characters into underscores and lowercase snake_case.
+2. **Timestamp Standardization**: Business columns identified as timestamps (by naming convention or data type inspection) are converted to a uniform `YYYY-MM-DD HH:MM:SS` string format via `_conform_timestamp_to_string()`. This method handles:
+   - Native PySpark `TimestampType`, `DateType`, `TimestampNTZType`
+   - Numeric epoch values (seconds: 10 digits, milliseconds: 13 digits)
+   - ISO 8601 strings (`2024-09-24T11:00:00Z`, `2024-09-24T11:00:00+00:00`)
+   - Standard space-separated strings (`2024-09-24 11:00:00`)
+   - Slash-delimited strings (`2024/09/24`, `09/24/2024`)
+   - Date-only strings (`2024-09-24`)
+   - Null / empty / blank strings → `NULL`
+3. **Technical Audit Column Exemption**: `_updated_at`, `_inserted_at`, and `_data_as_of` are excluded from string conversion and remain as `TimestampType` to preserve precision for watermark filtering and delta detection.
+4. **Universal String Casting**: All remaining non-timestamp business columns are cast to `StringType`.
+5. **Schema Padding**: Columns present in the target Iceberg table but missing from the source DataFrame are padded with `NULL` (cast to `StringType` for business columns, or to the original data type for audit columns).
+6. **Schema Evolution**: Extra columns in the source but missing in the target are retained for Iceberg schema evolution.
+
+This logic is identically implemented in both `GoldInitialLoader.reconcile_schema()` and `GoldLayerManager.reconcile_schema()`, ensuring consistent schema enforcement across initial load and incremental pipelines.
+
+#### 5.3.4 Ghost Iceberg Table Auto-Remediation & Initial Load
 
 If historical export data (CSV or Parquet) is found in `gold/initial_exports/<source>/`, `GoldInitialLoader` reconciles the schema against the target SQL definition, normalizes column names, and populates the initial Iceberg table.
 
@@ -625,7 +650,16 @@ If an Iceberg table exists in the AWS Glue Data Catalog but its metadata JSON fi
 2. Purges any remaining orphan objects under the S3 prefix.
 3. Re-initializes a fresh, healthy Iceberg table cleanly.
 
-#### 5.3.4 Physical Iceberg Table as the Authoritative Single Source of Truth
+#### 5.3.5 Iceberg Schema Incompatibility Auto-Resolution
+
+When the existing Gold Iceberg table has column data types incompatible with the incoming DataFrame (e.g., existing column is `bigint` but incoming is `string`), Iceberg does not support in-place type changes. The `_check_and_resolve_iceberg_incompatibilities()` method detects these conflicts and automatically:
+1. Logs the incompatible columns and their type mismatches.
+2. Purges the stale Glue Catalog entry and S3 metadata.
+3. Recreates the table cleanly with the corrected, conformed string schema.
+
+This ensures that schema drift from upstream sources never causes persistent failures.
+
+#### 5.3.6 Physical Iceberg Table as the Authoritative Single Source of Truth
 
 The Gold layer materializes a physical Apache Iceberg table (`gold_<source>_<table_name>`) directly in the AWS Glue Data Catalog. Rather than generating multiple redundant catalog views that create catalog clutter, the physical Iceberg table acts as the definitive source of truth.
 
@@ -639,7 +673,7 @@ WHEN MATCHED THEN UPDATE SET *
 WHEN NOT MATCHED THEN INSERT *
 ```
 
-#### 5.3.5 Incremental Delta Filtering (LLM & API Cost Protection)
+#### 5.3.7 Incremental Delta Filtering (LLM & API Cost Protection)
 
 For incremental marts, `filter_incremental_delta()` anti-joins incoming Silver records against the authoritative Gold Iceberg table to isolate:
 1. **Brand-new records** (natural key not yet in Gold).
@@ -648,7 +682,15 @@ For incremental marts, `filter_incremental_delta()` anti-joins incoming Silver r
 
 This guarantees that expensive downstream custom transform scripts (such as Bedrock LLM calls or external REST APIs) only process delta records.
 
-#### 5.3.6 Naming Guardrails & Shared Database Safety
+#### 5.3.8 Protegrity PII Encryption — Gold Layer
+
+The Gold layer supports **Protegrity PII tokenization** for historical initial load data via `ProtegrityEncryptionManager`. Encryption is activated only when `encryption_columns` is defined for a table in `gold_config.json` and a valid `lambda_arn` is available. Key behaviors:
+- **Guarded Activation**: If `encryption_columns` is empty or omitted, the encryption subsystem is completely skipped. No `lambda_arn` validation occurs unless columns are explicitly configured.
+- **Lazy Import**: `ProtegrityEncryptionManager` is dynamically imported to prevent circular import issues and runtime failures when the encryption module is not available.
+- **Shared `_clean_key()` Method**: Column name matching uses the identical `_clean_key()` static method (replaces spaces/dots/hyphens with underscores, strips non-alphanumeric chars, lowercases) shared between `bronze/script/protegrity_encryption.py` and `gold/script/protegrity_encryption.py`.
+- **PySpark `mapInPandas` Distribution**: Gold layer encryption operates on PySpark DataFrames using `mapInPandas` for distributed micro-batch processing across Spark workers, versus the Bronze layer which processes in-memory Python dicts.
+
+#### 5.3.9 Naming Guardrails & Shared Database Safety
 
 All database write operations strictly enforce enterprise safety guardrails:
 * All Gold tables must start with the `gold_` prefix.
@@ -723,18 +765,22 @@ Data-pipeline/
 │   ├── bronze/
 │   │   ├── BRONZE_LAYER.md        # Bronze engine internals
 │   │   ├── CONFIG_BLUEPRINT.md    # bronze_config.json parameter reference
-│   │   └── ENHANCEMENT_GUIDE.md   # Contributor guide
+│   │   ├── ENHANCEMENT_GUIDE.md   # Contributor guide
+│   │   └── REFERENCE_INDEX.md     # Code component map
 │   ├── silver/
 │   │   ├── SILVER_LAYER.md        # Silver engine internals
 │   │   ├── CONFIG_BLUEPRINT.md    # silver_config.json parameter reference
-│   │   └── ENHANCEMENT_GUIDE.md   # Contributor guide
+│   │   ├── ENHANCEMENT_GUIDE.md   # Contributor guide
+│   │   └── REFERENCE_INDEX.md     # Code component map
 │   └── gold/
 │       ├── GOLD_LAYER.md          # Gold engine internals
 │       ├── CONFIG_BLUEPRINT.md    # gold_config.json parameter reference
-│       └── ENHANCEMENT_GUIDE.md   # Contributor guide
+│       ├── ENHANCEMENT_GUIDE.md   # Contributor guide
+│       └── REFERENCE_INDEX.md     # Code component map
 ├── bronze/script/
 │   ├── uax_bronze_load.py         # Main Bronze Glue job
 │   ├── config_loader.py           # Config resolution + parameter parsing
+│   ├── protegrity_encryption.py   # Protegrity PII tokenization (Bronze)
 │   ├── config/bronze_config.json  # Source system + table definitions
 │   └── connectors/                # REST / JDBC / S3 connectors
 ├── silver/script/
@@ -747,10 +793,10 @@ Data-pipeline/
 │   ├── gold_layer_manager.py      # Main Gold + Consumer Glue job
 │   ├── gold_config_loader.py      # Gold config resolution
 │   ├── gold_initial_load.py       # Full-refresh bootstrap utility
+│   ├── protegrity_encryption.py   # Protegrity PII tokenization (Gold)
 │   ├── custom_transforms/         # Per-mart post-processing scripts
 │   └── config/gold_config.json    # Mart SQL paths, routing, refresh modes
 └── gold/query/
     ├── genesys/                   # Genesys mart SQL files
     └── moveworks/                 # Moveworks mart SQL files
 ```
-
