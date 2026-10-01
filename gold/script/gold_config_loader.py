@@ -611,7 +611,7 @@ class GoldConfigLoader:
         if configured_path and os.path.exists(configured_path):
             return configured_path
 
-        # Convention-based check
+        # Convention-based check with singular/plural source tolerance
         clean_source = source_system.strip().lower()
         clean_table = table_name.strip().lower()
         for prefix in [f"gold_{clean_source}_", "gold_tbl_", "gold_", "v_"]:
@@ -620,15 +620,36 @@ class GoldConfigLoader:
                 break
 
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        candidate_paths = [
-            os.path.join(current_dir, "custom_transforms", f"{clean_source}_{clean_table}.py"),
-            f"gold/script/custom_transforms/{clean_source}_{clean_table}.py",
-            f"scripts/gold/custom_transforms/{clean_source}_{clean_table}.py",
-            f"/tmp/custom_transforms/{clean_source}_{clean_table}.py"
-        ]
+        workspace_root = os.getcwd()
+
+        source_variants = [clean_source]
+        if clean_source.endswith("s"):
+            source_variants.append(clean_source[:-1])
+        else:
+            source_variants.append(f"{clean_source}s")
+
+        candidate_paths = []
+        if configured_path:
+            candidate_paths.append(configured_path)
+            if "custom_transform/" in configured_path and "custom_transforms/" not in configured_path:
+                candidate_paths.append(configured_path.replace("custom_transform/", "custom_transforms/"))
+            elif "custom_transforms/" in configured_path:
+                candidate_paths.append(configured_path.replace("custom_transforms/", "custom_transform/"))
+
+        for s_var in source_variants:
+            conv_filename = f"{s_var}_{clean_table}.py"
+            candidate_paths.extend([
+                os.path.join(current_dir, "custom_transforms", conv_filename),
+                os.path.join(current_dir, "custom_transform", conv_filename),
+                os.path.join(workspace_root, "gold", "script", "custom_transforms", conv_filename),
+                f"gold/script/custom_transforms/{conv_filename}",
+                f"custom_transforms/{conv_filename}",
+                f"/tmp/custom_transforms/{conv_filename}"
+            ])
+
         for p in candidate_paths:
-            if os.path.exists(p):
-                return p
+            if p and os.path.isfile(p):
+                return os.path.normpath(p)
 
         return configured_path
 

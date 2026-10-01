@@ -996,10 +996,6 @@ class GoldLayerManager:
                     api_secret_name = GoldConfigLoader.get_api_secret_name(source_system, clean_base_name, gold_cfg)
 
                 if custom_script_path:
-                    logger.info(
-                        f"[CUSTOM TRANSFORM] Calling custom script for '{clean_base_name}': '{custom_script_path}' "
-                        f"(is_initial_load=False, is_incremental={is_incremental}, external_columns={external_cols})..."
-                    )
                     context = {
                         "source_system": source_system,
                         "table_name": clean_base_name,
@@ -2600,24 +2596,97 @@ class GoldLayerManager:
         if not script_path or not str(script_path).strip():
             return df
 
-        resolved_path = script_path
-        if not os.path.isabs(script_path):
+        resolved_path = None
+        if os.path.isabs(script_path) and os.path.exists(script_path):
+            resolved_path = script_path
+        elif str(script_path).startswith("s3://"):
+            try:
+                import boto3
+                match = re.match(r"^s3://([^/]+)/(.*)$", script_path)
+                if match:
+                    s3_bucket, s3_key = match.groups()
+                    local_dir = "/tmp/custom_transforms"
+                    os.makedirs(local_dir, exist_ok=True)
+                    local_file = os.path.join(local_dir, os.path.basename(s3_key))
+                    s3 = boto3.client("s3")
+                    s3.download_file(s3_bucket, s3_key, local_file)
+                    if os.path.exists(local_file):
+                        resolved_path = local_file
+            except Exception as s3_err:
+                logger.warning(f"[CUSTOM TRANSFORM] S3 download error for '{script_path}': {s3_err}")
+        else:
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            candidates = [
-                os.path.join(current_dir, script_path),
-                os.path.join(current_dir, "custom_transforms", os.path.basename(script_path)),
-                os.path.join(os.getcwd(), script_path),
-                os.path.join("/tmp", script_path),
-                os.path.join("/tmp", os.path.basename(script_path))
-            ]
-            for cand in candidates:
-                if os.path.exists(cand):
-                    resolved_path = cand
+            workspace_root = os.getcwd()
+
+            ctx = context or {}
+            src_name = str(ctx.get("source_system", "")).strip().lower()
+            tbl_name = str(ctx.get("table_name", "")).strip().lower()
+            for prefix in [f"gold_{src_name}_", f"{src_name}_", "gold_"]:
+                if tbl_name.startswith(prefix):
+                    tbl_name = tbl_name[len(prefix):]
                     break
 
-        if not os.path.exists(resolved_path):
-            logger.info(f"[CUSTOM TRANSFORM] No custom script found at '{resolved_path}'. Proceeding with standard DataFrame.")
+            base_file = os.path.basename(script_path)
+            base_variants = [base_file]
+            if src_name and tbl_name:
+                convention_name = f"{src_name}_{tbl_name}.py"
+                if convention_name not in base_variants:
+                    base_variants.append(convention_name)
+
+            # Generate relative path variants (e.g. custom_transform/ <-> custom_transforms/)
+            rel_variants = [script_path]
+            if "custom_transform/" in script_path and "custom_transforms/" not in script_path:
+                rel_variants.append(script_path.replace("custom_transform/", "custom_transforms/"))
+            elif "custom_transforms/" in script_path:
+                rel_variants.append(script_path.replace("custom_transforms/", "custom_transform/"))
+            if src_name and tbl_name:
+                rel_variants.append(f"gold/script/custom_transforms/{src_name}_{tbl_name}.py")
+                rel_variants.append(f"custom_transforms/{src_name}_{tbl_name}.py")
+
+            search_dirs = [
+                current_dir,
+                os.path.join(current_dir, "custom_transforms"),
+                os.path.join(current_dir, "custom_transform"),
+                workspace_root,
+                os.path.join(workspace_root, "gold", "script", "custom_transforms"),
+                os.path.join(workspace_root, "gold", "script", "custom_transform"),
+                "/tmp/custom_transforms",
+                "/tmp"
+            ]
+
+            for d in search_dirs:
+                for r in rel_variants:
+                    cand = os.path.normpath(os.path.join(d, r))
+                    if os.path.isfile(cand):
+                        resolved_path = cand
+                        break
+                if resolved_path:
+                    break
+
+            if not resolved_path:
+                for d in search_dirs:
+                    for b in base_variants:
+                        cand = os.path.normpath(os.path.join(d, b))
+                        if os.path.isfile(cand):
+                            resolved_path = cand
+                            break
+                    if resolved_path:
+                        break
+
+        if not resolved_path or not os.path.exists(resolved_path):
+            logger.info(f"[CUSTOM TRANSFORM] No custom script found at '{script_path}'. Proceeding with standard DataFrame.")
             return df
+
+        ctx = context or {}
+        source_system = ctx.get("source_system", "")
+        table_name = ctx.get("table_name", "table")
+        is_initial_load = ctx.get("is_initial_load", False)
+        external_cols = ctx.get("external_columns", [])
+
+        logger.info(
+            f"[CUSTOM TRANSFORM] Calling custom script for '{source_system}.{table_name}': '{resolved_path}' "
+            f"(is_initial_load={is_initial_load}, external_columns={external_cols})..."
+        )
 
         try:
             logger.info(f"[CUSTOM TRANSFORM] Loading custom transform script: '{resolved_path}'")
@@ -3799,10 +3868,6 @@ class GoldInitialLoader:
         custom_script_path = GoldConfigLoader.get_custom_transform_path(source_system, table_name, gold_cfg) if GoldConfigLoader else None
 
         if custom_script_path:
-            logger.info(
-                f"[CUSTOM TRANSFORM] Calling custom script for initial load '{table_name}': '{custom_script_path}' "
-                f"(is_initial_load=True, historical data pre-enriched, external_columns={external_cols})..."
-            )
             api_secret_name = (
                 params.get('API_SECRET_NAME')
                 or params.get('api_secret_name')
