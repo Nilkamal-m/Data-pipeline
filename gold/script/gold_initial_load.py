@@ -477,6 +477,9 @@ class GoldInitialLoader:
         if not script_path or not str(script_path).strip():
             return df
 
+        import importlib.util
+        import inspect
+
         resolved_path = None
         if os.path.isabs(script_path) and os.path.exists(script_path):
             resolved_path = script_path
@@ -554,8 +557,102 @@ class GoldInitialLoader:
                     if resolved_path:
                         break
 
+            # 1. Fallback to Python module import via sys.path / extra-py-files
+            if not resolved_path:
+                mod_candidates = []
+                for b in base_variants:
+                    mod_root = os.path.splitext(b)[0]
+                    mod_candidates.extend([
+                        mod_root,
+                        f"custom_transforms.{mod_root}",
+                        f"gold.script.custom_transforms.{mod_root}"
+                    ])
+                for m_cand in mod_candidates:
+                    try:
+                        spec = importlib.util.find_spec(m_cand)
+                        if spec and spec.origin and os.path.isfile(spec.origin):
+                            resolved_path = spec.origin
+                            break
+                    except Exception:
+                        pass
+
+            # 2. Fallback to Amazon S3 download (when executing on AWS Glue / EMR worker)
+            s3_bucket = None
+            if not resolved_path:
+                params_dict = ctx.get("params", {}) or {}
+                s3_bucket = (
+                    ctx.get("bucket_name")
+                    or params_dict.get("DATA_LAKE_BUCKET")
+                    or params_dict.get("data_lake_bucket")
+                    or params_dict.get("GOLD_BUCKET")
+                    or params_dict.get("gold_bucket")
+                    or params_dict.get("BUCKET_NAME")
+                    or params_dict.get("bucket_name")
+                )
+                if not s3_bucket and params_dict.get("GOLD_CONFIG_S3_PATH"):
+                    cfg_s3 = str(params_dict.get("GOLD_CONFIG_S3_PATH"))
+                    m = re.match(r"^s3://([^/]+)/", cfg_s3)
+                    if m:
+                        s3_bucket = m.group(1)
+
+                if not s3_bucket and GoldConfigLoader:
+                    try:
+                        gold_cfg = GoldConfigLoader.load_config()
+                        defaults = GoldConfigLoader.get_defaults(gold_cfg)
+                        s3_bucket = defaults.get("gold_bucket")
+                    except Exception:
+                        pass
+
+                if s3_bucket:
+                    s3_keys_to_try = []
+                    for r in rel_variants:
+                        clean_r = r.lstrip("/")
+                        if clean_r not in s3_keys_to_try:
+                            s3_keys_to_try.append(clean_r)
+                        if not clean_r.startswith("gold/script/"):
+                            s3_keys_to_try.append(f"gold/script/{clean_r}")
+                        if not clean_r.startswith("scripts/gold/"):
+                            s3_keys_to_try.append(f"scripts/gold/{clean_r}")
+
+                    for b in base_variants:
+                        for s_prefix in [
+                            "gold/script/custom_transforms/",
+                            "gold/script/custom_transform/",
+                            "scripts/gold/custom_transforms/",
+                            "scripts/gold/custom_transform/",
+                            "custom_transforms/",
+                            "custom_transform/"
+                        ]:
+                            k = f"{s_prefix}{b}"
+                            if k not in s3_keys_to_try:
+                                s3_keys_to_try.append(k)
+
+                    s3_client_obj = ctx.get("_s3_client")
+                    if not s3_client_obj:
+                        try:
+                            import boto3
+                            s3_client_obj = boto3.client("s3")
+                        except Exception:
+                            s3_client_obj = None
+
+                    if s3_client_obj:
+                        local_dir = "/tmp/custom_transforms"
+                        os.makedirs(local_dir, exist_ok=True)
+                        for s3_key in s3_keys_to_try:
+                            try:
+                                s3_client_obj.head_object(Bucket=s3_bucket, Key=s3_key)
+                                local_dest = os.path.join(local_dir, os.path.basename(s3_key))
+                                logger.info(f"[CUSTOM TRANSFORM] Found script on S3 at 's3://{s3_bucket}/{s3_key}'. Downloading to '{local_dest}'...")
+                                s3_client_obj.download_file(s3_bucket, s3_key, local_dest)
+                                if os.path.isfile(local_dest):
+                                    resolved_path = local_dest
+                                    break
+                            except Exception:
+                                continue
+
         if not resolved_path or not os.path.exists(resolved_path):
-            logger.info(f"[CUSTOM TRANSFORM] No custom script found at '{script_path}'. Proceeding with standard DataFrame.")
+            s3_checked_note = f" (checked local search dirs and s3://{s3_bucket}/)" if s3_bucket else ""
+            logger.info(f"[CUSTOM TRANSFORM] No custom script found at '{script_path}'{s3_checked_note}. Proceeding with standard DataFrame.")
             return df
 
         ctx = context or {}
@@ -1335,8 +1432,9 @@ class GoldInitialLoader:
                 "external_columns": external_cols,
                 "llm_column": primary_ext_col,
                 "api_secret_name": api_secret_name,
-                "llm_secret_name": api_secret_name,
-                "params": params
+                "params": params,
+                "bucket_name": bucket_name,
+                "_s3_client": s3_client
             }
             df_consolidated = cls._apply_custom_transform(
                 df_consolidated, custom_script_path, spark=spark, context=context
