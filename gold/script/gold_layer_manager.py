@@ -967,7 +967,8 @@ class GoldLayerManager:
                 if 'FULL_REFRESH' in params and str(params['FULL_REFRESH']).strip().lower() in ('true', '1', 'yes'):
                     is_incremental = False
 
-                llm_col = GoldConfigLoader.get_llm_column(source_system, clean_base_name, gold_cfg) if GoldConfigLoader else None
+                external_cols = GoldConfigLoader.get_external_columns(source_system, clean_base_name, gold_cfg) if GoldConfigLoader else []
+                primary_ext_col = external_cols[0] if external_cols else None
 
                 if is_incremental and pks:
                     logger.info(f"[INCREMENTAL FILTER] Isolating new/changed delta for '{clean_base_name}' against '{glue_database}.{target_table_name}'...")
@@ -977,7 +978,7 @@ class GoldLayerManager:
                         glue_database=glue_database,
                         target_table_name=target_table_name,
                         nkeys=pks,
-                        enrichment_column=llm_col
+                        enrichment_column=primary_ext_col
                     )
 
                 # 4. Invoke Custom Transform Hook if exists
@@ -995,19 +996,28 @@ class GoldLayerManager:
                     api_secret_name = GoldConfigLoader.get_api_secret_name(source_system, clean_base_name, gold_cfg)
 
                 if custom_script_path:
+                    logger.info(
+                        f"[CUSTOM TRANSFORM] Calling custom script for '{clean_base_name}': '{custom_script_path}' "
+                        f"(is_initial_load=False, is_incremental={is_incremental}, external_columns={external_cols})..."
+                    )
                     context = {
                         "source_system": source_system,
                         "table_name": clean_base_name,
                         "target_table": target_table_name,
                         "glue_database": glue_database,
                         "primary_keys": pks,
+                        "is_initial_load": False,
                         "is_incremental": is_incremental,
-                        "llm_column": llm_col,
+                        "external_columns": external_cols,
+                        "llm_column": primary_ext_col,
                         "api_secret_name": api_secret_name,
                         "llm_secret_name": api_secret_name,
                         "params": params
                     }
                     df_mart = cls._apply_custom_transform(df_mart, custom_script_path, spark=spark, context=context)
+
+                # Enforce Column Conflict Resolution & Deduplication: Transform (df.withColumn) > SQL Query Column > Config Default (NULL)
+                df_mart = cls._resolve_and_deduplicate_columns(df_mart, primary_keys=pks, external_columns=external_cols)
 
                 # 5. Technical audit columns (_updated_at, _inserted_at)
                 if "_updated_at" not in df_mart.columns:
@@ -1867,6 +1877,70 @@ class GoldLayerManager:
                 logger.debug(f"[ROW DEDUPLICATION] Window deduplication fallback: {win_err}")
 
         return df.dropDuplicates(subset=valid_nkeys)
+
+    @classmethod
+    def _resolve_and_deduplicate_columns(
+        cls,
+        df: DataFrame,
+        primary_keys: Optional[List[str]] = None,
+        external_columns: Optional[Union[List[str], str]] = None,
+        llm_column: Optional[str] = None
+    ) -> DataFrame:
+        """
+        Enforces strict Column Conflict Resolution & Deduplication:
+        Precedence Hierarchy:
+        Custom Transform (df.withColumn) > SQL Query Column > Config Default (NULL)
+
+        1. Ensures no duplicate or ambiguous column references exist case-insensitively.
+        2. Retains the highest-priority column instance (Custom Transform overrides SQL and Config).
+        3. Anchors primary keys in deterministic positions.
+        4. Injects Config Default (NULL) for any configured external_columns missing from DataFrame.
+        """
+        if df is None:
+            return df
+
+        pks = [k.strip() for k in (primary_keys or [])]
+        seen_case_insensitive = set()
+        deduped_columns = []
+
+        # 1. Anchor natural keys (pks) first if present
+        for pk in pks:
+            pk_lower = pk.lower()
+            if pk in df.columns and pk_lower not in seen_case_insensitive:
+                seen_case_insensitive.add(pk_lower)
+                deduped_columns.append(pk)
+
+        # 2. Iterate through DataFrame columns in order (Transform > SQL)
+        for c in df.columns:
+            c_lower = c.strip().lower()
+            if c_lower not in seen_case_insensitive:
+                seen_case_insensitive.add(c_lower)
+                deduped_columns.append(c)
+
+        # 3. Resolve list of external columns
+        target_ext_cols = []
+        if external_columns:
+            if isinstance(external_columns, list):
+                target_ext_cols.extend([str(c).strip() for c in external_columns if str(c).strip()])
+            elif isinstance(external_columns, str) and external_columns.strip():
+                target_ext_cols.append(external_columns.strip())
+        if llm_column and str(llm_column).strip():
+            if str(llm_column).strip() not in target_ext_cols:
+                target_ext_cols.append(str(llm_column).strip())
+
+        # If any external_column is missing from DataFrame, inject lit(None).cast("string") as Config Default
+        from pyspark.sql.functions import lit
+        for ext_col in target_ext_cols:
+            if ext_col.lower() not in seen_case_insensitive:
+                df = df.withColumn(ext_col, lit(None).cast("string"))
+                seen_case_insensitive.add(ext_col.lower())
+                deduped_columns.append(ext_col)
+
+        logger.info(
+            f"[COLUMN RESOLUTION] Enforced column precedence & deduplicated columns "
+            f"(Total unique columns: {len(deduped_columns)})."
+        )
+        return df.select(deduped_columns)
 
     # --------------------------------------------------------------------------
     # Incremental Delta Isolation
@@ -3718,6 +3792,50 @@ class GoldInitialLoader:
             )
 
         df_consolidated = cls.reconcile_schema(df_raw, target_fields)
+
+        # Custom Transform Invocation for Initial Load (Historical pre-enriched data)
+        external_cols = GoldConfigLoader.get_external_columns(source_system, table_name, gold_cfg) if GoldConfigLoader else []
+        primary_ext_col = external_cols[0] if external_cols else None
+        custom_script_path = GoldConfigLoader.get_custom_transform_path(source_system, table_name, gold_cfg) if GoldConfigLoader else None
+
+        if custom_script_path:
+            logger.info(
+                f"[CUSTOM TRANSFORM] Calling custom script for initial load '{table_name}': '{custom_script_path}' "
+                f"(is_initial_load=True, historical data pre-enriched, external_columns={external_cols})..."
+            )
+            api_secret_name = (
+                params.get('API_SECRET_NAME')
+                or params.get('api_secret_name')
+                or params.get('LLM_SECRET_NAME')
+                or params.get('llm_secret_name')
+            )
+            if not api_secret_name and GoldConfigLoader:
+                api_secret_name = GoldConfigLoader.get_api_secret_name(source_system, table_name, gold_cfg)
+
+            context = {
+                "source_system": source_system,
+                "table_name": table_name,
+                "target_table": target_table_name,
+                "glue_database": glue_database,
+                "primary_keys": pks,
+                "is_initial_load": True,
+                "is_incremental": False,
+                "external_columns": external_cols,
+                "llm_column": primary_ext_col,
+                "api_secret_name": api_secret_name,
+                "llm_secret_name": api_secret_name,
+                "params": params
+            }
+            if hasattr(GoldLayerManager, "_apply_custom_transform"):
+                df_consolidated = GoldLayerManager._apply_custom_transform(
+                    df_consolidated, custom_script_path, spark=spark, context=context
+                )
+
+        # Enforce Column Conflict Resolution & Deduplication (Transform > SQL > Config)
+        if hasattr(GoldLayerManager, "_resolve_and_deduplicate_columns"):
+            df_consolidated = GoldLayerManager._resolve_and_deduplicate_columns(
+                df_consolidated, primary_keys=pks, external_columns=external_cols
+            )
 
         if "_updated_at" not in df_consolidated.columns:
             df_consolidated = df_consolidated.withColumn("_updated_at", to_timestamp(date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")))

@@ -61,6 +61,9 @@
           },
           "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
           "api_secret_name": "dev/data-pipeline/genesys-llm-api",
+          "external_columns": [
+            "conversation_summary"
+          ],
           "aurora": {
             "schema": "enterprise_reporting",
             "table_name": "gold_genesys_conversations"
@@ -103,6 +106,12 @@
             "delimiter": ",",
             "has_header": true
           },
+          "custom_transform_script": "gold/script/custom_transforms/moveworks_interactions.py",
+          "api_secret_name": "dev/data-pipeline/moveworks-api",
+          "external_columns": [
+            "resolution_summary",
+            "bot_intent_label"
+          ],
           "aurora": {
             "schema": "enterprise_reporting",
             "table_name": "gold_moveworks_interactions"

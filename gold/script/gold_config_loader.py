@@ -411,6 +411,32 @@ class GoldConfigLoader:
         return bool(defaults.get("incremental", False))
 
     @classmethod
+    def get_external_columns(
+        cls,
+        source_system: str,
+        table_name: str,
+        config_dict: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
+        """
+        Retrieves list of configured external / enrichment columns
+        (e.g. ['conversation_summary', 'sentiment_score']) used for custom transforms
+        and column conflict resolution. Accepts list or string.
+        """
+        tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
+        val = (
+            tbl_cfg.get("external_columns")
+            or tbl_cfg.get("llm_columns")
+            or tbl_cfg.get("llm_column")
+            or tbl_cfg.get("enrichment_columns")
+            or tbl_cfg.get("enrichment_column")
+        )
+        if isinstance(val, list):
+            return [str(c).strip() for c in val if str(c).strip()]
+        elif isinstance(val, str) and val.strip():
+            return [val.strip()]
+        return []
+
+    @classmethod
     def get_llm_column(
         cls,
         source_system: str,
@@ -418,11 +444,10 @@ class GoldConfigLoader:
         config_dict: Optional[Dict[str, Any]] = None
     ) -> Optional[str]:
         """
-        Retrieves configured LLM / enrichment column (e.g. 'sentiment_score', 'llm_summary')
-        used to identify unenriched historical records for backfilling.
+        Backward-compatibility helper: returns the primary external column if configured.
         """
-        tbl_cfg = cls.get_table_config(source_system, table_name, config_dict)
-        return tbl_cfg.get("llm_column") or tbl_cfg.get("enrichment_column")
+        cols = cls.get_external_columns(source_system, table_name, config_dict)
+        return cols[0] if cols else None
 
     @classmethod
     def get_secret_name(

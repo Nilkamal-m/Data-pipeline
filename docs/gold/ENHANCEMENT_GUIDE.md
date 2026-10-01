@@ -42,7 +42,9 @@ parse_spark_arguments()
                 │     └─► Purge & recreate if existing column types conflict with incoming schema
                 └─► GoldInitialLoader.run_initial_load() if initial CSV exists in gold/initial_exports/
                       ├─► Protegrity encryption (if encryption_columns configured & lambda_arn available)
-                      └─► reconcile_schema() → timestamp standardization + string enforcement
+                      ├─► reconcile_schema() → timestamp standardization + string enforcement
+                      ├─► _apply_custom_transform() (is_initial_load=True, historical data pre-enriched)
+                      └─► _resolve_and_deduplicate_columns() (Transform > SQL/CSV > Config)
         └─► [Mart Discovery & DAG Phase]
             _discover_queries()
             _sort_queries_by_dependency()     # Topological sort for inter-mart DAG
@@ -50,9 +52,10 @@ parse_spark_arguments()
                     _ensure_dependency_views_registered()
                         # Pre-loads raw_tbl_* (Bronze), tbl_* (Silver), gold_* (Gold) as Spark temp views
                     execute_mart_sql(query_file)
+                    └─► filter_incremental_delta()    # If incremental=true: delta anti-join (includes unenriched llm_column rows)
+                    └─► run_custom_transform()        # If custom_transform_script configured (batched rate-limited loop)
+                    └─► _resolve_and_deduplicate_columns() # Transform (df.withColumn) > SQL > Config (NULL)
                     └─► reconcile_schema()          # Timestamp standardization + string enforcement
-                    └─► run_custom_transform()        # If custom_transform_script configured
-                    └─► filter_incremental_delta()    # If incremental=true: delta anti-join
                     └─► _align_schema()               # Pad missing cols as NULL, reorder to catalog
                     └─► _materialize_athena_table()   # Spark SQL MERGE INTO Gold Iceberg table
                     └─► _serve_to_mysql()             # If 'aurora' in targets: zero-downtime atomic swap
@@ -251,32 +254,88 @@ aws glue start-job-run \
 
 ---
 
-## 11. Custom Transform Hooks
+## 11. Custom Transform Hooks & External Column Enrichment
 
-For enrichment logic beyond SQL (API calls, ML scoring, aggregations):
+For enrichment logic beyond standard SQL (API calls, LLM summaries, ML scoring, complex parsing):
 
-**1. Create the script:**
+### 1. Script Location & Naming Convention
 ```
-gold/script/custom_transforms/moveworks_interactions.py
+gold/script/custom_transforms/<source>_<table>.py
 ```
+*Example:* `gold/script/custom_transforms/genesys_conversations.py`
 
-**2. Implement the interface:**
+### 2. Standard Interface & Signature
 ```python
 from pyspark.sql import DataFrame, SparkSession
+from typing import Optional, Dict, Any
 
-def transform(df: DataFrame, spark: SparkSession, params: dict) -> DataFrame:
-    # params contains config values, secret names, env, etc.
-    return df.withColumn("category_label", classify_udf(col("subject")))
+def transform(df: DataFrame, spark: Optional[SparkSession] = None, context: Optional[dict] = None) -> DataFrame:
+    """
+    Invoked during both Initial Load (is_initial_load=True) and Incremental Mart runs.
+    """
 ```
 
-**3. Reference in `gold_config.json`:**
-```json
-"interactions": {
-  "custom_transform_script": "gold/script/custom_transforms/moveworks_interactions.py"
-}
-```
+### 3. Context Metadata (`context` dictionary)
+The engine automatically passes runtime metadata into `context`:
+* `source_system`: Source identifier (e.g. `genesys`).
+* `table_name`: Base table name (e.g. `conversations`).
+* `target_table`: Target Iceberg table name.
+* `is_initial_load`: `True` during historical CSV ingestion; `False` during incremental Silver runs.
+* `is_incremental`: Boolean indicating delta mode.
+* `external_columns`: List of configured enrichment column names (e.g. `["conversation_summary"]`).
+* `api_secret_name`: Secrets Manager secret holding credentials.
+* `params`: Complete dictionary of CLI / Glue job arguments.
 
-The transform runs **after** the mart SQL executes and **before** schema alignment and Iceberg merge.
+### 4. Strict Column Precedence Hierarchy
+The engine enforces:
+$$\mathbf{1.\ Custom\ Transform\ (df.withColumn)} \;\;>\;\; \mathbf{2.\ SQL\ Query\ Column} \;\;>\;\; \mathbf{3.\ Config\ Default\ (external\_columns\ NULL)}$$
+
+Any column added or modified via `df = df.withColumn(col_name, ...)` cleanly overrides SQL query columns and configuration defaults. Duplicate column names are deduplicated case-insensitively.
+
+### 5. Developer Implementation: Rate Limiting, Batching & Sample Template
+Developers have complete control to implement rate limiting (e.g. sleep delay or token bucket), micro-batching, and API retry handling directly within their custom script. The pipeline emits structured execution logging and executes the custom transform:
+
+```python
+import logging
+from pyspark.sql import DataFrame
+
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# SAMPLE DEVELOPER IMPLEMENTATION TEMPLATE (COMMENTED OUT)
+# ==============================================================================
+# import time, random
+# from pyspark.sql.functions import col, lit, when
+#
+# def call_external_api_with_retry(prompt: str, max_retries: int = 3) -> str:
+#     for attempt in range(max_retries):
+#         try:
+#             # time.sleep(0.05)  # Enforce developer rate limit (e.g. 20 RPS)
+#             return f"Enriched insight: {prompt[:50]}"
+#         except Exception as err:
+#             if "429" in str(err) or "Throttling" in str(err):
+#                 time.sleep((2 ** attempt) + random.uniform(0.1, 0.5))
+#             else:
+#                 raise
+#     return "Fallback summary"
+# ==============================================================================
+
+def transform(df: DataFrame, spark=None, context: dict = None) -> DataFrame:
+    context = context or {}
+    source_system = context.get("source_system", "genesys")
+    table_name = context.get("table_name", "conversations")
+    is_initial_load = context.get("is_initial_load", False)
+    external_cols = context.get("external_columns", [])
+
+    # Pipeline logs that custom script is being called
+    logger.info(
+        f"[CUSTOM TRANSFORM] Calling custom script for '{source_system}.{table_name}' "
+        f"(is_initial_load={is_initial_load}, external_columns={external_cols})."
+    )
+
+    # Custom transformation logic can be implemented here by the developer.
+    return df
+```
 
 ---
 

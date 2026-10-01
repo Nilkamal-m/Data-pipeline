@@ -69,6 +69,9 @@ This document provides the definitive configuration blueprint for `gold_config.j
           },
           "custom_transform_script": "gold/script/custom_transforms/genesys_conversations.py",
           "api_secret_name": "uax-datalake/genesys-credentials-{env}",
+          "external_columns": [
+            "conversation_summary"
+          ],
           "aurora": {
             "schema": "enterprise_reporting",
             "table_name": "gold_genesys_conversations"
@@ -158,8 +161,8 @@ This document provides the definitive configuration blueprint for `gold_config.j
 | `nkey` | array | **Required** | *Used in `_upsert_iceberg_table` and MySQL PK upsert*: Primary / unique business key(s) identifying a distinct entity. |
 | `incremental` | boolean | Optional (Default: `true`) | *Used in SQL query builder*: If `true`, filters incoming Silver data using `WHERE _updated_at > MAX(gold._updated_at)`. If `false`, full-refresh: all Silver records re-materialized. |
 | `max_target_partitions` | integer | Optional (Default: none) | *Used in Spark writer before Iceberg MERGE*: Controls `coalesce(N)` applied to the mart DataFrame before writing. Limits small-file proliferation for high-volume tables. Omit to let Spark decide automatically. |
-| `custom_transform_script` | string | Optional | *Used in `GoldLayerManager`*: Relative path to Python transformation script extending business logic. |
-| `api_secret_name` | string | Optional | *Used in custom transforms*: Secrets Manager key name for third-party APIs (e.g. LLM scoring endpoints). |
+| `custom_transform_script` | string | Optional | *Used in `GoldLayerManager` and `GoldInitialLoader`*: Relative path to Python transformation script extending business logic (invoked during both initial load and incremental runs). |
+| `external_columns` | array of strings | Optional | List of external / enrichment columns produced or populated by custom transforms (e.g. `["conversation_summary", "sentiment_score"]`). Anchored during column conflict resolution (Transform > SQL > Config Default NULL). Developers handle rate limiting, micro-batching, and API retry logic directly inside the custom script. |
 | `initial_load.path` | string | Optional | *Used in `GoldInitialLoader`*: Specific S3 URI pointing to the historical CSV file for this table. |
 | `encryption_columns` | object / array | Optional | Defines sensitive columns to encrypt and their Protegrity data element (e.g. `{"customer_name": "EMP_MEMBERNAME_ALPHANUM_LP", "customer_email": "EMP_MEMBER_EMAIL_LP"}`). Used in `gold_initial_load.py` for cold-start CSV exports. Column names are matched using the shared `_clean_key()` normalizer. |
 

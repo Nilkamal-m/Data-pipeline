@@ -15,7 +15,7 @@ import re
 import logging
 import traceback
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
@@ -461,6 +461,132 @@ class GoldInitialLoader:
             except Exception:
                 pass
         return df.dropDuplicates(subset=valid_nkeys)
+
+    @classmethod
+    def _apply_custom_transform(
+        cls,
+        df: DataFrame,
+        script_path: str,
+        spark: Optional[SparkSession] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> DataFrame:
+        """
+        Dynamically loads and invokes transform(df, spark=None, context=None) -> DataFrame
+        from gold/script/custom_transforms/<source>_<table>.py.
+        """
+        if not script_path or not str(script_path).strip():
+            return df
+
+        resolved_path = script_path
+        if not os.path.isabs(script_path):
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(current_dir, script_path),
+                os.path.join(current_dir, "custom_transforms", os.path.basename(script_path)),
+                os.path.join(os.getcwd(), script_path),
+                os.path.join("/tmp", script_path),
+                os.path.join("/tmp", os.path.basename(script_path))
+            ]
+            for cand in candidates:
+                if os.path.exists(cand):
+                    resolved_path = cand
+                    break
+
+        if not os.path.exists(resolved_path):
+            logger.info(f"[CUSTOM TRANSFORM] No custom script found at '{resolved_path}'. Proceeding with standard DataFrame.")
+            return df
+
+        try:
+            import importlib.util
+            import inspect
+            import traceback
+            logger.info(f"[CUSTOM TRANSFORM] Loading custom transform script: '{resolved_path}'")
+            module_name = f"gold_custom_{os.path.splitext(os.path.basename(resolved_path))[0]}"
+            spec = importlib.util.spec_from_file_location(module_name, resolved_path)
+            custom_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(custom_module)
+
+            if hasattr(custom_module, "transform"):
+                transform_func = getattr(custom_module, "transform")
+                sig = inspect.signature(transform_func)
+                param_count = len(sig.parameters)
+                logger.info(f"[CUSTOM TRANSFORM] Invoking transform() with {param_count} parameters from '{resolved_path}'...")
+                if param_count >= 3:
+                    return transform_func(df, spark, context or {})
+                elif param_count == 2:
+                    return transform_func(df, spark)
+                else:
+                    return transform_func(df)
+            else:
+                logger.warning(f"[CUSTOM TRANSFORM] Script '{resolved_path}' has no transform() function. Skipping.")
+                return df
+        except Exception as err:
+            logger.error(f"[CUSTOM TRANSFORM ERROR] Failed executing custom transform '{resolved_path}': {err}")
+            raise
+
+    @classmethod
+    def _resolve_and_deduplicate_columns(
+        cls,
+        df: DataFrame,
+        primary_keys: Optional[List[str]] = None,
+        external_columns: Optional[Union[List[str], str]] = None,
+        llm_column: Optional[str] = None
+    ) -> DataFrame:
+        """
+        Enforces strict Column Conflict Resolution & Deduplication:
+        Precedence Hierarchy:
+        Custom Transform (df.withColumn) > SQL Query Column > Config Default (NULL)
+
+        1. Ensures no duplicate or ambiguous column references exist case-insensitively.
+        2. Retains the highest-priority column instance (Custom Transform overrides SQL and Config).
+        3. Anchors primary keys in deterministic positions.
+        4. Injects Config Default (NULL) for any configured external_columns missing from DataFrame.
+        """
+        if df is None:
+            return df
+
+        pks = [k.strip() for k in (primary_keys or [])]
+        seen_case_insensitive = set()
+        deduped_columns = []
+
+        # 1. Anchor natural keys (pks) first if present
+        for pk in pks:
+            pk_lower = pk.lower()
+            if pk in df.columns and pk_lower not in seen_case_insensitive:
+                seen_case_insensitive.add(pk_lower)
+                deduped_columns.append(pk)
+
+        # 2. Iterate through DataFrame columns in order (Transform > SQL)
+        for c in df.columns:
+            c_lower = c.strip().lower()
+            if c_lower not in seen_case_insensitive:
+                seen_case_insensitive.add(c_lower)
+                deduped_columns.append(c)
+
+        # 3. Resolve list of external columns
+        target_ext_cols = []
+        if external_columns:
+            if isinstance(external_columns, list):
+                target_ext_cols.extend([str(c).strip() for c in external_columns if str(c).strip()])
+            elif isinstance(external_columns, str) and external_columns.strip():
+                target_ext_cols.append(external_columns.strip())
+        if llm_column and str(llm_column).strip():
+            if str(llm_column).strip() not in target_ext_cols:
+                target_ext_cols.append(str(llm_column).strip())
+
+        # If any external_column is missing from DataFrame, inject lit(None).cast("string") as Config Default
+        from pyspark.sql.functions import lit
+        for ext_col in target_ext_cols:
+            if ext_col.lower() not in seen_case_insensitive:
+                df = df.withColumn(ext_col, lit(None).cast("string"))
+                seen_case_insensitive.add(ext_col.lower())
+                deduped_columns.append(ext_col)
+
+        logger.info(
+            f"[COLUMN RESOLUTION] Enforced column precedence & deduplicated columns "
+            f"(Total unique columns: {len(deduped_columns)})."
+        )
+        return df.select(deduped_columns)
 
     @classmethod
     def _purge_s3_prefix(cls, s3_client, s3_uri: str) -> int:
@@ -1109,6 +1235,48 @@ class GoldInitialLoader:
 
         # 3. Reconcile Schemas
         df_consolidated = cls.reconcile_schema(df_raw, target_fields)
+
+        # Custom Transform Invocation for Initial Load (Historical pre-enriched data)
+        external_cols = GoldConfigLoader.get_external_columns(source_system, table_name, gold_cfg) if GoldConfigLoader else []
+        primary_ext_col = external_cols[0] if external_cols else None
+        custom_script_path = GoldConfigLoader.get_custom_transform_path(source_system, table_name, gold_cfg) if GoldConfigLoader else None
+
+        if custom_script_path:
+            logger.info(
+                f"[CUSTOM TRANSFORM] Calling custom script for initial load '{table_name}': '{custom_script_path}' "
+                f"(is_initial_load=True, historical data pre-enriched, external_columns={external_cols})..."
+            )
+            api_secret_name = (
+                params.get('API_SECRET_NAME')
+                or params.get('api_secret_name')
+                or params.get('LLM_SECRET_NAME')
+                or params.get('llm_secret_name')
+            )
+            if not api_secret_name and GoldConfigLoader:
+                api_secret_name = GoldConfigLoader.get_api_secret_name(source_system, table_name, gold_cfg)
+
+            context = {
+                "source_system": source_system,
+                "table_name": table_name,
+                "target_table": target_table_name,
+                "glue_database": glue_database,
+                "primary_keys": pks,
+                "is_initial_load": True,
+                "is_incremental": False,
+                "external_columns": external_cols,
+                "llm_column": primary_ext_col,
+                "api_secret_name": api_secret_name,
+                "llm_secret_name": api_secret_name,
+                "params": params
+            }
+            df_consolidated = cls._apply_custom_transform(
+                df_consolidated, custom_script_path, spark=spark, context=context
+            )
+
+        # Enforce Column Conflict Resolution & Deduplication (Transform > SQL > Config)
+        df_consolidated = cls._resolve_and_deduplicate_columns(
+            df_consolidated, primary_keys=pks, external_columns=external_cols
+        )
 
         # 4. Attach Technical Audit Columns
         if "_updated_at" not in df_consolidated.columns:

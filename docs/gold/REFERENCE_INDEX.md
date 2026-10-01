@@ -29,15 +29,17 @@ This document provides a master index and component map for the entire Gold Laye
 | `reconcile_schema()` | L239–L317 | Core schema reconciliation: cleanses column names, identifies timestamps via heuristics, standardizes to string format, pads missing target columns with NULL, retains extra columns for schema evolution. Technical audit columns remain as `TimestampType`. |
 | `_probe_target_schema_from_query()` | L320–L436 | Discovers the target Gold table schema from the corresponding SQL query file. Executes a zero-record probe query (`WHERE 1=0`) via Spark SQL to extract schema fields without reading data. |
 | `_deduplicate_by_nkey()` | L439–L463 | Ensures row uniqueness by natural keys using windowed `ROW_NUMBER()` with `_updated_at DESC` ordering. |
-| `_purge_s3_prefix()` | L466–L497 | Safely deletes orphaned or corrupted metadata/data files under an S3 URI prefix. |
-| `_resolve_aws_region()` | L500–L536 | Dynamically resolves the AWS region from params, environment variables, boto3 session, or S3 bucket location. |
-| `_purge_table_registration()` | L539–L577 | Completely purges a table from Spark SQL, Spark catalog cache, Glue Catalog, and S3. |
-| `_create_iceberg_table_from_df()` | L580–L664 | Creates or recreates an Iceberg table from a DataFrame. Includes Spark SQL DDL fallback and automatic ghost table purge on collision. |
-| `_check_and_resolve_iceberg_incompatibilities()` | L667–L731 | Detects column type mismatches between incoming DataFrame and existing Iceberg table. Purges and signals recreation if incompatible types found (e.g., `bigint` → `string`). |
-| `_get_gold_layer_manager()` | L734–L753 | Lazily imports `GoldLayerManager` to prevent circular import locks. |
-| `_get_protegrity_encryption_manager()` | L756–L780 | Lazily and dynamically imports `ProtegrityEncryptionManager` class from multiple candidate paths. |
-| `run_initial_load()` | L783–L1282 | **Main orchestration method**: Reads CSV/Parquet, cleanses column names, encrypts PII (if configured), reconciles schema, deduplicates, upserts into Iceberg table, and optionally serves to Aurora MySQL. |
-| `main()` | L1285–L1361 | Glue job entrypoint with SparkConf, GlueContext, and Iceberg catalog configuration. |
+| `_apply_custom_transform()` | L466–L526 | Dynamically imports and executes external custom Python transform hook (`transform(df, spark, context)`) during initial load. Injects `is_initial_load=True` and `external_columns` so historical pre-enriched data is preserved. |
+| `_resolve_and_deduplicate_columns()` | L528–L573 | Enforces strict Precedence Hierarchy: `Custom Transform (df.withColumn) > SQL Query Column > Config Default (external_columns NULL)`. Drops case-insensitive duplicate references, prioritizes transform outputs, and guarantees schema stability. |
+| `_purge_s3_prefix()` | L577–L608 | Safely deletes orphaned or corrupted metadata/data files under an S3 URI prefix. |
+| `_resolve_aws_region()` | L611–L647 | Dynamically resolves the AWS region from params, environment variables, boto3 session, or S3 bucket location. |
+| `_purge_table_registration()` | L650–L688 | Completely purges a table from Spark SQL, Spark catalog cache, Glue Catalog, and S3. |
+| `_create_iceberg_table_from_df()` | L691–L775 | Creates or recreates an Iceberg table from a DataFrame. Includes Spark SQL DDL fallback and automatic ghost table purge on collision. |
+| `_check_and_resolve_iceberg_incompatibilities()` | L778–L842 | Detects column type mismatches between incoming DataFrame and existing Iceberg table. Purges and signals recreation if incompatible types found (e.g., `bigint` → `string`). |
+| `_get_gold_layer_manager()` | L845–L864 | Lazily imports `GoldLayerManager` to prevent circular import locks. |
+| `_get_protegrity_encryption_manager()` | L867–L891 | Lazily and dynamically imports `ProtegrityEncryptionManager` class from multiple candidate paths. |
+| `run_initial_load()` | L894–L1438 | **Main orchestration method**: Reads CSV/Parquet, cleanses column names, encrypts PII (if configured), reconciles schema, triggers custom transform hook with rate-limit context, enforces column precedence, deduplicates, upserts into Iceberg table, and optionally serves to Aurora MySQL. |
+| `main()` | L1441–L1517 | Glue job entrypoint with SparkConf, GlueContext, and Iceberg catalog configuration. |
 
 ---
 
@@ -63,18 +65,19 @@ This document provides a master index and component map for the entire Gold Laye
 | `_s3_path_exists()` | L1314–L1353 | Tests whether an S3 prefix or Iceberg metadata pointer exists using `boto3`. | Cold-start validation & ghost table detection. |
 | `_check_and_run_initial_load()` | L1355–L1529 | Cold-start & ghost table guard: purges orphan catalog entries if metadata is missing and triggers `GoldInitialLoader`. | Called prior to executing incremental marts. |
 | `_materialize_athena_table()` | L1531–L1727 | Writes query results directly to AWS Glue Iceberg catalog table with schema evolution and partition alignment. | Called when query specifies `table` materialization. |
-| `_deduplicate_by_nkey()` | L1729–L1766 | In-memory windowed deduplication over natural keys (`ROW_NUMBER() OVER (PARTITION BY nkey ORDER BY ...)`). | Called prior to serving write. |
-| `filter_incremental_delta()` | L1768–L1851 | Anti-joins incoming delta against current target table state to filter out unchanged records. | Incremental delta processing. |
-| `_validate_gold_table_name()` | L1853–L1857 | Enforces naming conventions and prevents SQL injection on table identifiers. | Called before all DDL/DML. |
-| `_validate_droppable_table_name()` | L1865–L1873 | Security guard: strictly prevents dropping non-staging tables during swap cleanup. | Called in `_cleanup_staging_table()`. |
-| `_cleanup_staging_table()` | L1875–L1890 | Drops transient staging tables in MySQL (`staging_tbl_*`) upon failure or completion. | Staging lifecycle management. |
-| `_verify_schema_exists_or_raise()` | L1892–L1930 | Verifies target schema/database exists in MySQL before initiating write operations. | Pre-flight check. |
-| `_spark_type_to_mysql()` | L1949–L1974 | Translates PySpark data types to native MySQL DDL types. | Dynamic DDL generation. |
-| `_detect_schema_evolution()` | L1976–L2056 | Introspects MySQL `information_schema.COLUMNS`, detects missing columns, and executes `ALTER TABLE ... ADD COLUMN`. | MySQL schema evolution. |
-| `_write_staging_table()` | L2078–L2115 | Writes PySpark DataFrame to MySQL staging table via JDBC using connection pooling and batch commits. | Called in atomic swap workflow. |
-| `_execute_isolated_atomic_swap()` | L2128–L2190 | **Zero-Downtime Swap**: Atomically renames `target -> target_old, staging -> target`, then drops `target_old`. | Called when `mode == 'atomic_swap'`. |
-| `_ensure_mysql_index()` | L2192–L2221 | Dynamically creates B-Tree indexes on natural keys in MySQL if not already present. | Post-swap optimization. |
-| `_apply_custom_transform()` | L2411–L2468 | Dynamically loads and runs custom Python transformation scripts defined in `custom_transforms/`. | Custom mart transformation. |
+| `_deduplicate_by_nkey()` | L1849–L1883 | In-memory windowed deduplication over natural keys (`ROW_NUMBER() OVER (PARTITION BY nkey ORDER BY ...)`). | Called prior to serving write. |
+| `_resolve_and_deduplicate_columns()` | L1885–L1934 | Enforces strict Precedence Hierarchy: `Custom Transform (df.withColumn) > SQL Query Column > Config Default (external_columns NULL)`. Drops case-insensitive duplicate references, prioritizes transform outputs, and deterministically anchors natural keys. | Called in `_process_table()` & `GoldInitialLoader.run_initial_load()`. |
+| `filter_incremental_delta()` | L1937–L2020 | Anti-joins incoming delta against current target table state to filter out unchanged records. | Incremental delta processing. |
+| `_validate_gold_table_name()` | L2022–L2026 | Enforces naming conventions and prevents SQL injection on table identifiers. | Called before all DDL/DML. |
+| `_validate_droppable_table_name()` | L2034–L2042 | Security guard: strictly prevents dropping non-staging tables during swap cleanup. | Called in `_cleanup_staging_table()`. |
+| `_cleanup_staging_table()` | L2044–L2059 | Drops transient staging tables in MySQL (`staging_tbl_*`) upon failure or completion. | Staging lifecycle management. |
+| `_verify_schema_exists_or_raise()` | L2061–L2099 | Verifies target schema/database exists in MySQL before initiating write operations. | Pre-flight check. |
+| `_spark_type_to_mysql()` | L2118–L2143 | Translates PySpark data types to native MySQL DDL types. | Dynamic DDL generation. |
+| `_detect_schema_evolution()` | L2145–L2225 | Introspects MySQL `information_schema.COLUMNS`, detects missing columns, and executes `ALTER TABLE ... ADD COLUMN`. | MySQL schema evolution. |
+| `_write_staging_table()` | L2247–L2284 | Writes PySpark DataFrame to MySQL staging table via JDBC using connection pooling and batch commits. | Called in atomic swap workflow. |
+| `_execute_isolated_atomic_swap()` | L2297–L2359 | **Zero-Downtime Swap**: Atomically renames `target -> target_old, staging -> target`, then drops `target_old`. | Called when `mode == 'atomic_swap'`. |
+| `_ensure_mysql_index()` | L2361–L2390 | Dynamically creates B-Tree indexes on natural keys in MySQL if not already present. | Post-swap optimization. |
+| `_apply_custom_transform()` | L2577–L2634 | Dynamically loads and runs custom Python transformation scripts defined in `custom_transforms/`, injecting operational context (`is_initial_load`, `llm_column`, `rate_limit_rps`, `batch_size`). | Custom mart transformation & initial load. |
 | `_discover_queries()` | L2470–L2534 | Scans S3 or local SQL directories to locate all `.sql` query definition files. | Discovery phase. |
 | `_sort_queries_by_dependency()` | L2594–L2618 | Builds a directed graph of mart queries and performs topological sorting to determine execution order. | DAG ordering. |
 | `_ensure_dependency_views_registered()` | L2680–L2763 | Introspects SQL tokens and pre-registers Spark temp views from Bronze (`raw_tbl_*`), Silver (`tbl_*`), or Gold (`gold_*`). | Cross-layer query preparation. |
@@ -102,21 +105,23 @@ This document provides a master index and component map for the entire Gold Laye
 
 ## 5. Configuration Engine: `gold_config_loader.py`
 
-### Class: `GoldConfigLoader` (Lines 18–600)
+### Class: `GoldConfigLoader` (Lines 18–662)
 
 | Method | Line Range | Architectural Purpose |
 | :--- | :--- | :--- |
-| `interpolate_env()` | L58–L77 | Recursively traverses nested dicts and strings, replacing `{env}` with current environment (`dev`, `stage`, `prod`). |
-| `load_config()` | L79–L291 | Loads config from S3 (`s3://.../gold_config.json`) or local disk, caches in memory, and validates required keys. |
-| `get_defaults()` | L293–L297 | Returns `pipeline_defaults` block. |
-| `get_glue_database()` | L299–L313 | Returns target AWS Glue database name for Gold layer (`uax_datalake_db_{env}`). |
-| `get_source_config()` | L315–L329 | Returns configuration block for a specific Gold mart / source system. |
-| `get_table_config()` | L331–L358 | Resolves table-level configuration merged with parent defaults. |
-| `get_primary_key()` | L360–L380 | Resolves natural keys / primary keys for deduplication and upserts. |
-| `is_incremental()` | L382–L398 | Returns whether table is configured for incremental delta loads vs full rebuild. |
-| `get_secret_name()` | L414–L440 | Resolves AWS Secrets Manager secret name for database credentials. |
-| `get_target_engines()` | L473–L510 | Returns list of enabled serving engines (`athena`, `aurora`). |
-| `get_custom_transform_path()` | L558–L595 | Resolves S3 path to custom Python transform script if configured. |
+| `interpolate_env()` | L64–L83 | Recursively traverses nested dicts and strings, replacing `{env}` with current environment (`dev`, `stage`, `prod`). |
+| `load_config()` | L85–L297 | Loads config from S3 (`s3://.../gold_config.json`) or local disk, caches in memory, and validates required keys. |
+| `get_defaults()` | L299–L303 | Returns `pipeline_defaults` block. |
+| `get_glue_database()` | L305–L319 | Returns target AWS Glue database name for Gold layer (`uax_datalake_db_{env}`). |
+| `get_source_config()` | L321–L335 | Returns configuration block for a specific Gold mart / source system. |
+| `get_table_config()` | L337–L372 | Resolves table-level configuration merged with parent defaults. |
+| `get_primary_key()` | L374–L394 | Resolves natural keys / primary keys for deduplication and upserts. |
+| `is_incremental()` | L396–L412 | Returns whether table is configured for incremental delta loads vs full rebuild. |
+| `get_external_columns()` | L414–L438 | Resolves list of configured external / enrichment columns (e.g., `["conversation_summary"]`) for custom transforms and precedence resolution. |
+| `get_llm_column()` | L440–L451 | Backward-compatibility helper returning the primary external column if configured. |
+| `get_secret_name()` | L453–L479 | Resolves AWS Secrets Manager secret name for database credentials. |
+| `get_target_engines()` | L512–L549 | Returns list of enabled serving engines (`athena`, `aurora`). |
+| `get_custom_transform_path()` | L597–L634 | Resolves S3 path to custom Python transform script if configured. |
 
 ---
 

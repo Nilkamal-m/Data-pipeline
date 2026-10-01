@@ -19,7 +19,8 @@ In the end-to-end data pipeline, the Gold job runs as **Job 3 of the 3-job seque
 * **Iceberg Schema Incompatibility Auto-Resolution**: Detects when existing table column types conflict with incoming data (e.g., `bigint` → `string`) and automatically purges and recreates the table with the corrected schema.
 * **Zero-Downtime Aurora MySQL Serving**: Reads back conformed records from the authoritative Gold Iceberg table, stages them in an isolated temporary table (`{table}_staging`), performs a microsecond atomic DDL swap (`RENAME TABLE target TO old, staging TO target`), and ensures index performance on natural keys (`_ensure_mysql_index`).
 * **Protegrity PII Encryption**: Supports Protegrity PII tokenization for historical initial load data via `ProtegrityEncryptionManager` with guarded activation — encryption is invoked only when `encryption_columns` is configured and a valid `lambda_arn` is available.
-* **Pluggable Python Business Transforms**: Provides script hooks (`gold/script/custom_transforms/*.py`) for machine learning enrichment, advanced KPI calculation, and unstructured text parsing.
+* **Pluggable Python Business Transforms & LLM Enrichment**: Provides script hooks (`gold/script/custom_transforms/*.py`) for machine learning enrichment, advanced KPI calculation, and unstructured text parsing. Invoked during both **Initial Load** (preserving pre-enriched historical data) and **Incremental Silver** processing.
+* **Strict Column Conflict Resolution & Deduplication**: Enforces a definitive precedence hierarchy across conflicting column sources: $\mathbf{Custom\ Transform\ (df.withColumn)} > \mathbf{SQL\ Query\ Column} > \mathbf{Config\ Default\ (NULL)}$, ensuring zero ambiguous reference collisions in PySpark and Iceberg.
 * **Historical Data Migration & Archival**: Ingests historical reporting CSV exports (`gold/initial_exports/`), parses complex multiline records, dedupes against incoming telemetry, and automatically archives processed source files to S3 `_archived/` directories.
 
 ---
@@ -57,8 +58,11 @@ flowchart TD
         CheckInitial -- Yes --> ParseCSV["GoldInitialLoader.load():\nRead CSV with multiLine, escape & quote"]
         ParseCSV --> EncryptPII{"Protegrity Encryption\nColumns Configured?"}
         EncryptPII -- Yes --> RunEncrypt["ProtegrityEncryptionManager.encrypt_spark_dataframe()\nGuarded: validates lambda_arn before invocation"]
-        EncryptPII -- No --> DedupeCSV
-        RunEncrypt --> DedupeCSV["Deduplicate by nkey\nOrdered by _updated_at DESC"]
+        EncryptPII -- No --> ReconcileInit["reconcile_schema():\n1. Sanitize column names\n2. Standardize timestamps to YYYY-MM-DD HH:MM:SS\n3. Cast non-timestamps to StringType"]
+        RunEncrypt --> ReconcileInit
+        ReconcileInit --> ExecCustomInit["Execute custom_transforms/{source}_{table}.py\n(is_initial_load=True, historical data pre-enriched)"]
+        ExecCustomInit --> PrecedenceInit["_resolve_and_deduplicate_columns():\nTransform (df.withColumn) > SQL/CSV > Config (NULL)"]
+        PrecedenceInit --> DedupeCSV["Deduplicate by nkey\nOrdered by _updated_at DESC"]
         DedupeCSV --> ArchiveS3["Move CSV to S3 _archived/:\ns3://.../gold/initial_exports/{source}/_archived/"]
         ArchiveS3 --> InitIceberg["Bootstrap Initial Gold Iceberg Table"]
         CheckInitial -- No --> MartPlanning
@@ -69,12 +73,13 @@ flowchart TD
         MartPlanning["Discover Mart Queries:\ngold/query/{source}/*.sql"] --> BuildDAG["Build Dependency Graph & Topological Sort\n(Detect prerequisite marts)"]
         BuildDAG --> PreRegisterViews["_ensure_dependency_views_registered:\nScan clean_sql for table tokens & register Spark temp views\n(raw_tbl_* from Bronze, tbl_* from Silver, gold_* from Gold)"]
         PreRegisterViews --> RunSQL["Execute Mart SQL Query"]
-        RunSQL --> ReconcileSchema["reconcile_schema():\n1. Sanitize column names\n2. Detect timestamp columns by name/type heuristic\n3. Convert timestamps to YYYY-MM-DD HH:MM:SS string\n4. Cast all other business columns to StringType\n5. Preserve _updated_at, _inserted_at, _data_as_of as TimestampType"]
-        ReconcileSchema --> CheckCustom{"Custom Transform\nScript Configured?"}
-        CheckCustom -- Yes --> ExecCustom["Execute custom_transforms/{source}_{table}.py\n(e.g., Genesys transcript & metric parsing)"]
-        CheckCustom -- No --> FilterDelta
-        ExecCustom --> FilterDelta["filter_incremental_delta():\nAnti-join against existing Gold Iceberg table\n(Isolate new, updated, and unenriched records)"]
-    end
+        RunSQL --> FilterDelta["filter_incremental_delta():\nAnti-join against existing Gold Iceberg table\n(Isolate new, updated, and unenriched records)"]
+        FilterDelta --> CheckCustom{"Custom Transform\nScript Configured?"}
+        CheckCustom -- Yes --> ExecCustom["Execute custom_transforms/{source}_{table}.py\n(Batched loop + rate-limiting 20 RPS + backoff)"]
+        CheckCustom -- No --> ReconcileSchema
+        ExecCustom --> ReconcileSchema["reconcile_schema():\n1. Sanitize column names\n2. Detect timestamp columns by name/type heuristic\n3. Convert timestamps to YYYY-MM-DD HH:MM:SS string\n4. Cast all other business columns to StringType\n5. Preserve _updated_at, _inserted_at, _data_as_of as TimestampType"]
+        ReconcileSchema --> PrecedenceSilver["_resolve_and_deduplicate_columns():\nTransform (df.withColumn) > SQL > Config (NULL)"]
+        PrecedenceSilver --> IcebergTarget
 
     subgraph IcebergTarget ["4. Authoritative Iceberg Mart Upsert"]
         FilterDelta --> CheckCompat{"Iceberg Schema\nCompatible?"}
@@ -207,6 +212,22 @@ When a Gold table doesn't yet exist in the catalog, `_probe_target_schema_from_q
 2. Executing a zero-record probe query: `SELECT * FROM (<sql>) WHERE 1=0`.
 3. Extracting the schema fields and data types in milliseconds without reading actual data.
 4. Passing the probed schema into `reconcile_schema()` for type-aware timestamp detection.
+
+### 5.4 Strict Column Conflict Resolution & Deduplication
+
+In modern analytics pipelines, the same column name (e.g. `conversation_summary`, `sentiment_score`) can originate from multiple stages: table configuration (`external_columns`), the base SQL query (`SELECT ...`), or external custom transform scripts (`df.withColumn(...)`).
+
+To prevent PySpark `AnalysisException: Reference is ambiguous` or Iceberg schema collision errors, `GoldLayerManager._resolve_and_deduplicate_columns()` enforces a strict **Precedence Hierarchy**:
+
+$$\mathbf{1.\ Custom\ Transform\ (df.withColumn)} \;\;>\;\; \mathbf{2.\ SQL\ Query\ Column} \;\;>\;\; \mathbf{3.\ Config\ Default\ (external\_columns\ NULL)}$$
+
+| Precedence Level | Column Source | Resolution & Deduplication Rule |
+| :---: | :--- | :--- |
+| **Priority 1 (Highest)** | **Custom Transform** (`df.withColumn(...)`) | Overrides any existing values from the SQL query or configuration defaults. The transformed/enriched column is retained in the final DataFrame. |
+| **Priority 2 (Medium)** | **SQL Query Column** | If the column was produced by the SQL query and not modified by a custom transform, its SQL value is preserved. |
+| **Priority 3 (Lowest)** | **Config Default (NULL)** | If an item in `external_columns` is configured in `gold_config.json` but omitted from both the SQL query and custom transform, the engine injects `lit(None).cast("string")`. |
+
+* **Case-Insensitive Deduplication**: Resolves duplicate column names regardless of casing (e.g. `Summary` vs `summary`), preserving the casing of the highest-precedence instance and anchoring primary keys (`nkey`) at the beginning of the table. Developers implement custom rate limiting, micro-batching, and API retry logic directly inside their custom scripts.
 
 ---
 

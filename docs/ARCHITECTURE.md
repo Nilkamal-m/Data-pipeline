@@ -697,6 +697,15 @@ All database write operations strictly enforce enterprise safety guardrails:
 * The pipeline never executes `CREATE DATABASE` or `CREATE SCHEMA`.
 * Table dropping is strictly confined to temporary staging and backup tables ending in `_staging` or `_old`. Production tables are never dropped.
 
+#### 5.3.10 Custom Transform Extensibility & Strict Column Precedence
+
+The Gold layer supports dynamic Python transform hooks (`transform(df, spark, context)`) invoked during both **Initial Cold-Start Load** (historical pre-enriched data) and **Incremental Refresh** (delta records):
+* **Initial Load Awareness**: Historical exports that already contain pre-enriched values (e.g. LLM summaries, classifications) preserve existing data (`is_initial_load=True`), preventing costly redundant external API invocations.
+* **Developer Control over Rate Limiting & Batching**: Custom transform scripts receive runtime execution metadata (`context`), allowing developers to implement domain-specific rate limits, micro-batching, and external API retry logic directly within their script.
+* **Strict Column Precedence Hierarchy**: When schema reconciliation, SQL queries, and custom script transforms produce overlapping or conflicting column names, the engine enforces a deterministic priority:
+  $$\mathbf{Custom\ Transform\ (df.withColumn)} > \mathbf{SQL\ Query\ Column} > \mathbf{Config\ Default\ (external\_columns\ NULL)}$$
+* **Case-Insensitive Deduplication**: Resolves potential PySpark ambiguous column reference collisions while guaranteeing primary keys and technical audit timestamps (`_updated_at`, `_inserted_at`) are cleanly anchored.
+
 ---
 
 ### 5.4 Consumer Layer — Aurora MySQL Zero-Downtime Serving
