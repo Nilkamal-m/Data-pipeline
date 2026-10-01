@@ -165,10 +165,18 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         # Bronze specific parameters
         'config_s3_path': '--CONFIG_S3_PATH',
         'CONFIG_S3_PATH': '--CONFIG_S3_PATH',
-        'initial_load_date': '--INITIAL_LOAD_DATE_CLI',
-        'INITIAL_LOAD_DATE': '--INITIAL_LOAD_DATE_CLI',
+        'initial_load_date': '--INITIAL_LOAD_DATE',
+        'INITIAL_LOAD_DATE': '--INITIAL_LOAD_DATE',
         'initial_load_date_cli': '--INITIAL_LOAD_DATE_CLI',
         'INITIAL_LOAD_DATE_CLI': '--INITIAL_LOAD_DATE_CLI',
+        'upper_bound': '--UPPER_BOUND',
+        'UPPER_BOUND': '--UPPER_BOUND',
+        'bronze_bucket': '--BRONZE_BUCKET',
+        'BRONZE_BUCKET': '--BRONZE_BUCKET',
+        'state_bucket': '--STATE_BUCKET',
+        'STATE_BUCKET': '--STATE_BUCKET',
+        'base_url': '--BASE_URL',
+        'BASE_URL': '--BASE_URL',
         'batch_size': '--BATCH_SIZE',
         'BATCH_SIZE': '--BATCH_SIZE',
         's3_chunk_size': '--S3_CHUNK_SIZE',
@@ -183,6 +191,14 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         'CRAWLER_NAME': '--CRAWLER_NAME',
         'silver_crawler_name': '--SILVER_CRAWLER_NAME',
         'SILVER_CRAWLER_NAME': '--SILVER_CRAWLER_NAME',
+        'fetch_mode': '--FETCH_MODE',
+        'FETCH_MODE': '--FETCH_MODE',
+        'source_bucket': '--SOURCE_BUCKET',
+        'SOURCE_BUCKET': '--SOURCE_BUCKET',
+        'file_prefix': '--FILE_PREFIX',
+        'FILE_PREFIX': '--FILE_PREFIX',
+        'file_format': '--FILE_FORMAT',
+        'FILE_FORMAT': '--FILE_FORMAT',
         # Silver specific parameters
         'silver_config_s3_path': '--SILVER_CONFIG_S3_PATH',
         'SILVER_CONFIG_S3_PATH': '--SILVER_CONFIG_S3_PATH',
@@ -295,6 +311,17 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         'EXTERNAL_COLUMNS': '--EXTERNAL_COLUMNS',
         'process_layer': '--PROCESS_LAYER',
         'PROCESS_LAYER': '--PROCESS_LAYER',
+        # Gold API & Mart parameters
+        'api_secret_name': '--API_SECRET_NAME',
+        'API_SECRET_NAME': '--API_SECRET_NAME',
+        'llm_secret_name': '--LLM_SECRET_NAME',
+        'LLM_SECRET_NAME': '--LLM_SECRET_NAME',
+        'mart_name': '--MART_NAME',
+        'MART_NAME': '--MART_NAME',
+        'table_list': '--TABLE_LIST',
+        'TABLE_LIST': '--TABLE_LIST',
+        'incremental': '--INCREMENTAL',
+        'INCREMENTAL': '--INCREMENTAL',
         # Athena Workgroup parameters
         'athena_workgroup': '--ATHENA_WORKGROUP',
         'ATHENA_WORKGROUP': '--ATHENA_WORKGROUP',
@@ -306,6 +333,12 @@ def build_glue_arguments(event: Dict[str, Any]) -> Dict[str, str]:
         val = event.get(event_key)
         if val is not None and str(val).strip() != '':
             glue_args[glue_arg_key] = str(val).strip()
+
+    # Dual-populate --INITIAL_LOAD_DATE and --INITIAL_LOAD_DATE_CLI so all Bronze Glue versions receive the cutoff
+    if '--INITIAL_LOAD_DATE_CLI' in glue_args and '--INITIAL_LOAD_DATE' not in glue_args:
+        glue_args['--INITIAL_LOAD_DATE'] = glue_args['--INITIAL_LOAD_DATE_CLI']
+    elif '--INITIAL_LOAD_DATE' in glue_args and '--INITIAL_LOAD_DATE_CLI' not in glue_args:
+        glue_args['--INITIAL_LOAD_DATE_CLI'] = glue_args['--INITIAL_LOAD_DATE']
 
     # Determine process layer (--PROCESS_LAYER strictly silver or gold for uax_silver_etl.py)
     layer = str(event.get('layer', '')).strip().lower()
