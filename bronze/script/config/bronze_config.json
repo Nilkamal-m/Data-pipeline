@@ -258,8 +258,8 @@
       }
     },
     "peakon": {
-      "_secrets_required": ["api_token"],
-      "_note": "api_token is the Peakon Custom Application Access Token (or pre-exchanged JWT bearer token). Optional in secret: api_base_url (defaults to https://api.peakon.com).",
+      "_secrets_required": ["peakon_api_token"],
+      "_note": "peakon_api_token is the Peakon Custom Application Access Token (or pre-exchanged JWT bearer token). Optional in secret: api_base_url (defaults to https://api.peakon.com).",
       "secret_name": "uax-datalake/peakon-credentials-{env}",
       "base_url": "https://api.peakon.com",
       "api_endpoint_template": "/api/v1/{table_name}",

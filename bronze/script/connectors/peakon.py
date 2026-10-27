@@ -10,9 +10,9 @@ Cursor pagination via JSON:API links.next.
 Delta extraction via responseAnsweredAt / updated timestamps.
 
 Required Secrets Manager keys:
-  api_token    : Peakon Custom Application Access Token (or JWT Bearer token)
-  api_base_url : (Optional) Peakon instance base URL (default: https://api.peakon.com)
-  batch_size   : (Optional) Max answers per page (default: 2000, max: 20000)
+  peakon_api_token : Peakon Custom Application Access Token (or JWT Bearer token). Alias: api_token
+  api_base_url     : (Optional) Peakon instance base URL (default: https://api.peakon.com)
+  batch_size       : (Optional) Max answers per page (default: 2000, max: 20000)
 
 Required bronze_config.json keys (source_systems.peakon):
   base_url             : Fallback Peakon base URL if not in secret
@@ -113,7 +113,7 @@ class PeakonConnector:
                 pass
             raise RuntimeError(
                 f"Peakon authentication failed (HTTP {http_err.code}): {http_err.reason}. "
-                f"Response body: {body}. Verify 'api_token' in AWS Secrets Manager."
+                f"Response body: {body}. Verify 'peakon_api_token' in AWS Secrets Manager."
             ) from http_err
         except Exception as err:
             raise RuntimeError(f"Peakon authentication error: {err}") from err
@@ -206,14 +206,15 @@ class PeakonConnector:
 
         # 1. Resolve Credentials & Token
         api_token = (
-            secret_dict.get("api_token")
+            secret_dict.get("peakon_api_token")
+            or secret_dict.get("api_token")
             or secret_dict.get("token")
             or secret_dict.get("access_token")
             or secret_dict.get("bearer_token")
         )
         if not api_token:
             raise ValueError(
-                "Peakon connector: Missing 'api_token' in AWS Secrets Manager. "
+                "Peakon connector: Missing 'peakon_api_token' (or 'api_token') in AWS Secrets Manager. "
                 "Store your Peakon Custom Application Access Token in Secrets Manager."
             )
 

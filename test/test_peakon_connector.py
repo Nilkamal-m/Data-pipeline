@@ -102,7 +102,7 @@ class TestPeakonConnector(unittest.TestCase):
         mock_request.side_effect = [page1_resp, page2_resp]
 
         secret_dict = {
-            "api_token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+            "peakon_api_token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
             "api_base_url": "https://api.peakon.com"
         }
         source_config = {
