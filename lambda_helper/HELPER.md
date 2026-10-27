@@ -51,7 +51,7 @@ The Helper Lambda function provides a unified control plane and execution interf
 | `layer` | string | All | `"bronze"` | Execution mode: `"bronze"`, `"silver"`, `"gold"`, or `"all"` (runs Bronze $\rightarrow$ Silver $\rightarrow$ Gold). |
 | `layers` | list | All | `None` | Custom stage list: e.g. `["silver", "gold"]` or `["bronze", "silver", "gold"]`. |
 | `skip_bronze` | boolean | All | `false` | When `layer="all"`, set to `true` to execute `Silver -> Gold` only. |
-| `source_system` | string | All | **Required** | Source system name (e.g. `servicenow`, `moveworks`, `genesys`, `postgresql`, `s3_file`). |
+| `source_system` | string | All | **Required** | Source system name (e.g. `servicenow`, `moveworks`, `genesys`, `peakon`, `postgresql`, `s3_file`). |
 | `source_table_name` | string \| list | Bronze, Silver | Config defaults | Target table name(s). Accepts single string (`"incident"`), array (`["incident", "sys_user"]`), or comma-separated string (`"incident, sys_user"`). Aliases: `table_name`, `tables`. |
 | `env` / `environment` | string | All | `dev` | Target environment (`dev`, `stage`, `prod`). Automatically interpolates `{env}` tokens in paths and secrets. |
 | `job_name` | string | Bronze, Silver, Gold | Auto-resolved | Explicit Glue job name override (e.g. `uax-datalake-bronze-ingestion-dev`). |
@@ -267,6 +267,17 @@ Extracts data strictly within a bounded historical time window:
   "source_system": "s3_file",
   "source_table_name": "hr_roster",
   "fetch_mode": "latest",
+  "wait_until_completion": true
+}
+```
+
+#### 7. Ingest Survey Answers from Workday Peakon (`peakon`)
+Ingests raw survey feedback answers, scores, and questions via Peakon's JSON:API export:
+```json
+{
+  "layer": "bronze",
+  "source_system": "peakon",
+  "source_table_name": "answers",
   "wait_until_completion": true
 }
 ```

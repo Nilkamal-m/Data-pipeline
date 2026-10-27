@@ -8,6 +8,7 @@ All connectors expose a single public method: fetch_delta().
 from .servicenow import ServiceNowConnector
 from .genesys    import GenesysConnector
 from .moveworks  import MoveworksConnector
+from .peakon     import PeakonConnector
 from .database   import DatabaseConnector
 from .s3_file    import S3FileConnector
 from .oauth      import OAuth2Client
@@ -18,6 +19,7 @@ CONNECTOR_MAP = {
     'servicenow':  ServiceNowConnector,
     'genesys':     GenesysConnector,
     'moveworks':   MoveworksConnector,
+    'peakon':      PeakonConnector,
     'postgresql':  DatabaseConnector,
     'mysql':       DatabaseConnector,
     'mariadb':     DatabaseConnector,
@@ -71,6 +73,7 @@ __all__ = [
     'ServiceNowConnector',
     'GenesysConnector',
     'MoveworksConnector',
+    'PeakonConnector',
     'DatabaseConnector',
     'S3FileConnector',
     'OAuth2Client',

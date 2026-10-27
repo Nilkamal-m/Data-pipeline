@@ -256,6 +256,42 @@
           "fetch_mode": "latest"
         }
       }
+    },
+    "peakon": {
+      "_secrets_required": ["api_token"],
+      "_note": "api_token is the Peakon Custom Application Access Token (or pre-exchanged JWT bearer token). Optional in secret: api_base_url (defaults to https://api.peakon.com).",
+      "secret_name": "uax-datalake/peakon-credentials-{env}",
+      "base_url": "https://api.peakon.com",
+      "api_endpoint_template": "/api/v1/{table_name}",
+      "response_records_key": "data",
+      "batch_size": 2000,
+      "tables": {
+        "answers": {
+          "custom_endpoint": "/api/v1/answers/export",
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "employees": {
+          "custom_endpoint": "/api/v1/employees",
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "engagement_overview": {
+          "custom_endpoint": "/api/v1/engagement/overview",
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "engagement_drivers": {
+          "custom_endpoint": "/api/v1/engagement/drivers",
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        },
+        "segments": {
+          "custom_endpoint": "/api/v1/segments",
+          "initial_load_date": "2024-01-01 00:00:00",
+          "upper_bound": ""
+        }
+      }
     }
   }
 }

@@ -578,6 +578,7 @@ CONNECTOR_MAP = {
     'servicenow':  ServiceNowConnector,
     'genesys':     GenesysConnector,
     'moveworks':   MoveworksConnector,
+    'peakon':      PeakonConnector,
     'postgresql':  DatabaseConnector,
     'mysql':       DatabaseConnector,
     'mariadb':     DatabaseConnector,
